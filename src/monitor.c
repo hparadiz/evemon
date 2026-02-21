@@ -18,6 +18,7 @@
 #include <time.h>
 #include <pwd.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 
 #define POLL_INTERVAL_MS 2000
 
@@ -206,6 +207,147 @@ static unsigned long long read_cpu_ticks(pid_t pid)
     return (unsigned long long)utime + (unsigned long long)stime;
 }
 
+/*
+ * Detect whether a process is running inside a Linux container.
+ *
+ * Strategy (two-pronged):
+ *  1. PID-namespace check – compare the inode of /proc/<pid>/ns/pid with
+ *     that of /proc/1/ns/pid.  If they differ the process lives in a
+ *     different PID namespace, which is the kernel-level definition of
+ *     "in a container".
+ *  2. Cgroup heuristic – scan /proc/<pid>/cgroup for well-known path
+ *     fragments that container runtimes inject (docker, lxc, podman,
+ *     kubepods, containerd, garden, buildkit, etc.).
+ *
+ * The cgroup check runs first because it can tell us *which* runtime is
+ * in use.  The namespace check is a fallback for runtimes that don't
+ * leave an obvious cgroup breadcrumb.
+ *
+ * Writes a short label into buf: "docker", "lxc", "podman", "k8s",
+ * "containerd", "nspawn", "container" (generic), or "" (host).
+ */
+static void read_container(pid_t pid, char *buf, size_t bufsz)
+{
+    buf[0] = '\0';
+
+    /* ── 1. cgroup heuristic ────────────────────────────────── */
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cgroup", pid);
+
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "docker") || strstr(line, "/moby/")) {
+                snprintf(buf, bufsz, "docker");
+                break;
+            }
+            if (strstr(line, "lxc")) {
+                snprintf(buf, bufsz, "lxc");
+                break;
+            }
+            if (strstr(line, "libpod")) {
+                snprintf(buf, bufsz, "podman");
+                break;
+            }
+            if (strstr(line, "kubepods") || strstr(line, "kubelet")) {
+                snprintf(buf, bufsz, "k8s");
+                break;
+            }
+            if (strstr(line, "containerd")) {
+                snprintf(buf, bufsz, "containerd");
+                break;
+            }
+            if (strstr(line, "machine.slice") ||
+                strstr(line, "machine-")) {
+                snprintf(buf, bufsz, "nspawn");
+                break;
+            }
+            if (strstr(line, "garden")) {
+                snprintf(buf, bufsz, "garden");
+                break;
+            }
+            if (strstr(line, "buildkit")) {
+                snprintf(buf, bufsz, "buildkit");
+                break;
+            }
+        }
+        fclose(f);
+        if (buf[0] != '\0')
+            return;   /* identified a specific runtime */
+    }
+
+    /* ── 2. PID-namespace check (fallback) ──────────────────── */
+    static ino_t init_ns_ino = 0;
+    if (init_ns_ino == 0) {
+        struct stat st;
+        if (stat("/proc/1/ns/pid", &st) == 0)
+            init_ns_ino = st.st_ino;
+    }
+    if (init_ns_ino != 0) {
+        snprintf(path, sizeof(path), "/proc/%d/ns/pid", pid);
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_ino != init_ns_ino)
+            snprintf(buf, bufsz, "container");
+    }
+}
+
+/*
+ * Read the process start time from /proc/<pid>/stat field 22 (starttime)
+ * and convert it to an epoch timestamp using the system boot time.
+ * Returns epoch seconds, or 0 on failure.
+ */
+static unsigned long long read_start_time(pid_t pid)
+{
+    /* Get system boot time (cached after first call) */
+    static time_t boot_time = 0;
+    if (boot_time == 0) {
+        FILE *f = fopen("/proc/stat", "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "btime ", 6) == 0) {
+                    boot_time = (time_t)atoll(line + 6);
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        if (boot_time == 0) return 0;
+    }
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    char buf[1024];
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
+    fclose(f);
+
+    /* Skip past the comm field (in parens, may contain spaces) */
+    const char *p = strrchr(buf, ')');
+    if (!p) return 0;
+    p++;
+
+    /* Fields after comm: state(3), ppid(4), pgrp(5), session(6),
+     * tty_nr(7), tpgid(8), flags(9), minflt(10), cminflt(11),
+     * majflt(12), cmajflt(13), utime(14), stime(15), cutime(16),
+     * cstime(17), priority(18), nice(19), num_threads(20),
+     * itrealvalue(21), starttime(22).                              */
+    unsigned long long starttime = 0;
+    int n = sscanf(p, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u"
+                      " %*u %*u %*d %*d %*d %*d %*u %*d %llu",
+                   &starttime);
+    if (n != 1) return 0;
+
+    long clk_tck = sysconf(_SC_CLK_TCK);
+    if (clk_tck < 1) clk_tck = 100;
+
+    return (unsigned long long)boot_time + starttime / (unsigned long long)clk_tck;
+}
+
 /* Returns non-zero when every character in s is a digit (PID directory). */
 static int is_pid_dir(const char *s)
 {
@@ -310,6 +452,12 @@ static proc_snapshot_t build_snapshot(void)
         /* CPU ticks and percentage */
         e->cpu_ticks = read_cpu_ticks(pid);
         e->cpu_percent = 0.0;
+
+        /* Process start time */
+        e->start_time = read_start_time(pid);
+
+        /* Container detection */
+        read_container(pid, e->container, sizeof(e->container));
 
         snap.count++;
     }

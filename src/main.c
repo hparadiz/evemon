@@ -9,6 +9,7 @@
 #include "profile.h"
 
 #include <gtk/gtk.h>
+#include <fontconfig/fontconfig.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -30,6 +31,7 @@ static void on_sigint(int sig)
 int main(int argc, char *argv[])
 {
     profile_init();
+    FcInit();
     gtk_init(&argc, &argv);
 
     if (monitor_state_init(&g_state) != 0) {

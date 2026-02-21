@@ -9,6 +9,7 @@
 #define PROC_CMD_MAX   4096
 #define PROC_USER_MAX  64
 #define PROC_CWD_MAX   1024
+#define PROC_CTR_MAX   64
 #define PROC_LIST_MAX  2048
 
 /* A single process entry */
@@ -19,9 +20,11 @@ typedef struct {
     char     cmdline[PROC_CMD_MAX];
     char     user[PROC_USER_MAX];
     char     cwd[PROC_CWD_MAX];
+    char     container[PROC_CTR_MAX];   /* container runtime or empty   */
     long     mem_rss_kb;            /* resident set size in KiB */
     unsigned long long cpu_ticks;   /* utime + stime (USER_HZ ticks)  */
     double   cpu_percent;           /* CPU% since last snapshot        */
+    unsigned long long start_time;  /* process start time (epoch secs) */
 } proc_entry_t;
 
 /* Snapshot of all processes at a point in time */
