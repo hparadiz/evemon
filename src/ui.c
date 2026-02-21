@@ -22,6 +22,9 @@
 #include <utmpx.h>
 #include <arpa/inet.h>
 #include <inttypes.h>
+#include <limits.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 /* ── tree-store column indices ───────────────────────────────── */
 enum {
@@ -98,6 +101,8 @@ typedef struct {
     GtkWidget          *menubar;       /* toggleable menu bar                 */
     GtkWidget          *tree;          /* the GtkTreeView widget              */
     GtkCssProvider     *css;           /* live CSS provider for font changes  */
+    GtkCssProvider     *sidebar_css;   /* CSS for sidebar labels / frame      */
+    GtkCssProvider     *fd_css;        /* CSS for fd tree (1pt smaller)       */
     int                 font_size;     /* current font size in pt             */
     gboolean            auto_font;     /* auto-scale font with window size    */
 
@@ -2238,6 +2243,155 @@ static void on_menu_exit(GtkMenuItem *item, gpointer data)
     gtk_widget_destroy(window);
 }
 
+/* ── GTK theme discovery & selection ──────────────────────────── */
+
+static int theme_name_cmp(const void *a, const void *b)
+{
+    return g_ascii_strcasecmp(*(const char **)a, *(const char **)b);
+}
+
+/*
+ * Collect available GTK3 theme names from the standard search paths.
+ * A directory is a valid theme if it contains gtk-3.0/gtk.css.
+ * Returns a NULL-terminated array of strdup'd names (caller frees).
+ */
+static char **collect_gtk_themes(int *out_count)
+{
+    /* Candidate directories: ~/.themes, ~/.local/share/themes,
+     * $XDG_DATA_DIRS/themes (default /usr/share/themes) */
+    const char *home = g_get_home_dir();
+    char buf[PATH_MAX];
+
+    /* Build a list of base directories to scan */
+    const char *bases[16];
+    int nbases = 0;
+
+    static char home_themes[PATH_MAX];
+    static char home_local[PATH_MAX];
+    snprintf(home_themes, sizeof(home_themes), "%s/.themes", home);
+    snprintf(home_local,  sizeof(home_local),  "%s/.local/share/themes", home);
+    bases[nbases++] = home_themes;
+    bases[nbases++] = home_local;
+
+    /* Parse XDG_DATA_DIRS (colon-separated) */
+    const char *xdg = g_getenv("XDG_DATA_DIRS");
+    if (!xdg || !xdg[0])
+        xdg = "/usr/local/share:/usr/share";
+
+    char *xdg_copy = strdup(xdg);
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(xdg_copy, ":", &saveptr);
+         tok && nbases < 14;
+         tok = strtok_r(NULL, ":", &saveptr)) {
+        /* We'll construct the full path later with /themes appended */
+        bases[nbases++] = tok;  /* points into xdg_copy, alive until free */
+    }
+
+    /* Collect theme names into a dynamic array */
+    int cap = 64, count = 0;
+    char **names = malloc(cap * sizeof(char *));
+
+    for (int i = 0; i < nbases; i++) {
+        /* For XDG_DATA_DIRS entries, append /themes */
+        const char *dir;
+        char full[PATH_MAX];
+        if (i < 2) {
+            dir = bases[i];  /* already has /themes */
+        } else {
+            snprintf(full, sizeof(full), "%s/themes", bases[i]);
+            dir = full;
+        }
+
+        DIR *d = opendir(dir);
+        if (!d) continue;
+
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+
+            /* Check for gtk-3.0/gtk.css inside the theme dir */
+            int n = snprintf(buf, sizeof(buf), "%s/%s/gtk-3.0/gtk.css",
+                             dir, ent->d_name);
+            if (n < 0 || (size_t)n >= sizeof(buf))
+                continue;  /* path too long – skip */
+            struct stat st;
+            if (stat(buf, &st) != 0 || !S_ISREG(st.st_mode))
+                continue;
+
+            /* Skip duplicates */
+            gboolean dup = FALSE;
+            for (int j = 0; j < count; j++) {
+                if (strcmp(names[j], ent->d_name) == 0) {
+                    dup = TRUE;
+                    break;
+                }
+            }
+            if (dup) continue;
+
+            if (count + 1 >= cap) {
+                cap *= 2;
+                names = realloc(names, cap * sizeof(char *));
+            }
+            names[count++] = strdup(ent->d_name);
+        }
+        closedir(d);
+    }
+    free(xdg_copy);
+
+    /* Sort alphabetically */
+    if (count > 1)
+        qsort(names, count, sizeof(char *), theme_name_cmp);
+
+    names[count] = NULL;
+    if (out_count) *out_count = count;
+    return names;
+}
+
+static void on_theme_selected(GtkCheckMenuItem *item, gpointer data)
+{
+    (void)data;
+    if (!gtk_check_menu_item_get_active(item))
+        return;  /* ignore deactivation of the old radio item */
+
+    const char *name = gtk_menu_item_get_label(GTK_MENU_ITEM(item));
+    GtkSettings *settings = gtk_settings_get_default();
+    g_object_set(settings, "gtk-theme-name", name, NULL);
+}
+
+/*
+ * Build a "Theme" submenu with radio items for each discovered GTK3 theme.
+ * The currently active theme gets the radio bullet.
+ */
+static GtkWidget *build_theme_submenu(void)
+{
+    GtkWidget *menu = gtk_menu_new();
+
+    /* Get current theme name */
+    GtkSettings *settings = gtk_settings_get_default();
+    char *current = NULL;
+    g_object_get(settings, "gtk-theme-name", &current, NULL);
+
+    int count = 0;
+    char **themes = collect_gtk_themes(&count);
+
+    GSList *group = NULL;
+    for (int i = 0; i < count; i++) {
+        GtkWidget *item = gtk_radio_menu_item_new_with_label(group, themes[i]);
+        group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(item));
+
+        if (current && strcmp(themes[i], current) == 0)
+            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item), TRUE);
+
+        g_signal_connect(item, "toggled", G_CALLBACK(on_theme_selected), NULL);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+        free(themes[i]);
+    }
+    free(themes);
+    g_free(current);
+
+    return menu;
+}
+
 static void on_menu_about(GtkMenuItem *item, gpointer data)
 {
     (void)item;
@@ -2264,11 +2418,198 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
 
 static void reload_font_css(ui_ctx_t *ctx)
 {
-    char buf[128];
+    char buf[256];
+
+    /* Main process tree */
     snprintf(buf, sizeof(buf),
              "treeview { font-family: Monospace; font-size: %dpt; }",
              ctx->font_size);
     gtk_css_provider_load_from_data(ctx->css, buf, -1, NULL);
+
+    /* Sidebar labels and frame title */
+    if (ctx->sidebar_css) {
+        snprintf(buf, sizeof(buf),
+                 "frame, label, checkbutton { font-size: %dpt; }",
+                 ctx->font_size);
+        gtk_css_provider_load_from_data(ctx->sidebar_css, buf, -1, NULL);
+    }
+
+    /* FD tree in sidebar (1pt smaller than main) */
+    if (ctx->fd_css) {
+        int fd_size = ctx->font_size > FONT_SIZE_MIN
+                    ? ctx->font_size - 1 : ctx->font_size;
+        snprintf(buf, sizeof(buf),
+                 "treeview { font-family: Monospace; font-size: %dpt; }",
+                 fd_size);
+        gtk_css_provider_load_from_data(ctx->fd_css, buf, -1, NULL);
+    }
+}
+
+/* ── desktop-environment–aware modifier detection ─────────────── */
+
+/*
+ * Detect whether the user's desktop shortcuts use Meta (Super) instead
+ * of Ctrl as the primary application-shortcut modifier.
+ *
+ * Strategy (checked in order):
+ *
+ *  1. KDE  – parse ~/.config/kdeglobals [Shortcuts] section.
+ *            If Copy=Meta+C (or similar), the user has macOS-style
+ *            bindings → use GDK_META_MASK.
+ *
+ *  2. GTK 3 – parse ~/.config/gtk-3.0/settings.ini for
+ *             gtk-key-theme-name.  "Mac" or "Emacs" themes remap
+ *             shortcuts, but in practice GTK apps always use Ctrl
+ *             unless the KDE portal overrides it (handled by #1).
+ *
+ *  3. GTK 2 – ~/.gtkrc-2.0 gtk-key-theme-name, same idea.
+ *
+ *  4. Fallback – Ctrl (the universal default).
+ */
+static GdkModifierType detect_shortcut_modifier(void)
+{
+    /* ── 1. KDE: ~/.config/kdeglobals [Shortcuts] ─────────────── */
+    const char *config_home = g_getenv("XDG_CONFIG_HOME");
+    char path[PATH_MAX];
+    if (config_home && config_home[0])
+        snprintf(path, sizeof(path), "%s/kdeglobals", config_home);
+    else
+        snprintf(path, sizeof(path), "%s/.config/kdeglobals",
+                 g_get_home_dir());
+
+    FILE *fp = fopen(path, "r");
+    if (fp) {
+        char line[512];
+        gboolean in_shortcuts = FALSE;
+        while (fgets(line, sizeof(line), fp)) {
+            /* strip trailing whitespace */
+            size_t len = strlen(line);
+            while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'
+                           || line[len - 1] == ' '))
+                line[--len] = '\0';
+
+            if (line[0] == '[') {
+                in_shortcuts = (g_ascii_strcasecmp(line, "[Shortcuts]") == 0);
+                continue;
+            }
+            if (!in_shortcuts)
+                continue;
+
+            /* Look for  Copy=Meta+C  or  Paste=Meta+V  etc. */
+            if (g_str_has_prefix(line, "Copy=") ||
+                g_str_has_prefix(line, "Paste=") ||
+                g_str_has_prefix(line, "Cut=") ||
+                g_str_has_prefix(line, "SelectAll=")) {
+                const char *val = strchr(line, '=');
+                if (val && g_ascii_strncasecmp(val + 1, "Meta+", 5) == 0) {
+                    fclose(fp);
+                    return GDK_META_MASK;
+                }
+                /* Explicitly set to something other than Meta → Ctrl */
+                if (val && val[1] != '\0') {
+                    fclose(fp);
+                    return GDK_CONTROL_MASK;
+                }
+            }
+        }
+        fclose(fp);
+    }
+
+    /* ── 2. GTK 3: ~/.config/gtk-3.0/settings.ini ────────────── */
+    if (config_home && config_home[0])
+        snprintf(path, sizeof(path), "%s/gtk-3.0/settings.ini", config_home);
+    else
+        snprintf(path, sizeof(path), "%s/.config/gtk-3.0/settings.ini",
+                 g_get_home_dir());
+
+    GKeyFile *kf = g_key_file_new();
+    if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+        char *theme = g_key_file_get_string(kf, "Settings",
+                                            "gtk-key-theme-name", NULL);
+        if (theme) {
+            /* "Mac" key theme remaps shortcuts to Meta */
+            gboolean is_mac = (g_ascii_strcasecmp(theme, "Mac") == 0);
+            g_free(theme);
+            g_key_file_free(kf);
+            return is_mac ? GDK_META_MASK : GDK_CONTROL_MASK;
+        }
+    }
+    g_key_file_free(kf);
+
+    /* ── 3. GTK 2: ~/.gtkrc-2.0 ──────────────────────────────── */
+    snprintf(path, sizeof(path), "%s/.gtkrc-2.0", g_get_home_dir());
+    fp = fopen(path, "r");
+    if (fp) {
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            /* gtk-key-theme-name="Mac" */
+            if (strstr(line, "gtk-key-theme-name")) {
+                gboolean is_mac = (strcasestr(line, "\"Mac\"") != NULL);
+                fclose(fp);
+                return is_mac ? GDK_META_MASK : GDK_CONTROL_MASK;
+            }
+        }
+        fclose(fp);
+    }
+
+    /* ── 4. Fallback: Ctrl (universal default) ────────────────── */
+    return GDK_CONTROL_MASK;
+}
+
+/* ── keyboard shortcuts ──────────────────────────────────────── */
+
+static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
+                             gpointer data)
+{
+    (void)widget;
+    ui_ctx_t *ctx = data;
+
+    static GdkModifierType mod = 0;
+    if (mod == 0)
+        mod = detect_shortcut_modifier();
+
+    /* Mask out lock bits (Caps Lock, Num Lock, etc.) */
+    guint state = ev->state & gtk_accelerator_get_default_mod_mask();
+
+    if (state != (guint)mod)
+        return FALSE;       /* modifier not held – not our shortcut */
+
+    switch (ev->keyval) {
+    case GDK_KEY_plus:       /* Ctrl + Shift + = (i.e. "+") */
+    case GDK_KEY_equal:      /* Ctrl + =  (no shift needed) */
+    case GDK_KEY_KP_Add:     /* Ctrl + numpad "+"           */
+        if (ctx->font_size < FONT_SIZE_MAX) {
+            ctx->font_size++;
+            ctx->auto_font = FALSE;
+            reload_font_css(ctx);
+        }
+        return TRUE;
+
+    case GDK_KEY_minus:      /* Ctrl + -                    */
+    case GDK_KEY_KP_Subtract:/* Ctrl + numpad "-"           */
+        if (ctx->font_size > FONT_SIZE_MIN) {
+            ctx->font_size--;
+            ctx->auto_font = FALSE;
+            reload_font_css(ctx);
+        }
+        return TRUE;
+
+    case GDK_KEY_0:          /* Ctrl + 0  → reset font size */
+    case GDK_KEY_KP_0:
+        ctx->font_size = FONT_SIZE_DEFAULT;
+        ctx->auto_font = FALSE;
+        reload_font_css(ctx);
+        return TRUE;
+
+    case GDK_KEY_q:          /* Ctrl + Q  → quit            */
+        gtk_main_quit();
+        return TRUE;
+
+    default:
+        break;
+    }
+
+    return FALSE;
 }
 
 static void on_font_increase(GtkMenuItem *item, gpointer data)
@@ -2727,7 +3068,7 @@ void *ui_thread(void *arg)
     gtk_style_context_add_provider(gtk_widget_get_style_context(fd_tree),
         GTK_STYLE_PROVIDER(fd_css),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    g_object_unref(fd_css);
+    /* NOTE: don't unref fd_css – kept alive for dynamic font changes */
 
     /* Enable selection so user can copy paths */
     GtkTreeSelection *fd_sel = gtk_tree_view_get_selection(
@@ -2747,6 +3088,20 @@ void *ui_thread(void *arg)
 
     GtkWidget *sidebar_frame = gtk_frame_new("Details");
     gtk_container_add(GTK_CONTAINER(sidebar_frame), sidebar_scroll);
+
+    /* Live CSS provider for sidebar font size (cascades to all children) */
+    GtkCssProvider *sidebar_css = gtk_css_provider_new();
+    {
+        char sbuf[128];
+        snprintf(sbuf, sizeof(sbuf),
+                 "frame, label, checkbutton { font-size: %dpt; }",
+                 FONT_SIZE_DEFAULT);
+        gtk_css_provider_load_from_data(sidebar_css, sbuf, -1, NULL);
+    }
+    gtk_style_context_add_provider(gtk_widget_get_style_context(sidebar_frame),
+        GTK_STYLE_PROVIDER(sidebar_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    /* NOTE: don't unref sidebar_css – kept alive for dynamic font changes */
 
     /* ── horizontal paned: tree | sidebar ─────────────────────── */
     GtkWidget *hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
@@ -2792,6 +3147,14 @@ void *ui_thread(void *arg)
     gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu),
                           gtk_separator_menu_item_new());
     gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), font_auto);
+
+    /* Theme picker submenu */
+    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu),
+                          gtk_separator_menu_item_new());
+    GtkWidget *theme_item = gtk_menu_item_new_with_label("Theme");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(theme_item),
+                              build_theme_submenu());
+    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), theme_item);
 
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), appear_item);
     gtk_menu_shell_append(GTK_MENU_SHELL(menubar), view_item);
@@ -2840,6 +3203,8 @@ void *ui_thread(void *arg)
     ctx.menubar      = menubar;
     ctx.tree         = tree;
     ctx.css          = css;
+    ctx.sidebar_css  = sidebar_css;
+    ctx.fd_css       = fd_css;
     ctx.font_size    = FONT_SIZE_DEFAULT;
     ctx.auto_font    = FALSE;
     ctx.collapsed    = (pid_set_t){ NULL, 0, 0 };
@@ -2899,6 +3264,9 @@ void *ui_thread(void *arg)
     g_signal_connect(tree,   "button-release-event", G_CALLBACK(on_button_release), &ctx);
     g_signal_connect(tree,   "motion-notify-event",  G_CALLBACK(on_motion_notify),  &ctx);
     g_signal_connect(window, "focus-out-event",      G_CALLBACK(on_focus_out),      &ctx);
+
+    /* Global keyboard shortcuts (Ctrl+Plus / Ctrl+Minus / Ctrl+0 / Ctrl+Q) */
+    g_signal_connect(window, "key-press-event", G_CALLBACK(on_key_press), &ctx);
 
     /* Double-click a row to open the sidebar */
     g_signal_connect(tree, "row-activated", G_CALLBACK(on_row_activated), &ctx);
