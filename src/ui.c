@@ -145,6 +145,10 @@ typedef struct {
     double              velocity_y;
     guint               scroll_timer;    /* g_timeout source ID, 0 = none  */
 
+    /* async fd scan state */
+    guint               fd_generation;   /* bumped on each new scan request */
+    GCancellable       *fd_cancel;       /* cancels in-flight scan         */
+
 } ui_ctx_t;
 
 /* ── helpers ─────────────────────────────────────────────────── */
@@ -1098,24 +1102,6 @@ static void read_pid_fds(pid_t pid, fd_list_t *out)
     closedir(dp);
 }
 
-/*
- * Collect all children (recursive) of `parent_pid` from the tree store
- * and read their fds too.
- */
-static void collect_descendant_fds(GtkTreeModel *model, GtkTreeIter *parent,
-                                   fd_list_t *out)
-{
-    GtkTreeIter child;
-    gboolean valid = gtk_tree_model_iter_children(model, &child, parent);
-    while (valid) {
-        gint pid;
-        gtk_tree_model_get(model, &child, COL_PID, &pid, -1);
-        read_pid_fds((pid_t)pid, out);
-        collect_descendant_fds(model, &child, out);
-        valid = gtk_tree_model_iter_next(model, &child);
-    }
-}
-
 /* ── hash table for PID lookups ──────────────────────────────── */
 
 #define HT_SIZE 8192
@@ -1728,6 +1714,296 @@ static gboolean find_iter_by_pid(GtkTreeModel *model, GtkTreeIter *parent,
     return FALSE;
 }
 
+/* ── async fd scan infrastructure ─────────────────────────────── */
+
+/*
+ * Collect descendant PIDs by walking the GtkTreeModel (must be called
+ * on the main thread).  Returns a malloc'd array; caller frees.
+ */
+static void collect_descendant_pids(GtkTreeModel *model, GtkTreeIter *parent,
+                                    pid_t **out, size_t *out_count, size_t *out_cap)
+{
+    GtkTreeIter child;
+    gboolean valid = gtk_tree_model_iter_children(model, &child, parent);
+    while (valid) {
+        gint pid;
+        gtk_tree_model_get(model, &child, COL_PID, &pid, -1);
+        if (*out_count >= *out_cap) {
+            *out_cap = *out_cap ? *out_cap * 2 : 64;
+            pid_t *tmp = realloc(*out, *out_cap * sizeof(pid_t));
+            if (!tmp) return;
+            *out = tmp;
+        }
+        (*out)[(*out_count)++] = (pid_t)pid;
+        collect_descendant_pids(model, &child, out, out_count, out_cap);
+        valid = gtk_tree_model_iter_next(model, &child);
+    }
+}
+
+/* Data passed to / returned from the background fd scan task. */
+typedef struct {
+    /* ── input (set on main thread before dispatch) ──────────── */
+    pid_t    pid;                   /* primary PID to scan        */
+    pid_t   *desc_pids;            /* descendant PIDs (or NULL)   */
+    size_t   desc_count;
+    guint    generation;            /* matches ctx->fd_generation  */
+
+    /* ── output (filled by background thread) ────────────────── */
+    fd_list_t buckets[FD_CAT_COUNT];
+
+    /* ── back-pointer (read-only on bg thread — not dereferenced) */
+    ui_ctx_t *ctx;
+} fd_scan_task_t;
+
+static void fd_scan_task_free(fd_scan_task_t *t)
+{
+    if (!t) return;
+    free(t->desc_pids);
+    for (int c = 0; c < FD_CAT_COUNT; c++)
+        fd_list_free(&t->buckets[c]);
+    free(t);
+}
+
+/*
+ * Background thread: read /proc fds, build socket table, classify,
+ * sort.  No GTK API calls here — purely /proc I/O + data crunching.
+ */
+static void fd_scan_thread_func(GTask        *task,
+                                gpointer      source_object,
+                                gpointer      task_data,
+                                GCancellable *cancellable)
+{
+    (void)source_object;
+    fd_scan_task_t *t = task_data;
+
+    if (g_cancellable_is_cancelled(cancellable))
+        return;
+
+    /* Read fds for the primary PID */
+    fd_list_t fds;
+    fd_list_init(&fds);
+    read_pid_fds(t->pid, &fds);
+
+    /* Read fds for descendants if requested */
+    for (size_t i = 0; i < t->desc_count; i++) {
+        if (g_cancellable_is_cancelled(cancellable)) {
+            fd_list_free(&fds);
+            return;
+        }
+        read_pid_fds(t->desc_pids[i], &fds);
+    }
+
+    if (g_cancellable_is_cancelled(cancellable)) {
+        fd_list_free(&fds);
+        return;
+    }
+
+    /* Build socket table for inode resolution */
+    sock_table_t socktbl;
+    sock_table_build(&socktbl);
+
+    /* Bucket & classify */
+    for (int c = 0; c < FD_CAT_COUNT; c++)
+        fd_list_init(&t->buckets[c]);
+
+    for (size_t i = 0; i < fds.count; i++) {
+        if (g_cancellable_is_cancelled(cancellable))
+            break;
+
+        fd_category_t cat = classify_fd(fds.entries[i].path);
+        if (cat == FD_CAT_OTHER_SOCKETS &&
+            strncmp(fds.entries[i].path, "socket:[", 8) == 0) {
+            unsigned long inode = strtoul(
+                fds.entries[i].path + 8, NULL, 10);
+            char desc[512];
+            cat = resolve_socket(inode, &socktbl, desc, sizeof(desc));
+            fd_list_push(&t->buckets[cat], fds.entries[i].fd, desc);
+        } else if (cat == FD_CAT_DEVICES) {
+            char desc[512];
+            label_device(fds.entries[i].path, desc, sizeof(desc));
+            fd_list_push(&t->buckets[cat], fds.entries[i].fd, desc);
+        } else {
+            fd_list_push(&t->buckets[cat], fds.entries[i].fd,
+                         fds.entries[i].path);
+        }
+    }
+    sock_table_free(&socktbl);
+    fd_list_free(&fds);
+
+    /* Sort within each bucket */
+    for (int c = 0; c < FD_CAT_COUNT; c++) {
+        if (t->buckets[c].count > 1)
+            qsort(t->buckets[c].entries, t->buckets[c].count,
+                  sizeof(fd_entry_t), fd_entry_path_cmp);
+    }
+
+    g_task_return_boolean(task, TRUE);
+}
+
+/*
+ * Completion callback — runs on the main thread.
+ * Applies the bucketed fd results to the GtkTreeStore.
+ */
+static void fd_scan_complete(GObject      *source_object,
+                             GAsyncResult *result,
+                             gpointer      user_data)
+{
+    (void)source_object;
+    ui_ctx_t *ctx = user_data;
+
+    GTask *task = G_TASK(result);
+    fd_scan_task_t *t = g_task_get_task_data(task);
+
+    /* Discard stale results (a newer scan was kicked off) */
+    if (!t || t->generation != ctx->fd_generation)
+        return;
+
+    /* If cancelled or failed, leave the tree as-is */
+    if (g_task_had_error(task))
+        return;
+
+    /* Save scroll position */
+    GtkAdjustment *fd_vadj = gtk_scrolled_window_get_vadjustment(
+        GTK_SCROLLED_WINDOW(gtk_widget_get_parent(
+            GTK_WIDGET(ctx->fd_view))));
+    double fd_scroll_pos = gtk_adjustment_get_value(fd_vadj);
+
+    GtkTreeModel *fd_model = GTK_TREE_MODEL(ctx->fd_store);
+
+    /* Build a map of existing category iters */
+    GtkTreeIter cat_iters[FD_CAT_COUNT];
+    gboolean    cat_exists[FD_CAT_COUNT];
+    memset(cat_exists, 0, sizeof(cat_exists));
+
+    {
+        GtkTreeIter top;
+        gboolean valid = gtk_tree_model_iter_children(fd_model, &top, NULL);
+        while (valid) {
+            gint cat_id = -1;
+            gtk_tree_model_get(fd_model, &top, FD_COL_CAT, &cat_id, -1);
+            if (cat_id >= 0 && cat_id < FD_CAT_COUNT) {
+                cat_iters[cat_id]  = top;
+                cat_exists[cat_id] = TRUE;
+            }
+            valid = gtk_tree_model_iter_next(fd_model, &top);
+        }
+    }
+
+    /* Remove categories that are now empty */
+    for (int c = 0; c < FD_CAT_COUNT; c++) {
+        if (cat_exists[c] && t->buckets[c].count == 0) {
+            gtk_tree_store_remove(ctx->fd_store, &cat_iters[c]);
+            cat_exists[c] = FALSE;
+        }
+    }
+
+    /* Add or update each non-empty category */
+    for (int c = 0; c < FD_CAT_COUNT; c++) {
+        if (t->buckets[c].count == 0) continue;
+
+        char hdr[128];
+        snprintf(hdr, sizeof(hdr), "%s (%zu)",
+                 fd_cat_label[c], t->buckets[c].count);
+
+        GtkTreeIter parent;
+        if (!cat_exists[c]) {
+            gtk_tree_store_append(ctx->fd_store, &parent, NULL);
+            gtk_tree_store_set(ctx->fd_store, &parent,
+                               FD_COL_TEXT, hdr,
+                               FD_COL_CAT, (gint)c, -1);
+            cat_exists[c] = TRUE;
+            cat_iters[c]  = parent;
+        } else {
+            parent = cat_iters[c];
+            gtk_tree_store_set(ctx->fd_store, &parent,
+                               FD_COL_TEXT, hdr, -1);
+        }
+
+        GtkTreeIter child;
+        gboolean child_valid = gtk_tree_model_iter_children(
+            fd_model, &child, &parent);
+        size_t bi = 0;
+
+        while (bi < t->buckets[c].count && child_valid) {
+            gtk_tree_store_set(ctx->fd_store, &child,
+                               FD_COL_TEXT, t->buckets[c].entries[bi].path,
+                               FD_COL_CAT, (gint)-1, -1);
+            bi++;
+            child_valid = gtk_tree_model_iter_next(fd_model, &child);
+        }
+
+        while (bi < t->buckets[c].count) {
+            GtkTreeIter new_child;
+            gtk_tree_store_append(ctx->fd_store, &new_child, &parent);
+            gtk_tree_store_set(ctx->fd_store, &new_child,
+                               FD_COL_TEXT, t->buckets[c].entries[bi].path,
+                               FD_COL_CAT, (gint)-1, -1);
+            bi++;
+        }
+
+        while (child_valid) {
+            child_valid = gtk_tree_store_remove(ctx->fd_store, &child);
+        }
+
+        GtkTreePath *cat_path = gtk_tree_model_get_path(
+            fd_model, &cat_iters[c]);
+        if (ctx->fd_collapsed & (1u << c))
+            gtk_tree_view_collapse_row(ctx->fd_view, cat_path);
+        else
+            gtk_tree_view_expand_row(ctx->fd_view, cat_path, FALSE);
+        gtk_tree_path_free(cat_path);
+    }
+
+    /* Restore scroll position */
+    gtk_adjustment_set_value(fd_vadj, fd_scroll_pos);
+}
+
+/*
+ * Kick off an async fd scan for the given PID.
+ * Cancels any in-flight scan first.  Must be called on the main thread.
+ */
+static void fd_scan_start(ui_ctx_t *ctx, pid_t pid)
+{
+    /* Cancel previous scan */
+    if (ctx->fd_cancel) {
+        g_cancellable_cancel(ctx->fd_cancel);
+        g_object_unref(ctx->fd_cancel);
+    }
+    ctx->fd_cancel = g_cancellable_new();
+    ctx->fd_generation++;
+
+    /* If the selected PID changed, reset collapse state */
+    if (pid != ctx->fd_last_pid) {
+        ctx->fd_collapsed = 0;
+        ctx->fd_last_pid  = pid;
+    }
+
+    /* Allocate task data */
+    fd_scan_task_t *t = calloc(1, sizeof(*t));
+    if (!t) return;
+    t->pid        = pid;
+    t->generation = ctx->fd_generation;
+    t->ctx        = ctx;
+
+    /* Collect descendant PIDs from the tree model (main thread) */
+    if (ctx->fd_include_desc) {
+        GtkTreeIter fd_iter;
+        if (find_iter_by_pid(GTK_TREE_MODEL(ctx->store), NULL,
+                             pid, &fd_iter)) {
+            size_t cap = 0;
+            collect_descendant_pids(GTK_TREE_MODEL(ctx->store),
+                                    &fd_iter,
+                                    &t->desc_pids, &t->desc_count, &cap);
+        }
+    }
+
+    /* Dispatch to background thread */
+    GTask *task = g_task_new(NULL, ctx->fd_cancel, fd_scan_complete, ctx);
+    g_task_set_task_data(task, t, (GDestroyNotify)fd_scan_task_free);
+    g_task_run_in_thread(task, fd_scan_thread_func);
+    g_object_unref(task);
+}
+
 /* ── sidebar: update detail panel from selection ─────────────── */
 
 static void sidebar_update(ui_ctx_t *ctx)
@@ -1813,178 +2089,8 @@ static void sidebar_update(ui_ctx_t *ctx)
     gtk_label_set_text(ctx->sb_cwd,       cwd       ? cwd       : "–");
     gtk_label_set_text(ctx->sb_cmdline,   cmdline   ? cmdline   : "–");
 
-    /* ── populate file descriptor tree (incremental) ────────── */
-    {
-        /* If the selected PID changed, reset collapse state */
-        if ((pid_t)pid != ctx->fd_last_pid) {
-            ctx->fd_collapsed = 0;
-            ctx->fd_last_pid  = (pid_t)pid;
-        }
-
-        fd_list_t fds;
-        fd_list_init(&fds);
-
-        read_pid_fds((pid_t)pid, &fds);
-
-        if (ctx->fd_include_desc) {
-            GtkTreeIter fd_iter;
-            if (find_iter_by_pid(GTK_TREE_MODEL(ctx->store), NULL,
-                                (pid_t)pid, &fd_iter)) {
-                collect_descendant_fds(GTK_TREE_MODEL(ctx->store),
-                                       &fd_iter, &fds);
-            }
-        }
-
-        /* Build socket inode table for resolution */
-        sock_table_t socktbl;
-        sock_table_build(&socktbl);
-
-        /* Bucket fds by category */
-        fd_list_t buckets[FD_CAT_COUNT];
-        for (int c = 0; c < FD_CAT_COUNT; c++)
-            fd_list_init(&buckets[c]);
-
-        for (size_t i = 0; i < fds.count; i++) {
-            fd_category_t cat = classify_fd(fds.entries[i].path);
-            /* For sockets, resolve the inode to get the real
-             * sub-category (net/unix/other) and a descriptive path. */
-            if (cat == FD_CAT_OTHER_SOCKETS &&
-                strncmp(fds.entries[i].path, "socket:[", 8) == 0) {
-                unsigned long inode = strtoul(
-                    fds.entries[i].path + 8, NULL, 10);
-                char desc[512];
-                cat = resolve_socket(inode, &socktbl,
-                                     desc, sizeof(desc));
-                fd_list_push(&buckets[cat], fds.entries[i].fd, desc);
-            } else if (cat == FD_CAT_DEVICES) {
-                char desc[512];
-                label_device(fds.entries[i].path, desc, sizeof(desc));
-                fd_list_push(&buckets[cat], fds.entries[i].fd, desc);
-            } else {
-                fd_list_push(&buckets[cat], fds.entries[i].fd,
-                             fds.entries[i].path);
-            }
-        }
-        sock_table_free(&socktbl);
-        for (int c = 0; c < FD_CAT_COUNT; c++) {
-            if (buckets[c].count > 1)
-                qsort(buckets[c].entries, buckets[c].count,
-                      sizeof(fd_entry_t), fd_entry_path_cmp);
-        }
-
-        /* Save scroll position */
-        GtkAdjustment *fd_vadj = gtk_scrolled_window_get_vadjustment(
-            GTK_SCROLLED_WINDOW(gtk_widget_get_parent(
-                GTK_WIDGET(ctx->fd_view))));
-        double fd_scroll_pos = gtk_adjustment_get_value(fd_vadj);
-
-        GtkTreeModel *fd_model = GTK_TREE_MODEL(ctx->fd_store);
-
-        /*
-         * Incremental update: walk existing top-level rows by category id.
-         * Build a map of existing category iters.
-         */
-        GtkTreeIter cat_iters[FD_CAT_COUNT];
-        gboolean    cat_exists[FD_CAT_COUNT];
-        memset(cat_exists, 0, sizeof(cat_exists));
-
-        {
-            GtkTreeIter top;
-            gboolean valid = gtk_tree_model_iter_children(fd_model, &top, NULL);
-            while (valid) {
-                gint cat_id = -1;
-                gtk_tree_model_get(fd_model, &top, FD_COL_CAT, &cat_id, -1);
-                if (cat_id >= 0 && cat_id < FD_CAT_COUNT) {
-                    cat_iters[cat_id]  = top;
-                    cat_exists[cat_id] = TRUE;
-                }
-                valid = gtk_tree_model_iter_next(fd_model, &top);
-            }
-        }
-
-        /* Remove categories that are now empty */
-        for (int c = 0; c < FD_CAT_COUNT; c++) {
-            if (cat_exists[c] && buckets[c].count == 0) {
-                gtk_tree_store_remove(ctx->fd_store, &cat_iters[c]);
-                cat_exists[c] = FALSE;
-            }
-        }
-
-        /* Add or update each non-empty category */
-        for (int c = 0; c < FD_CAT_COUNT; c++) {
-            if (buckets[c].count == 0) continue;
-
-            char hdr[128];
-            snprintf(hdr, sizeof(hdr), "%s (%zu)",
-                     fd_cat_label[c], buckets[c].count);
-
-            GtkTreeIter parent;
-            if (!cat_exists[c]) {
-                /* New category – append and expand by default */
-                gtk_tree_store_append(ctx->fd_store, &parent, NULL);
-                gtk_tree_store_set(ctx->fd_store, &parent,
-                                   FD_COL_TEXT, hdr,
-                                   FD_COL_CAT, (gint)c, -1);
-                cat_exists[c] = TRUE;
-                cat_iters[c]  = parent;
-            } else {
-                parent = cat_iters[c];
-                /* Update header text (count may have changed) */
-                gtk_tree_store_set(ctx->fd_store, &parent,
-                                   FD_COL_TEXT, hdr, -1);
-            }
-
-            /*
-             * Sync children: walk existing children and the new sorted
-             * bucket in parallel.  Update in-place where possible,
-             * insert/remove to match.
-             */
-            GtkTreeIter child;
-            gboolean child_valid = gtk_tree_model_iter_children(
-                fd_model, &child, &parent);
-            size_t bi = 0;
-
-            while (bi < buckets[c].count && child_valid) {
-                /* Update existing child row */
-                gtk_tree_store_set(ctx->fd_store, &child,
-                                   FD_COL_TEXT, buckets[c].entries[bi].path,
-                                   FD_COL_CAT, (gint)-1, -1);
-                bi++;
-                child_valid = gtk_tree_model_iter_next(fd_model, &child);
-            }
-
-            /* Append any remaining new entries */
-            while (bi < buckets[c].count) {
-                GtkTreeIter new_child;
-                gtk_tree_store_append(ctx->fd_store, &new_child, &parent);
-                gtk_tree_store_set(ctx->fd_store, &new_child,
-                                   FD_COL_TEXT, buckets[c].entries[bi].path,
-                                   FD_COL_CAT, (gint)-1, -1);
-                bi++;
-            }
-
-            /* Remove surplus old children */
-            while (child_valid) {
-                child_valid = gtk_tree_store_remove(ctx->fd_store, &child);
-            }
-
-            /* Expand/collapse based on saved user state */
-            GtkTreePath *cat_path = gtk_tree_model_get_path(
-                fd_model, &cat_iters[c]);
-            if (ctx->fd_collapsed & (1u << c))
-                gtk_tree_view_collapse_row(ctx->fd_view, cat_path);
-            else
-                gtk_tree_view_expand_row(ctx->fd_view, cat_path, FALSE);
-            gtk_tree_path_free(cat_path);
-        }
-
-        /* Restore scroll position */
-        gtk_adjustment_set_value(fd_vadj, fd_scroll_pos);
-
-        for (int c = 0; c < FD_CAT_COUNT; c++)
-            fd_list_free(&buckets[c]);
-        fd_list_free(&fds);
-    }
+    /* ── populate file descriptor tree (async, off main thread) ── */
+    fd_scan_start(ctx, (pid_t)pid);
 
     g_free(user); g_free(name); g_free(cpu_text);
     g_free(rss_text); g_free(grp_rss_text); g_free(grp_cpu_text);

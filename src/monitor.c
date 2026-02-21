@@ -98,7 +98,7 @@ static pid_t read_ppid(pid_t pid)
     return ppid;
 }
 
-/* Read the owning user of /proc/<pid> via Uid from status + getpwuid. */
+/* Read the owning user of /proc/<pid> via Uid from status + getpwuid_r. */
 static int read_user(pid_t pid, char *buf, size_t bufsz)
 {
     char path[64];
@@ -123,9 +123,11 @@ static int read_user(pid_t pid, char *buf, size_t bufsz)
         return -1;
     }
 
-    struct passwd *pw = getpwuid(uid);
-    if (pw)
-        snprintf(buf, bufsz, "%s", pw->pw_name);
+    struct passwd pwbuf, *result = NULL;
+    char pwstore[1024];
+    if (getpwuid_r(uid, &pwbuf, pwstore, sizeof(pwstore), &result) == 0
+        && result)
+        snprintf(buf, bufsz, "%s", result->pw_name);
     else
         snprintf(buf, bufsz, "%u", (unsigned)uid);
 
