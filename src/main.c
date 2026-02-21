@@ -18,14 +18,38 @@
 /* Global so the signal handler can reach it. */
 static monitor_state_t g_state;
 
+/*
+ * Shutdown flag set atomically from the signal handler.
+ * The monitor thread and UI poll this to know when to exit.
+ * Using sig_atomic_t avoids calling pthread_mutex_lock() from
+ * a signal handler, which is undefined behaviour per POSIX and
+ * deadlocks if the signal fires while the lock is already held.
+ */
+static volatile sig_atomic_t g_shutdown_requested = 0;
+
 static void on_sigint(int sig)
 {
     (void)sig;
+    g_shutdown_requested = 1;
+}
 
-    pthread_mutex_lock(&g_state.lock);
-    g_state.running = 0;
-    pthread_cond_broadcast(&g_state.updated);   /* wake waiters */
-    pthread_mutex_unlock(&g_state.lock);
+/*
+ * GLib idle callback that checks the atomic flag and performs the
+ * actual (thread-safe) shutdown from the main loop context.
+ */
+static gboolean check_shutdown(gpointer data)
+{
+    (void)data;
+    if (g_shutdown_requested) {
+        pthread_mutex_lock(&g_state.lock);
+        g_state.running = 0;
+        pthread_cond_broadcast(&g_state.updated);
+        pthread_mutex_unlock(&g_state.lock);
+
+        gtk_main_quit();
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
 }
 
 int main(int argc, char *argv[])
@@ -52,6 +76,14 @@ int main(int argc, char *argv[])
         monitor_state_destroy(&g_state);
         return EXIT_FAILURE;
     }
+
+    /*
+     * Poll the atomic shutdown flag from the GTK main loop.
+     * This bridges the async-signal-safe flag into the thread-safe
+     * mutex/cond world without calling pthread functions from a
+     * signal handler.
+     */
+    g_timeout_add(200, check_shutdown, NULL);
 
     /* Run GTK UI on the main thread (ui_thread calls gtk_main) */
     ui_thread(&g_state);

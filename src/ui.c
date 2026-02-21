@@ -67,8 +67,11 @@ static void pid_set_add(pid_set_t *s, pid_t pid)
         if (s->pids[i] == pid) return;
 
     if (s->count >= s->capacity) {
-        s->capacity = s->capacity ? s->capacity * 2 : 64;
-        s->pids = realloc(s->pids, s->capacity * sizeof(pid_t));
+        size_t newcap = s->capacity ? s->capacity * 2 : 64;
+        pid_t *tmp = realloc(s->pids, newcap * sizeof(pid_t));
+        if (!tmp) return;   /* OOM – silently drop the add */
+        s->pids     = tmp;
+        s->capacity = newcap;
     }
     s->pids[s->count++] = pid;
 }
@@ -221,8 +224,11 @@ static void fd_list_free(fd_list_t *l)
 static void fd_list_push(fd_list_t *l, int fd, const char *path)
 {
     if (l->count >= l->capacity) {
-        l->capacity = l->capacity ? l->capacity * 2 : 64;
-        l->entries = realloc(l->entries, l->capacity * sizeof(fd_entry_t));
+        size_t newcap = l->capacity ? l->capacity * 2 : 64;
+        fd_entry_t *tmp = realloc(l->entries, newcap * sizeof(fd_entry_t));
+        if (!tmp) return;   /* OOM – drop this fd entry */
+        l->entries  = tmp;
+        l->capacity = newcap;
     }
     l->entries[l->count].fd = fd;
     snprintf(l->entries[l->count].path, sizeof(l->entries[0].path), "%s", path);
@@ -314,8 +320,11 @@ static void sock_table_free(sock_table_t *t)
 static sock_info_t *sock_table_push(sock_table_t *t)
 {
     if (t->count >= t->capacity) {
-        t->capacity = t->capacity ? t->capacity * 2 : 256;
-        t->entries = realloc(t->entries, t->capacity * sizeof(sock_info_t));
+        size_t newcap = t->capacity ? t->capacity * 2 : 256;
+        sock_info_t *tmp = realloc(t->entries, newcap * sizeof(sock_info_t));
+        if (!tmp) return NULL;   /* OOM */
+        t->entries  = tmp;
+        t->capacity = newcap;
     }
     memset(&t->entries[t->count], 0, sizeof(sock_info_t));
     return &t->entries[t->count++];
@@ -356,6 +365,7 @@ static void parse_proc_net_inet(const char *path, sock_kind_t kind,
         (void)st;
         if (n >= 6 && inode > 0) {
             sock_info_t *s = sock_table_push(out);
+            if (!s) continue;   /* OOM – skip entry */
             s->inode       = inode;
             s->kind        = kind;
             s->local_addr  = local_addr;
@@ -394,6 +404,7 @@ static void parse_proc_net_inet6(const char *path, sock_kind_t kind,
         (void)st;
         if (n >= 6 && inode > 0) {
             sock_info_t *s = sock_table_push(out);
+            if (!s) continue;   /* OOM – skip entry */
             s->inode       = inode;
             s->kind        = kind;
             s->local_port6 = (uint16_t)local_port;
@@ -434,6 +445,7 @@ static void parse_proc_net_unix(sock_table_t *out)
                        &type, &inode, path);
         if (n >= 2 && inode > 0) {
             sock_info_t *s = sock_table_push(out);
+            if (!s) continue;   /* OOM – skip entry */
             s->inode     = inode;
             s->kind      = SOCK_KIND_UNIX;
             s->unix_type = (int)type;
@@ -1144,8 +1156,11 @@ typedef struct {
 static void iter_map_add(iter_map_t *m, pid_t pid, GtkTreeIter *iter)
 {
     if (m->count >= m->capacity) {
-        m->capacity = m->capacity ? m->capacity * 2 : 256;
-        m->entries = realloc(m->entries, m->capacity * sizeof(iter_map_entry_t));
+        size_t newcap = m->capacity ? m->capacity * 2 : 256;
+        iter_map_entry_t *tmp = realloc(m->entries, newcap * sizeof(iter_map_entry_t));
+        if (!tmp) return;   /* OOM – silently drop */
+        m->entries  = tmp;
+        m->capacity = newcap;
     }
     m->entries[m->count].pid  = pid;
     m->entries[m->count].iter = *iter;
@@ -2330,7 +2345,9 @@ static char **collect_gtk_themes(int *out_count)
 
             if (count + 1 >= cap) {
                 cap *= 2;
-                names = realloc(names, cap * sizeof(char *));
+                char **tmp = realloc(names, cap * sizeof(char *));
+                if (!tmp) break;   /* OOM – stop collecting */
+                names = tmp;
             }
             names[count++] = strdup(ent->d_name);
         }
