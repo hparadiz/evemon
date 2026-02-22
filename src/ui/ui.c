@@ -250,10 +250,38 @@ static void on_end_process_tree(GtkMenuItem *item, gpointer data)
     free(d);
 }
 
+static void on_copy_command(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    const char *cmdline = data;
+    GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gtk_clipboard_set_text(cb, cmdline, -1);
+}
+
 static void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
-                                     pid_t pid, const char *name)
+                                     pid_t pid, const char *name,
+                                     const char *cmdline)
 {
     GtkWidget *menu = gtk_menu_new();
+
+    /* ── Copy Command ── */
+    GtkWidget *mi_copy = gtk_menu_item_new_with_label("Copy Command");
+    if (cmdline && cmdline[0]) {
+        /* Store a copy of the cmdline string as data on the menu item
+         * so it survives until the callback fires. */
+        gchar *cmd_dup = g_strdup(cmdline);
+        g_signal_connect(mi_copy, "activate",
+                         G_CALLBACK(on_copy_command), cmd_dup);
+        g_object_set_data_full(G_OBJECT(mi_copy), "cmd",
+                               cmd_dup, g_free);
+    } else {
+        gtk_widget_set_sensitive(mi_copy, FALSE);
+    }
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_copy);
+
+    /* ── separator ── */
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu),
+                          gtk_separator_menu_item_new());
 
     char label1[320];
     snprintf(label1, sizeof(label1), "End Process (%s, pid %d)", name, pid);
@@ -272,6 +300,10 @@ static void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
         g_signal_connect(mi2, "activate", G_CALLBACK(on_end_process_tree), d);
     }
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi2);
+
+
+
+
 
     gtk_widget_show_all(menu);
     gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
@@ -304,11 +336,15 @@ static gboolean on_button_press(GtkWidget *widget, GdkEventButton *ev,
                     ctx->sort_model);
                 gint pid = 0;
                 gchar *name = NULL;
+                gchar *cmdline = NULL;
                 gtk_tree_model_get(child_model, &child_iter,
-                                   COL_PID, &pid, COL_NAME, &name, -1);
+                                   COL_PID, &pid, COL_NAME, &name,
+                                   COL_CMDLINE, &cmdline, -1);
                 show_process_context_menu(ctx, ev, (pid_t)pid,
-                                         name ? name : "?");
+                                         name ? name : "?",
+                                         cmdline ? cmdline : "");
                 g_free(name);
+                g_free(cmdline);
             }
             gtk_tree_path_free(path);
         }
