@@ -16,6 +16,11 @@
 #include <signal.h>
 #include <utmpx.h>
 
+/* Forward declarations for filter helpers */
+static void rebuild_filter_store(ui_ctx_t *ctx);
+static void sync_filter_store(ui_ctx_t *ctx);
+static void switch_to_real_store(ui_ctx_t *ctx);
+
 /* ── pid_set helpers ─────────────────────────────────────────── */
 
 void pid_set_add(pid_set_t *s, pid_t pid)
@@ -287,12 +292,19 @@ static gboolean on_button_press(GtkWidget *widget, GdkEventButton *ev,
                 GTK_TREE_VIEW(widget));
             gtk_tree_selection_select_path(sel, path);
 
-            GtkTreeIter iter;
-            if (gtk_tree_model_get_iter(GTK_TREE_MODEL(ctx->store),
-                                       &iter, path)) {
+            GtkTreeIter sort_iter;
+            if (gtk_tree_model_get_iter(
+                    GTK_TREE_MODEL(ctx->sort_model),
+                    &sort_iter, path)) {
+                /* sort iter → underlying store iter */
+                GtkTreeIter child_iter;
+                gtk_tree_model_sort_convert_iter_to_child_iter(
+                    ctx->sort_model, &child_iter, &sort_iter);
+                GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
+                    ctx->sort_model);
                 gint pid = 0;
                 gchar *name = NULL;
-                gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), &iter,
+                gtk_tree_model_get(child_model, &child_iter,
                                    COL_PID, &pid, COL_NAME, &name, -1);
                 show_process_context_menu(ctx, ev, (pid_t)pid,
                                          name ? name : "?");
@@ -402,7 +414,12 @@ static void on_row_collapsed(GtkTreeView *view,
     (void)view; (void)path;
     ui_ctx_t *ctx = data;
     gint pid;
-    gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), iter, COL_PID, &pid, -1);
+    /* iter is from the sort model; convert sort → underlying store */
+    GtkTreeIter child_iter;
+    gtk_tree_model_sort_convert_iter_to_child_iter(
+        ctx->sort_model, &child_iter, iter);
+    GtkTreeModel *child_model = gtk_tree_model_sort_get_model(ctx->sort_model);
+    gtk_tree_model_get(child_model, &child_iter, COL_PID, &pid, -1);
     pid_set_add(&ctx->collapsed, (pid_t)pid);
 }
 
@@ -414,7 +431,12 @@ static void on_row_expanded(GtkTreeView *view,
     (void)view; (void)path;
     ui_ctx_t *ctx = data;
     gint pid;
-    gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), iter, COL_PID, &pid, -1);
+    /* iter is from the sort model; convert sort → underlying store */
+    GtkTreeIter child_iter;
+    gtk_tree_model_sort_convert_iter_to_child_iter(
+        ctx->sort_model, &child_iter, iter);
+    GtkTreeModel *child_model = gtk_tree_model_sort_get_model(ctx->sort_model);
+    gtk_tree_model_get(child_model, &child_iter, COL_PID, &pid, -1);
     pid_set_remove(&ctx->collapsed, (pid_t)pid);
 }
 
@@ -522,11 +544,17 @@ static gboolean on_refresh(gpointer data)
             GList *rows = gtk_tree_selection_get_selected_rows(sel, NULL);
             if (rows) {
                 GtkTreePath *sel_path = rows->data;
+                /* sel_path is a sort-model path; sort → underlying store */
+                GtkTreePath *store_path = gtk_tree_model_sort_convert_path_to_child_path(
+                    ctx->sort_model, sel_path);
+                GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
+                    ctx->sort_model);
                 GtkTreeIter sel_iter;
-                if (gtk_tree_model_get_iter(GTK_TREE_MODEL(ctx->store),
-                                           &sel_iter, sel_path)) {
+                if (store_path &&
+                    gtk_tree_model_get_iter(child_model,
+                                           &sel_iter, store_path)) {
                     gint pid;
-                    gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), &sel_iter,
+                    gtk_tree_model_get(child_model, &sel_iter,
                                        COL_PID, &pid, -1);
                     sel_pid = (pid_t)pid;
 
@@ -544,6 +572,8 @@ static gboolean on_refresh(gpointer data)
                     if (sel_align > 1.0f) sel_align = 1.0f;
                     have_sel = TRUE;
                 }
+                if (store_path)
+                    gtk_tree_path_free(store_path);
                 g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
             }
         }
@@ -572,6 +602,13 @@ static gboolean on_refresh(gpointer data)
     compute_group_rss(ctx->store, NULL);
     compute_group_cpu(ctx->store, NULL);
 
+    /* Sync the filtered shadow store if a filter is active.
+     * This updates data in-place, preserving view state (expand,
+     * selection, scroll).  A full rebuild only happens if the set
+     * of matching processes has structurally changed. */
+    if (ctx->filter_text[0] != '\0')
+        sync_filter_store(ctx);
+
     PROFILE_END(ui_render);
 
     /*
@@ -581,15 +618,38 @@ static gboolean on_refresh(gpointer data)
      * coordinate arithmetic which is unreliable across re-sorts.
      */
     if (have_sel && sel_pid > 0) {
+        /* Find the PID in whichever store the sort model is wrapping */
+        GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
+            ctx->sort_model);
         GtkTreeIter found_iter;
-        if (find_iter_by_pid(GTK_TREE_MODEL(ctx->store), NULL,
+        if (find_iter_by_pid(child_model, NULL,
                              sel_pid, &found_iter)) {
-            GtkTreePath *found_path = gtk_tree_model_get_path(
-                GTK_TREE_MODEL(ctx->store), &found_iter);
-            if (found_path) {
-                gtk_tree_view_scroll_to_cell(ctx->view, found_path,
-                                             NULL, TRUE, sel_align, 0.0f);
-                gtk_tree_path_free(found_path);
+            GtkTreePath *child_path = gtk_tree_model_get_path(
+                child_model, &found_iter);
+            if (child_path) {
+                GtkTreePath *sort_path =
+                    gtk_tree_model_sort_convert_child_path_to_path(
+                        ctx->sort_model, child_path);
+                if (sort_path) {
+                    /* Re-select (sort may have moved the iter) */
+                    GtkTreeSelection *sel =
+                        gtk_tree_view_get_selection(ctx->view);
+                    gtk_tree_selection_select_path(sel, sort_path);
+
+                    /* Only scroll if the row is not already visible */
+                    GdkRectangle cell_rect;
+                    gtk_tree_view_get_cell_area(ctx->view, sort_path,
+                                                NULL, &cell_rect);
+                    GdkRectangle vis_rect;
+                    gtk_tree_view_get_visible_rect(ctx->view, &vis_rect);
+                    int cy = cell_rect.y;
+                    if (cy < vis_rect.y ||
+                        cy + cell_rect.height > vis_rect.y + vis_rect.height)
+                        gtk_tree_view_scroll_to_cell(ctx->view, sort_path,
+                                                     NULL, TRUE, sel_align, 0.0f);
+                    gtk_tree_path_free(sort_path);
+                }
+                gtk_tree_path_free(child_path);
             }
         }
     }
@@ -995,6 +1055,591 @@ static GdkModifierType detect_shortcut_modifier(void)
     return GDK_CONTROL_MASK;
 }
 
+/* ── name-filter helpers ──────────────────────────────────────── */
+
+/*
+ * Return TRUE if the row's COL_NAME contains the filter text
+ * (case-insensitive substring match).
+ */
+static gboolean row_name_matches(GtkTreeModel *model,
+                                 GtkTreeIter  *iter,
+                                 const char   *filter_lower)
+{
+    gchar *name = NULL;
+    gtk_tree_model_get(model, iter, COL_NAME, &name, -1);
+    if (!name)
+        return FALSE;
+    gchar *name_down = g_utf8_strdown(name, -1);
+    gboolean match = (strstr(name_down, filter_lower) != NULL);
+    g_free(name_down);
+    g_free(name);
+    return match;
+}
+
+/*
+ * Deep-copy a subtree from `src` into `dst` under `dst_parent`.
+ * Copies the row at `src_iter` and all its children, recursively.
+ */
+static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
+                         GtkTreeModel *src, GtkTreeIter *src_iter)
+{
+    GtkTreeIter dst_iter;
+    gtk_tree_store_append(dst, &dst_iter, dst_parent);
+
+    /* Copy all column values */
+    gint pid, ppid, cpu, rss, grp_rss, grp_cpu;
+    gint64 start_time;
+    gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
+    gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
+    gchar *start_text = NULL, *container = NULL, *cwd = NULL, *cmdline = NULL;
+
+    gtk_tree_model_get(src, src_iter,
+        COL_PID, &pid, COL_PPID, &ppid, COL_USER, &user, COL_NAME, &name,
+        COL_CPU, &cpu, COL_CPU_TEXT, &cpu_text,
+        COL_RSS, &rss, COL_RSS_TEXT, &rss_text,
+        COL_GROUP_RSS, &grp_rss, COL_GROUP_RSS_TEXT, &grp_rss_text,
+        COL_GROUP_CPU, &grp_cpu, COL_GROUP_CPU_TEXT, &grp_cpu_text,
+        COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
+        COL_CONTAINER, &container, COL_CWD, &cwd, COL_CMDLINE, &cmdline,
+        -1);
+
+    gtk_tree_store_set(dst, &dst_iter,
+        COL_PID, pid, COL_PPID, ppid, COL_USER, user, COL_NAME, name,
+        COL_CPU, cpu, COL_CPU_TEXT, cpu_text,
+        COL_RSS, rss, COL_RSS_TEXT, rss_text,
+        COL_GROUP_RSS, grp_rss, COL_GROUP_RSS_TEXT, grp_rss_text,
+        COL_GROUP_CPU, grp_cpu, COL_GROUP_CPU_TEXT, grp_cpu_text,
+        COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
+        COL_CONTAINER, container, COL_CWD, cwd, COL_CMDLINE, cmdline,
+        -1);
+
+    g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
+    g_free(grp_rss_text); g_free(grp_cpu_text); g_free(start_text);
+    g_free(container); g_free(cwd); g_free(cmdline);
+
+    /* Recurse into children */
+    GtkTreeIter child;
+    gboolean valid = gtk_tree_model_iter_children(src, &child, src_iter);
+    while (valid) {
+        copy_subtree(dst, &dst_iter, src, &child);
+        valid = gtk_tree_model_iter_next(src, &child);
+    }
+}
+
+/*
+ * Walk the real store and find rows whose name matches the filter.
+ * For each match, copy the entire subtree (the match + all its
+ * descendants) into the filter_store as a new top-level root.
+ *
+ * Skips rows that are descendants of an already-matched ancestor
+ * (they're already included via copy_subtree).
+ */
+static void find_and_copy_matches(GtkTreeStore *dst, GtkTreeModel *src,
+                                   GtkTreeIter *parent,
+                                   const char *filter_lower,
+                                   gboolean ancestor_matched)
+{
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(src, &iter, parent);
+    while (valid) {
+        gboolean self_matches = row_name_matches(src, &iter, filter_lower);
+
+        if (ancestor_matched) {
+            /* Already copied as part of a parent's subtree – skip */
+        } else if (self_matches) {
+            /* This row matches: copy it + full subtree as a top-level root */
+            copy_subtree(dst, NULL, src, &iter);
+        } else {
+            /* No match here – recurse to look for matches deeper */
+            find_and_copy_matches(dst, src, &iter, filter_lower, FALSE);
+        }
+
+        valid = gtk_tree_model_iter_next(src, &iter);
+    }
+}
+
+/*
+ * Update the column values of a single filter_store row from the
+ * corresponding row in the real store (found by PID).
+ */
+static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
+                               GtkTreeModel *real, GtkTreeIter *real_iter)
+{
+    gint pid, ppid, cpu, rss, grp_rss, grp_cpu;
+    gint64 start_time;
+    gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
+    gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
+    gchar *start_text = NULL, *container = NULL, *cwd = NULL, *cmdline = NULL;
+
+    gtk_tree_model_get(real, real_iter,
+        COL_PID, &pid, COL_PPID, &ppid, COL_USER, &user, COL_NAME, &name,
+        COL_CPU, &cpu, COL_CPU_TEXT, &cpu_text,
+        COL_RSS, &rss, COL_RSS_TEXT, &rss_text,
+        COL_GROUP_RSS, &grp_rss, COL_GROUP_RSS_TEXT, &grp_rss_text,
+        COL_GROUP_CPU, &grp_cpu, COL_GROUP_CPU_TEXT, &grp_cpu_text,
+        COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
+        COL_CONTAINER, &container, COL_CWD, &cwd, COL_CMDLINE, &cmdline,
+        -1);
+
+    gtk_tree_store_set(fs, fs_iter,
+        COL_PID, pid, COL_PPID, ppid, COL_USER, user, COL_NAME, name,
+        COL_CPU, cpu, COL_CPU_TEXT, cpu_text,
+        COL_RSS, rss, COL_RSS_TEXT, rss_text,
+        COL_GROUP_RSS, grp_rss, COL_GROUP_RSS_TEXT, grp_rss_text,
+        COL_GROUP_CPU, grp_cpu, COL_GROUP_CPU_TEXT, grp_cpu_text,
+        COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
+        COL_CONTAINER, container, COL_CWD, cwd, COL_CMDLINE, cmdline,
+        -1);
+
+    g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
+    g_free(grp_rss_text); g_free(grp_cpu_text); g_free(start_text);
+    g_free(container); g_free(cwd); g_free(cmdline);
+}
+
+/*
+ * Recursively update all rows in the filter_store from the real store.
+ * Returns FALSE if any PID in the filter_store is missing from the real
+ * store (i.e. a process has exited and the structure needs a rebuild).
+ */
+static gboolean sync_filter_rows(GtkTreeStore *fs, GtkTreeIter *fs_parent,
+                                  GtkTreeModel *real)
+{
+    GtkTreeIter fs_iter;
+    gboolean valid = fs_parent
+        ? gtk_tree_model_iter_children(GTK_TREE_MODEL(fs), &fs_iter, fs_parent)
+        : gtk_tree_model_get_iter_first(GTK_TREE_MODEL(fs), &fs_iter);
+
+    while (valid) {
+        gint pid;
+        gtk_tree_model_get(GTK_TREE_MODEL(fs), &fs_iter, COL_PID, &pid, -1);
+
+        GtkTreeIter real_iter;
+        if (!find_iter_by_pid(real, NULL, (pid_t)pid, &real_iter))
+            return FALSE;  /* process vanished – need full rebuild */
+
+        sync_row_from_real(fs, &fs_iter, real, &real_iter);
+
+        /* Recurse into children */
+        if (!sync_filter_rows(fs, &fs_iter, real))
+            return FALSE;
+
+        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(fs), &fs_iter);
+    }
+    return TRUE;
+}
+
+/*
+ * Count how many top-level matches the current filter would produce
+ * from the real store.  Used to detect when a new process appears
+ * that matches the filter (structural change requiring rebuild).
+ */
+static int count_filter_matches(GtkTreeModel *real, GtkTreeIter *parent,
+                                 const char *filter_lower,
+                                 gboolean ancestor_matched)
+{
+    int count = 0;
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(real, &iter, parent);
+    while (valid) {
+        gboolean self_matches = row_name_matches(real, &iter, filter_lower);
+        if (ancestor_matched) {
+            /* This row is part of a matched parent's subtree */
+            count++;
+            count += count_filter_matches(real, &iter, filter_lower, TRUE);
+        } else if (self_matches) {
+            count++;
+            /* Children are part of this subtree, count them too */
+            count += count_filter_matches(real, &iter, filter_lower, TRUE);
+        } else {
+            count += count_filter_matches(real, &iter, filter_lower, FALSE);
+        }
+        valid = gtk_tree_model_iter_next(real, &iter);
+    }
+    return count;
+}
+
+/*
+ * Count total rows in the filter store (all levels).
+ */
+static int count_store_rows(GtkTreeModel *model, GtkTreeIter *parent)
+{
+    int count = 0;
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
+    while (valid) {
+        count++;
+        count += count_store_rows(model, &iter);
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+    return count;
+}
+
+/*
+ * Incremental sync of the filter store: update column values in-place
+ * from the real store.  If the structure has changed (process died or
+ * a new process matches), fall back to a full rebuild.
+ *
+ * This preserves the view's expand/collapse state, selection, and
+ * scroll position across normal refresh ticks.
+ */
+static void sync_filter_store(ui_ctx_t *ctx)
+{
+    if (!ctx->filter_store || ctx->filter_text[0] == '\0')
+        return;
+
+    GtkTreeModel *real = GTK_TREE_MODEL(ctx->store);
+
+    /* Quick structural check: has the total number of matching rows changed? */
+    gchar *filter_lower = g_utf8_strdown(ctx->filter_text, -1);
+    int expected = count_filter_matches(real, NULL, filter_lower, FALSE);
+    int current  = count_store_rows(GTK_TREE_MODEL(ctx->filter_store), NULL);
+    g_free(filter_lower);
+
+    if (expected != current) {
+        /* Structure changed – fall back to full rebuild */
+        rebuild_filter_store(ctx);
+        return;
+    }
+
+    /* Structure is stable – just update column values in place */
+    if (!sync_filter_rows(ctx->filter_store, NULL, real)) {
+        /* A PID vanished mid-walk – fall back to rebuild */
+        rebuild_filter_store(ctx);
+    }
+}
+
+/*
+ * Register inverted sort functions on a sort model.  Called each time
+ * we create a new GtkTreeModelSort (which happens when switching
+ * between the real store and the filter store).
+ */
+static void register_sort_funcs(GtkTreeModelSort *sm);
+
+/*
+ * Expand every row in the tree view EXCEPT those whose PID appears
+ * in the user-collapsed set.  This preserves manual collapse state
+ * across model swaps.
+ */
+static void expand_respecting_collapsed_recurse(ui_ctx_t *ctx,
+                                                 GtkTreeModel *model,
+                                                 GtkTreeIter *parent)
+{
+    GtkTreeIter iter;
+    gboolean valid = parent
+        ? gtk_tree_model_iter_children(model, &iter, parent)
+        : gtk_tree_model_get_iter_first(model, &iter);
+
+    while (valid) {
+        if (gtk_tree_model_iter_has_child(model, &iter)) {
+            GtkTreeIter child_it;
+            gtk_tree_model_sort_convert_iter_to_child_iter(
+                ctx->sort_model, &child_it, &iter);
+            GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
+                ctx->sort_model);
+            gint pid;
+            gtk_tree_model_get(child_model, &child_it, COL_PID, &pid, -1);
+
+            GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
+            if (pid_set_contains(&ctx->collapsed, (pid_t)pid)) {
+                gtk_tree_view_collapse_row(ctx->view, path);
+            } else {
+                gtk_tree_view_expand_row(ctx->view, path, FALSE);
+                /* Recurse into children */
+                expand_respecting_collapsed_recurse(ctx, model, &iter);
+            }
+            gtk_tree_path_free(path);
+        }
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+}
+
+static void expand_respecting_collapsed(ui_ctx_t *ctx)
+{
+    GtkTreeModel *model = gtk_tree_view_get_model(ctx->view);
+    if (!model) return;
+    expand_respecting_collapsed_recurse(ctx, model, NULL);
+}
+
+/*
+ * Rebuild the shadow filter_store from scratch and point the sort
+ * model at it.  Called whenever the filter text changes (non-empty)
+ * or when the underlying store is refreshed while a filter is active.
+ *
+ * The original store is never modified.
+ */
+static void rebuild_filter_store(ui_ctx_t *ctx)
+{
+    /* Remember the currently selected PID so we can re-select it
+     * after the model swap (set_model clears the selection). */
+    pid_t sel_pid = 0;
+    {
+        GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
+        GtkTreeModel *old_model = NULL;
+        GtkTreeIter sel_iter;
+        if (sel && gtk_tree_selection_get_selected(sel, &old_model, &sel_iter)) {
+            GtkTreeIter child_iter;
+            gtk_tree_model_sort_convert_iter_to_child_iter(
+                ctx->sort_model, &child_iter, &sel_iter);
+            GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
+                ctx->sort_model);
+            gint pid_val;
+            gtk_tree_model_get(child_model, &child_iter, COL_PID, &pid_val, -1);
+            sel_pid = (pid_t)pid_val;
+        }
+    }
+
+    gchar *filter_lower = g_utf8_strdown(ctx->filter_text, -1);
+
+    /* Create a fresh filter store */
+    GtkTreeStore *fs = gtk_tree_store_new(NUM_COLS,
+        G_TYPE_INT, G_TYPE_INT, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
+        G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
+        G_TYPE_INT64, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_STRING);
+
+    find_and_copy_matches(fs, GTK_TREE_MODEL(ctx->store), NULL,
+                          filter_lower, FALSE);
+    g_free(filter_lower);
+
+    /* Replace old filter_store */
+    if (ctx->filter_store)
+        g_object_unref(ctx->filter_store);
+    ctx->filter_store = fs;
+
+    /* Save / restore sort column across the switch */
+    gint sort_col = GTK_TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID;
+    GtkSortType sort_order = GTK_SORT_ASCENDING;
+    gtk_tree_sortable_get_sort_column_id(
+        GTK_TREE_SORTABLE(ctx->sort_model), &sort_col, &sort_order);
+
+    /* Build a new sort model wrapping the filter store */
+    GtkTreeModel *new_sort = gtk_tree_model_sort_new_with_model(
+        GTK_TREE_MODEL(fs));
+    ctx->sort_model = GTK_TREE_MODEL_SORT(new_sort);
+    register_sort_funcs(ctx->sort_model);
+
+    if (sort_col != GTK_TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID)
+        gtk_tree_sortable_set_sort_column_id(
+            GTK_TREE_SORTABLE(ctx->sort_model), sort_col, sort_order);
+
+    gtk_tree_view_set_model(ctx->view, new_sort);
+
+    g_signal_handlers_block_by_func(ctx->view, on_row_collapsed, ctx);
+    g_signal_handlers_block_by_func(ctx->view, on_row_expanded,  ctx);
+    expand_respecting_collapsed(ctx);
+    g_signal_handlers_unblock_by_func(ctx->view, on_row_collapsed, ctx);
+    g_signal_handlers_unblock_by_func(ctx->view, on_row_expanded,  ctx);
+
+    g_signal_connect(new_sort, "sort-column-changed",
+                     G_CALLBACK(on_sort_column_changed), ctx);
+
+    /* Re-select the previously-selected PID in the new model */
+    if (sel_pid > 0) {
+        GtkTreeIter found;
+        if (find_iter_by_pid(GTK_TREE_MODEL(fs), NULL, sel_pid, &found)) {
+            GtkTreePath *child_path = gtk_tree_model_get_path(
+                GTK_TREE_MODEL(fs), &found);
+            if (child_path) {
+                GtkTreePath *sort_path =
+                    gtk_tree_model_sort_convert_child_path_to_path(
+                        ctx->sort_model, child_path);
+                if (sort_path) {
+                    GtkTreeSelection *sel =
+                        gtk_tree_view_get_selection(ctx->view);
+                    gtk_tree_selection_select_path(sel, sort_path);
+
+                    /* Only scroll if the row ended up off-screen */
+                    GdkRectangle cell_rect;
+                    gtk_tree_view_get_cell_area(ctx->view, sort_path,
+                                                NULL, &cell_rect);
+                    GdkRectangle vis_rect;
+                    gtk_tree_view_get_visible_rect(ctx->view, &vis_rect);
+                    int cy = cell_rect.y;
+                    if (cy < vis_rect.y ||
+                        cy + cell_rect.height > vis_rect.y + vis_rect.height)
+                        gtk_tree_view_scroll_to_cell(
+                            ctx->view, sort_path, NULL, FALSE, 0, 0);
+                    gtk_tree_path_free(sort_path);
+                }
+                gtk_tree_path_free(child_path);
+            }
+        }
+    }
+}
+
+/*
+ * Switch the view back to the real (unfiltered) store.  Called when
+ * the filter is cleared.
+ */
+static void switch_to_real_store(ui_ctx_t *ctx)
+{
+    if (ctx->filter_store) {
+        g_object_unref(ctx->filter_store);
+        ctx->filter_store = NULL;
+    }
+
+    gint sort_col = GTK_TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID;
+    GtkSortType sort_order = GTK_SORT_ASCENDING;
+    gtk_tree_sortable_get_sort_column_id(
+        GTK_TREE_SORTABLE(ctx->sort_model), &sort_col, &sort_order);
+
+    GtkTreeModel *new_sort = gtk_tree_model_sort_new_with_model(
+        GTK_TREE_MODEL(ctx->store));
+    ctx->sort_model = GTK_TREE_MODEL_SORT(new_sort);
+    register_sort_funcs(ctx->sort_model);
+
+    if (sort_col != GTK_TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID)
+        gtk_tree_sortable_set_sort_column_id(
+            GTK_TREE_SORTABLE(ctx->sort_model), sort_col, sort_order);
+
+    gtk_tree_view_set_model(ctx->view, new_sort);
+
+    g_signal_handlers_block_by_func(ctx->view, on_row_collapsed, ctx);
+    g_signal_handlers_block_by_func(ctx->view, on_row_expanded,  ctx);
+    expand_respecting_collapsed(ctx);
+    g_signal_handlers_unblock_by_func(ctx->view, on_row_collapsed, ctx);
+    g_signal_handlers_unblock_by_func(ctx->view, on_row_expanded,  ctx);
+
+    g_signal_connect(new_sort, "sort-column-changed",
+                     G_CALLBACK(on_sort_column_changed), ctx);
+}
+
+/*
+ * Position the filter entry in the overlay so it sits in the column
+ * header row, right after the "Name" label text.
+ *
+ * We query the Name column's header button allocation to find where
+ * the header text ends, then place the entry immediately to its right.
+ */
+static gboolean on_overlay_get_child_position(GtkOverlay   *overlay,
+                                              GtkWidget    *child,
+                                              GdkRectangle *alloc,
+                                              gpointer      data)
+{
+    (void)overlay;
+    ui_ctx_t *ctx = data;
+
+    if (child != ctx->filter_entry)
+        return FALSE;   /* let GTK handle other overlay children */
+
+    /* Get the header button widget for the Name column */
+    GtkWidget *btn = gtk_tree_view_column_get_button(ctx->name_col);
+    if (!btn || !gtk_widget_get_realized(btn))
+        return FALSE;
+
+    /* Get the header button's allocation relative to the tree */
+    GtkAllocation btn_alloc;
+    gtk_widget_get_allocation(btn, &btn_alloc);
+
+    /* Translate the button's coordinates into the overlay's coordinate space */
+    int ox = 0, oy = 0;
+    GtkWidget *overlay_widget = GTK_WIDGET(overlay);
+    gtk_widget_translate_coordinates(btn, overlay_widget, 0, 0, &ox, &oy);
+
+    /* Measure the "Name" label text width using the button's Pango context */
+    PangoLayout *layout = gtk_widget_create_pango_layout(btn, "Name");
+    int text_w = 0, text_h = 0;
+    pango_layout_get_pixel_size(layout, &text_w, &text_h);
+    g_object_unref(layout);
+
+    /* Measure the natural size of the entry */
+    GtkRequisition entry_nat;
+    gtk_widget_get_preferred_size(child, NULL, &entry_nat);
+
+    /* Right-align the entry within the column header.
+     * Use the entry's natural width, but clamp to the available
+     * space (column width minus label text minus padding). */
+    int margin  = 4;  /* pixels from column right edge */
+    int min_gap = 6;  /* minimum gap between label and entry */
+    int entry_h = entry_nat.height;
+    if (entry_h > btn_alloc.height - 2)
+        entry_h = btn_alloc.height - 2;
+
+    int col_right = ox + btn_alloc.width - margin;
+    int entry_w   = entry_nat.width;
+    int max_w     = col_right - (ox + text_w + min_gap);
+    if (max_w < 30) max_w = 30;
+    if (entry_w > max_w) entry_w = max_w;
+
+    alloc->x      = col_right - entry_w;
+    alloc->y      = oy + (btn_alloc.height - entry_h) / 2;
+    alloc->width  = entry_w;
+    alloc->height = entry_h;
+
+    return TRUE;
+}
+
+/* ── auto-hide timer for an empty, visible filter entry ────── */
+
+static gboolean on_filter_hide_timeout(gpointer data)
+{
+    ui_ctx_t *ctx = data;
+    ctx->filter_hide_timer = 0;
+
+    /* Only hide if still empty */
+    if (ctx->filter_text[0] == '\0' && ctx->filter_entry &&
+        gtk_widget_get_visible(ctx->filter_entry)) {
+        gtk_widget_hide(ctx->filter_entry);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void filter_cancel_hide_timer(ui_ctx_t *ctx)
+{
+    if (ctx->filter_hide_timer) {
+        g_source_remove(ctx->filter_hide_timer);
+        ctx->filter_hide_timer = 0;
+    }
+}
+
+static void filter_schedule_hide(ui_ctx_t *ctx)
+{
+    filter_cancel_hide_timer(ctx);
+    ctx->filter_hide_timer = g_timeout_add(5000, on_filter_hide_timeout, ctx);
+}
+
+static gboolean on_filter_entry_key_release(GtkWidget *widget,
+                                            GdkEventKey *ev,
+                                            gpointer data)
+{
+    ui_ctx_t *ctx = data;
+
+    if (ev->keyval == GDK_KEY_Escape) {
+        filter_cancel_hide_timer(ctx);
+        gtk_entry_set_text(GTK_ENTRY(ctx->filter_entry), "");
+        ctx->filter_text[0] = '\0';
+        switch_to_real_store(ctx);
+        gtk_widget_hide(ctx->filter_entry);
+        gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
+        return TRUE;
+    }
+    if (ev->keyval == GDK_KEY_Return || ev->keyval == GDK_KEY_KP_Enter) {
+        gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
+        return TRUE;
+    }
+
+    /* Ignore releases with Ctrl/Meta held — the window key-press
+     * handler already takes care of Ctrl+F / Meta+F toggling. */
+    guint state = ev->state & gtk_accelerator_get_default_mod_mask();
+    if (state & (GDK_CONTROL_MASK | GDK_META_MASK))
+        return FALSE;
+
+    /* Update filter text and rebuild shadow store on every plain key release */
+    const char *text = gtk_entry_get_text(GTK_ENTRY(widget));
+    snprintf(ctx->filter_text, sizeof(ctx->filter_text), "%s", text ? text : "");
+
+    if (ctx->filter_text[0] != '\0') {
+        filter_cancel_hide_timer(ctx);
+        rebuild_filter_store(ctx);
+    } else {
+        switch_to_real_store(ctx);
+        filter_schedule_hide(ctx);
+    }
+
+    return FALSE;
+}
+
 /* ── keyboard shortcuts ──────────────────────────────────────── */
 
 static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
@@ -1009,6 +1654,26 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
 
     /* Mask out lock bits (Caps Lock, Num Lock, etc.) */
     guint state = ev->state & gtk_accelerator_get_default_mod_mask();
+
+    /* Ctrl+F or Meta+F → toggle name filter (honour both modifiers) */
+    if (ev->keyval == GDK_KEY_f &&
+        (state == GDK_CONTROL_MASK || state == GDK_META_MASK)) {
+        if (ctx->filter_entry) {
+            if (gtk_widget_get_visible(ctx->filter_entry)) {
+                filter_cancel_hide_timer(ctx);
+                gtk_entry_set_text(GTK_ENTRY(ctx->filter_entry), "");
+                ctx->filter_text[0] = '\0';
+                switch_to_real_store(ctx);
+                gtk_widget_hide(ctx->filter_entry);
+                gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
+            } else {
+                filter_cancel_hide_timer(ctx);
+                gtk_widget_show(ctx->filter_entry);
+                gtk_widget_grab_focus(ctx->filter_entry);
+            }
+        }
+        return TRUE;
+    }
 
     if (state != (guint)mod)
         return FALSE;       /* modifier not held – not our shortcut */
@@ -1225,6 +1890,39 @@ static gint sort_int64_inverted(GtkTreeModel *model,
     return (va < vb) ? 1 : (va > vb) ? -1 : 0;
 }
 
+/*
+ * Register all inverted sort functions on a GtkTreeModelSort.
+ * Called every time we create a new sort model (when switching
+ * between the real store and the filter shadow store).
+ */
+static void register_sort_funcs(GtkTreeModelSort *sm)
+{
+    GtkTreeSortable *sortable = GTK_TREE_SORTABLE(sm);
+
+    gtk_tree_sortable_set_sort_func(sortable, COL_PID,
+        sort_int_inverted, GINT_TO_POINTER(COL_PID), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_PPID,
+        sort_int_inverted, GINT_TO_POINTER(COL_PPID), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_USER,
+        sort_string_inverted, GINT_TO_POINTER(COL_USER), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_NAME,
+        sort_string_inverted, GINT_TO_POINTER(COL_NAME), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_CPU,
+        sort_int_inverted, GINT_TO_POINTER(COL_CPU), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_RSS,
+        sort_int_inverted, GINT_TO_POINTER(COL_RSS), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_GROUP_RSS,
+        sort_int_inverted, GINT_TO_POINTER(COL_GROUP_RSS), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_GROUP_CPU,
+        sort_int_inverted, GINT_TO_POINTER(COL_GROUP_CPU), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_START_TIME,
+        sort_int64_inverted, GINT_TO_POINTER(COL_START_TIME), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_CONTAINER,
+        sort_string_inverted, GINT_TO_POINTER(COL_CONTAINER), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_CWD,
+        sort_string_inverted, GINT_TO_POINTER(COL_CWD), NULL);
+}
+
 /* ── public entry point ──────────────────────────────────────── */
 
 void *ui_thread(void *arg)
@@ -1311,11 +2009,17 @@ void *ui_thread(void *arg)
                                              G_TYPE_STRING,   /* CWD          */
                                              G_TYPE_STRING);  /* CMDLINE      */
 
-    GtkWidget *tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
-    g_object_unref(store);   /* view holds a ref now */
+    /* Sort model wraps the store directly (no filter model – we use
+     * a shadow store approach for filtering instead). */
+    GtkTreeModel *sort_model = gtk_tree_model_sort_new_with_model(
+        GTK_TREE_MODEL(store));
+
+    GtkWidget *tree = gtk_tree_view_new_with_model(sort_model);
+    /* Don't unref sort_model – kept in ctx */
 
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), TRUE);
     gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(tree), TRUE);
+    gtk_tree_view_set_enable_search(GTK_TREE_VIEW(tree), FALSE);
 
     /* Columns */
     GtkCellRenderer *r;
@@ -1352,6 +2056,7 @@ void *ui_thread(void *arg)
     gtk_tree_view_column_set_resizable(col, TRUE);
     gtk_tree_view_column_set_min_width(col, 150);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+    GtkTreeViewColumn *name_col = col;  /* save for filter positioning */
 
     r = gtk_cell_renderer_text_new();
     g_object_set(r, "xalign", 1.0f, NULL);
@@ -1420,33 +2125,8 @@ void *ui_thread(void *arg)
     gtk_tree_view_column_set_min_width(col, 300);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
 
-    /* Register inverted sort functions so ▲ = largest/highest first.
-     * Integer columns use sort_int_inverted; string columns use
-     * sort_string_inverted.  The column index is passed as user-data. */
-    GtkTreeSortable *sortable = GTK_TREE_SORTABLE(store);
-
-    gtk_tree_sortable_set_sort_func(sortable, COL_PID,
-        sort_int_inverted, GINT_TO_POINTER(COL_PID), NULL);
-    gtk_tree_sortable_set_sort_func(sortable, COL_PPID,
-        sort_int_inverted, GINT_TO_POINTER(COL_PPID), NULL);
-    gtk_tree_sortable_set_sort_func(sortable, COL_USER,
-        sort_string_inverted, GINT_TO_POINTER(COL_USER), NULL);
-    gtk_tree_sortable_set_sort_func(sortable, COL_NAME,
-        sort_string_inverted, GINT_TO_POINTER(COL_NAME), NULL);
-    gtk_tree_sortable_set_sort_func(sortable, COL_CPU,
-        sort_int_inverted, GINT_TO_POINTER(COL_CPU), NULL);
-    gtk_tree_sortable_set_sort_func(sortable, COL_RSS,
-        sort_int_inverted, GINT_TO_POINTER(COL_RSS), NULL);
-    gtk_tree_sortable_set_sort_func(sortable, COL_GROUP_RSS,
-        sort_int_inverted, GINT_TO_POINTER(COL_GROUP_RSS), NULL);
-    gtk_tree_sortable_set_sort_func(sortable, COL_GROUP_CPU,
-        sort_int_inverted, GINT_TO_POINTER(COL_GROUP_CPU), NULL);
-    gtk_tree_sortable_set_sort_func(sortable, COL_START_TIME,
-        sort_int64_inverted, GINT_TO_POINTER(COL_START_TIME), NULL);
-    gtk_tree_sortable_set_sort_func(sortable, COL_CONTAINER,
-        sort_string_inverted, GINT_TO_POINTER(COL_CONTAINER), NULL);
-    gtk_tree_sortable_set_sort_func(sortable, COL_CWD,
-        sort_string_inverted, GINT_TO_POINTER(COL_CWD), NULL);
+    /* Register inverted sort functions so ▲ = largest/highest first. */
+    register_sort_funcs(GTK_TREE_MODEL_SORT(sort_model));
 
     /* Use a monospace font for the tree via CSS */
     GtkCssProvider *css = gtk_css_provider_new();
@@ -1462,6 +2142,35 @@ void *ui_thread(void *arg)
                                    GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(scroll), tree);
+
+    /* ── name-filter entry (overlaid on the column header) ────── */
+    GtkWidget *name_filter_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(name_filter_entry), "filter…");
+    gtk_entry_set_width_chars(GTK_ENTRY(name_filter_entry), 16);
+    gtk_widget_set_no_show_all(name_filter_entry, TRUE);
+    gtk_widget_set_valign(name_filter_entry, GTK_ALIGN_START);
+    gtk_widget_set_halign(name_filter_entry, GTK_ALIGN_START);
+
+    /* Compact CSS: small font, minimal padding so it fits the header row */
+    {
+        GtkCssProvider *filt_css = gtk_css_provider_new();
+        gtk_css_provider_load_from_data(filt_css,
+            "entry {"
+            "  font-size: 8pt;"
+            "  min-height: 0;"
+            "  padding: 1px 4px;"
+            "  border-radius: 3px;"
+            "}", -1, NULL);
+        gtk_style_context_add_provider(
+            gtk_widget_get_style_context(name_filter_entry),
+            GTK_STYLE_PROVIDER(filt_css),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        g_object_unref(filt_css);
+    }
+
+    GtkWidget *tree_overlay = gtk_overlay_new();
+    gtk_container_add(GTK_CONTAINER(tree_overlay), scroll);
+    gtk_overlay_add_overlay(GTK_OVERLAY(tree_overlay), name_filter_entry);
 
     /* ── sidebar (detail panel) ───────────────────────────────── */
     GtkWidget *sidebar_scroll = gtk_scrolled_window_new(NULL, NULL);
@@ -1604,7 +2313,7 @@ void *ui_thread(void *arg)
 
     /* ── horizontal paned: tree | sidebar ─────────────────────── */
     GtkWidget *hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_paned_pack1(GTK_PANED(hpaned), scroll, TRUE, FALSE);
+    gtk_paned_pack1(GTK_PANED(hpaned), tree_overlay, TRUE, FALSE);
     gtk_paned_pack2(GTK_PANED(hpaned), sidebar_frame, FALSE, FALSE);
 
     /* ── menu bar (hidden by default) ─────────────────────────── */
@@ -1709,6 +2418,13 @@ void *ui_thread(void *arg)
     ctx.collapsed    = (pid_set_t){ NULL, 0, 0 };
     ctx.follow_selection = FALSE;
 
+    /* Name filter */
+    ctx.filter_store = NULL;
+    ctx.sort_model   = GTK_TREE_MODEL_SORT(sort_model);
+    ctx.filter_entry = name_filter_entry;
+    ctx.name_col     = name_col;
+    ctx.filter_text[0] = '\0';
+
     /* Sidebar detail panel */
     ctx.sidebar            = sidebar_frame;
     ctx.sidebar_menu_item  = GTK_CHECK_MENU_ITEM(sidebar_toggle);
@@ -1746,6 +2462,10 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_fd_desc_toggled), &ctx);
     g_signal_connect(fd_group_dup_toggle, "toggled",
                      G_CALLBACK(on_fd_group_dup_toggled), &ctx);
+    g_signal_connect(name_filter_entry, "key-release-event",
+                     G_CALLBACK(on_filter_entry_key_release), &ctx);
+    g_signal_connect(tree_overlay, "get-child-position",
+                     G_CALLBACK(on_overlay_get_child_position), &ctx);
     g_signal_connect(fd_tree, "row-collapsed",
                      G_CALLBACK(on_fd_row_collapsed), &ctx);
     g_signal_connect(fd_tree, "row-expanded",
@@ -1783,7 +2503,7 @@ void *ui_thread(void *arg)
     g_signal_connect(sel, "changed", G_CALLBACK(on_selection_changed), &ctx);
 
     /* Enable follow-selection when user clicks a sort column */
-    g_signal_connect(store, "sort-column-changed",
+    g_signal_connect(sort_model, "sort-column-changed",
                      G_CALLBACK(on_sort_column_changed), &ctx);
 
     /* Disable follow-selection when user scrolls manually */
@@ -1809,6 +2529,15 @@ void *ui_thread(void *arg)
 
 void ui_ctx_destroy(ui_ctx_t *ctx)
 {
+    /* Cancel filter auto-hide timer */
+    filter_cancel_hide_timer(ctx);
+
+    /* Free the shadow filter store */
+    if (ctx->filter_store) {
+        g_object_unref(ctx->filter_store);
+        ctx->filter_store = NULL;
+    }
+
     /* Cancel any in-flight async fd scan */
     if (ctx->fd_cancel) {
         g_cancellable_cancel(ctx->fd_cancel);

@@ -34,11 +34,18 @@ void sidebar_update(ui_ctx_t *ctx)
     }
 
     GtkTreePath *path = rows->data;
+    /* path is from the sort model (the view's model); sort → underlying store */
+    GtkTreePath *store_path = gtk_tree_model_sort_convert_path_to_child_path(
+        ctx->sort_model, path);
+    GtkTreeModel *child_model = gtk_tree_model_sort_get_model(ctx->sort_model);
     GtkTreeIter iter;
-    if (!gtk_tree_model_get_iter(GTK_TREE_MODEL(ctx->store), &iter, path)) {
+    if (!store_path ||
+        !gtk_tree_model_get_iter(child_model, &iter, store_path)) {
+        if (store_path) gtk_tree_path_free(store_path);
         g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
         return;
     }
+    gtk_tree_path_free(store_path);
 
     gint pid = 0, ppid = 0, cpu_raw = 0, rss = 0, grp_rss = 0, grp_cpu = 0;
     gint64 start_epoch = 0;
@@ -46,7 +53,7 @@ void sidebar_update(ui_ctx_t *ctx)
     gchar *rss_text = NULL, *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *start_time_text = NULL, *container = NULL, *cwd = NULL, *cmdline = NULL;
 
-    gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), &iter,
+    gtk_tree_model_get(child_model, &iter,
                        COL_PID,            &pid,
                        COL_PPID,           &ppid,
                        COL_USER,           &user,

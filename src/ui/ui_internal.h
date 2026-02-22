@@ -117,6 +117,14 @@ typedef struct {
 
     /* startup: fast-poll until first snapshot arrives */
     gboolean            initial_refresh;
+
+    /* name-filter (Ctrl+F / Meta+F) */
+    GtkWidget          *filter_entry;
+    GtkTreeStore       *filter_store;   /* shadow store for filtered view   */
+    GtkTreeModelSort   *sort_model;
+    GtkTreeViewColumn  *name_col;
+    char                filter_text[256];
+    guint               filter_hide_timer; /* auto-hide after idle (0=none) */
 } ui_ctx_t;
 
 /* ── fd types ────────────────────────────────────────────────── */
