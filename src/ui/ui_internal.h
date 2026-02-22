@@ -98,6 +98,8 @@ typedef struct {
     GtkTreeView        *fd_view;
     GtkWidget          *fd_desc_toggle;
     gboolean            fd_include_desc;
+    GtkWidget          *fd_group_dup_toggle;
+    gboolean            fd_group_dup_active;
     unsigned            fd_collapsed;      /* bitmask: 1 << cat */
     pid_t               fd_last_pid;
 
@@ -112,6 +114,9 @@ typedef struct {
     /* async fd scan state */
     guint               fd_generation;
     GCancellable       *fd_cancel;
+
+    /* startup: fast-poll until first snapshot arrives */
+    gboolean            initial_refresh;
 } ui_ctx_t;
 
 /* ── fd types ────────────────────────────────────────────────── */
@@ -229,6 +234,7 @@ void sidebar_update(ui_ctx_t *ctx);
 
 /* sidebar signal callbacks (connected by ui.c, defined in sidebar.c) */
 void on_fd_desc_toggled(GtkToggleButton *btn, gpointer data);
+void on_fd_group_dup_toggled(GtkToggleButton *btn, gpointer data);
 void on_fd_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
                          GtkTreePath *path, gpointer data);
 void on_fd_row_expanded(GtkTreeView *view, GtkTreeIter *iter,

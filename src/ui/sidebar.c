@@ -103,7 +103,14 @@ void on_fd_desc_toggled(GtkToggleButton *btn, gpointer data)
 {
     ui_ctx_t *ctx = data;
     ctx->fd_include_desc = gtk_toggle_button_get_active(btn);
-    ctx->fd_collapsed = 0;   /* reset collapse state on structural change */
+    gtk_tree_store_clear(ctx->fd_store);
+    sidebar_update(ctx);
+}
+
+void on_fd_group_dup_toggled(GtkToggleButton *btn, gpointer data)
+{
+    ui_ctx_t *ctx = data;
+    ctx->fd_group_dup_active = gtk_toggle_button_get_active(btn);
     gtk_tree_store_clear(ctx->fd_store);
     sidebar_update(ctx);
 }

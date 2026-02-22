@@ -556,27 +556,75 @@ static void fd_scan_complete(GObject      *source_object,
                                FD_COL_TEXT, hdr, -1);
         }
 
+        /* Build the display list: optionally group duplicates */
+        fd_list_t display;
+        fd_list_init(&display);
+
+        if (ctx->fd_group_dup_active && t->buckets[c].count > 0) {
+            /* Buckets are already sorted by path, so duplicates are adjacent */
+            size_t run_start = 0;
+            while (run_start < t->buckets[c].count) {
+                size_t run_end = run_start + 1;
+                while (run_end < t->buckets[c].count &&
+                       strcmp(t->buckets[c].entries[run_start].path,
+                              t->buckets[c].entries[run_end].path) == 0)
+                    run_end++;
+                size_t run_len = run_end - run_start;
+                if (run_len > 2) {
+                    char grouped[600];
+                    snprintf(grouped, sizeof(grouped), "%s (%zu duplicates)",
+                             t->buckets[c].entries[run_start].path, run_len);
+                    fd_list_push(&display, t->buckets[c].entries[run_start].fd,
+                                 grouped);
+                } else {
+                    for (size_t j = run_start; j < run_end; j++)
+                        fd_list_push(&display, t->buckets[c].entries[j].fd,
+                                     t->buckets[c].entries[j].path);
+                }
+                run_start = run_end;
+            }
+        } else {
+            for (size_t j = 0; j < t->buckets[c].count; j++)
+                fd_list_push(&display, t->buckets[c].entries[j].fd,
+                             t->buckets[c].entries[j].path);
+        }
+
+        /* Update the category header with the true fd count */
+        {
+            char hdr2[128];
+            if (ctx->fd_group_dup_active && display.count != t->buckets[c].count)
+                snprintf(hdr2, sizeof(hdr2), "%s (%zu, %zu unique)",
+                         fd_cat_label[c], t->buckets[c].count, display.count);
+            else
+                snprintf(hdr2, sizeof(hdr2), "%s (%zu)",
+                         fd_cat_label[c], t->buckets[c].count);
+            gtk_tree_store_set(ctx->fd_store, &parent,
+                               FD_COL_TEXT, hdr2, -1);
+        }
+
         GtkTreeIter child;
         gboolean child_valid = gtk_tree_model_iter_children(
             fd_model, &child, &parent);
         size_t bi = 0;
 
-        while (bi < t->buckets[c].count && child_valid) {
+        while (bi < display.count && child_valid) {
             gtk_tree_store_set(ctx->fd_store, &child,
-                               FD_COL_TEXT, t->buckets[c].entries[bi].path,
+                               FD_COL_TEXT, display.entries[bi].path,
                                FD_COL_CAT, (gint)-1, -1);
             bi++;
             child_valid = gtk_tree_model_iter_next(fd_model, &child);
         }
 
-        while (bi < t->buckets[c].count) {
+        while (bi < display.count) {
             GtkTreeIter new_child;
             gtk_tree_store_append(ctx->fd_store, &new_child, &parent);
             gtk_tree_store_set(ctx->fd_store, &new_child,
-                               FD_COL_TEXT, t->buckets[c].entries[bi].path,
+                               FD_COL_TEXT, display.entries[bi].path,
                                FD_COL_CAT, (gint)-1, -1);
             bi++;
         }
+
+        fd_list_free(&display);
 
         while (child_valid) {
             child_valid = gtk_tree_store_remove(ctx->fd_store, &child);

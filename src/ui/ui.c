@@ -432,6 +432,14 @@ static gboolean on_refresh(gpointer data)
         /* First time: full populate + expand all */
         populate_store_initial(ctx->store, ctx->view, local, count);
         g_first_refresh = 0;
+
+        /* Switch from fast startup poll to the normal 1-second interval */
+        if (ctx->initial_refresh) {
+            ctx->initial_refresh = FALSE;
+            g_timeout_add(1000, on_refresh, ctx);
+            /* Update status bar with first data before we drop this source */
+            goto finish;
+        }
     } else {
         /* Incremental: update in-place, no clear, no flash */
         update_store(ctx->store, ctx->view, local, count, &ctx->collapsed);
@@ -518,6 +526,26 @@ static gboolean on_refresh(gpointer data)
 
     free(local);
     return G_SOURCE_CONTINUE;
+
+finish:
+    /* First refresh done – finish status update, then remove the fast timer */
+    {
+        double snap_last = 0, snap_avg = 0, snap_max = 0;
+        double ui_last = 0, ui_avg = 0, ui_max = 0;
+        profile_get("snapshot_build", &snap_last, &snap_avg, &snap_max);
+        profile_get("ui_render",     &ui_last,   &ui_avg,   &ui_max);
+
+        char status[512];
+        snprintf(status, sizeof(status),
+                 " %zu processes  |  snapshot: %.1f ms (avg %.1f, max %.1f)  |  "
+                 "render: %.1f ms (avg %.1f, max %.1f)",
+                 count,
+                 snap_last, snap_avg, snap_max,
+                 ui_last, ui_avg, ui_max);
+        gtk_label_set_text(ctx->status_label, status);
+    }
+    free(local);
+    return G_SOURCE_REMOVE;
 }
 
 /* ── menu bar actions ─────────────────────────────────────────── */
@@ -1329,7 +1357,12 @@ void *ui_thread(void *arg)
     /* "Include descendants" toggle */
     GtkWidget *fd_desc_toggle = gtk_check_button_new_with_label(
         "Include descendant tree");
-    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_desc_toggle, 0, 14, 2, 1);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_desc_toggle, 0, 14, 1, 1);
+
+    /* "Group duplicates" toggle */
+    GtkWidget *fd_group_dup_toggle = gtk_check_button_new_with_label(
+        "Group duplicates");
+    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_group_dup_toggle, 1, 14, 1, 1);
 
     /* Scrollable tree view for the fd list */
     GtkTreeStore *fd_store = gtk_tree_store_new(FD_NUM_COLS,
@@ -1518,10 +1551,12 @@ void *ui_thread(void *arg)
     /* File descriptor list */
     ctx.fd_store        = fd_store;
     ctx.fd_view         = GTK_TREE_VIEW(fd_tree);
-    ctx.fd_desc_toggle  = fd_desc_toggle;
-    ctx.fd_include_desc = FALSE;
-    ctx.fd_collapsed    = 0;
-    ctx.fd_last_pid     = 0;
+    ctx.fd_desc_toggle      = fd_desc_toggle;
+    ctx.fd_include_desc     = FALSE;
+    ctx.fd_group_dup_toggle = fd_group_dup_toggle;
+    ctx.fd_group_dup_active = FALSE;
+    ctx.fd_collapsed        = 0;
+    ctx.fd_last_pid         = 0;
 
     /* Font menu callbacks (need ctx address, so connect after ctx init) */
     g_signal_connect(font_inc,  "activate", G_CALLBACK(on_font_increase),    &ctx);
@@ -1531,6 +1566,8 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_toggle_sidebar), &ctx);
     g_signal_connect(fd_desc_toggle, "toggled",
                      G_CALLBACK(on_fd_desc_toggled), &ctx);
+    g_signal_connect(fd_group_dup_toggle, "toggled",
+                     G_CALLBACK(on_fd_group_dup_toggled), &ctx);
     g_signal_connect(fd_tree, "row-collapsed",
                      G_CALLBACK(on_fd_row_collapsed), &ctx);
     g_signal_connect(fd_tree, "row-expanded",
@@ -1576,7 +1613,8 @@ void *ui_thread(void *arg)
     g_signal_connect(tree, "scroll-event",
                      G_CALLBACK(on_tree_scroll_event), &ctx);
 
-    g_timeout_add(1000, on_refresh, &ctx);
+    ctx.initial_refresh = TRUE;
+    g_timeout_add(50, on_refresh, &ctx);
 
     /* ── show & run ──────────────────────────────────────────── */
     gtk_widget_show_all(window);

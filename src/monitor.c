@@ -556,12 +556,24 @@ void *monitor_thread(void *arg)
         pthread_cond_signal(&state->updated);
         pthread_mutex_unlock(&state->lock);
 
-        /* Sleep for the poll interval */
-        struct timespec ts = {
-            .tv_sec  = POLL_INTERVAL_MS / 1000,
-            .tv_nsec = (POLL_INTERVAL_MS % 1000) * 1000000L,
-        };
-        nanosleep(&ts, NULL);
+        /* Sleep for the poll interval, but wake immediately on shutdown.
+         * Use pthread_cond_timedwait so that broadcasting `updated`
+         * (which the shutdown path does) unblocks us at once.          */
+        {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec  += POLL_INTERVAL_MS / 1000;
+            deadline.tv_nsec += (POLL_INTERVAL_MS % 1000) * 1000000L;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec  += 1;
+                deadline.tv_nsec -= 1000000000L;
+            }
+
+            pthread_mutex_lock(&state->lock);
+            if (state->running)
+                pthread_cond_timedwait(&state->updated, &state->lock, &deadline);
+            pthread_mutex_unlock(&state->lock);
+        }
     }
 
     return NULL;

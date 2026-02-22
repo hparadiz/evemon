@@ -83,7 +83,7 @@ int main(int argc, char *argv[])
      * mutex/cond world without calling pthread functions from a
      * signal handler.
      */
-    g_timeout_add(200, check_shutdown, NULL);
+    g_timeout_add(50, check_shutdown, NULL);
 
     /* Run GTK UI on the main thread (ui_thread calls gtk_main) */
     ui_thread(&g_state);
