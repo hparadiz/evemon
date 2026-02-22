@@ -13,6 +13,7 @@
 #include "ui_internal.h"
 
 #include <math.h>
+#include <signal.h>
 #include <utmpx.h>
 
 /* ── pid_set helpers ─────────────────────────────────────────── */
@@ -174,11 +175,133 @@ static gboolean autoscroll_tick(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
+/* ── right-click: end process / end process tree ─────────────── */
+
+/*
+ * Collect all descendant PIDs of `parent_pid` from the current tree model.
+ * Uses the tree structure (not /proc) so it matches what the user sees.
+ */
+static void collect_tree_descendants(GtkTreeModel *model, GtkTreeIter *parent,
+                                    pid_t **out, size_t *cnt, size_t *cap)
+{
+    GtkTreeIter child;
+    gboolean valid = gtk_tree_model_iter_children(model, &child, parent);
+    while (valid) {
+        gint pid;
+        gtk_tree_model_get(model, &child, COL_PID, &pid, -1);
+        if (*cnt >= *cap) {
+            *cap = *cap ? *cap * 2 : 64;
+            pid_t *tmp = realloc(*out, *cap * sizeof(pid_t));
+            if (!tmp) return;
+            *out = tmp;
+        }
+        (*out)[(*cnt)++] = (pid_t)pid;
+        collect_tree_descendants(model, &child, out, cnt, cap);
+        valid = gtk_tree_model_iter_next(model, &child);
+    }
+}
+
+static void on_end_process(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    pid_t pid = GPOINTER_TO_INT(data);
+    if (pid > 1)
+        kill(pid, SIGTERM);
+}
+
+typedef struct {
+    ui_ctx_t *ctx;
+    pid_t     pid;
+} end_tree_data_t;
+
+static void on_end_process_tree(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    end_tree_data_t *d = data;
+    GtkTreeModel *model = GTK_TREE_MODEL(d->ctx->store);
+
+    GtkTreeIter iter;
+    if (!find_iter_by_pid(model, NULL, d->pid, &iter)) {
+        free(d);
+        return;
+    }
+
+    /* Kill children first (bottom-up is more graceful) */
+    pid_t *kids = NULL;
+    size_t nkids = 0, cap = 0;
+    collect_tree_descendants(model, &iter, &kids, &nkids, &cap);
+
+    /* Kill descendants in reverse order (deepest first) */
+    for (size_t i = nkids; i > 0; i--) {
+        if (kids[i - 1] > 1)
+            kill(kids[i - 1], SIGTERM);
+    }
+    free(kids);
+
+    /* Kill the root process last */
+    if (d->pid > 1)
+        kill(d->pid, SIGTERM);
+
+    free(d);
+}
+
+static void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
+                                     pid_t pid, const char *name)
+{
+    GtkWidget *menu = gtk_menu_new();
+
+    char label1[320];
+    snprintf(label1, sizeof(label1), "End Process (%s, pid %d)", name, pid);
+    GtkWidget *mi1 = gtk_menu_item_new_with_label(label1);
+    g_signal_connect(mi1, "activate", G_CALLBACK(on_end_process),
+                     GINT_TO_POINTER(pid));
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi1);
+
+    char label2[320];
+    snprintf(label2, sizeof(label2), "End Process Tree (%s, pid %d)", name, pid);
+    GtkWidget *mi2 = gtk_menu_item_new_with_label(label2);
+    end_tree_data_t *d = malloc(sizeof(*d));
+    if (d) {
+        d->ctx = ctx;
+        d->pid = pid;
+        g_signal_connect(mi2, "activate", G_CALLBACK(on_end_process_tree), d);
+    }
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi2);
+
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+}
+
 static gboolean on_button_press(GtkWidget *widget, GdkEventButton *ev,
                                 gpointer data)
 {
-    (void)widget;
     ui_ctx_t *ctx = data;
+
+    if (ev->button == 3) {   /* right-click */
+        GtkTreePath *path = NULL;
+        if (gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(widget),
+                                         (gint)ev->x, (gint)ev->y,
+                                         &path, NULL, NULL, NULL)) {
+            /* Select the row under the cursor */
+            GtkTreeSelection *sel = gtk_tree_view_get_selection(
+                GTK_TREE_VIEW(widget));
+            gtk_tree_selection_select_path(sel, path);
+
+            GtkTreeIter iter;
+            if (gtk_tree_model_get_iter(GTK_TREE_MODEL(ctx->store),
+                                       &iter, path)) {
+                gint pid = 0;
+                gchar *name = NULL;
+                gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), &iter,
+                                   COL_PID, &pid, COL_NAME, &name, -1);
+                show_process_context_menu(ctx, ev, (pid_t)pid,
+                                         name ? name : "?");
+                g_free(name);
+            }
+            gtk_tree_path_free(path);
+        }
+        return TRUE;
+    }
 
     if (ev->button == 2) {   /* middle button */
         ctx->autoscroll = TRUE;
@@ -1112,6 +1235,60 @@ void *ui_thread(void *arg)
     GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window), "allmon – Process Monitor");
     gtk_window_set_default_size(GTK_WINDOW(window), 1100, 700);
+
+    /* Set the window icon from the embedded GResource PNG.
+     *
+     * The source image may be large and non-square, so we produce
+     * square, RGBA-with-alpha versions at the standard icon sizes
+     * that window managers request (16, 32, 48, 64, 128).
+     * This avoids blurry stretching and preserves transparency.      */
+    {
+        GdkPixbuf *raw = gdk_pixbuf_new_from_resource(
+            "/org/allmon/icon.png", NULL);
+        if (raw) {
+            static const int sizes[] = { 16, 32, 48, 64, 128 };
+            GList *icon_list = NULL;
+
+            for (int i = 0; i < (int)(sizeof(sizes) / sizeof(sizes[0])); i++) {
+                int sz = sizes[i];
+
+                /* Scale preserving aspect ratio into a sz×sz box */
+                int src_w = gdk_pixbuf_get_width(raw);
+                int src_h = gdk_pixbuf_get_height(raw);
+                double scale = (double)sz / (src_w > src_h ? src_w : src_h);
+                int dst_w = (int)(src_w * scale + 0.5);
+                int dst_h = (int)(src_h * scale + 0.5);
+                if (dst_w < 1) dst_w = 1;
+                if (dst_h < 1) dst_h = 1;
+
+                GdkPixbuf *scaled = gdk_pixbuf_scale_simple(
+                    raw, dst_w, dst_h, GDK_INTERP_BILINEAR);
+                if (!scaled) continue;
+
+                /* Centre the scaled image on a transparent sz×sz canvas */
+                GdkPixbuf *canvas = gdk_pixbuf_new(
+                    GDK_COLORSPACE_RGB, TRUE, 8, sz, sz);
+                gdk_pixbuf_fill(canvas, 0x00000000);   /* fully transparent */
+
+                int off_x = (sz - dst_w) / 2;
+                int off_y = (sz - dst_h) / 2;
+                gdk_pixbuf_composite(scaled, canvas,
+                                     off_x, off_y, dst_w, dst_h,
+                                     off_x, off_y, 1.0, 1.0,
+                                     GDK_INTERP_BILINEAR, 255);
+                g_object_unref(scaled);
+
+                icon_list = g_list_append(icon_list, canvas);
+            }
+
+            if (icon_list)
+                gtk_window_set_icon_list(GTK_WINDOW(window), icon_list);
+
+            g_list_free_full(icon_list, g_object_unref);
+            g_object_unref(raw);
+        }
+    }
+
     g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), mon);
 
     /* ── tree store & view ───────────────────────────────────── */
@@ -1367,6 +1544,7 @@ void *ui_thread(void *arg)
     /* Scrollable tree view for the fd list */
     GtkTreeStore *fd_store = gtk_tree_store_new(FD_NUM_COLS,
                                                 G_TYPE_STRING,   /* FD_COL_TEXT */
+                                                G_TYPE_STRING,   /* FD_COL_MARKUP */
                                                 G_TYPE_INT);     /* FD_COL_CAT  */
     GtkWidget *fd_tree = gtk_tree_view_new_with_model(
         GTK_TREE_MODEL(fd_store));
@@ -1378,7 +1556,7 @@ void *ui_thread(void *arg)
     GtkCellRenderer *fd_r = gtk_cell_renderer_text_new();
     g_object_set(fd_r, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
     GtkTreeViewColumn *fd_col = gtk_tree_view_column_new_with_attributes(
-        "Path", fd_r, "text", FD_COL_TEXT, NULL);
+        "Path", fd_r, "markup", FD_COL_MARKUP, NULL);
     gtk_tree_view_column_set_expand(fd_col, TRUE);
     gtk_tree_view_append_column(GTK_TREE_VIEW(fd_tree), fd_col);
 

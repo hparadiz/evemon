@@ -152,6 +152,7 @@ typedef enum {
 
 enum {
     FD_COL_TEXT,
+    FD_COL_MARKUP,
     FD_COL_CAT,
     FD_NUM_COLS
 };
@@ -200,6 +201,8 @@ fd_category_t     classify_fd(const char *path);
 
 void read_pid_fds(pid_t pid, fd_list_t *out);
 int  fd_entry_path_cmp(const void *a, const void *b);
+int  strcmp_trimmed(const char *a, const char *b);
+char *fd_path_to_markup(const char *path);
 
 /* ── async fd scan ───────────────────────────────────────────── */
 

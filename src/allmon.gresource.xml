@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/org/allmon">
+    <file alias="icon.png">../icon.png</file>
+  </gresource>
+</gresources>

@@ -305,6 +305,108 @@ fd_category_t classify_fd(const char *path)
     return FD_CAT_OTHER;
 }
 
+/* ── whitespace-trimmed comparison for dedup ─────────────────── */
+
+/*
+ * Compare two strings ignoring leading and trailing whitespace.
+ * Returns 0 if the trimmed content is identical, non-zero otherwise.
+ */
+int strcmp_trimmed(const char *a, const char *b)
+{
+    /* Skip leading whitespace */
+    while (*a && (*a == ' ' || *a == '\t' || *a == '\n' || *a == '\r')) a++;
+    while (*b && (*b == ' ' || *b == '\t' || *b == '\n' || *b == '\r')) b++;
+
+    /* Find end of non-whitespace content */
+    const char *ea = a + strlen(a);
+    while (ea > a && (ea[-1] == ' ' || ea[-1] == '\t' || ea[-1] == '\n' || ea[-1] == '\r')) ea--;
+
+    const char *eb = b + strlen(b);
+    while (eb > b && (eb[-1] == ' ' || eb[-1] == '\t' || eb[-1] == '\n' || eb[-1] == '\r')) eb--;
+
+    size_t la = (size_t)(ea - a);
+    size_t lb = (size_t)(eb - b);
+    if (la != lb) return 1;
+    return memcmp(a, b, la);
+}
+
+/* ── markup helper: render whitespace as grayed-out symbols ──── */
+
+/*
+ * Convert a path string to Pango markup.  Visible content is escaped
+ * normally; leading/trailing whitespace is rendered as visible symbols
+ * in a gray color:  '·' for space, '→' for tab, '↵' for newline/CR.
+ */
+char *fd_path_to_markup(const char *path)
+{
+    if (!path || !path[0])
+        return g_strdup("–");
+
+    const char *start = path;
+    const char *end   = path + strlen(path);
+
+    /* Find the trimmed core region */
+    const char *core_start = start;
+    while (core_start < end &&
+           (*core_start == ' ' || *core_start == '\t' ||
+            *core_start == '\n' || *core_start == '\r'))
+        core_start++;
+
+    const char *core_end = end;
+    while (core_end > core_start &&
+           (core_end[-1] == ' ' || core_end[-1] == '\t' ||
+            core_end[-1] == '\n' || core_end[-1] == '\r'))
+        core_end--;
+
+    /* If no whitespace at edges, just escape the whole thing */
+    if (core_start == start && core_end == end) {
+        char *escaped = g_markup_escape_text(path, -1);
+        return escaped;
+    }
+
+    GString *out = g_string_new(NULL);
+
+    /* Render leading whitespace as grayed symbols */
+    if (core_start > start) {
+        g_string_append(out, "<span foreground=\"#888888\">");
+        for (const char *p = start; p < core_start; p++) {
+            switch (*p) {
+            case ' ':  g_string_append(out, "·");  break;
+            case '\t': g_string_append(out, "→");  break;
+            case '\n': g_string_append(out, "↵");  break;
+            case '\r': g_string_append(out, "↵");  break;
+            default:   g_string_append_c(out, *p);  break;
+            }
+        }
+        g_string_append(out, "</span>");
+    }
+
+    /* Render the core content normally (escaped) */
+    if (core_end > core_start) {
+        char *escaped = g_markup_escape_text(core_start,
+                                             (gssize)(core_end - core_start));
+        g_string_append(out, escaped);
+        g_free(escaped);
+    }
+
+    /* Render trailing whitespace as grayed symbols */
+    if (core_end < end) {
+        g_string_append(out, "<span foreground=\"#888888\">");
+        for (const char *p = core_end; p < end; p++) {
+            switch (*p) {
+            case ' ':  g_string_append(out, "·");  break;
+            case '\t': g_string_append(out, "→");  break;
+            case '\n': g_string_append(out, "↵");  break;
+            case '\r': g_string_append(out, "↵");  break;
+            default:   g_string_append_c(out, *p);  break;
+            }
+        }
+        g_string_append(out, "</span>");
+    }
+
+    return g_string_free(out, FALSE);
+}
+
 /* ── fd path sorting ─────────────────────────────────────────── */
 
 static const char *get_home_prefix(size_t *len_out)
@@ -544,16 +646,22 @@ static void fd_scan_complete(GObject      *source_object,
 
         GtkTreeIter parent;
         if (!cat_exists[c]) {
+            char *hdr_escaped = g_markup_escape_text(hdr, -1);
             gtk_tree_store_append(ctx->fd_store, &parent, NULL);
             gtk_tree_store_set(ctx->fd_store, &parent,
                                FD_COL_TEXT, hdr,
+                               FD_COL_MARKUP, hdr_escaped,
                                FD_COL_CAT, (gint)c, -1);
+            g_free(hdr_escaped);
             cat_exists[c] = TRUE;
             cat_iters[c]  = parent;
         } else {
             parent = cat_iters[c];
+            char *hdr_escaped = g_markup_escape_text(hdr, -1);
             gtk_tree_store_set(ctx->fd_store, &parent,
-                               FD_COL_TEXT, hdr, -1);
+                               FD_COL_TEXT, hdr,
+                               FD_COL_MARKUP, hdr_escaped, -1);
+            g_free(hdr_escaped);
         }
 
         /* Build the display list: optionally group duplicates */
@@ -561,16 +669,18 @@ static void fd_scan_complete(GObject      *source_object,
         fd_list_init(&display);
 
         if (ctx->fd_group_dup_active && t->buckets[c].count > 0) {
-            /* Buckets are already sorted by path, so duplicates are adjacent */
+            /* Buckets are already sorted by path, so duplicates are adjacent.
+             * Use strcmp_trimmed so paths differing only in leading/trailing
+             * whitespace are grouped together.                              */
             size_t run_start = 0;
             while (run_start < t->buckets[c].count) {
                 size_t run_end = run_start + 1;
                 while (run_end < t->buckets[c].count &&
-                       strcmp(t->buckets[c].entries[run_start].path,
-                              t->buckets[c].entries[run_end].path) == 0)
+                       strcmp_trimmed(t->buckets[c].entries[run_start].path,
+                                      t->buckets[c].entries[run_end].path) == 0)
                     run_end++;
                 size_t run_len = run_end - run_start;
-                if (run_len > 2) {
+                if (run_len > 1) {
                     char grouped[600];
                     snprintf(grouped, sizeof(grouped), "%s (%zu duplicates)",
                              t->buckets[c].entries[run_start].path, run_len);
@@ -598,8 +708,11 @@ static void fd_scan_complete(GObject      *source_object,
             else
                 snprintf(hdr2, sizeof(hdr2), "%s (%zu)",
                          fd_cat_label[c], t->buckets[c].count);
+            char *hdr2_escaped = g_markup_escape_text(hdr2, -1);
             gtk_tree_store_set(ctx->fd_store, &parent,
-                               FD_COL_TEXT, hdr2, -1);
+                               FD_COL_TEXT, hdr2,
+                               FD_COL_MARKUP, hdr2_escaped, -1);
+            g_free(hdr2_escaped);
         }
 
         GtkTreeIter child;
@@ -608,19 +721,25 @@ static void fd_scan_complete(GObject      *source_object,
         size_t bi = 0;
 
         while (bi < display.count && child_valid) {
+            char *markup = fd_path_to_markup(display.entries[bi].path);
             gtk_tree_store_set(ctx->fd_store, &child,
                                FD_COL_TEXT, display.entries[bi].path,
+                               FD_COL_MARKUP, markup,
                                FD_COL_CAT, (gint)-1, -1);
+            g_free(markup);
             bi++;
             child_valid = gtk_tree_model_iter_next(fd_model, &child);
         }
 
         while (bi < display.count) {
             GtkTreeIter new_child;
+            char *markup = fd_path_to_markup(display.entries[bi].path);
             gtk_tree_store_append(ctx->fd_store, &new_child, &parent);
             gtk_tree_store_set(ctx->fd_store, &new_child,
                                FD_COL_TEXT, display.entries[bi].path,
+                               FD_COL_MARKUP, markup,
                                FD_COL_CAT, (gint)-1, -1);
+            g_free(markup);
             bi++;
         }
 
