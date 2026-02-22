@@ -27,6 +27,7 @@ void sidebar_update(ui_ctx_t *ctx)
         gtk_label_set_text(ctx->sb_group_cpu, "–");
         gtk_label_set_text(ctx->sb_start_time, "–");
         gtk_label_set_text(ctx->sb_container, "–");
+        gtk_label_set_text(ctx->sb_service,   "–");
         gtk_label_set_text(ctx->sb_cwd,       "–");
         gtk_label_set_text(ctx->sb_cmdline,   "–");
         gtk_tree_store_clear(ctx->fd_store);
@@ -51,7 +52,8 @@ void sidebar_update(ui_ctx_t *ctx)
     gint64 start_epoch = 0;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL;
     gchar *rss_text = NULL, *grp_rss_text = NULL, *grp_cpu_text = NULL;
-    gchar *start_time_text = NULL, *container = NULL, *cwd = NULL, *cmdline = NULL;
+    gchar *start_time_text = NULL, *container = NULL, *service = NULL,
+          *cwd = NULL, *cmdline = NULL;
 
     gtk_tree_model_get(child_model, &iter,
                        COL_PID,            &pid,
@@ -65,6 +67,7 @@ void sidebar_update(ui_ctx_t *ctx)
                        COL_START_TIME,     &start_epoch,
                        COL_START_TIME_TEXT, &start_time_text,
                        COL_CONTAINER,      &container,
+                       COL_SERVICE,        &service,
                        COL_CWD,           &cwd,
                        COL_CMDLINE,        &cmdline,
                        -1);
@@ -93,6 +96,7 @@ void sidebar_update(ui_ctx_t *ctx)
         gtk_label_set_text(ctx->sb_start_time, start_time_text ? start_time_text : "–");
     }
     gtk_label_set_text(ctx->sb_container, (container && container[0]) ? container : "–");
+    gtk_label_set_text(ctx->sb_service,   (service && service[0])     ? service   : "–");
     gtk_label_set_text(ctx->sb_cwd,       cwd       ? cwd       : "–");
     gtk_label_set_text(ctx->sb_cmdline,   cmdline   ? cmdline   : "–");
 
@@ -101,7 +105,8 @@ void sidebar_update(ui_ctx_t *ctx)
 
     g_free(user); g_free(name); g_free(cpu_text);
     g_free(rss_text); g_free(grp_rss_text); g_free(grp_cpu_text);
-    g_free(start_time_text); g_free(container); g_free(cwd); g_free(cmdline);
+    g_free(start_time_text); g_free(container); g_free(service);
+    g_free(cwd); g_free(cmdline);
 
     g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
 }

@@ -10,6 +10,7 @@
 #define PROC_USER_MAX  64
 #define PROC_CWD_MAX   1024
 #define PROC_CTR_MAX   64
+#define PROC_SVC_MAX   128
 #define PROC_LIST_MAX  2048
 
 /* A single process entry */
@@ -21,6 +22,7 @@ typedef struct {
     char     user[PROC_USER_MAX];
     char     cwd[PROC_CWD_MAX];
     char     container[PROC_CTR_MAX];   /* container runtime or empty   */
+    char     service[PROC_SVC_MAX];     /* systemd unit or openrc svc   */
     long     mem_rss_kb;            /* resident set size in KiB */
     unsigned long long cpu_ticks;   /* utime + stime (USER_HZ ticks)  */
     double   cpu_percent;           /* CPU% since last snapshot        */

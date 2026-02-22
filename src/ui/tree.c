@@ -142,6 +142,7 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
                        COL_START_TIME,      (gint64)e->start_time,
                        COL_START_TIME_TEXT, start_text,
                        COL_CONTAINER,  e->container[0] ? e->container : "",
+                       COL_SERVICE,    e->service[0]   ? e->service   : "",
                        COL_CWD,      e->cwd,
                        COL_CMDLINE,  e->cmdline,
                        -1);

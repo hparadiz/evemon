@@ -39,6 +39,7 @@ enum {
     COL_START_TIME,    /* epoch seconds (gint64) for sorting   */
     COL_START_TIME_TEXT,/* formatted start-time string          */
     COL_CONTAINER,     /* container runtime label (string)      */
+    COL_SERVICE,       /* systemd unit / openrc service name    */
     COL_CWD,
     COL_CMDLINE,
     NUM_COLS
@@ -90,6 +91,7 @@ typedef struct {
     GtkLabel           *sb_group_cpu;
     GtkLabel           *sb_start_time;
     GtkLabel           *sb_container;
+    GtkLabel           *sb_service;
     GtkLabel           *sb_cwd;
     GtkLabel           *sb_cmdline;
 

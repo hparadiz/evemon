@@ -294,6 +294,270 @@ static void read_container(pid_t pid, char *buf, size_t bufsz)
     }
 }
 
+/* ── service unit detection ──────────────────────────────────── */
+
+typedef enum {
+    INIT_UNKNOWN,
+    INIT_SYSTEMD,
+    INIT_OPENRC,
+    INIT_OTHER,
+} init_system_t;
+
+static init_system_t g_init_system = INIT_UNKNOWN;
+
+static init_system_t detect_init_system(void)
+{
+    struct stat st;
+    if (stat("/run/systemd/system", &st) == 0 && S_ISDIR(st.st_mode))
+        return INIT_SYSTEMD;
+    if (stat("/run/openrc", &st) == 0 && S_ISDIR(st.st_mode))
+        return INIT_OPENRC;
+    return INIT_OTHER;
+}
+
+/*
+ * For systemd: extract the service unit from /proc/<pid>/cgroup.
+ * We look for a line like:
+ *   0::/system.slice/sshd.service
+ *   0::/user.slice/user-1000.slice/...
+ * and extract the last .service (or .scope, .slice) component.
+ *
+ * Only called for direct children of init (ppid == 1) for performance.
+ */
+static void read_service_systemd(pid_t pid, char *buf, size_t bufsz)
+{
+    buf[0] = '\0';
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cgroup", pid);
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        /* Prefer the unified hierarchy (v2): starts with "0::" */
+        if (strncmp(line, "0::", 3) == 0) {
+            /* Strip trailing newline */
+            size_t len = strlen(line);
+            if (len > 0 && line[len - 1] == '\n')
+                line[len - 1] = '\0';
+
+            /* Find the last path component that ends in .service or .scope */
+            char *cgroup_path = line + 3;  /* skip "0::" */
+
+            /* Walk backwards for the last segment containing ".service" */
+            char *svc = strstr(cgroup_path, ".service");
+            if (!svc) svc = strstr(cgroup_path, ".scope");
+            if (svc) {
+                /* Find the start of this segment (after last '/') */
+                char *seg_start = svc;
+                while (seg_start > cgroup_path && *(seg_start - 1) != '/')
+                    seg_start--;
+                /* Find end of the unit name */
+                char *seg_end = svc;
+                while (*seg_end && *seg_end != '/' && *seg_end != '\n')
+                    seg_end++;
+                size_t seg_len = (size_t)(seg_end - seg_start);
+                if (seg_len >= bufsz) seg_len = bufsz - 1;
+                memcpy(buf, seg_start, seg_len);
+                buf[seg_len] = '\0';
+                fclose(f);
+                return;
+            }
+
+            /* If it's a user slice like /user.slice/user-1000.slice/... */
+            if (strstr(cgroup_path, "user.slice")) {
+                /* Extract the meaningful slice */
+                char *slice = strstr(cgroup_path, "user-");
+                if (slice) {
+                    char *end = strstr(slice, ".slice");
+                    if (end) {
+                        end += 6; /* include ".slice" */
+                        size_t seg_len = (size_t)(end - slice);
+                        if (seg_len >= bufsz) seg_len = bufsz - 1;
+                        memcpy(buf, slice, seg_len);
+                        buf[seg_len] = '\0';
+                        fclose(f);
+                        return;
+                    }
+                }
+            }
+            break;
+        }
+        /* Fallback for cgroup v1: look for name=systemd or systemd hierarchy */
+        if (strstr(line, "name=systemd") || strstr(line, ":systemd:")) {
+            char *p = strchr(line, ':');
+            if (p) p = strchr(p + 1, ':');
+            if (p) {
+                p++;  /* skip second ':' */
+                size_t len = strlen(p);
+                if (len > 0 && p[len - 1] == '\n')
+                    p[len - 1] = '\0';
+
+                char *svc = strstr(p, ".service");
+                if (!svc) svc = strstr(p, ".scope");
+                if (svc) {
+                    char *seg_start = svc;
+                    while (seg_start > p && *(seg_start - 1) != '/')
+                        seg_start--;
+                    char *seg_end = svc;
+                    while (*seg_end && *seg_end != '/' && *seg_end != '\n')
+                        seg_end++;
+                    size_t seg_len = (size_t)(seg_end - seg_start);
+                    if (seg_len >= bufsz) seg_len = bufsz - 1;
+                    memcpy(buf, seg_start, seg_len);
+                    buf[seg_len] = '\0';
+                    fclose(f);
+                    return;
+                }
+            }
+        }
+    }
+    fclose(f);
+}
+
+/*
+ * OpenRC service PID map: built once per snapshot from /run/openrc/started/.
+ * Each file in that directory is a service name; its content is the PID.
+ */
+
+#define SVC_MAP_SIZE 256
+
+typedef struct {
+    pid_t pid;
+    char  name[PROC_SVC_MAX];
+} svc_map_entry_t;
+
+typedef struct {
+    svc_map_entry_t entries[SVC_MAP_SIZE];
+    size_t          count;
+} svc_map_t;
+
+static void svc_map_build_openrc(svc_map_t *map)
+{
+    map->count = 0;
+
+    /*
+     * /run/openrc/daemons/<service>/<instance> files contain metadata
+     * including "pidfile=<path>".  We read the pidfile path, then read
+     * the actual PID from it.
+     */
+    DIR *dp = opendir("/run/openrc/daemons");
+    if (!dp)
+        return;
+
+    struct dirent *svc_de;
+    while ((svc_de = readdir(dp)) != NULL && map->count < SVC_MAP_SIZE) {
+        if (svc_de->d_name[0] == '.')
+            continue;
+
+        /* Open the per-service subdirectory */
+        char svc_dir[384];
+        snprintf(svc_dir, sizeof(svc_dir),
+                 "/run/openrc/daemons/%s", svc_de->d_name);
+
+        DIR *sdp = opendir(svc_dir);
+        if (!sdp)
+            continue;
+
+        struct dirent *inst_de;
+        while ((inst_de = readdir(sdp)) != NULL && map->count < SVC_MAP_SIZE) {
+            if (inst_de->d_name[0] == '.')
+                continue;
+
+            char inst_path[512];
+            snprintf(inst_path, sizeof(inst_path),
+                     "%s/%s", svc_dir, inst_de->d_name);
+
+            /* Parse the instance file for "pidfile=<path>" */
+            FILE *f = fopen(inst_path, "r");
+            if (!f)
+                continue;
+
+            char pidfile_path[256] = "";
+            char line[512];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "pidfile=", 8) == 0) {
+                    /* Strip trailing whitespace/newline */
+                    char *val = line + 8;
+                    size_t vlen = strlen(val);
+                    while (vlen > 0 &&
+                           (val[vlen-1] == '\n' || val[vlen-1] == '\r' ||
+                            val[vlen-1] == ' '))
+                        vlen--;
+                    if (vlen >= sizeof(pidfile_path))
+                        vlen = sizeof(pidfile_path) - 1;
+                    memcpy(pidfile_path, val, vlen);
+                    pidfile_path[vlen] = '\0';
+                    break;
+                }
+            }
+            fclose(f);
+
+            if (!pidfile_path[0])
+                continue;
+
+            /* Read the PID from the pidfile */
+            FILE *pf = fopen(pidfile_path, "r");
+            if (!pf)
+                continue;
+
+            char pidbuf[32];
+            pid_t pid = 0;
+            if (fgets(pidbuf, sizeof(pidbuf), pf))
+                pid = (pid_t)atoi(pidbuf);
+            fclose(pf);
+
+            if (pid > 0) {
+                svc_map_entry_t *e = &map->entries[map->count++];
+                e->pid = pid;
+                snprintf(e->name, sizeof(e->name), "%s", svc_de->d_name);
+            }
+        }
+        closedir(sdp);
+    }
+    closedir(dp);
+}
+
+static const char *svc_map_lookup(const svc_map_t *map, pid_t pid)
+{
+    for (size_t i = 0; i < map->count; i++)
+        if (map->entries[i].pid == pid)
+            return map->entries[i].name;
+    return NULL;
+}
+
+/*
+ * Resolve the service name for a process.
+ * Only called for direct children of init (ppid <= 1) for performance.
+ */
+static void read_service(pid_t pid, pid_t ppid, char *buf, size_t bufsz,
+                         const svc_map_t *openrc_map)
+{
+    buf[0] = '\0';
+
+    /* Only resolve for direct children of init */
+    if (ppid != 0 && ppid != 1)
+        return;
+
+    switch (g_init_system) {
+    case INIT_SYSTEMD:
+        read_service_systemd(pid, buf, bufsz);
+        break;
+    case INIT_OPENRC:
+        if (openrc_map) {
+            const char *name = svc_map_lookup(openrc_map, pid);
+            if (name)
+                snprintf(buf, bufsz, "%s", name);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 /*
  * Read the process start time from /proc/<pid>/stat field 22 (starttime)
  * and convert it to an epoch timestamp using the system boot time.
@@ -400,6 +664,15 @@ static proc_snapshot_t build_snapshot(void)
 {
     proc_snapshot_t snap = { .entries = NULL, .count = 0 };
 
+    /* Detect the init system once */
+    if (g_init_system == INIT_UNKNOWN)
+        g_init_system = detect_init_system();
+
+    /* For OpenRC, build the PID→service map once per snapshot */
+    svc_map_t openrc_map = { .count = 0 };
+    if (g_init_system == INIT_OPENRC)
+        svc_map_build_openrc(&openrc_map);
+
     DIR *dp = opendir("/proc");
     if (!dp)
         return snap;
@@ -460,6 +733,10 @@ static proc_snapshot_t build_snapshot(void)
 
         /* Container detection */
         read_container(pid, e->container, sizeof(e->container));
+
+        /* Service unit (only for direct children of init) */
+        read_service(pid, e->ppid, e->service, sizeof(e->service),
+                     &openrc_map);
 
         snap.count++;
     }
