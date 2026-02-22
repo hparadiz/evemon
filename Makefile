@@ -25,6 +25,7 @@ BUILD_DIR := build
 
 # Exclude the BPF kernel program from gcc compilation
 SRCS := $(filter-out $(SRC_DIR)/fdmon_ebpf_kern.c, $(wildcard $(SRC_DIR)/*.c))
+SRCS += $(wildcard $(SRC_DIR)/ui/*.c)
 OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
 # BPF object (compiled with clang, loaded at runtime)
@@ -43,12 +44,18 @@ $(TARGET): $(OBJS)
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+$(BUILD_DIR)/ui/%.o: $(SRC_DIR)/ui/%.c | $(BUILD_DIR)/ui
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 # BPF kernel program — compiled to BPF bytecode with clang
 $(BPF_OBJ): $(BPF_SRC) | $(BUILD_DIR)
 	$(CLANG) $(BPF_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/ui:
+	mkdir -p $(BUILD_DIR)/ui
 
 clean:
 	rm -rf $(BUILD_DIR)

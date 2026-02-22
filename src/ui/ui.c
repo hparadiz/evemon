@@ -1,0 +1,1614 @@
+/*
+ * ui.c – GTK3 process-tree UI entry point and event handlers.
+ *
+ * Displays processes in a hierarchical GtkTreeView (like Sysinternals
+ * Process Explorer / procmon on Windows).  Each process is nested under
+ * its parent so you can expand/collapse entire process subtrees.
+ *
+ * A GLib timeout fires every ~1 s, grabs the latest snapshot from the
+ * monitor thread, rebuilds the GtkTreeStore, and re-expands any rows
+ * the user had open.
+ */
+
+#include "ui_internal.h"
+
+#include <math.h>
+#include <utmpx.h>
+
+/* ── pid_set helpers ─────────────────────────────────────────── */
+
+void pid_set_add(pid_set_t *s, pid_t pid)
+{
+    /* avoid duplicates */
+    for (size_t i = 0; i < s->count; i++)
+        if (s->pids[i] == pid) return;
+
+    if (s->count >= s->capacity) {
+        size_t newcap = s->capacity ? s->capacity * 2 : 64;
+        pid_t *tmp = realloc(s->pids, newcap * sizeof(pid_t));
+        if (!tmp) return;   /* OOM – silently drop the add */
+        s->pids     = tmp;
+        s->capacity = newcap;
+    }
+    s->pids[s->count++] = pid;
+}
+
+void pid_set_remove(pid_set_t *s, pid_t pid)
+{
+    for (size_t i = 0; i < s->count; i++) {
+        if (s->pids[i] == pid) {
+            s->pids[i] = s->pids[--s->count];
+            return;
+        }
+    }
+}
+
+int pid_set_contains(const pid_set_t *s, pid_t pid)
+{
+    for (size_t i = 0; i < s->count; i++)
+        if (s->pids[i] == pid) return 1;
+    return 0;
+}
+
+/* ── formatting helpers ──────────────────────────────────────── */
+
+/* Format a KiB value into a human-readable string. */
+void format_memory(long kb, char *buf, size_t bufsz)
+{
+    if (kb <= 0)
+        snprintf(buf, bufsz, "–");
+    else if (kb < 1024)
+        snprintf(buf, bufsz, "%ld KiB", kb);
+    else if (kb < 1024 * 1024)
+        snprintf(buf, bufsz, "%.1f MiB", (double)kb / 1024.0);
+    else
+        snprintf(buf, bufsz, "%.2f GiB", (double)kb / (1024.0 * 1024.0));
+}
+
+/* Format an elapsed-seconds value into a human-friendly "ago" string. */
+void format_fuzzy_time(time_t epoch, char *buf, size_t bufsz)
+{
+    if (epoch <= 0) { snprintf(buf, bufsz, "–"); return; }
+
+    time_t now = time(NULL);
+    long diff = (long)(now - epoch);
+    if (diff < 0) { snprintf(buf, bufsz, "just now"); return; }
+
+    if (diff < 60)
+        snprintf(buf, bufsz, "%lds ago", diff);
+    else if (diff < 3600)
+        snprintf(buf, bufsz, "%ldm %lds ago", diff / 60, diff % 60);
+    else if (diff < 86400) {
+        long h = diff / 3600;
+        long m = (diff % 3600) / 60;
+        snprintf(buf, bufsz, "%ldh %ldm ago", h, m);
+    } else if (diff < 86400 * 30L) {
+        long d = diff / 86400;
+        long h = (diff % 86400) / 3600;
+        snprintf(buf, bufsz, "%ldd %ldh ago", d, h);
+    } else if (diff < 86400 * 365L) {
+        long d = diff / 86400;
+        snprintf(buf, bufsz, "%ldd ago", d);
+    } else {
+        long y = diff / (86400 * 365L);
+        long d = (diff % (86400 * 365L)) / 86400;
+        snprintf(buf, bufsz, "%ldy %ldd ago", y, d);
+    }
+}
+
+/* ── find a row by PID (recursive) ────────────────────────────── */
+
+/*
+ * Walk the tree model to find the row whose COL_PID equals `target`.
+ * Returns TRUE and fills `result` if found, FALSE otherwise.
+ */
+gboolean find_iter_by_pid(GtkTreeModel *model, GtkTreeIter *parent,
+                          pid_t target, GtkTreeIter *result)
+{
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
+    while (valid) {
+        gint pid;
+        gtk_tree_model_get(model, &iter, COL_PID, &pid, -1);
+        if ((pid_t)pid == target) {
+            *result = iter;
+            return TRUE;
+        }
+        if (find_iter_by_pid(model, &iter, target, result))
+            return TRUE;
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+    return FALSE;
+}
+
+/* ── middle-click autoscroll (browser-style) ─────────────────── */
+
+/* Dead-zone radius as a fraction of the smaller window dimension.
+ * e.g. 0.03 = 3% of min(width, height).                          */
+#define AUTOSCROLL_DEADZONE_FRAC 0.03
+
+/* How often the scroll timer fires (ms). */
+#define AUTOSCROLL_INTERVAL 16   /* ~60 fps */
+
+/* Logarithmic speed factor. */
+#define AUTOSCROLL_SCALE    12.0
+
+static void stop_autoscroll(ui_ctx_t *ctx)
+{
+    ctx->autoscroll = FALSE;
+    ctx->velocity_x = ctx->velocity_y = 0;
+
+    if (ctx->scroll_timer) {
+        g_source_remove(ctx->scroll_timer);
+        ctx->scroll_timer = 0;
+    }
+
+    GdkDisplay *display = gdk_display_get_default();
+    GdkSeat    *seat    = gdk_display_get_default_seat(display);
+    gdk_seat_ungrab(seat);
+}
+
+/* Timer callback – apply velocity each tick. */
+static gboolean autoscroll_tick(gpointer data)
+{
+    ui_ctx_t *ctx = data;
+    if (!ctx->autoscroll) return G_SOURCE_REMOVE;
+
+    GtkAdjustment *hadj = gtk_scrolled_window_get_hadjustment(ctx->scroll);
+    GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(ctx->scroll);
+
+    double hval = gtk_adjustment_get_value(hadj) + ctx->velocity_x;
+    double vval = gtk_adjustment_get_value(vadj) + ctx->velocity_y;
+
+    double hmax = gtk_adjustment_get_upper(hadj) - gtk_adjustment_get_page_size(hadj);
+    double vmax = gtk_adjustment_get_upper(vadj) - gtk_adjustment_get_page_size(vadj);
+
+    if (hval < 0) hval = 0;
+    if (hval > hmax) hval = hmax;
+    if (vval < 0) vval = 0;
+    if (vval > vmax) vval = vmax;
+
+    gtk_adjustment_set_value(hadj, hval);
+    gtk_adjustment_set_value(vadj, vval);
+
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean on_button_press(GtkWidget *widget, GdkEventButton *ev,
+                                gpointer data)
+{
+    (void)widget;
+    ui_ctx_t *ctx = data;
+
+    if (ev->button == 2) {   /* middle button */
+        ctx->autoscroll = TRUE;
+        ctx->follow_selection = FALSE;   /* user is scrolling manually */
+        ctx->anchor_x   = ev->x_root;
+        ctx->anchor_y   = ev->y_root;
+        ctx->velocity_x = 0;
+        ctx->velocity_y = 0;
+
+        /* Grab pointer + show all-scroll cursor */
+        GdkDisplay *display = gdk_display_get_default();
+        GdkSeat    *seat    = gdk_display_get_default_seat(display);
+        GdkWindow  *win     = gtk_widget_get_window(widget);
+        GdkCursor  *cursor  = gdk_cursor_new_from_name(display, "all-scroll");
+
+        gdk_seat_grab(seat, win, GDK_SEAT_CAPABILITY_POINTER,
+                      TRUE, cursor, (GdkEvent *)ev, NULL, NULL);
+        if (cursor) g_object_unref(cursor);
+
+        /* Start the scroll timer */
+        ctx->scroll_timer = g_timeout_add(AUTOSCROLL_INTERVAL,
+                                          autoscroll_tick, ctx);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean on_button_release(GtkWidget *widget, GdkEventButton *ev,
+                                  gpointer data)
+{
+    (void)widget;
+    ui_ctx_t *ctx = data;
+
+    if (ev->button == 2 && ctx->autoscroll) {
+        stop_autoscroll(ctx);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/*
+ * As the mouse moves away from the anchor, compute a velocity whose
+ * magnitude scales logarithmically with distance.  Inside a small
+ * dead-zone around the anchor the velocity is zero.
+ */
+static gboolean on_motion_notify(GtkWidget *widget, GdkEventMotion *ev,
+                                 gpointer data)
+{
+    (void)widget;
+    ui_ctx_t *ctx = data;
+    if (!ctx->autoscroll) return FALSE;
+
+    double raw_dx = ev->x_root - ctx->anchor_x;
+    double raw_dy = ev->y_root - ctx->anchor_y;
+    double dist   = sqrt(raw_dx * raw_dx + raw_dy * raw_dy);
+
+    /* Compute dead-zone from the smaller window dimension */
+    GtkWidget *toplevel = gtk_widget_get_toplevel(widget);
+    int win_w = gtk_widget_get_allocated_width(toplevel);
+    int win_h = gtk_widget_get_allocated_height(toplevel);
+    double deadzone = AUTOSCROLL_DEADZONE_FRAC * (win_w < win_h ? win_w : win_h);
+    if (deadzone < 8.0) deadzone = 8.0;   /* sensible minimum */
+
+    if (dist < deadzone) {
+        ctx->velocity_x = 0;
+        ctx->velocity_y = 0;
+    } else {
+        /* Logarithmic ramp: speed = scale * log(1 + dist_beyond_deadzone) */
+        double beyond = dist - deadzone;
+        double speed  = AUTOSCROLL_SCALE * log(1.0 + beyond);
+        /* Split into X / Y components proportionally */
+        ctx->velocity_x = speed * (raw_dx / dist);
+        ctx->velocity_y = speed * (raw_dy / dist);
+    }
+    return TRUE;
+}
+
+/* ── cancel autoscroll on window focus loss ───────────────────── */
+
+static gboolean on_focus_out(GtkWidget *widget, GdkEventFocus *ev,
+                             gpointer data)
+{
+    (void)widget; (void)ev;
+    ui_ctx_t *ctx = data;
+
+    if (ctx->autoscroll)
+        stop_autoscroll(ctx);
+    return FALSE;
+}
+
+/* ── signal handlers for user collapse / expand ──────────────── */
+
+static void on_row_collapsed(GtkTreeView *view,
+                              GtkTreeIter *iter,
+                              GtkTreePath *path,
+                              gpointer     data)
+{
+    (void)view; (void)path;
+    ui_ctx_t *ctx = data;
+    gint pid;
+    gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), iter, COL_PID, &pid, -1);
+    pid_set_add(&ctx->collapsed, (pid_t)pid);
+}
+
+static void on_row_expanded(GtkTreeView *view,
+                             GtkTreeIter *iter,
+                             GtkTreePath *path,
+                             gpointer     data)
+{
+    (void)view; (void)path;
+    ui_ctx_t *ctx = data;
+    gint pid;
+    gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), iter, COL_PID, &pid, -1);
+    pid_set_remove(&ctx->collapsed, (pid_t)pid);
+}
+
+/* ── selection / sidebar interaction ─────────────────────────── */
+
+static void on_selection_changed(GtkTreeSelection *sel, gpointer data)
+{
+    (void)sel;
+    sidebar_update((ui_ctx_t *)data);
+}
+
+static void on_toggle_sidebar(GtkCheckMenuItem *item, gpointer data)
+{
+    ui_ctx_t *ctx = data;
+    if (gtk_check_menu_item_get_active(item)) {
+        gtk_widget_show_all(ctx->sidebar);
+        sidebar_update(ctx);
+    } else {
+        gtk_widget_hide(ctx->sidebar);
+    }
+}
+
+/* ── double-click: open sidebar for the activated row ─────────── */
+
+static void on_row_activated(GtkTreeView       *view,
+                             GtkTreePath       *path,
+                             GtkTreeViewColumn *col,
+                             gpointer           data)
+{
+    (void)view; (void)path; (void)col;
+    ui_ctx_t *ctx = data;
+
+    if (!gtk_widget_get_visible(ctx->sidebar)) {
+        /* Toggling the menu item fires the "toggled" signal, which
+         * calls on_toggle_sidebar → show + update.                 */
+        gtk_check_menu_item_set_active(ctx->sidebar_menu_item, TRUE);
+    }
+}
+
+/* ── sort-click: enable follow-selection ──────────────────────── */
+
+static void on_sort_column_changed(GtkTreeSortable *sortable, gpointer data)
+{
+    (void)sortable;
+    ui_ctx_t *ctx = data;
+    ctx->follow_selection = TRUE;
+}
+
+/* ── user scroll: disable follow-selection ───────────────────── */
+
+static gboolean on_tree_scroll_event(GtkWidget *widget, GdkEventScroll *ev,
+                                     gpointer data)
+{
+    (void)widget; (void)ev;
+    ui_ctx_t *ctx = data;
+    ctx->follow_selection = FALSE;
+    return FALSE;   /* let GTK handle the scroll normally */
+}
+
+/* ── periodic refresh callback ───────────────────────────────── */
+
+static int g_first_refresh = 1;
+
+static gboolean on_refresh(gpointer data)
+{
+    ui_ctx_t *ctx = data;
+
+    pthread_mutex_lock(&ctx->mon->lock);
+    int running = ctx->mon->running;
+    size_t count = ctx->mon->snapshot.count;
+
+    proc_entry_t *local = NULL;
+    if (count > 0) {
+        local = malloc(count * sizeof(proc_entry_t));
+        if (local)
+            memcpy(local, ctx->mon->snapshot.entries,
+                   count * sizeof(proc_entry_t));
+    }
+    pthread_mutex_unlock(&ctx->mon->lock);
+
+    if (!running) {
+        gtk_main_quit();
+        free(local);
+        return G_SOURCE_REMOVE;
+    }
+
+    if (!local)
+        return G_SOURCE_CONTINUE;
+
+    /* Block collapse/expand signals during programmatic changes */
+    g_signal_handlers_block_by_func(ctx->view, on_row_collapsed, ctx);
+    g_signal_handlers_block_by_func(ctx->view, on_row_expanded,  ctx);
+
+    /*
+     * If follow_selection is active, remember the selected PID and its
+     * viewport-relative position so we can scroll back after the update.
+     */
+    pid_t    sel_pid    = 0;
+    float    sel_align  = 0.0f;
+    gboolean have_sel   = FALSE;
+
+    if (ctx->follow_selection) {
+        GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
+        if (sel) {
+            GList *rows = gtk_tree_selection_get_selected_rows(sel, NULL);
+            if (rows) {
+                GtkTreePath *sel_path = rows->data;
+                GtkTreeIter sel_iter;
+                if (gtk_tree_model_get_iter(GTK_TREE_MODEL(ctx->store),
+                                           &sel_iter, sel_path)) {
+                    gint pid;
+                    gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), &sel_iter,
+                                       COL_PID, &pid, -1);
+                    sel_pid = (pid_t)pid;
+
+                    GdkRectangle cell_rect;
+                    gtk_tree_view_get_cell_area(ctx->view, sel_path, NULL, &cell_rect);
+
+                    GdkRectangle vis_rect;
+                    gtk_tree_view_get_visible_rect(ctx->view, &vis_rect);
+
+                    double vp_y = (double)(cell_rect.y - vis_rect.y);
+                    double vp_h = (double)vis_rect.height;
+                    if (vp_h > 0)
+                        sel_align = (float)(vp_y / vp_h);
+                    if (sel_align < 0.0f) sel_align = 0.0f;
+                    if (sel_align > 1.0f) sel_align = 1.0f;
+                    have_sel = TRUE;
+                }
+                g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+            }
+        }
+    }
+
+    PROFILE_BEGIN(ui_render);
+
+    if (g_first_refresh) {
+        /* First time: full populate + expand all */
+        populate_store_initial(ctx->store, ctx->view, local, count);
+        g_first_refresh = 0;
+    } else {
+        /* Incremental: update in-place, no clear, no flash */
+        update_store(ctx->store, ctx->view, local, count, &ctx->collapsed);
+    }
+
+    /* Recompute group totals (self + all descendants) */
+    compute_group_rss(ctx->store, NULL);
+    compute_group_cpu(ctx->store, NULL);
+
+    PROFILE_END(ui_render);
+
+    /*
+     * If there was a selection, find the row by PID (stable across
+     * re-sorts) and use GTK's scroll_to_cell to place it at the same
+     * viewport fraction as before.  This avoids manual bin-window
+     * coordinate arithmetic which is unreliable across re-sorts.
+     */
+    if (have_sel && sel_pid > 0) {
+        GtkTreeIter found_iter;
+        if (find_iter_by_pid(GTK_TREE_MODEL(ctx->store), NULL,
+                             sel_pid, &found_iter)) {
+            GtkTreePath *found_path = gtk_tree_model_get_path(
+                GTK_TREE_MODEL(ctx->store), &found_iter);
+            if (found_path) {
+                gtk_tree_view_scroll_to_cell(ctx->view, found_path,
+                                             NULL, TRUE, sel_align, 0.0f);
+                gtk_tree_path_free(found_path);
+            }
+        }
+    }
+
+    g_signal_handlers_unblock_by_func(ctx->view, on_row_collapsed, ctx);
+    g_signal_handlers_unblock_by_func(ctx->view, on_row_expanded,  ctx);
+
+    /* Update the sidebar detail panel for the selected process */
+    sidebar_update(ctx);
+
+    /* Update system info (right side of status bar) */
+    {
+        /* uptime from /proc/uptime */
+        double uptime_secs = 0;
+        FILE *f = fopen("/proc/uptime", "r");
+        if (f) { fscanf(f, "%lf", &uptime_secs); fclose(f); }
+        int up_days  = (int)(uptime_secs / 86400);
+        int up_hours = (int)((long)uptime_secs % 86400) / 3600;
+        int up_mins  = (int)((long)uptime_secs % 3600) / 60;
+
+        /* logged-in users via utmpx */
+        int nusers = 0;
+        setutxent();
+        struct utmpx *ut;
+        while ((ut = getutxent()) != NULL)
+            if (ut->ut_type == USER_PROCESS) nusers++;
+        endutxent();
+
+        /* load averages from /proc/loadavg */
+        double load1 = 0, load5 = 0, load15 = 0;
+        f = fopen("/proc/loadavg", "r");
+        if (f) { fscanf(f, "%lf %lf %lf", &load1, &load5, &load15); fclose(f); }
+
+        char sysinfo[256];
+        snprintf(sysinfo, sizeof(sysinfo),
+                 "up %dd %dh %dm  |  %d user%s  |  load: %.2f %.2f %.2f ",
+                 up_days, up_hours, up_mins,
+                 nusers, nusers == 1 ? "" : "s",
+                 load1, load5, load15);
+        gtk_label_set_text(ctx->status_right, sysinfo);
+    }
+
+    /* Update status bar (left side) */
+    double snap_last = 0, snap_avg = 0, snap_max = 0;
+    double ui_last = 0, ui_avg = 0, ui_max = 0;
+    profile_get("snapshot_build", &snap_last, &snap_avg, &snap_max);
+    profile_get("ui_render",     &ui_last,   &ui_avg,   &ui_max);
+
+    char status[512];
+    snprintf(status, sizeof(status),
+             " %zu processes  |  snapshot: %.1f ms (avg %.1f, max %.1f)  |  "
+             "render: %.1f ms (avg %.1f, max %.1f)",
+             count,
+             snap_last, snap_avg, snap_max,
+             ui_last, ui_avg, ui_max);
+    gtk_label_set_text(ctx->status_label, status);
+
+    free(local);
+    return G_SOURCE_CONTINUE;
+}
+
+/* ── menu bar actions ─────────────────────────────────────────── */
+
+static void on_menu_exit(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    GtkWidget *window = data;
+    gtk_widget_destroy(window);
+}
+
+/* ── GTK theme discovery & selection ──────────────────────────── */
+
+static int theme_name_cmp(const void *a, const void *b)
+{
+    return g_ascii_strcasecmp(*(const char **)a, *(const char **)b);
+}
+
+/*
+ * Collect available GTK3 theme names from the standard search paths.
+ * A directory is a valid theme if it contains gtk-3.0/gtk.css.
+ * Returns a NULL-terminated array of strdup'd names (caller frees).
+ */
+static char **collect_gtk_themes(int *out_count)
+{
+    /* Candidate directories: ~/.themes, ~/.local/share/themes,
+     * $XDG_DATA_DIRS/themes (default /usr/share/themes) */
+    const char *home = g_get_home_dir();
+    char buf[PATH_MAX];
+
+    /* Build a list of base directories to scan */
+    const char *bases[16];
+    int nbases = 0;
+
+    static char home_themes[PATH_MAX];
+    static char home_local[PATH_MAX];
+    snprintf(home_themes, sizeof(home_themes), "%s/.themes", home);
+    snprintf(home_local,  sizeof(home_local),  "%s/.local/share/themes", home);
+    bases[nbases++] = home_themes;
+    bases[nbases++] = home_local;
+
+    /* Parse XDG_DATA_DIRS (colon-separated) */
+    const char *xdg = g_getenv("XDG_DATA_DIRS");
+    if (!xdg || !xdg[0])
+        xdg = "/usr/local/share:/usr/share";
+
+    char *xdg_copy = strdup(xdg);
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(xdg_copy, ":", &saveptr);
+         tok && nbases < 14;
+         tok = strtok_r(NULL, ":", &saveptr)) {
+        /* We'll construct the full path later with /themes appended */
+        bases[nbases++] = tok;  /* points into xdg_copy, alive until free */
+    }
+
+    /* Collect theme names into a dynamic array */
+    int cap = 64, count = 0;
+    char **names = malloc(cap * sizeof(char *));
+
+    for (int i = 0; i < nbases; i++) {
+        /* For XDG_DATA_DIRS entries, append /themes */
+        const char *dir;
+        char full[PATH_MAX];
+        if (i < 2) {
+            dir = bases[i];  /* already has /themes */
+        } else {
+            snprintf(full, sizeof(full), "%s/themes", bases[i]);
+            dir = full;
+        }
+
+        DIR *d = opendir(dir);
+        if (!d) continue;
+
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+
+            /* Check for gtk-3.0/gtk.css inside the theme dir */
+            int n = snprintf(buf, sizeof(buf), "%s/%s/gtk-3.0/gtk.css",
+                             dir, ent->d_name);
+            if (n < 0 || (size_t)n >= sizeof(buf))
+                continue;  /* path too long – skip */
+            struct stat st;
+            if (stat(buf, &st) != 0 || !S_ISREG(st.st_mode))
+                continue;
+
+            /* Skip duplicates */
+            gboolean dup = FALSE;
+            for (int j = 0; j < count; j++) {
+                if (strcmp(names[j], ent->d_name) == 0) {
+                    dup = TRUE;
+                    break;
+                }
+            }
+            if (dup) continue;
+
+            if (count + 1 >= cap) {
+                cap *= 2;
+                char **tmp = realloc(names, cap * sizeof(char *));
+                if (!tmp) break;   /* OOM – stop collecting */
+                names = tmp;
+            }
+            names[count++] = strdup(ent->d_name);
+        }
+        closedir(d);
+    }
+    free(xdg_copy);
+
+    /* Sort alphabetically */
+    if (count > 1)
+        qsort(names, count, sizeof(char *), theme_name_cmp);
+
+    names[count] = NULL;
+    if (out_count) *out_count = count;
+    return names;
+}
+
+static void on_theme_selected(GtkCheckMenuItem *item, gpointer data)
+{
+    (void)data;
+    if (!gtk_check_menu_item_get_active(item))
+        return;  /* ignore deactivation of the old radio item */
+
+    const char *name = gtk_menu_item_get_label(GTK_MENU_ITEM(item));
+    GtkSettings *settings = gtk_settings_get_default();
+    g_object_set(settings, "gtk-theme-name", name, NULL);
+}
+
+/*
+ * Build a "Theme" submenu with radio items for each discovered GTK3 theme.
+ * The currently active theme gets the radio bullet.
+ */
+static GtkWidget *build_theme_submenu(void)
+{
+    GtkWidget *menu = gtk_menu_new();
+
+    /* Get current theme name */
+    GtkSettings *settings = gtk_settings_get_default();
+    char *current = NULL;
+    g_object_get(settings, "gtk-theme-name", &current, NULL);
+
+    int count = 0;
+    char **themes = collect_gtk_themes(&count);
+
+    GSList *group = NULL;
+    for (int i = 0; i < count; i++) {
+        GtkWidget *item = gtk_radio_menu_item_new_with_label(group, themes[i]);
+        group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(item));
+
+        if (current && strcmp(themes[i], current) == 0)
+            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item), TRUE);
+
+        g_signal_connect(item, "toggled", G_CALLBACK(on_theme_selected), NULL);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+        free(themes[i]);
+    }
+    free(themes);
+    g_free(current);
+
+    return menu;
+}
+
+static void on_menu_about(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    GtkWidget *window = data;
+
+    GtkWidget *dlg = gtk_message_dialog_new(
+        GTK_WINDOW(window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_INFO,
+        GTK_BUTTONS_OK,
+        "allmon – Process Monitor\n"
+        "Version 0.1.0\n\n"
+        "A lightweight Linux process monitor\n"
+        "with a hierarchical tree view.");
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+}
+
+/* ── font helpers ─────────────────────────────────────────────── */
+
+#define FONT_SIZE_MIN  6
+#define FONT_SIZE_MAX  30
+#define FONT_SIZE_DEFAULT 9
+
+static void reload_font_css(ui_ctx_t *ctx)
+{
+    char buf[256];
+
+    /* Main process tree */
+    snprintf(buf, sizeof(buf),
+             "treeview { font-family: Monospace; font-size: %dpt; }",
+             ctx->font_size);
+    gtk_css_provider_load_from_data(ctx->css, buf, -1, NULL);
+
+    /* Sidebar labels and frame title */
+    if (ctx->sidebar_css) {
+        snprintf(buf, sizeof(buf),
+                 "frame, label, checkbutton { font-size: %dpt; }",
+                 ctx->font_size);
+        gtk_css_provider_load_from_data(ctx->sidebar_css, buf, -1, NULL);
+    }
+
+    /* FD tree in sidebar (1pt smaller than main) */
+    if (ctx->fd_css) {
+        int fd_size = ctx->font_size > FONT_SIZE_MIN
+                    ? ctx->font_size - 1 : ctx->font_size;
+        snprintf(buf, sizeof(buf),
+                 "treeview { font-family: Monospace; font-size: %dpt; }",
+                 fd_size);
+        gtk_css_provider_load_from_data(ctx->fd_css, buf, -1, NULL);
+    }
+}
+
+/* ── desktop-environment–aware modifier detection ─────────────── */
+
+/*
+ * Detect whether the user's desktop shortcuts use Meta (Super) instead
+ * of Ctrl as the primary application-shortcut modifier.
+ *
+ * Strategy (checked in order):
+ *
+ *  1. KDE  – parse ~/.config/kdeglobals [Shortcuts] section.
+ *            If Copy=Meta+C (or similar), the user has macOS-style
+ *            bindings → use GDK_META_MASK.
+ *
+ *  2. GTK 3 – parse ~/.config/gtk-3.0/settings.ini for
+ *             gtk-key-theme-name.  "Mac" or "Emacs" themes remap
+ *             shortcuts, but in practice GTK apps always use Ctrl
+ *             unless the KDE portal overrides it (handled by #1).
+ *
+ *  3. GTK 2 – ~/.gtkrc-2.0 gtk-key-theme-name, same idea.
+ *
+ *  4. Fallback – Ctrl (the universal default).
+ */
+static GdkModifierType detect_shortcut_modifier(void)
+{
+    /* ── 1. KDE: ~/.config/kdeglobals [Shortcuts] ─────────────── */
+    const char *config_home = g_getenv("XDG_CONFIG_HOME");
+    char path[PATH_MAX];
+    if (config_home && config_home[0])
+        snprintf(path, sizeof(path), "%s/kdeglobals", config_home);
+    else
+        snprintf(path, sizeof(path), "%s/.config/kdeglobals",
+                 g_get_home_dir());
+
+    FILE *fp = fopen(path, "r");
+    if (fp) {
+        char line[512];
+        gboolean in_shortcuts = FALSE;
+        while (fgets(line, sizeof(line), fp)) {
+            /* strip trailing whitespace */
+            size_t len = strlen(line);
+            while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'
+                           || line[len - 1] == ' '))
+                line[--len] = '\0';
+
+            if (line[0] == '[') {
+                in_shortcuts = (g_ascii_strcasecmp(line, "[Shortcuts]") == 0);
+                continue;
+            }
+            if (!in_shortcuts)
+                continue;
+
+            /* Look for  Copy=Meta+C  or  Paste=Meta+V  etc. */
+            if (g_str_has_prefix(line, "Copy=") ||
+                g_str_has_prefix(line, "Paste=") ||
+                g_str_has_prefix(line, "Cut=") ||
+                g_str_has_prefix(line, "SelectAll=")) {
+                const char *val = strchr(line, '=');
+                if (val && g_ascii_strncasecmp(val + 1, "Meta+", 5) == 0) {
+                    fclose(fp);
+                    return GDK_META_MASK;
+                }
+                /* Explicitly set to something other than Meta → Ctrl */
+                if (val && val[1] != '\0') {
+                    fclose(fp);
+                    return GDK_CONTROL_MASK;
+                }
+            }
+        }
+        fclose(fp);
+    }
+
+    /* ── 2. GTK 3: ~/.config/gtk-3.0/settings.ini ────────────── */
+    if (config_home && config_home[0])
+        snprintf(path, sizeof(path), "%s/gtk-3.0/settings.ini", config_home);
+    else
+        snprintf(path, sizeof(path), "%s/.config/gtk-3.0/settings.ini",
+                 g_get_home_dir());
+
+    GKeyFile *kf = g_key_file_new();
+    if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+        char *theme = g_key_file_get_string(kf, "Settings",
+                                            "gtk-key-theme-name", NULL);
+        if (theme) {
+            /* "Mac" key theme remaps shortcuts to Meta */
+            gboolean is_mac = (g_ascii_strcasecmp(theme, "Mac") == 0);
+            g_free(theme);
+            g_key_file_free(kf);
+            return is_mac ? GDK_META_MASK : GDK_CONTROL_MASK;
+        }
+    }
+    g_key_file_free(kf);
+
+    /* ── 3. GTK 2: ~/.gtkrc-2.0 ──────────────────────────────── */
+    snprintf(path, sizeof(path), "%s/.gtkrc-2.0", g_get_home_dir());
+    fp = fopen(path, "r");
+    if (fp) {
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            /* gtk-key-theme-name="Mac" */
+            if (strstr(line, "gtk-key-theme-name")) {
+                gboolean is_mac = (strcasestr(line, "\"Mac\"") != NULL);
+                fclose(fp);
+                return is_mac ? GDK_META_MASK : GDK_CONTROL_MASK;
+            }
+        }
+        fclose(fp);
+    }
+
+    /* ── 4. Fallback: Ctrl (universal default) ────────────────── */
+    return GDK_CONTROL_MASK;
+}
+
+/* ── keyboard shortcuts ──────────────────────────────────────── */
+
+static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
+                             gpointer data)
+{
+    (void)widget;
+    ui_ctx_t *ctx = data;
+
+    static GdkModifierType mod = 0;
+    if (mod == 0)
+        mod = detect_shortcut_modifier();
+
+    /* Mask out lock bits (Caps Lock, Num Lock, etc.) */
+    guint state = ev->state & gtk_accelerator_get_default_mod_mask();
+
+    if (state != (guint)mod)
+        return FALSE;       /* modifier not held – not our shortcut */
+
+    switch (ev->keyval) {
+    case GDK_KEY_plus:       /* Ctrl + Shift + = (i.e. "+") */
+    case GDK_KEY_equal:      /* Ctrl + =  (no shift needed) */
+    case GDK_KEY_KP_Add:     /* Ctrl + numpad "+"           */
+        if (ctx->font_size < FONT_SIZE_MAX) {
+            ctx->font_size++;
+            ctx->auto_font = FALSE;
+            reload_font_css(ctx);
+        }
+        return TRUE;
+
+    case GDK_KEY_minus:      /* Ctrl + -                    */
+    case GDK_KEY_KP_Subtract:/* Ctrl + numpad "-"           */
+        if (ctx->font_size > FONT_SIZE_MIN) {
+            ctx->font_size--;
+            ctx->auto_font = FALSE;
+            reload_font_css(ctx);
+        }
+        return TRUE;
+
+    case GDK_KEY_0:          /* Ctrl + 0  → reset font size */
+    case GDK_KEY_KP_0:
+        ctx->font_size = FONT_SIZE_DEFAULT;
+        ctx->auto_font = FALSE;
+        reload_font_css(ctx);
+        return TRUE;
+
+    case GDK_KEY_q:          /* Ctrl + Q  → quit            */
+        gtk_main_quit();
+        return TRUE;
+
+    default:
+        break;
+    }
+
+    return FALSE;
+}
+
+static void on_font_increase(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    ui_ctx_t *ctx = data;
+    if (ctx->font_size < FONT_SIZE_MAX) {
+        ctx->font_size++;
+        ctx->auto_font = FALSE;
+        reload_font_css(ctx);
+    }
+}
+
+static void on_font_decrease(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    ui_ctx_t *ctx = data;
+    if (ctx->font_size > FONT_SIZE_MIN) {
+        ctx->font_size--;
+        ctx->auto_font = FALSE;
+        reload_font_css(ctx);
+    }
+}
+
+static void on_font_auto_toggle(GtkCheckMenuItem *item, gpointer data)
+{
+    ui_ctx_t *ctx = data;
+    ctx->auto_font = gtk_check_menu_item_get_active(item);
+}
+
+/* Recompute the auto-scaled font size based on physical pixel height. */
+static void recompute_auto_font(ui_ctx_t *ctx)
+{
+    if (!ctx->auto_font) return;
+
+    GtkWidget *w = GTK_WIDGET(ctx->view);
+    GtkAllocation alloc;
+    gtk_widget_get_allocation(gtk_widget_get_toplevel(w), &alloc);
+
+    /* Multiply by the scale factor to get real physical pixel height.
+     * On a 2K monitor scale_factor is typically 1; on a 4K monitor it's 2. */
+    int scale = gtk_widget_get_scale_factor(gtk_widget_get_toplevel(w));
+    int phys_height = alloc.height * scale;
+
+    /* Baseline: 9pt at 700 physical pixels. */
+    int new_size = (int)(9.0 * phys_height / 700.0 + 0.5);
+    if (new_size < FONT_SIZE_MIN) new_size = FONT_SIZE_MIN;
+    if (new_size > FONT_SIZE_MAX) new_size = FONT_SIZE_MAX;
+    if (new_size != ctx->font_size) {
+        ctx->font_size = new_size;
+        reload_font_css(ctx);
+    }
+}
+
+static gboolean on_window_configure(GtkWidget *widget, GdkEventConfigure *ev,
+                                    gpointer data)
+{
+    (void)widget;
+    (void)ev;
+    recompute_auto_font(data);
+    return FALSE;
+}
+
+/* Fired when the window moves to a monitor with a different scale factor. */
+static void on_scale_factor_changed(GObject *obj, GParamSpec *pspec,
+                                    gpointer data)
+{
+    (void)obj;
+    (void)pspec;
+    recompute_auto_font(data);
+}
+
+/* ── status bar right-click context menu ──────────────────────── */
+
+static void on_toggle_menubar(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    ui_ctx_t *ctx = data;
+    if (gtk_widget_get_visible(ctx->menubar))
+        gtk_widget_hide(ctx->menubar);
+    else
+        gtk_widget_show_all(ctx->menubar);
+}
+
+static gboolean on_status_button_press(GtkWidget *widget, GdkEventButton *ev,
+                                       gpointer data)
+{
+    (void)widget;
+    ui_ctx_t *ctx = data;
+
+    if (ev->button == 3) {   /* right-click */
+        GtkWidget *menu = gtk_menu_new();
+
+        gboolean visible = gtk_widget_get_visible(ctx->menubar);
+        const char *label = visible ? "Hide Menubar" : "Show Menubar";
+
+        GtkWidget *mi = gtk_menu_item_new_with_label(label);
+        g_signal_connect(mi, "activate", G_CALLBACK(on_toggle_menubar), ctx);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+
+        gtk_widget_show_all(menu);
+        gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* ── window close handler ────────────────────────────────────── */
+
+static void on_destroy(GtkWidget *w, gpointer data)
+{
+    (void)w;
+    monitor_state_t *mon = data;
+
+    pthread_mutex_lock(&mon->lock);
+    mon->running = 0;
+    pthread_cond_broadcast(&mon->updated);
+    pthread_mutex_unlock(&mon->lock);
+
+    gtk_main_quit();
+}
+
+/* ── inverted sort comparators ────────────────────────────────── */
+
+/*
+ * GTK's default sort-indicator arrows can feel backwards: the "up"
+ * arrow (▲) means ascending (smallest first) and "down" (▼) means
+ * descending.  Most users expect ▲ = highest first.  We fix this by
+ * negating the comparison so GTK's "ascending" actually sorts
+ * descending-by-value, making the arrow intuitive.
+ */
+
+static gint sort_int_inverted(GtkTreeModel *model,
+                              GtkTreeIter  *a,
+                              GtkTreeIter  *b,
+                              gpointer      col_id_ptr)
+{
+    gint col = GPOINTER_TO_INT(col_id_ptr);
+    gint va = 0, vb = 0;
+    gtk_tree_model_get(model, a, col, &va, -1);
+    gtk_tree_model_get(model, b, col, &vb, -1);
+    /* Negate: GTK "ascending" will now show largest first. */
+    return (va < vb) ? 1 : (va > vb) ? -1 : 0;
+}
+
+static gint sort_string_inverted(GtkTreeModel *model,
+                                 GtkTreeIter  *a,
+                                 GtkTreeIter  *b,
+                                 gpointer      col_id_ptr)
+{
+    gint col = GPOINTER_TO_INT(col_id_ptr);
+    gchar *sa = NULL, *sb = NULL;
+    gtk_tree_model_get(model, a, col, &sa, -1);
+    gtk_tree_model_get(model, b, col, &sb, -1);
+    int cmp = 0;
+    if (sa && sb)      cmp = g_utf8_collate(sa, sb);
+    else if (sa)       cmp = 1;
+    else if (sb)       cmp = -1;
+    g_free(sa);
+    g_free(sb);
+    /* Negate for inverted arrow direction. */
+    return -cmp;
+}
+
+static gint sort_int64_inverted(GtkTreeModel *model,
+                               GtkTreeIter  *a,
+                               GtkTreeIter  *b,
+                               gpointer      col_id_ptr)
+{
+    gint col = GPOINTER_TO_INT(col_id_ptr);
+    gint64 va = 0, vb = 0;
+    gtk_tree_model_get(model, a, col, &va, -1);
+    gtk_tree_model_get(model, b, col, &vb, -1);
+    return (va < vb) ? 1 : (va > vb) ? -1 : 0;
+}
+
+/* ── public entry point ──────────────────────────────────────── */
+
+void *ui_thread(void *arg)
+{
+    monitor_state_t *mon = (monitor_state_t *)arg;
+
+    /* ── window ──────────────────────────────────────────────── */
+    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(window), "allmon – Process Monitor");
+    gtk_window_set_default_size(GTK_WINDOW(window), 1100, 700);
+    g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), mon);
+
+    /* ── tree store & view ───────────────────────────────────── */
+    GtkTreeStore *store = gtk_tree_store_new(NUM_COLS,
+                                             G_TYPE_INT,      /* PID          */
+                                             G_TYPE_INT,      /* PPID         */
+                                             G_TYPE_STRING,   /* USER         */
+                                             G_TYPE_STRING,   /* NAME         */
+                                             G_TYPE_INT,      /* CPU% × 10000*/
+                                             G_TYPE_STRING,   /* CPU% text    */
+                                             G_TYPE_INT,      /* RSS (KiB)    */
+                                             G_TYPE_STRING,   /* RSS text     */
+                                             G_TYPE_INT,      /* group RSS    */
+                                             G_TYPE_STRING,   /* group RSS txt*/
+                                             G_TYPE_INT,      /* group CPU%   */
+                                             G_TYPE_STRING,   /* group CPU txt*/
+                                             G_TYPE_INT64,    /* start time   */
+                                             G_TYPE_STRING,   /* start time txt*/
+                                             G_TYPE_STRING,   /* container    */
+                                             G_TYPE_STRING,   /* CWD          */
+                                             G_TYPE_STRING);  /* CMDLINE      */
+
+    GtkWidget *tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
+    g_object_unref(store);   /* view holds a ref now */
+
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), TRUE);
+    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(tree), TRUE);
+
+    /* Columns */
+    GtkCellRenderer *r;
+    GtkTreeViewColumn *col;
+
+    r = gtk_cell_renderer_text_new();
+    col = gtk_tree_view_column_new_with_attributes("PID", r,
+                                                   "text", COL_PID, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_PID);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 70);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    col = gtk_tree_view_column_new_with_attributes("PPID", r,
+                                                   "text", COL_PPID, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_PPID);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 70);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    col = gtk_tree_view_column_new_with_attributes("User", r,
+                                                   "text", COL_USER, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_USER);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 80);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    col = gtk_tree_view_column_new_with_attributes("Name", r,
+                                                   "text", COL_NAME, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_NAME);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 150);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    g_object_set(r, "xalign", 1.0f, NULL);
+    col = gtk_tree_view_column_new_with_attributes("CPU%", r,
+                                                   "text", COL_CPU_TEXT, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_CPU);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 70);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    g_object_set(r, "xalign", 1.0f, NULL);   /* right-align numbers */
+    col = gtk_tree_view_column_new_with_attributes("Memory (RSS)", r,
+                                                   "text", COL_RSS_TEXT, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_RSS);  /* sort by raw value */
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 90);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    g_object_set(r, "xalign", 1.0f, NULL);
+    col = gtk_tree_view_column_new_with_attributes("Group Memory (RSS)", r,
+                                                   "text", COL_GROUP_RSS_TEXT, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_GROUP_RSS);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 120);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    g_object_set(r, "xalign", 1.0f, NULL);
+    col = gtk_tree_view_column_new_with_attributes("Group CPU%", r,
+                                                   "text", COL_GROUP_CPU_TEXT, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_GROUP_CPU);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 90);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    col = gtk_tree_view_column_new_with_attributes("Start Time", r,
+                                                   "text", COL_START_TIME_TEXT, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_START_TIME);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 140);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    col = gtk_tree_view_column_new_with_attributes("Container", r,
+                                                   "text", COL_CONTAINER, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_CONTAINER);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 90);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    col = gtk_tree_view_column_new_with_attributes("CWD", r,
+                                                   "text", COL_CWD, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_CWD);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 150);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    col = gtk_tree_view_column_new_with_attributes("Command", r,
+                                                   "text", COL_CMDLINE, NULL);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 300);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    /* Register inverted sort functions so ▲ = largest/highest first.
+     * Integer columns use sort_int_inverted; string columns use
+     * sort_string_inverted.  The column index is passed as user-data. */
+    GtkTreeSortable *sortable = GTK_TREE_SORTABLE(store);
+
+    gtk_tree_sortable_set_sort_func(sortable, COL_PID,
+        sort_int_inverted, GINT_TO_POINTER(COL_PID), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_PPID,
+        sort_int_inverted, GINT_TO_POINTER(COL_PPID), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_USER,
+        sort_string_inverted, GINT_TO_POINTER(COL_USER), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_NAME,
+        sort_string_inverted, GINT_TO_POINTER(COL_NAME), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_CPU,
+        sort_int_inverted, GINT_TO_POINTER(COL_CPU), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_RSS,
+        sort_int_inverted, GINT_TO_POINTER(COL_RSS), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_GROUP_RSS,
+        sort_int_inverted, GINT_TO_POINTER(COL_GROUP_RSS), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_GROUP_CPU,
+        sort_int_inverted, GINT_TO_POINTER(COL_GROUP_CPU), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_START_TIME,
+        sort_int64_inverted, GINT_TO_POINTER(COL_START_TIME), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_CONTAINER,
+        sort_string_inverted, GINT_TO_POINTER(COL_CONTAINER), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_CWD,
+        sort_string_inverted, GINT_TO_POINTER(COL_CWD), NULL);
+
+    /* Use a monospace font for the tree via CSS */
+    GtkCssProvider *css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(css,
+        "treeview { font-family: Monospace; font-size: 9pt; }", -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(tree),
+        GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    /* NOTE: don't unref css – kept alive for dynamic font changes */
+
+    /* ── scrolled window ─────────────────────────────────────── */
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(scroll), tree);
+
+    /* ── sidebar (detail panel) ───────────────────────────────── */
+    GtkWidget *sidebar_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sidebar_scroll),
+                                   GTK_POLICY_NEVER,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(sidebar_scroll, 240, -1);
+
+    GtkWidget *sidebar_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(sidebar_grid), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(sidebar_grid), 8);
+    gtk_widget_set_margin_start(sidebar_grid, 8);
+    gtk_widget_set_margin_end(sidebar_grid, 8);
+    gtk_widget_set_margin_top(sidebar_grid, 8);
+    gtk_widget_set_margin_bottom(sidebar_grid, 8);
+
+    /* Helper macro to add a label row to the sidebar grid */
+    #define SIDEBAR_ROW(row, key_str, label_var) do { \
+        GtkWidget *_k = gtk_label_new(key_str);                          \
+        gtk_label_set_xalign(GTK_LABEL(_k), 0.0f);                      \
+        gtk_widget_set_halign(_k, GTK_ALIGN_START);                      \
+        PangoAttrList *_a = pango_attr_list_new();                       \
+        pango_attr_list_insert(_a, pango_attr_weight_new(PANGO_WEIGHT_BOLD)); \
+        gtk_label_set_attributes(GTK_LABEL(_k), _a);                     \
+        pango_attr_list_unref(_a);                                       \
+        GtkWidget *_v = gtk_label_new("–");                              \
+        gtk_label_set_xalign(GTK_LABEL(_v), 0.0f);                      \
+        gtk_label_set_selectable(GTK_LABEL(_v), TRUE);                   \
+        gtk_label_set_ellipsize(GTK_LABEL(_v), PANGO_ELLIPSIZE_END);     \
+        gtk_widget_set_halign(_v, GTK_ALIGN_START);                      \
+        gtk_widget_set_hexpand(_v, TRUE);                                \
+        gtk_grid_attach(GTK_GRID(sidebar_grid), _k, 0, row, 1, 1);      \
+        gtk_grid_attach(GTK_GRID(sidebar_grid), _v, 1, row, 1, 1);      \
+        label_var = GTK_LABEL(_v);                                       \
+    } while (0)
+
+    GtkLabel *sb_pid, *sb_ppid, *sb_user, *sb_name;
+    GtkLabel *sb_cpu, *sb_rss, *sb_group_rss, *sb_group_cpu;
+    GtkLabel *sb_start_time, *sb_container, *sb_cwd, *sb_cmdline;
+
+    SIDEBAR_ROW(0,  "PID",             sb_pid);
+    SIDEBAR_ROW(1,  "PPID",            sb_ppid);
+    SIDEBAR_ROW(2,  "User",            sb_user);
+    SIDEBAR_ROW(3,  "Name",            sb_name);
+    SIDEBAR_ROW(4,  "CPU%",            sb_cpu);
+    SIDEBAR_ROW(5,  "Memory (RSS)",    sb_rss);
+    SIDEBAR_ROW(6,  "Group Memory",    sb_group_rss);
+    SIDEBAR_ROW(7,  "Group CPU%",      sb_group_cpu);
+    SIDEBAR_ROW(8,  "Start Time",      sb_start_time);
+    SIDEBAR_ROW(9,  "Container",       sb_container);
+    SIDEBAR_ROW(10, "CWD",            sb_cwd);
+    SIDEBAR_ROW(11, "Command",         sb_cmdline);
+    #undef SIDEBAR_ROW
+
+    /* ── file descriptors section ─────────────────────────────── */
+    GtkWidget *fd_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_sep, 0, 12, 2, 1);
+
+    /* Header label */
+    GtkWidget *fd_header = gtk_label_new("Open File Descriptors");
+    gtk_label_set_xalign(GTK_LABEL(fd_header), 0.0f);
+    {
+        PangoAttrList *a = pango_attr_list_new();
+        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(fd_header), a);
+        pango_attr_list_unref(a);
+    }
+    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_header, 0, 13, 2, 1);
+
+    /* "Include descendants" toggle */
+    GtkWidget *fd_desc_toggle = gtk_check_button_new_with_label(
+        "Include descendant tree");
+    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_desc_toggle, 0, 14, 2, 1);
+
+    /* Scrollable tree view for the fd list */
+    GtkTreeStore *fd_store = gtk_tree_store_new(FD_NUM_COLS,
+                                                G_TYPE_STRING,   /* FD_COL_TEXT */
+                                                G_TYPE_INT);     /* FD_COL_CAT  */
+    GtkWidget *fd_tree = gtk_tree_view_new_with_model(
+        GTK_TREE_MODEL(fd_store));
+    g_object_unref(fd_store);
+
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(fd_tree), FALSE);
+    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(fd_tree), TRUE);
+
+    GtkCellRenderer *fd_r = gtk_cell_renderer_text_new();
+    g_object_set(fd_r, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
+    GtkTreeViewColumn *fd_col = gtk_tree_view_column_new_with_attributes(
+        "Path", fd_r, "text", FD_COL_TEXT, NULL);
+    gtk_tree_view_column_set_expand(fd_col, TRUE);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(fd_tree), fd_col);
+
+    /* Apply the same monospace CSS to the fd tree */
+    GtkCssProvider *fd_css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(fd_css,
+        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(fd_tree),
+        GTK_STYLE_PROVIDER(fd_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    /* NOTE: don't unref fd_css – kept alive for dynamic font changes */
+
+    /* Enable selection so user can copy paths */
+    GtkTreeSelection *fd_sel = gtk_tree_view_get_selection(
+        GTK_TREE_VIEW(fd_tree));
+    gtk_tree_selection_set_mode(fd_sel, GTK_SELECTION_SINGLE);
+
+    GtkWidget *fd_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(fd_scroll),
+                                   GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(fd_scroll, -1, 200);
+    gtk_widget_set_vexpand(fd_scroll, TRUE);
+    gtk_container_add(GTK_CONTAINER(fd_scroll), fd_tree);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_scroll, 0, 15, 2, 1);
+
+    gtk_container_add(GTK_CONTAINER(sidebar_scroll), sidebar_grid);
+
+    GtkWidget *sidebar_frame = gtk_frame_new("Details");
+    gtk_container_add(GTK_CONTAINER(sidebar_frame), sidebar_scroll);
+
+    /* Live CSS provider for sidebar font size (cascades to all children) */
+    GtkCssProvider *sidebar_css = gtk_css_provider_new();
+    {
+        char sbuf[128];
+        snprintf(sbuf, sizeof(sbuf),
+                 "frame, label, checkbutton { font-size: %dpt; }",
+                 FONT_SIZE_DEFAULT);
+        gtk_css_provider_load_from_data(sidebar_css, sbuf, -1, NULL);
+    }
+    gtk_style_context_add_provider(gtk_widget_get_style_context(sidebar_frame),
+        GTK_STYLE_PROVIDER(sidebar_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    /* NOTE: don't unref sidebar_css – kept alive for dynamic font changes */
+
+    /* ── horizontal paned: tree | sidebar ─────────────────────── */
+    GtkWidget *hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_paned_pack1(GTK_PANED(hpaned), scroll, TRUE, FALSE);
+    gtk_paned_pack2(GTK_PANED(hpaned), sidebar_frame, FALSE, FALSE);
+
+    /* ── menu bar (hidden by default) ─────────────────────────── */
+    GtkWidget *menubar = gtk_menu_bar_new();
+
+    /* File menu */
+    GtkWidget *file_menu = gtk_menu_new();
+    GtkWidget *file_item = gtk_menu_item_new_with_label("File");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(file_item), file_menu);
+
+    GtkWidget *exit_item = gtk_menu_item_new_with_label("Exit");
+    g_signal_connect(exit_item, "activate", G_CALLBACK(on_menu_exit), window);
+    gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), exit_item);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), file_item);
+
+    /* View menu → Sidebar toggle + Appearance submenu */
+    GtkWidget *view_menu = gtk_menu_new();
+    GtkWidget *view_item = gtk_menu_item_new_with_label("View");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(view_item), view_menu);
+
+    GtkWidget *sidebar_toggle = gtk_check_menu_item_new_with_label("Sidebar");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(sidebar_toggle), FALSE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), sidebar_toggle);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),
+                          gtk_separator_menu_item_new());
+
+    GtkWidget *appear_menu = gtk_menu_new();
+    GtkWidget *appear_item = gtk_menu_item_new_with_label("Appearance");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(appear_item), appear_menu);
+
+    GtkWidget *font_inc = gtk_menu_item_new_with_label("Increase Font");
+    GtkWidget *font_dec = gtk_menu_item_new_with_label("Decrease Font");
+    GtkWidget *font_auto = gtk_check_menu_item_new_with_label("Scale Font with Screen Size");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(font_auto), FALSE);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), font_inc);
+    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), font_dec);
+    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu),
+                          gtk_separator_menu_item_new());
+    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), font_auto);
+
+    /* Theme picker submenu */
+    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu),
+                          gtk_separator_menu_item_new());
+    GtkWidget *theme_item = gtk_menu_item_new_with_label("Theme");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(theme_item),
+                              build_theme_submenu());
+    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), theme_item);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), appear_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), view_item);
+
+    /* Help menu */
+    GtkWidget *help_menu = gtk_menu_new();
+    GtkWidget *help_item = gtk_menu_item_new_with_label("Help");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(help_item), help_menu);
+
+    GtkWidget *about_item = gtk_menu_item_new_with_label("About");
+    g_signal_connect(about_item, "activate", G_CALLBACK(on_menu_about), window);
+    gtk_menu_shell_append(GTK_MENU_SHELL(help_menu), about_item);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), help_item);
+
+    /* ── status bar (in event box for right-click) ───────────── */
+    GtkWidget *status = gtk_label_new(" Loading…");
+    gtk_label_set_xalign(GTK_LABEL(status), 0.0f);
+
+    GtkWidget *status_right = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(status_right), 1.0f);
+
+    GtkWidget *status_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_pack_start(GTK_BOX(status_hbox), status, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(status_hbox), status_right, FALSE, FALSE, 8);
+
+    GtkWidget *status_ebox = gtk_event_box_new();
+    gtk_container_add(GTK_CONTAINER(status_ebox), status_hbox);
+    gtk_widget_add_events(status_ebox, GDK_BUTTON_PRESS_MASK);
+
+    /* ── layout ──────────────────────────────────────────────── */
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), menubar, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), hpaned, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), status_ebox, FALSE, FALSE, 4);
+    gtk_container_add(GTK_CONTAINER(window), vbox);
+
+    /* ── refresh timer ───────────────────────────────────────── */
+    static ui_ctx_t ctx;
+    ctx.mon          = mon;
+    ctx.store        = store;
+    ctx.view         = GTK_TREE_VIEW(tree);
+    ctx.scroll       = GTK_SCROLLED_WINDOW(scroll);
+    ctx.status_label = GTK_LABEL(status);
+    ctx.status_right = GTK_LABEL(status_right);
+    ctx.menubar      = menubar;
+    ctx.tree         = tree;
+    ctx.css          = css;
+    ctx.sidebar_css  = sidebar_css;
+    ctx.fd_css       = fd_css;
+    ctx.font_size    = FONT_SIZE_DEFAULT;
+    ctx.auto_font    = FALSE;
+    ctx.collapsed    = (pid_set_t){ NULL, 0, 0 };
+    ctx.follow_selection = FALSE;
+
+    /* Sidebar detail panel */
+    ctx.sidebar            = sidebar_frame;
+    ctx.sidebar_menu_item  = GTK_CHECK_MENU_ITEM(sidebar_toggle);
+    ctx.sidebar_grid       = sidebar_grid;
+    ctx.sb_pid        = sb_pid;
+    ctx.sb_ppid       = sb_ppid;
+    ctx.sb_user       = sb_user;
+    ctx.sb_name       = sb_name;
+    ctx.sb_cpu        = sb_cpu;
+    ctx.sb_rss        = sb_rss;
+    ctx.sb_group_rss  = sb_group_rss;
+    ctx.sb_group_cpu  = sb_group_cpu;
+    ctx.sb_start_time = sb_start_time;
+    ctx.sb_container  = sb_container;
+    ctx.sb_cwd        = sb_cwd;
+    ctx.sb_cmdline    = sb_cmdline;
+
+    /* File descriptor list */
+    ctx.fd_store        = fd_store;
+    ctx.fd_view         = GTK_TREE_VIEW(fd_tree);
+    ctx.fd_desc_toggle  = fd_desc_toggle;
+    ctx.fd_include_desc = FALSE;
+    ctx.fd_collapsed    = 0;
+    ctx.fd_last_pid     = 0;
+
+    /* Font menu callbacks (need ctx address, so connect after ctx init) */
+    g_signal_connect(font_inc,  "activate", G_CALLBACK(on_font_increase),    &ctx);
+    g_signal_connect(font_dec,  "activate", G_CALLBACK(on_font_decrease),    &ctx);
+    g_signal_connect(font_auto, "toggled",  G_CALLBACK(on_font_auto_toggle), &ctx);
+    g_signal_connect(sidebar_toggle, "toggled",
+                     G_CALLBACK(on_toggle_sidebar), &ctx);
+    g_signal_connect(fd_desc_toggle, "toggled",
+                     G_CALLBACK(on_fd_desc_toggled), &ctx);
+    g_signal_connect(fd_tree, "row-collapsed",
+                     G_CALLBACK(on_fd_row_collapsed), &ctx);
+    g_signal_connect(fd_tree, "row-expanded",
+                     G_CALLBACK(on_fd_row_expanded), &ctx);
+    g_signal_connect(window,    "configure-event",
+                     G_CALLBACK(on_window_configure), &ctx);
+    g_signal_connect(window,    "notify::scale-factor",
+                     G_CALLBACK(on_scale_factor_changed), &ctx);
+
+    /* Right-click on status bar to toggle menu bar */
+    g_signal_connect(status_ebox, "button-press-event",
+                     G_CALLBACK(on_status_button_press), &ctx);
+
+    /* Middle-click drag-to-scroll */
+    gtk_widget_add_events(tree, GDK_BUTTON_PRESS_MASK
+                              | GDK_BUTTON_RELEASE_MASK
+                              | GDK_POINTER_MOTION_MASK);
+    g_signal_connect(tree,   "button-press-event",   G_CALLBACK(on_button_press),   &ctx);
+    g_signal_connect(tree,   "button-release-event", G_CALLBACK(on_button_release), &ctx);
+    g_signal_connect(tree,   "motion-notify-event",  G_CALLBACK(on_motion_notify),  &ctx);
+    g_signal_connect(window, "focus-out-event",      G_CALLBACK(on_focus_out),      &ctx);
+
+    /* Global keyboard shortcuts (Ctrl+Plus / Ctrl+Minus / Ctrl+0 / Ctrl+Q) */
+    g_signal_connect(window, "key-press-event", G_CALLBACK(on_key_press), &ctx);
+
+    /* Double-click a row to open the sidebar */
+    g_signal_connect(tree, "row-activated", G_CALLBACK(on_row_activated), &ctx);
+
+    /* Track user collapse / expand actions */
+    g_signal_connect(tree, "row-collapsed", G_CALLBACK(on_row_collapsed), &ctx);
+    g_signal_connect(tree, "row-expanded",  G_CALLBACK(on_row_expanded),  &ctx);
+
+    /* Update sidebar immediately when selection changes (arrow keys, click) */
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+    g_signal_connect(sel, "changed", G_CALLBACK(on_selection_changed), &ctx);
+
+    /* Enable follow-selection when user clicks a sort column */
+    g_signal_connect(store, "sort-column-changed",
+                     G_CALLBACK(on_sort_column_changed), &ctx);
+
+    /* Disable follow-selection when user scrolls manually */
+    gtk_widget_add_events(tree, GDK_SCROLL_MASK);
+    g_signal_connect(tree, "scroll-event",
+                     G_CALLBACK(on_tree_scroll_event), &ctx);
+
+    g_timeout_add(1000, on_refresh, &ctx);
+
+    /* ── show & run ──────────────────────────────────────────── */
+    gtk_widget_show_all(window);
+    gtk_widget_hide(menubar);        /* hidden by default; toggle via status-bar right-click */
+    gtk_widget_hide(sidebar_frame);  /* hidden by default; toggle via View → Sidebar */
+    gtk_main();
+
+    ui_ctx_destroy(&ctx);
+
+    return NULL;
+}
+
+/* ── Fix 6: cleanup ──────────────────────────────────────────── */
+
+void ui_ctx_destroy(ui_ctx_t *ctx)
+{
+    /* Cancel any in-flight async fd scan */
+    if (ctx->fd_cancel) {
+        g_cancellable_cancel(ctx->fd_cancel);
+        g_object_unref(ctx->fd_cancel);
+        ctx->fd_cancel = NULL;
+    }
+
+    /* Stop autoscroll timer */
+    if (ctx->scroll_timer) {
+        g_source_remove(ctx->scroll_timer);
+        ctx->scroll_timer = 0;
+    }
+
+    /* Free the collapsed-PID set */
+    free(ctx->collapsed.pids);
+    ctx->collapsed.pids     = NULL;
+    ctx->collapsed.count    = 0;
+    ctx->collapsed.capacity = 0;
+}
