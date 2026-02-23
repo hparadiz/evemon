@@ -6,6 +6,198 @@ typedef struct {
     const char *color;      /* hex color string e.g. "#1793d1"     */
 } distro_glyph_t;
 
+/* ── Animated glyph rendering ────────────────────────────────── */
+
+/*
+ * We rasterize the font-logos glyph once into an alpha mask, then on
+ * every animation frame we sweep an animated gradient across it using
+ * the distro's brand color.  The gradient goes:
+ *   brand color → bright highlight → brand color
+ * sweeping diagonally to create a shimmering effect.
+ */
+
+#define GLYPH_ANIM_FPS     30
+#define GLYPH_ANIM_MS      (1000 / GLYPH_ANIM_FPS)
+#define GLYPH_ANIM_PERIOD  4.0   /* seconds for one full cycle */
+
+typedef struct {
+    uint8_t *alpha;          /* alpha mask (pw × ph, row-major)     */
+    int      pw, ph;         /* pixel dimensions of the glyph       */
+    uint8_t  r0, g0, b0;    /* brand color RGB                     */
+    double   phase;          /* animation phase 0..1                */
+    guint    timer_id;       /* g_timeout source id                 */
+    GtkWidget *da;           /* the GtkDrawingArea we draw into     */
+} glyph_anim_t;
+
+static void glyph_anim_free(glyph_anim_t *ga)
+{
+    if (!ga) return;
+    if (ga->timer_id) {
+        g_source_remove(ga->timer_id);
+        ga->timer_id = 0;
+    }
+    g_free(ga->alpha);
+    g_free(ga);
+}
+
+static gboolean glyph_anim_tick(gpointer data)
+{
+    glyph_anim_t *ga = data;
+    ga->phase += (double)GLYPH_ANIM_MS / (GLYPH_ANIM_PERIOD * 1000.0);
+    if (ga->phase >= 1.0) ga->phase -= 1.0;
+    gtk_widget_queue_draw(ga->da);
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean glyph_anim_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
+{
+    (void)widget;
+    glyph_anim_t *ga = data;
+    int pw = ga->pw, ph = ga->ph;
+
+    cairo_surface_t *surf = cairo_image_surface_create(
+        CAIRO_FORMAT_ARGB32, pw, ph);
+    unsigned char *pixels = cairo_image_surface_get_data(surf);
+    int stride = cairo_image_surface_get_stride(surf);
+
+    double phase = ga->phase;
+    double r0 = ga->r0, g0 = ga->g0, b0 = ga->b0;
+
+    /* Brighter highlight color: blend brand → white at 70% */
+    double rH = r0 + 0.70 * (255.0 - r0);
+    double gH = g0 + 0.70 * (255.0 - g0);
+    double bH = b0 + 0.70 * (255.0 - b0);
+
+    /* Diagonal dimension for normalization */
+    double diag = (double)(pw + ph);
+
+    for (int y = 0; y < ph; y++) {
+        uint32_t *row = (uint32_t *)(pixels + y * stride);
+        const uint8_t *arow = ga->alpha + y * pw;
+        for (int x = 0; x < pw; x++) {
+            uint8_t a = arow[x];
+            if (a == 0) { row[x] = 0; continue; }
+
+            /* Diagonal position normalized to 0..1 */
+            double pos = (double)(x + y) / diag;
+
+            /* Shimmer: a Gaussian-ish bright band sweeping diagonally.
+             * 'center' is where the bright peak is right now.  */
+            double center = phase;
+            /* Distance on the ring (wraps around) */
+            double d = pos - center;
+            if (d > 0.5)  d -= 1.0;
+            if (d < -0.5) d += 1.0;
+            /* Gaussian-like falloff, width ~0.15 of the diagonal */
+            double t = exp(-d * d / (2.0 * 0.02));
+
+            /* Interpolate brand ↔ highlight */
+            uint8_t r = (uint8_t)(r0 + t * (rH - r0));
+            uint8_t g = (uint8_t)(g0 + t * (gH - g0));
+            uint8_t b = (uint8_t)(b0 + t * (bH - b0));
+
+            /* Pre-multiplied alpha for Cairo ARGB32 */
+            r = (uint8_t)(r * a / 255);
+            g = (uint8_t)(g * a / 255);
+            b = (uint8_t)(b * a / 255);
+            row[x] = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
+                     ((uint32_t)g << 8)  | (uint32_t)b;
+        }
+    }
+    cairo_surface_mark_dirty(surf);
+
+    cairo_set_source_surface(cr, surf, 0, 0);
+    cairo_paint(cr);
+    cairo_surface_destroy(surf);
+
+    return FALSE;
+}
+
+static void on_glyph_dialog_destroy(GtkWidget *w, gpointer data)
+{
+    (void)w;
+    glyph_anim_free((glyph_anim_t *)data);
+}
+
+/*
+ * Rasterize the font-logos glyph into an alpha mask and return a
+ * GtkDrawingArea that animates a gradient shimmer across it.
+ * The caller must connect the dialog's "destroy" signal to
+ * on_glyph_dialog_destroy() with the returned glyph_anim_t.
+ */
+static GtkWidget *create_animated_glyph(gunichar codepoint,
+                                        const char *hex_color,
+                                        glyph_anim_t **out_ga)
+{
+    /* Encode the codepoint as UTF-8 */
+    char utf8[8];
+    int ulen = g_unichar_to_utf8(codepoint, utf8);
+    utf8[ulen] = '\0';
+
+    /* Measure the glyph with a throwaway Cairo context */
+    cairo_surface_t *tmp = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    cairo_t *tmp_cr = cairo_create(tmp);
+    PangoLayout *layout = pango_cairo_create_layout(tmp_cr);
+    PangoFontDescription *fd = pango_font_description_from_string("font-logos 150");
+    pango_layout_set_font_description(layout, fd);
+    pango_layout_set_text(layout, utf8, -1);
+
+    int pw, ph;
+    pango_layout_get_pixel_size(layout, &pw, &ph);
+    cairo_destroy(tmp_cr);
+    cairo_surface_destroy(tmp);
+
+    /* Render white-on-transparent to extract alpha */
+    cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pw, ph);
+    cairo_t *cr = cairo_create(surf);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+    pango_cairo_show_layout(cr, layout);
+    cairo_destroy(cr);
+
+    pango_font_description_free(fd);
+    g_object_unref(layout);
+
+    /* Extract the alpha channel into a separate buffer */
+    cairo_surface_flush(surf);
+    unsigned char *sdata = cairo_image_surface_get_data(surf);
+    int stride = cairo_image_surface_get_stride(surf);
+
+    uint8_t *alpha = g_malloc(pw * ph);
+    for (int y = 0; y < ph; y++) {
+        const uint32_t *row = (const uint32_t *)(sdata + y * stride);
+        for (int x = 0; x < pw; x++)
+            alpha[y * pw + x] = (row[x] >> 24) & 0xFF;
+    }
+    cairo_surface_destroy(surf);
+
+    /* Parse brand color */
+    unsigned int rc, gc, bc;
+    if (sscanf(hex_color, "#%02x%02x%02x", &rc, &gc, &bc) != 3)
+        rc = gc = bc = 0x33;
+
+    /* Build animation state */
+    glyph_anim_t *ga = g_new0(glyph_anim_t, 1);
+    ga->alpha = alpha;
+    ga->pw    = pw;
+    ga->ph    = ph;
+    ga->r0    = (uint8_t)rc;
+    ga->g0    = (uint8_t)gc;
+    ga->b0    = (uint8_t)bc;
+    ga->phase = 0.0;
+
+    /* Create a drawing area sized to the glyph */
+    GtkWidget *da = gtk_drawing_area_new();
+    gtk_widget_set_size_request(da, pw, ph);
+    g_signal_connect(da, "draw", G_CALLBACK(glyph_anim_draw), ga);
+    ga->da = da;
+
+    /* Start the animation timer */
+    ga->timer_id = g_timeout_add(GLYPH_ANIM_MS, glyph_anim_tick, ga);
+
+    *out_ga = ga;
+    return da;
+}
+
 static distro_glyph_t get_distro_glyph(const char *distro_id)
 {
     /* Default: Tux */
@@ -578,16 +770,38 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
         g_string_free(gpus, TRUE);
     }
 
-    /* ── Create the dialog ──────────────────────────────────────── */
-    GtkWidget *dlg = gtk_dialog_new_with_buttons(
-        "About allmon",
-        GTK_WINDOW(window),
-        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-        "_OK", GTK_RESPONSE_OK,
-        NULL);
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 680, 380);
+    /* ── Create splash-style window (no titlebar) ─────────────── */
+    GtkWidget *dlg = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(window));
+    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_decorated(GTK_WINDOW(dlg), FALSE);
+    gtk_window_set_skip_taskbar_hint(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_skip_pager_hint(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_position(GTK_WINDOW(dlg), GTK_WIN_POS_CENTER_ON_PARENT);
+    gtk_window_set_resizable(GTK_WINDOW(dlg), FALSE);
+    gtk_window_set_type_hint(GTK_WINDOW(dlg), GDK_WINDOW_TYPE_HINT_SPLASHSCREEN);
 
-    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    /* Rounded-corner frame + border via CSS */
+    {
+        char splash_css_str[256];
+        snprintf(splash_css_str, sizeof(splash_css_str),
+                 "window { border-radius: 12px;"
+                 " border: 1px solid %s;"
+                 " padding: 4px; }",
+                 glyph.color);
+        GtkCssProvider *splash_css = gtk_css_provider_new();
+        gtk_css_provider_load_from_data(splash_css,
+            splash_css_str, -1, NULL);
+        GtkStyleContext *sc = gtk_widget_get_style_context(dlg);
+        gtk_style_context_add_provider(sc,
+            GTK_STYLE_PROVIDER(splash_css),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        g_object_unref(splash_css);
+    }
+
+    /* Wrap everything in an event box so clicks anywhere dismiss it */
+    GtkWidget *evbox = gtk_event_box_new();
+    gtk_container_add(GTK_CONTAINER(dlg), evbox);
 
     /* ── Horizontal layout: icon | info ─────────────────────────── */
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 24);
@@ -596,25 +810,14 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
     gtk_widget_set_margin_top(hbox, 24);
     gtk_widget_set_margin_bottom(hbox, 16);
 
-    /* ── Distro icon (big font-logos glyph) ─────────────────────── */
+    /* ── Distro icon (animated gradient glyph) ─────────────────── */
+    glyph_anim_t *glyph_anim = NULL;
     {
-        /* Encode the codepoint as UTF-8 */
-        char utf8_glyph[8];
-        int len = g_unichar_to_utf8(glyph.codepoint, utf8_glyph);
-        utf8_glyph[len] = '\0';
-
-        /* Pango markup: large, colored, font-logos family */
-        char markup[512];
-        snprintf(markup, sizeof(markup),
-                 "<span font_family='font-logos' size='200000'"
-                 " foreground='%s'>%s</span>",
-                 glyph.color, utf8_glyph);
-
-        GtkWidget *icon_label = gtk_label_new(NULL);
-        gtk_label_set_markup(GTK_LABEL(icon_label), markup);
-        gtk_widget_set_valign(icon_label, GTK_ALIGN_CENTER);
-        gtk_widget_set_halign(icon_label, GTK_ALIGN_CENTER);
-        gtk_box_pack_start(GTK_BOX(hbox), icon_label, FALSE, FALSE, 0);
+        GtkWidget *icon_da = create_animated_glyph(
+            glyph.codepoint, glyph.color, &glyph_anim);
+        gtk_widget_set_valign(icon_da, GTK_ALIGN_CENTER);
+        gtk_widget_set_halign(icon_da, GTK_ALIGN_CENTER);
+        gtk_box_pack_start(GTK_BOX(hbox), icon_da, FALSE, FALSE, 0);
     }
 
     /* ── Info text ──────────────────────────────────────────────── */
@@ -687,7 +890,6 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
 
         GtkWidget *info_label = gtk_label_new(NULL);
         gtk_label_set_markup(GTK_LABEL(info_label), info->str);
-        gtk_label_set_selectable(GTK_LABEL(info_label), TRUE);
         gtk_label_set_xalign(GTK_LABEL(info_label), 0.0f);
         gtk_widget_set_valign(info_label, GTK_ALIGN_CENTER);
         gtk_box_pack_start(GTK_BOX(hbox), info_label, TRUE, TRUE, 0);
@@ -695,11 +897,24 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
         g_string_free(info, TRUE);
     }
 
-    gtk_box_pack_start(GTK_BOX(content), hbox, TRUE, TRUE, 0);
+    gtk_container_add(GTK_CONTAINER(evbox), hbox);
 
-    /* Non-blocking: let Ctrl+C and other signals through */
-    g_signal_connect(dlg, "response", G_CALLBACK(gtk_widget_destroy), NULL);
-    g_signal_connect(dlg, "destroy",  G_CALLBACK(gtk_widget_destroyed), &dlg);
+    /* Dismiss on click anywhere */
+    g_signal_connect_swapped(evbox, "button-press-event",
+                             G_CALLBACK(gtk_widget_destroy), dlg);
+
+    /* Dismiss on any key press */
+    g_signal_connect_swapped(dlg, "key-press-event",
+                             G_CALLBACK(gtk_widget_destroy), dlg);
+
+    /* Dismiss on focus loss */
+    g_signal_connect_swapped(dlg, "focus-out-event",
+                             G_CALLBACK(gtk_widget_destroy), dlg);
+
+    /* Clean up animation on destroy */
+    g_signal_connect(dlg, "destroy",
+                     G_CALLBACK(on_glyph_dialog_destroy), glyph_anim);
+
     gtk_widget_show_all(dlg);
 
     free(distro_id);
