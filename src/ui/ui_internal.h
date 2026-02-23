@@ -68,7 +68,9 @@ typedef struct {
     GtkScrolledWindow  *scroll;
     pid_set_t           collapsed;
     GtkWidget          *menubar;
+    GtkWidget          *file_menu_item;
     GtkWidget          *tree;
+    gboolean            alt_pressed;     /* bare Alt-tap detection */
     GtkCssProvider     *css;
     GtkCssProvider     *sidebar_css;
     GtkCssProvider     *fd_css;
@@ -252,6 +254,7 @@ void on_fd_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
                          GtkTreePath *path, gpointer data);
 void on_fd_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
                         GtkTreePath *path, gpointer data);
+gboolean on_fd_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
 
 /* ── cleanup (fix 6) ─────────────────────────────────────────── */
 

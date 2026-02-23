@@ -150,3 +150,37 @@ void on_fd_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
     if (cat_id >= 0 && cat_id < FD_CAT_COUNT)
         ctx->fd_collapsed &= ~(1u << cat_id);
 }
+
+gboolean on_fd_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data)
+{
+    (void)data;
+
+    if (ev->keyval != GDK_KEY_Return && ev->keyval != GDK_KEY_KP_Enter)
+        return FALSE;
+
+    GtkTreeView *view = GTK_TREE_VIEW(widget);
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(view);
+    GtkTreeModel *model = NULL;
+    GtkTreeIter iter;
+
+    if (!gtk_tree_selection_get_selected(sel, &model, &iter))
+        return FALSE;
+
+    /* Only act on top-level category rows (FD_COL_CAT >= 0) */
+    gint cat_id = -1;
+    gtk_tree_model_get(model, &iter, FD_COL_CAT, &cat_id, -1);
+    if (cat_id < 0)
+        return FALSE;
+
+    GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
+    if (!path)
+        return FALSE;
+
+    if (gtk_tree_view_row_expanded(view, path))
+        gtk_tree_view_collapse_row(view, path);
+    else
+        gtk_tree_view_expand_row(view, path, FALSE);
+
+    gtk_tree_path_free(path);
+    return TRUE;
+}

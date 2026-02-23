@@ -1,6 +1,8 @@
 CC      := gcc
-CFLAGS  := -Wall -Wextra -std=c11 -pthread -D_GNU_SOURCE
-LDFLAGS := -pthread -lm
+CFLAGS  := -Wall -Wextra -std=c11 -O2 -pthread -D_GNU_SOURCE \
+           -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+           -Wformat -Wformat-security -fPIE
+LDFLAGS := -pthread -lm -pie -Wl,-z,relro,-z,now
 
 # GTK3 flags
 GTK_CFLAGS  := $(shell pkg-config --cflags gtk+-3.0)

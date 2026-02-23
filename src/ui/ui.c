@@ -701,7 +701,7 @@ static gboolean on_refresh(gpointer data)
         /* uptime from /proc/uptime */
         double uptime_secs = 0;
         FILE *f = fopen("/proc/uptime", "r");
-        if (f) { fscanf(f, "%lf", &uptime_secs); fclose(f); }
+        if (f) { int r_ = fscanf(f, "%lf", &uptime_secs); (void)r_; fclose(f); }
         int up_days  = (int)(uptime_secs / 86400);
         int up_hours = (int)((long)uptime_secs % 86400) / 3600;
         int up_mins  = (int)((long)uptime_secs % 3600) / 60;
@@ -717,7 +717,7 @@ static gboolean on_refresh(gpointer data)
         /* load averages from /proc/loadavg */
         double load1 = 0, load5 = 0, load15 = 0;
         f = fopen("/proc/loadavg", "r");
-        if (f) { fscanf(f, "%lf %lf %lf", &load1, &load5, &load15); fclose(f); }
+        if (f) { int r_ = fscanf(f, "%lf %lf %lf", &load1, &load5, &load15); (void)r_; fclose(f); }
 
         char sysinfo[256];
         snprintf(sysinfo, sizeof(sysinfo),
@@ -1697,6 +1697,25 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
     /* Mask out lock bits (Caps Lock, Num Lock, etc.) */
     guint state = ev->state & gtk_accelerator_get_default_mod_mask();
 
+    /* Track bare Alt tap: set flag on Alt press, clear if any other
+     * key is pressed while Alt is held (Alt+<key> is not a bare tap). */
+    if (ev->keyval == GDK_KEY_Alt_L || ev->keyval == GDK_KEY_Alt_R) {
+        ctx->alt_pressed = TRUE;
+        return FALSE;
+    }
+    if (state & GDK_MOD1_MASK)
+        ctx->alt_pressed = FALSE;
+
+    /* Escape while sidebar has focus → return focus to the tree view */
+    if (ev->keyval == GDK_KEY_Escape && state == 0) {
+        GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(widget));
+        if (focus && gtk_widget_get_visible(ctx->sidebar) &&
+            gtk_widget_is_ancestor(focus, ctx->sidebar)) {
+            gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
+            return TRUE;
+        }
+    }
+
     /* Ctrl+F or Meta+F → toggle name filter (honour both modifiers) */
     if (ev->keyval == GDK_KEY_f &&
         (state == GDK_CONTROL_MASK || state == GDK_META_MASK)) {
@@ -1755,6 +1774,31 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
         break;
     }
 
+    return FALSE;
+}
+
+/* ── Alt tap: show menu bar & open File menu ─────────────────── */
+
+static gboolean on_key_release(GtkWidget *widget, GdkEventKey *ev,
+                               gpointer data)
+{
+    (void)widget;
+    ui_ctx_t *ctx = data;
+
+    if ((ev->keyval == GDK_KEY_Alt_L || ev->keyval == GDK_KEY_Alt_R) &&
+        ctx->alt_pressed) {
+        ctx->alt_pressed = FALSE;
+
+        /* If the menu bar is hidden, show it first */
+        if (!gtk_widget_get_visible(ctx->menubar))
+            gtk_widget_show_all(ctx->menubar);
+
+        /* Activate the File menu item (opens the dropdown) */
+        gtk_menu_shell_select_item(GTK_MENU_SHELL(ctx->menubar),
+                                   ctx->file_menu_item);
+        return TRUE;
+    }
+    ctx->alt_pressed = FALSE;
     return FALSE;
 }
 
@@ -2462,8 +2506,10 @@ void *ui_thread(void *arg)
     ctx.scroll       = GTK_SCROLLED_WINDOW(scroll);
     ctx.status_label = GTK_LABEL(status);
     ctx.status_right = GTK_LABEL(status_right);
-    ctx.menubar      = menubar;
-    ctx.tree         = tree;
+    ctx.menubar        = menubar;
+    ctx.file_menu_item = file_item;
+    ctx.tree           = tree;
+    ctx.alt_pressed    = FALSE;
     ctx.css          = css;
     ctx.sidebar_css  = sidebar_css;
     ctx.fd_css       = fd_css;
@@ -2525,6 +2571,8 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_fd_row_collapsed), &ctx);
     g_signal_connect(fd_tree, "row-expanded",
                      G_CALLBACK(on_fd_row_expanded), &ctx);
+    g_signal_connect(fd_tree, "key-press-event",
+                     G_CALLBACK(on_fd_key_press), &ctx);
     g_signal_connect(window,    "configure-event",
                      G_CALLBACK(on_window_configure), &ctx);
     g_signal_connect(window,    "notify::scale-factor",
@@ -2544,7 +2592,8 @@ void *ui_thread(void *arg)
     g_signal_connect(window, "focus-out-event",      G_CALLBACK(on_focus_out),      &ctx);
 
     /* Global keyboard shortcuts (Ctrl+Plus / Ctrl+Minus / Ctrl+0 / Ctrl+Q) */
-    g_signal_connect(window, "key-press-event", G_CALLBACK(on_key_press), &ctx);
+    g_signal_connect(window, "key-press-event",   G_CALLBACK(on_key_press),   &ctx);
+    g_signal_connect(window, "key-release-event", G_CALLBACK(on_key_release), &ctx);
 
     /* Double-click a row to open the sidebar */
     g_signal_connect(tree, "row-activated", G_CALLBACK(on_row_activated), &ctx);
