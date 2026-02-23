@@ -149,6 +149,18 @@ typedef struct {
     guint               mmap_generation;
     GCancellable       *mmap_cancel;
 
+#ifdef HAVE_PIPEWIRE
+    /* PipeWire audio connections in sidebar */
+    GtkTreeStore       *pw_store;
+    GtkTreeView        *pw_view;
+    GtkCssProvider     *pw_css;
+    unsigned            pw_collapsed;      /* bitmask: 1 << cat */
+    pid_t               pw_last_pid;
+    guint               pw_generation;
+    GCancellable       *pw_cancel;
+    GtkWidget          *pw_frame;          /* container to show/hide */
+#endif
+
     /* middle-click autoscroll */
     gboolean            autoscroll;
     double              anchor_x;
@@ -321,6 +333,33 @@ enum {
 extern const char *mmap_cat_label[MMAP_CAT_COUNT];
 
 void mmap_scan_start(ui_ctx_t *ctx, pid_t pid);
+
+/* ── PipeWire audio connection scanning ───────────────────────── */
+
+#ifdef HAVE_PIPEWIRE
+
+enum {
+    PW_COL_TEXT,          /* plain text (display line)           */
+    PW_COL_MARKUP,        /* Pango markup for display            */
+    PW_COL_CAT,           /* category (-1 for leaf rows)         */
+    PW_NUM_COLS
+};
+
+void pipewire_scan_start(ui_ctx_t *ctx, pid_t pid);
+
+/* sidebar signal callbacks for PipeWire tree (connected in ui.c) */
+void on_pw_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
+                         GtkTreePath *path, gpointer data);
+void on_pw_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
+                        GtkTreePath *path, gpointer data);
+gboolean on_pw_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
+
+#else
+
+static inline void pipewire_scan_start(void *ctx, pid_t pid)
+{ (void)ctx; (void)pid; }
+
+#endif /* HAVE_PIPEWIRE */
 
 /* sidebar signal callbacks for mmap tree (connected in ui.c) */
 void on_mmap_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,

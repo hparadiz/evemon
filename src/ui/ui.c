@@ -1332,6 +1332,18 @@ static void reload_font_css(ui_ctx_t *ctx)
                  mmap_size);
         gtk_css_provider_load_from_data(ctx->mmap_css, buf, -1, NULL);
     }
+
+#ifdef HAVE_PIPEWIRE
+    /* PipeWire tree in sidebar (same size as fd/env/mmap tree) */
+    if (ctx->pw_css) {
+        int pw_size = ctx->font_size > FONT_SIZE_MIN
+                    ? ctx->font_size - 1 : ctx->font_size;
+        snprintf(buf, sizeof(buf),
+                 "treeview { font-family: Monospace; font-size: %dpt; }",
+                 pw_size);
+        gtk_css_provider_load_from_data(ctx->pw_css, buf, -1, NULL);
+    }
+#endif
 }
 
 /* ── desktop-environment–aware modifier detection ─────────────── */
@@ -3068,6 +3080,62 @@ void *ui_thread(void *arg)
     gtk_container_add(GTK_CONTAINER(mmap_scroll), mmap_tree);
     gtk_grid_attach(GTK_GRID(sidebar_grid), mmap_scroll, 0, 23, 2, 1);
 
+    /* ── PipeWire audio connections section ─────────────────────── */
+#ifdef HAVE_PIPEWIRE
+    GtkWidget *pw_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), pw_sep, 0, 24, 2, 1);
+
+    GtkWidget *pw_header = gtk_label_new("PipeWire Audio");
+    gtk_label_set_xalign(GTK_LABEL(pw_header), 0.0f);
+    {
+        PangoAttrList *a = pango_attr_list_new();
+        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(pw_header), a);
+        pango_attr_list_unref(a);
+    }
+    gtk_grid_attach(GTK_GRID(sidebar_grid), pw_header, 0, 25, 2, 1);
+
+    GtkTreeStore *pw_store = gtk_tree_store_new(PW_NUM_COLS,
+                                                G_TYPE_STRING,   /* PW_COL_TEXT   */
+                                                G_TYPE_STRING,   /* PW_COL_MARKUP */
+                                                G_TYPE_INT);     /* PW_COL_CAT    */
+    GtkWidget *pw_tree = gtk_tree_view_new_with_model(
+        GTK_TREE_MODEL(pw_store));
+    g_object_unref(pw_store);
+
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(pw_tree), FALSE);
+    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(pw_tree), TRUE);
+
+    GtkCellRenderer *pw_r = gtk_cell_renderer_text_new();
+    g_object_set(pw_r, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+    GtkTreeViewColumn *pw_col = gtk_tree_view_column_new_with_attributes(
+        "Audio", pw_r, "markup", PW_COL_MARKUP, NULL);
+    gtk_tree_view_column_set_expand(pw_col, TRUE);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(pw_tree), pw_col);
+
+    /* Monospace CSS for the PipeWire tree (1pt smaller than main) */
+    GtkCssProvider *pw_css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(pw_css,
+        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(pw_tree),
+        GTK_STYLE_PROVIDER(pw_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    /* NOTE: don't unref pw_css – kept alive for dynamic font changes */
+
+    GtkTreeSelection *pw_sel = gtk_tree_view_get_selection(
+        GTK_TREE_VIEW(pw_tree));
+    gtk_tree_selection_set_mode(pw_sel, GTK_SELECTION_SINGLE);
+
+    GtkWidget *pw_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(pw_scroll),
+                                   GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(pw_scroll, -1, 150);
+    gtk_widget_set_vexpand(pw_scroll, TRUE);
+    gtk_container_add(GTK_CONTAINER(pw_scroll), pw_tree);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), pw_scroll, 0, 26, 2, 1);
+#endif /* HAVE_PIPEWIRE */
+
     gtk_container_add(GTK_CONTAINER(sidebar_scroll), sidebar_grid);
 
     GtkWidget *sidebar_frame = gtk_frame_new("Details");
@@ -3258,6 +3326,17 @@ void *ui_thread(void *arg)
     ctx.mmap_generation = 0;
     ctx.mmap_cancel     = NULL;
 
+#ifdef HAVE_PIPEWIRE
+    /* PipeWire audio connections */
+    ctx.pw_store      = pw_store;
+    ctx.pw_view       = GTK_TREE_VIEW(pw_tree);
+    ctx.pw_css        = pw_css;
+    ctx.pw_collapsed  = 0;
+    ctx.pw_last_pid   = 0;
+    ctx.pw_generation = 0;
+    ctx.pw_cancel     = NULL;
+#endif
+
     /* Pinned processes */
     ctx.pinned_pids     = NULL;
     ctx.pinned_count    = 0;
@@ -3308,6 +3387,14 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_mmap_row_expanded), &ctx);
     g_signal_connect(mmap_tree, "key-press-event",
                      G_CALLBACK(on_mmap_key_press), &ctx);
+#ifdef HAVE_PIPEWIRE
+    g_signal_connect(pw_tree, "row-collapsed",
+                     G_CALLBACK(on_pw_row_collapsed), &ctx);
+    g_signal_connect(pw_tree, "row-expanded",
+                     G_CALLBACK(on_pw_row_expanded), &ctx);
+    g_signal_connect(pw_tree, "key-press-event",
+                     G_CALLBACK(on_pw_key_press), &ctx);
+#endif
     g_signal_connect(window,    "configure-event",
                      G_CALLBACK(on_window_configure), &ctx);
     g_signal_connect(window,    "notify::scale-factor",
@@ -3397,6 +3484,15 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
         g_object_unref(ctx->mmap_cancel);
         ctx->mmap_cancel = NULL;
     }
+
+#ifdef HAVE_PIPEWIRE
+    /* Cancel any in-flight async PipeWire scan */
+    if (ctx->pw_cancel) {
+        g_cancellable_cancel(ctx->pw_cancel);
+        g_object_unref(ctx->pw_cancel);
+        ctx->pw_cancel = NULL;
+    }
+#endif
 
     /* Stop autoscroll timer */
     if (ctx->scroll_timer) {

@@ -15,6 +15,18 @@ FC_LDFLAGS  := $(shell pkg-config --libs fontconfig)
 CFLAGS  += $(GTK_CFLAGS) $(FC_CFLAGS)
 LDFLAGS += $(GTK_LDFLAGS) $(FC_LDFLAGS)
 
+# PipeWire (optional — audio connection info in sidebar)
+# Auto-detect: if libpipewire-0.3 is installed, enable the feature.
+# Disable explicitly with:  make HAVE_PIPEWIRE=0
+ifneq ($(HAVE_PIPEWIRE),0)
+  PW_CFLAGS  := $(shell pkg-config --cflags libpipewire-0.3 2>/dev/null)
+  PW_LDFLAGS := $(shell pkg-config --libs   libpipewire-0.3 2>/dev/null)
+  ifneq ($(PW_LDFLAGS),)
+    CFLAGS  += $(PW_CFLAGS) -DHAVE_PIPEWIRE
+    LDFLAGS += $(PW_LDFLAGS)
+  endif
+endif
+
 # libbpf (for eBPF fd-monitor backend)
 LDFLAGS += -lbpf -lelf -lz
 

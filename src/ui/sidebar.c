@@ -35,6 +35,9 @@ void sidebar_update(ui_ctx_t *ctx)
         gtk_tree_store_clear(ctx->fd_store);
         gtk_tree_store_clear(ctx->env_store);
         gtk_tree_store_clear(ctx->mmap_store);
+#ifdef HAVE_PIPEWIRE
+        gtk_tree_store_clear(ctx->pw_store);
+#endif
         return;
     }
 
@@ -193,6 +196,9 @@ void sidebar_update(ui_ctx_t *ctx)
 
     /* ── populate memory map tree (async, off main thread) ── */
     mmap_scan_start(ctx, (pid_t)pid);
+
+    /* ── populate PipeWire audio connections (async, off main thread) ── */
+    pipewire_scan_start(ctx, (pid_t)pid);
 
     g_free(user); g_free(name); g_free(cpu_text);
     g_free(rss_text); g_free(grp_rss_text); g_free(grp_cpu_text);
