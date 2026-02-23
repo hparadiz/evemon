@@ -45,17 +45,32 @@ enum {
     NUM_COLS
 };
 
-/* ── pid_set: tracks user-collapsed PIDs ─────────────────────── */
+/* ── process tree node state tracking ─────────────────────────── */
+
+/* Node states (stored per-PID in the set) */
+#define PTREE_EXPANDED  0
+#define PTREE_COLLAPSED 1
+
+/*
+ * Pin bit: OR into the PID key to keep pinned and unpinned process
+ * entries in separate key-spaces within the same set.
+ *
+ *   unpinned key = pid
+ *   pinned   key = pid | PTREE_PIN_BIT
+ */
+#define PTREE_PIN_BIT   (1 << 30)
 
 typedef struct {
-    pid_t *pids;
+    int   *keys;       /* PID (possibly | PTREE_PIN_BIT) */
+    int   *states;     /* PTREE_COLLAPSED or PTREE_EXPANDED */
     size_t count;
     size_t capacity;
-} pid_set_t;
+} ptree_node_set_t;
 
-void pid_set_add(pid_set_t *s, pid_t pid);
-void pid_set_remove(pid_set_t *s, pid_t pid);
-int  pid_set_contains(const pid_set_t *s, pid_t pid);
+void set_process_tree_node(ptree_node_set_t *s, gboolean pin,
+                           pid_t pid, int state);
+int  get_process_tree_node(const ptree_node_set_t *s, gboolean pin,
+                           pid_t pid);
 
 /* ── per-UI state ────────────────────────────────────────────── */
 
@@ -66,7 +81,7 @@ typedef struct {
     GtkLabel           *status_label;
     GtkLabel           *status_right;
     GtkScrolledWindow  *scroll;
-    pid_set_t           collapsed;
+    ptree_node_set_t    ptree_nodes;
     GtkWidget          *menubar;
     GtkWidget          *file_menu_item;
     GtkWidget          *tree;
@@ -227,8 +242,7 @@ void label_device(const char *path, char *desc, size_t descsz);
 /* ── tree store operations ───────────────────────────────────── */
 
 void update_store(GtkTreeStore *store, GtkTreeView *view,
-                  const proc_entry_t *entries, size_t count,
-                  const pid_set_t *collapsed);
+                  const proc_entry_t *entries, size_t count);
 
 void populate_store_initial(GtkTreeStore *store, GtkTreeView *view,
                             const proc_entry_t *entries, size_t count);

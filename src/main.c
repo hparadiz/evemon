@@ -58,6 +58,7 @@ int main(int argc, char *argv[])
     FcInit();
     gtk_init(&argc, &argv);
 
+    //fprintf(stdout, "allmon: starting up...\n");
     if (monitor_state_init(&g_state) != 0) {
         fprintf(stderr, "allmon: failed to initialise state\n");
         return EXIT_FAILURE;

@@ -23,37 +23,59 @@ static void switch_to_real_store(ui_ctx_t *ctx);
 
 /* ── pid_set helpers ─────────────────────────────────────────── */
 
-void pid_set_add(pid_set_t *s, pid_t pid)
+/*
+ * set_process_tree_node – record the expand/collapse state for a PID.
+ *
+ * pin  = TRUE  → operates on the pinned key-space  (pid | PTREE_PIN_BIT)
+ * pin  = FALSE → operates on the unpinned key-space (pid)
+ * state        → PTREE_COLLAPSED (1) or PTREE_EXPANDED (0)
+ *
+ * If the entry already exists its state is updated in place;
+ * otherwise a new entry is appended.
+ */
+void set_process_tree_node(ptree_node_set_t *s, gboolean pin,
+                           pid_t pid, int state)
 {
-    /* avoid duplicates */
-    for (size_t i = 0; i < s->count; i++)
-        if (s->pids[i] == pid) return;
+    int key = (int)pid | (pin ? PTREE_PIN_BIT : 0);
 
-    if (s->count >= s->capacity) {
-        size_t newcap = s->capacity ? s->capacity * 2 : 64;
-        pid_t *tmp = realloc(s->pids, newcap * sizeof(pid_t));
-        if (!tmp) return;   /* OOM – silently drop the add */
-        s->pids     = tmp;
-        s->capacity = newcap;
-    }
-    s->pids[s->count++] = pid;
-}
-
-void pid_set_remove(pid_set_t *s, pid_t pid)
-{
+    /* Update in place if the key already exists */
     for (size_t i = 0; i < s->count; i++) {
-        if (s->pids[i] == pid) {
-            s->pids[i] = s->pids[--s->count];
+        if (s->keys[i] == key) {
+            s->states[i] = state;
             return;
         }
     }
+
+    /* Append new entry */
+    if (s->count >= s->capacity) {
+        size_t newcap = s->capacity ? s->capacity * 2 : 64;
+        int *tk = realloc(s->keys,   newcap * sizeof(int));
+        int *ts = realloc(s->states, newcap * sizeof(int));
+        if (!tk || !ts) { free(tk); return; }   /* OOM – silently drop */
+        s->keys     = tk;
+        s->states   = ts;
+        s->capacity = newcap;
+    }
+    s->keys  [s->count] = key;
+    s->states[s->count] = state;
+    s->count++;
 }
 
-int pid_set_contains(const pid_set_t *s, pid_t pid)
+/*
+ * get_process_tree_node – query the expand/collapse state for a PID.
+ *
+ * Returns the stored state (PTREE_COLLAPSED or PTREE_EXPANDED).
+ * If the PID has never been recorded, returns PTREE_EXPANDED
+ * (the default: rows start expanded).
+ */
+int get_process_tree_node(const ptree_node_set_t *s, gboolean pin,
+                          pid_t pid)
 {
+    int key = (int)pid | (pin ? PTREE_PIN_BIT : 0);
+
     for (size_t i = 0; i < s->count; i++)
-        if (s->pids[i] == pid) return 1;
-    return 0;
+        if (s->keys[i] == key) return s->states[i];
+    return PTREE_EXPANDED;   /* default */
 }
 
 /* ── formatting helpers ──────────────────────────────────────── */
@@ -447,8 +469,26 @@ static void on_row_collapsed(GtkTreeView *view,
                               GtkTreePath *path,
                               gpointer     data)
 {
-    (void)view; (void)path;
     ui_ctx_t *ctx = data;
+
+    /*
+     * When the user collapses a parent, GTK cascades and emits
+     * row-collapsed for every expanded descendant too.  We must
+     * ignore those cascading signals – only record the row the
+     * user actually collapsed.  A cascading collapse is detected
+     * by checking whether the row's parent is still expanded in
+     * the view; if it isn't, this is a side-effect, not a user action.
+     */
+    if (gtk_tree_path_get_depth(path) > 1) {
+        GtkTreePath *parent_path = gtk_tree_path_copy(path);
+        gtk_tree_path_up(parent_path);
+        gboolean parent_expanded = gtk_tree_view_row_expanded(view,
+                                                              parent_path);
+        gtk_tree_path_free(parent_path);
+        if (!parent_expanded)
+            return;   /* cascade – ignore */
+    }
+
     gint pid;
     /* iter is from the sort model; convert sort → underlying store */
     GtkTreeIter child_iter;
@@ -456,7 +496,10 @@ static void on_row_collapsed(GtkTreeView *view,
         ctx->sort_model, &child_iter, iter);
     GtkTreeModel *child_model = gtk_tree_model_sort_get_model(ctx->sort_model);
     gtk_tree_model_get(child_model, &child_iter, COL_PID, &pid, -1);
-    pid_set_add(&ctx->collapsed, (pid_t)pid);
+    set_process_tree_node(&ctx->ptree_nodes, FALSE, (pid_t)pid,
+                          PTREE_COLLAPSED);
+
+    //fprintf(stdout, "allmon: collapsed PID %d\n", pid);
 }
 
 static void on_row_expanded(GtkTreeView *view,
@@ -464,7 +507,6 @@ static void on_row_expanded(GtkTreeView *view,
                              GtkTreePath *path,
                              gpointer     data)
 {
-    (void)view; (void)path;
     ui_ctx_t *ctx = data;
     gint pid;
     /* iter is from the sort model; convert sort → underlying store */
@@ -473,7 +515,41 @@ static void on_row_expanded(GtkTreeView *view,
         ctx->sort_model, &child_iter, iter);
     GtkTreeModel *child_model = gtk_tree_model_sort_get_model(ctx->sort_model);
     gtk_tree_model_get(child_model, &child_iter, COL_PID, &pid, -1);
-    pid_set_remove(&ctx->collapsed, (pid_t)pid);
+    set_process_tree_node(&ctx->ptree_nodes, FALSE, (pid_t)pid,
+                          PTREE_EXPANDED);
+
+    //fprintf(stdout, "allmon: expanded PID %d\n", pid);
+
+    /*
+     * When GTK expands a row it reveals immediate children in their
+     * default (collapsed) visual state.  Consult our source of truth
+     * and re-expand any children that should be expanded.
+     */
+    GtkTreeModel *sort_model = gtk_tree_view_get_model(view);
+    GtkTreeIter sort_child;
+    gboolean valid = gtk_tree_model_iter_children(sort_model, &sort_child,
+                                                  iter);
+    while (valid) {
+        if (gtk_tree_model_iter_has_child(sort_model, &sort_child)) {
+            GtkTreeIter store_child;
+            gtk_tree_model_sort_convert_iter_to_child_iter(
+                ctx->sort_model, &store_child, &sort_child);
+            gint child_pid;
+            gtk_tree_model_get(child_model, &store_child,
+                               COL_PID, &child_pid, -1);
+
+            if (get_process_tree_node(&ctx->ptree_nodes, FALSE,
+                                      (pid_t)child_pid) == PTREE_EXPANDED) {
+                GtkTreePath *child_path = gtk_tree_model_get_path(
+                    sort_model, &sort_child);
+                if (child_path) {
+                    gtk_tree_view_expand_row(view, child_path, FALSE);
+                    gtk_tree_path_free(child_path);
+                }
+            }
+        }
+        valid = gtk_tree_model_iter_next(sort_model, &sort_child);
+    }
 }
 
 /* ── selection / sidebar interaction ─────────────────────────── */
@@ -631,7 +707,7 @@ static gboolean on_refresh(gpointer data)
         }
     } else {
         /* Incremental: update in-place, no clear, no flash */
-        update_store(ctx->store, ctx->view, local, count, &ctx->collapsed);
+        update_store(ctx->store, ctx->view, local, count);
     }
 
     /* Recompute group totals (self + all descendants) */
@@ -747,6 +823,10 @@ static gboolean on_refresh(gpointer data)
     return G_SOURCE_CONTINUE;
 
 finish:
+    /* Unblock collapse/expand signals that were blocked above */
+    g_signal_handlers_unblock_by_func(ctx->view, on_row_collapsed, ctx);
+    g_signal_handlers_unblock_by_func(ctx->view, on_row_expanded,  ctx);
+
     /* First refresh done – finish status update, then remove the fast timer */
     {
         double snap_last = 0, snap_avg = 0, snap_max = 0;
@@ -1382,7 +1462,8 @@ static void expand_respecting_collapsed_recurse(ui_ctx_t *ctx,
             gtk_tree_model_get(child_model, &child_it, COL_PID, &pid, -1);
 
             GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
-            if (pid_set_contains(&ctx->collapsed, (pid_t)pid)) {
+            if (get_process_tree_node(&ctx->ptree_nodes, FALSE,
+                                      (pid_t)pid) == PTREE_COLLAPSED) {
                 gtk_tree_view_collapse_row(ctx->view, path);
             } else {
                 gtk_tree_view_expand_row(ctx->view, path, FALSE);
@@ -1712,6 +1793,40 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
         if (focus && gtk_widget_get_visible(ctx->sidebar) &&
             gtk_widget_is_ancestor(focus, ctx->sidebar)) {
             gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
+            return TRUE;
+        }
+    }
+
+    /* Left / Right arrow → collapse / expand selected row in tree view */
+    if (state == 0 &&
+        (ev->keyval == GDK_KEY_Left || ev->keyval == GDK_KEY_Right)) {
+        GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(widget));
+        if (focus == GTK_WIDGET(ctx->view)) {
+            GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
+            GtkTreeModel *model = NULL;
+            GtkTreeIter sort_iter;
+            if (gtk_tree_selection_get_selected(sel, &model, &sort_iter)) {
+                GtkTreePath *path = gtk_tree_model_get_path(model, &sort_iter);
+                if (path) {
+                    if (ev->keyval == GDK_KEY_Right) {
+                        gtk_tree_view_expand_row(ctx->view, path, FALSE);
+                    } else {
+                        /* Left on an already-collapsed or leaf row →
+                         * jump to the parent row instead. */
+                        if (!gtk_tree_view_row_expanded(ctx->view, path) ||
+                            !gtk_tree_model_iter_has_child(model, &sort_iter)) {
+                            if (gtk_tree_path_up(path) &&
+                                gtk_tree_path_get_depth(path) > 0) {
+                                gtk_tree_view_set_cursor(ctx->view, path,
+                                                         NULL, FALSE);
+                            }
+                        } else {
+                            gtk_tree_view_collapse_row(ctx->view, path);
+                        }
+                    }
+                    gtk_tree_path_free(path);
+                }
+            }
             return TRUE;
         }
     }
@@ -2515,7 +2630,7 @@ void *ui_thread(void *arg)
     ctx.fd_css       = fd_css;
     ctx.font_size    = FONT_SIZE_DEFAULT;
     ctx.auto_font    = FALSE;
-    ctx.collapsed    = (pid_set_t){ NULL, 0, 0 };
+    ctx.ptree_nodes  = (ptree_node_set_t){ NULL, NULL, 0, 0 };
     ctx.follow_selection = FALSE;
 
     /* Name filter */
@@ -2655,9 +2770,11 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
         ctx->scroll_timer = 0;
     }
 
-    /* Free the collapsed-PID set */
-    free(ctx->collapsed.pids);
-    ctx->collapsed.pids     = NULL;
-    ctx->collapsed.count    = 0;
-    ctx->collapsed.capacity = 0;
+    /* Free the process tree node set */
+    free(ctx->ptree_nodes.keys);
+    free(ctx->ptree_nodes.states);
+    ctx->ptree_nodes.keys     = NULL;
+    ctx->ptree_nodes.states   = NULL;
+    ctx->ptree_nodes.count    = 0;
+    ctx->ptree_nodes.capacity = 0;
 }

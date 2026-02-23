@@ -169,8 +169,7 @@ static GtkTreeIter *find_parent_iter(iter_map_t *map, pid_t ppid, pid_t self_pid
 void update_store(GtkTreeStore       *store,
                   GtkTreeView        *view,
                   const proc_entry_t *entries,
-                  size_t              count,
-                  const pid_set_t    *collapsed)
+                  size_t              count)
 {
     /* Build hash of new snapshot: PID → index */
     ht_entry_t *new_ht = calloc(HT_SIZE, sizeof(ht_entry_t));
@@ -251,32 +250,6 @@ void update_store(GtkTreeStore       *store,
             /* Add to existing map so children can find us */
             iter_map_add(&existing, e->pid, &new_iter);
             inserted[sidx] = 1;
-
-            /* Expand new row unless user has it collapsed */
-            if (!pid_set_contains(collapsed, e->pid) && parent_iter) {
-                GtkTreePath *store_path = gtk_tree_model_get_path(
-                    GTK_TREE_MODEL(store), parent_iter);
-                /* The view uses sort(store); convert the path up. */
-                GtkTreeModel *view_model = gtk_tree_view_get_model(view);
-                if (GTK_IS_TREE_MODEL_SORT(view_model)) {
-                    GtkTreeModelSort *sm = GTK_TREE_MODEL_SORT(view_model);
-                    GtkTreeModel *child = gtk_tree_model_sort_get_model(sm);
-                    /* Only convert if the sort model wraps this store
-                     * (not the filter shadow store). */
-                    if (child == GTK_TREE_MODEL(store)) {
-                        GtkTreePath *sort_path =
-                            gtk_tree_model_sort_convert_child_path_to_path(
-                                sm, store_path);
-                        if (sort_path) {
-                            gtk_tree_view_expand_row(view, sort_path, FALSE);
-                            gtk_tree_path_free(sort_path);
-                        }
-                    }
-                } else {
-                    gtk_tree_view_expand_row(view, store_path, FALSE);
-                }
-                gtk_tree_path_free(store_path);
-            }
         }
     }
 
