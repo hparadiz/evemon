@@ -145,6 +145,7 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
                        COL_SERVICE,    e->service[0]   ? e->service   : "",
                        COL_CWD,      e->cwd,
                        COL_CMDLINE,  e->cmdline,
+                       COL_PINNED_ROOT, (gint)PTREE_UNPINNED,
                        -1);
 }
 
@@ -408,4 +409,115 @@ void populate_store_initial(GtkTreeStore       *store,
 
     /* Expand everything on first load */
     gtk_tree_view_expand_all(view);
+}
+
+/* ── pinned-process subtree management ───────────────────────── */
+
+/*
+ * Remove all top-level rows whose COL_PINNED_ROOT != PTREE_UNPINNED.
+ * Called before rebuilding the pinned section so stale copies are purged.
+ */
+void remove_pinned_rows(GtkTreeStore *store)
+{
+    GtkTreeModel *model = GTK_TREE_MODEL(store);
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
+
+    while (valid) {
+        gint pr = 0;
+        gtk_tree_model_get(model, &iter, COL_PINNED_ROOT, &pr, -1);
+        if (pr != (gint)PTREE_UNPINNED) {
+            valid = gtk_tree_store_remove(store, &iter);
+        } else {
+            valid = gtk_tree_model_iter_next(model, &iter);
+        }
+    }
+}
+
+/*
+ * Deep-copy a subtree from `src_iter` (and all children) into `dst`
+ * under `dst_parent`, stamping every row with the given pinned_root.
+ */
+static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
+                                GtkTreeModel *src, GtkTreeIter *src_iter,
+                                gint pinned_root)
+{
+    GtkTreeIter dst_iter;
+    gtk_tree_store_append(dst, &dst_iter, dst_parent);
+
+    gint pid, ppid, cpu, rss, grp_rss, grp_cpu;
+    gint64 start_time;
+    gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
+    gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
+    gchar *start_text = NULL, *container = NULL, *service = NULL,
+          *cwd = NULL, *cmdline = NULL;
+
+    gtk_tree_model_get(src, src_iter,
+        COL_PID, &pid, COL_PPID, &ppid, COL_USER, &user, COL_NAME, &name,
+        COL_CPU, &cpu, COL_CPU_TEXT, &cpu_text,
+        COL_RSS, &rss, COL_RSS_TEXT, &rss_text,
+        COL_GROUP_RSS, &grp_rss, COL_GROUP_RSS_TEXT, &grp_rss_text,
+        COL_GROUP_CPU, &grp_cpu, COL_GROUP_CPU_TEXT, &grp_cpu_text,
+        COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
+        COL_CONTAINER, &container, COL_SERVICE, &service,
+        COL_CWD, &cwd, COL_CMDLINE, &cmdline,
+        -1);
+
+    gtk_tree_store_set(dst, &dst_iter,
+        COL_PID, pid, COL_PPID, ppid, COL_USER, user, COL_NAME, name,
+        COL_CPU, cpu, COL_CPU_TEXT, cpu_text,
+        COL_RSS, rss, COL_RSS_TEXT, rss_text,
+        COL_GROUP_RSS, grp_rss, COL_GROUP_RSS_TEXT, grp_rss_text,
+        COL_GROUP_CPU, grp_cpu, COL_GROUP_CPU_TEXT, grp_cpu_text,
+        COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
+        COL_CONTAINER, container, COL_SERVICE, service,
+        COL_CWD, cwd, COL_CMDLINE, cmdline,
+        COL_PINNED_ROOT, pinned_root,
+        -1);
+
+    g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
+    g_free(grp_rss_text); g_free(grp_cpu_text); g_free(start_text);
+    g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
+
+    /* Recurse into children */
+    GtkTreeIter child;
+    gboolean valid = gtk_tree_model_iter_children(src, &child, src_iter);
+    while (valid) {
+        copy_subtree_pinned(dst, &dst_iter, src, &child, pinned_root);
+        valid = gtk_tree_model_iter_next(src, &child);
+    }
+}
+
+/*
+ * Rebuild the pinned section of the store.  Removes all existing pinned
+ * rows, then for each PID in pinned_pids, finds the row in the normal
+ * tree (COL_PINNED_ROOT == PTREE_UNPINNED) and copies it + descendants
+ * as a new top-level subtree with COL_PINNED_ROOT = that pid.
+ *
+ * The sort comparators ensure pinned rows always float to the top.
+ */
+void rebuild_pinned_rows(GtkTreeStore *store,
+                         const pid_t *pinned_pids, size_t pinned_count)
+{
+    remove_pinned_rows(store);
+
+    if (pinned_count == 0)
+        return;
+
+    GtkTreeModel *model = GTK_TREE_MODEL(store);
+
+    for (size_t i = 0; i < pinned_count; i++) {
+        GtkTreeIter src_iter;
+        if (!find_iter_by_pid(model, NULL, pinned_pids[i], &src_iter))
+            continue;  /* process no longer alive – skip */
+
+        /* Verify this is a normal-tree row, not another pinned copy */
+        gint pr = 0;
+        gtk_tree_model_get(model, &src_iter, COL_PINNED_ROOT, &pr, -1);
+        if (pr != (gint)PTREE_UNPINNED)
+            continue;
+
+        copy_subtree_pinned(store, NULL, model, &src_iter,
+                            (gint)pinned_pids[i]);
+    }
 }

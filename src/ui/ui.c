@@ -21,26 +21,34 @@ static void rebuild_filter_store(ui_ctx_t *ctx);
 static void sync_filter_store(ui_ctx_t *ctx);
 static void switch_to_real_store(ui_ctx_t *ctx);
 
+/* Forward declaration for expand helper */
+static void expand_respecting_collapsed_recurse(ui_ctx_t *ctx,
+                                                 GtkTreeModel *model,
+                                                 GtkTreeIter *parent);
+
 /* ── pid_set helpers ─────────────────────────────────────────── */
 
 /*
  * set_process_tree_node – record the expand/collapse state for a PID.
  *
- * pin  = TRUE  → operates on the pinned key-space  (pid | PTREE_PIN_BIT)
- * pin  = FALSE → operates on the unpinned key-space (pid)
- * state        → PTREE_COLLAPSED (1) or PTREE_EXPANDED (0)
+ * pinned_pid = the PID of the pinned root that owns this subtree,
+ *              or PTREE_UNPINNED (-1) for the main (unpinned) tree.
+ * pid        = the actual process PID whose state we are recording.
+ * state      = PTREE_COLLAPSED (1) or PTREE_EXPANDED (0).
+ *
+ * The (pinned_pid, pid) pair forms the composite key, so the same
+ * PID can have independent expand/collapse state in multiple pinned
+ * subtrees without collision.
  *
  * If the entry already exists its state is updated in place;
  * otherwise a new entry is appended.
  */
-void set_process_tree_node(ptree_node_set_t *s, gboolean pin,
+void set_process_tree_node(ptree_node_set_t *s, pid_t pinned_pid,
                            pid_t pid, int state)
 {
-    int key = (int)pid | (pin ? PTREE_PIN_BIT : 0);
-
-    /* Update in place if the key already exists */
+    /* Update in place if the (pinned_pid, pid) pair already exists */
     for (size_t i = 0; i < s->count; i++) {
-        if (s->keys[i] == key) {
+        if (s->pinned_pids[i] == pinned_pid && s->pids[i] == pid) {
             s->states[i] = state;
             return;
         }
@@ -49,32 +57,38 @@ void set_process_tree_node(ptree_node_set_t *s, gboolean pin,
     /* Append new entry */
     if (s->count >= s->capacity) {
         size_t newcap = s->capacity ? s->capacity * 2 : 64;
-        int *tk = realloc(s->keys,   newcap * sizeof(int));
-        int *ts = realloc(s->states, newcap * sizeof(int));
-        if (!tk || !ts) { free(tk); return; }   /* OOM – silently drop */
-        s->keys     = tk;
-        s->states   = ts;
-        s->capacity = newcap;
+        pid_t *tp = realloc(s->pinned_pids, newcap * sizeof(pid_t));
+        pid_t *tk = realloc(s->pids,        newcap * sizeof(pid_t));
+        int   *ts = realloc(s->states,       newcap * sizeof(int));
+        if (!tp || !tk || !ts) { free(tp); free(tk); return; }   /* OOM – silently drop */
+        s->pinned_pids = tp;
+        s->pids        = tk;
+        s->states      = ts;
+        s->capacity    = newcap;
     }
-    s->keys  [s->count] = key;
-    s->states[s->count] = state;
+    s->pinned_pids[s->count] = pinned_pid;
+    s->pids       [s->count] = pid;
+    s->states     [s->count] = state;
     s->count++;
 }
 
 /*
  * get_process_tree_node – query the expand/collapse state for a PID.
  *
+ * pinned_pid = the PID of the pinned root that owns this subtree,
+ *              or PTREE_UNPINNED (-1) for the main (unpinned) tree.
+ * pid        = the actual process PID to query.
+ *
  * Returns the stored state (PTREE_COLLAPSED or PTREE_EXPANDED).
- * If the PID has never been recorded, returns PTREE_EXPANDED
- * (the default: rows start expanded).
+ * If the (pinned_pid, pid) pair has never been recorded, returns
+ * PTREE_EXPANDED (the default: rows start expanded).
  */
-int get_process_tree_node(const ptree_node_set_t *s, gboolean pin,
+int get_process_tree_node(const ptree_node_set_t *s, pid_t pinned_pid,
                           pid_t pid)
 {
-    int key = (int)pid | (pin ? PTREE_PIN_BIT : 0);
-
     for (size_t i = 0; i < s->count; i++)
-        if (s->keys[i] == key) return s->states[i];
+        if (s->pinned_pids[i] == pinned_pid && s->pids[i] == pid)
+            return s->states[i];
     return PTREE_EXPANDED;   /* default */
 }
 
@@ -149,7 +163,53 @@ gboolean find_iter_by_pid(GtkTreeModel *model, GtkTreeIter *parent,
     return FALSE;
 }
 
+/*
+ * Walk the tree model to find the row whose COL_PID equals `target`
+ * AND whose COL_PINNED_ROOT equals `pinned_root`.  This disambiguates
+ * between the pinned copy and the original tree row for the same PID.
+ * Returns TRUE and fills `result` if found, FALSE otherwise.
+ */
+static gboolean find_iter_by_pid_and_pinned_root(GtkTreeModel *model,
+                                                  GtkTreeIter  *parent,
+                                                  pid_t target,
+                                                  pid_t pinned_root,
+                                                  GtkTreeIter  *result)
+{
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
+    while (valid) {
+        gint pid, pr;
+        gtk_tree_model_get(model, &iter,
+                           COL_PID, &pid,
+                           COL_PINNED_ROOT, &pr, -1);
+        if ((pid_t)pid == target && (pid_t)pr == pinned_root) {
+            *result = iter;
+            return TRUE;
+        }
+        if (find_iter_by_pid_and_pinned_root(model, &iter, target,
+                                              pinned_root, result))
+            return TRUE;
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+    return FALSE;
+}
+
 /* ── middle-click autoscroll (browser-style) ─────────────────── */
+
+/*
+ * get_row_pinned_root – given a store iter, return its COL_PINNED_ROOT
+ * value.  For rows in the normal tree this is PTREE_UNPINNED (-1);
+ * for rows inside a pinned subtree it is the PID of the pinned root.
+ *
+ * This works by reading COL_PINNED_ROOT directly from the row –
+ * every row in a pinned subtree is stamped with the same pinned root.
+ */
+static pid_t get_row_pinned_root(GtkTreeModel *model, GtkTreeIter *iter)
+{
+    gint pr = (gint)PTREE_UNPINNED;
+    gtk_tree_model_get(model, iter, COL_PINNED_ROOT, &pr, -1);
+    return (pid_t)pr;
+}
 
 /* Dead-zone radius as a fraction of the smaller window dimension.
  * e.g. 0.03 = 3% of min(width, height).                          */
@@ -280,11 +340,80 @@ static void on_copy_command(GtkMenuItem *item, gpointer data)
     gtk_clipboard_set_text(cb, cmdline, -1);
 }
 
+/* ── pin / unpin helpers ─────────────────────────────────────── */
+
+static gboolean pid_is_pinned(const ui_ctx_t *ctx, pid_t pid)
+{
+    for (size_t i = 0; i < ctx->pinned_count; i++)
+        if (ctx->pinned_pids[i] == pid) return TRUE;
+    return FALSE;
+}
+
+static void pin_pid(ui_ctx_t *ctx, pid_t pid)
+{
+    if (pid_is_pinned(ctx, pid)) return;
+    if (ctx->pinned_count >= ctx->pinned_capacity) {
+        size_t newcap = ctx->pinned_capacity ? ctx->pinned_capacity * 2 : 16;
+        pid_t *tmp = realloc(ctx->pinned_pids, newcap * sizeof(pid_t));
+        if (!tmp) return;
+        ctx->pinned_pids     = tmp;
+        ctx->pinned_capacity = newcap;
+    }
+    ctx->pinned_pids[ctx->pinned_count++] = pid;
+}
+
+static void unpin_pid(ui_ctx_t *ctx, pid_t pid)
+{
+    for (size_t i = 0; i < ctx->pinned_count; i++) {
+        if (ctx->pinned_pids[i] == pid) {
+            ctx->pinned_pids[i] = ctx->pinned_pids[--ctx->pinned_count];
+            return;
+        }
+    }
+}
+
+typedef struct {
+    ui_ctx_t *ctx;
+    pid_t     pid;
+} pin_toggle_data_t;
+
+static void on_toggle_pin(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    pin_toggle_data_t *d = data;
+    if (pid_is_pinned(d->ctx, d->pid))
+        unpin_pid(d->ctx, d->pid);
+    else
+        pin_pid(d->ctx, d->pid);
+    free(d);
+}
+
 static void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
                                      pid_t pid, const char *name,
                                      const char *cmdline)
 {
     GtkWidget *menu = gtk_menu_new();
+
+    /* ── Pin / Unpin toggle (at the very top) ── */
+    {
+        gboolean pinned = pid_is_pinned(ctx, pid);
+        char pin_label[320];
+        snprintf(pin_label, sizeof(pin_label), "%s (%s, pid %d)",
+                 pinned ? "Unpin Process" : "Pin Process", name, pid);
+        GtkWidget *mi_pin = gtk_menu_item_new_with_label(pin_label);
+        pin_toggle_data_t *pd = malloc(sizeof(*pd));
+        if (pd) {
+            pd->ctx = ctx;
+            pd->pid = pid;
+            g_signal_connect(mi_pin, "activate",
+                             G_CALLBACK(on_toggle_pin), pd);
+        }
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_pin);
+    }
+
+    /* ── separator ── */
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu),
+                          gtk_separator_menu_item_new());
 
     /* ── Copy Command ── */
     GtkWidget *mi_copy = gtk_menu_item_new_with_label("Copy Command");
@@ -496,7 +625,10 @@ static void on_row_collapsed(GtkTreeView *view,
         ctx->sort_model, &child_iter, iter);
     GtkTreeModel *child_model = gtk_tree_model_sort_get_model(ctx->sort_model);
     gtk_tree_model_get(child_model, &child_iter, COL_PID, &pid, -1);
-    set_process_tree_node(&ctx->ptree_nodes, FALSE, (pid_t)pid,
+
+    /* Determine whether this row is inside a pinned subtree */
+    pid_t pinned_root = get_row_pinned_root(child_model, &child_iter);
+    set_process_tree_node(&ctx->ptree_nodes, pinned_root, (pid_t)pid,
                           PTREE_COLLAPSED);
 
     //fprintf(stdout, "allmon: collapsed PID %d\n", pid);
@@ -515,7 +647,10 @@ static void on_row_expanded(GtkTreeView *view,
         ctx->sort_model, &child_iter, iter);
     GtkTreeModel *child_model = gtk_tree_model_sort_get_model(ctx->sort_model);
     gtk_tree_model_get(child_model, &child_iter, COL_PID, &pid, -1);
-    set_process_tree_node(&ctx->ptree_nodes, FALSE, (pid_t)pid,
+
+    /* Determine whether this row is inside a pinned subtree */
+    pid_t pinned_root = get_row_pinned_root(child_model, &child_iter);
+    set_process_tree_node(&ctx->ptree_nodes, pinned_root, (pid_t)pid,
                           PTREE_EXPANDED);
 
     //fprintf(stdout, "allmon: expanded PID %d\n", pid);
@@ -538,7 +673,7 @@ static void on_row_expanded(GtkTreeView *view,
             gtk_tree_model_get(child_model, &store_child,
                                COL_PID, &child_pid, -1);
 
-            if (get_process_tree_node(&ctx->ptree_nodes, FALSE,
+            if (get_process_tree_node(&ctx->ptree_nodes, pinned_root,
                                       (pid_t)child_pid) == PTREE_EXPANDED) {
                 GtkTreePath *child_path = gtk_tree_model_get_path(
                     sort_model, &sort_child);
@@ -638,56 +773,49 @@ static gboolean on_refresh(gpointer data)
     if (!local)
         return G_SOURCE_CONTINUE;
 
-    /* Block collapse/expand signals during programmatic changes */
+    /* Block collapse/expand and selection-changed signals during
+     * programmatic changes.  Without blocking selection-changed,
+     * remove_pinned_rows would destroy the selected pinned row and
+     * GTK would auto-select a nearby row (e.g. init/kthreadd). */
     g_signal_handlers_block_by_func(ctx->view, on_row_collapsed, ctx);
     g_signal_handlers_block_by_func(ctx->view, on_row_expanded,  ctx);
+    GtkTreeSelection *tree_sel = gtk_tree_view_get_selection(ctx->view);
+    g_signal_handlers_block_by_func(tree_sel, on_selection_changed, ctx);
 
     /*
-     * If follow_selection is active, remember the selected PID and its
-     * viewport-relative position so we can scroll back after the update.
+     * Always remember the selected PID and its pinned-root so we can
+     * re-select the correct copy (pinned vs original) after the store
+     * update.  Pinned rows are destroyed and recreated every tick, so
+     * we must restore selection even when follow_selection is off.
      */
-    pid_t    sel_pid    = 0;
-    float    sel_align  = 0.0f;
-    gboolean have_sel   = FALSE;
+    pid_t    sel_pid         = 0;
+    pid_t    sel_pinned_root = PTREE_UNPINNED;
+    gboolean have_sel        = FALSE;
 
-    if (ctx->follow_selection) {
-        GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
-        if (sel) {
-            GList *rows = gtk_tree_selection_get_selected_rows(sel, NULL);
-            if (rows) {
-                GtkTreePath *sel_path = rows->data;
-                /* sel_path is a sort-model path; sort → underlying store */
-                GtkTreePath *store_path = gtk_tree_model_sort_convert_path_to_child_path(
-                    ctx->sort_model, sel_path);
-                GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
-                    ctx->sort_model);
-                GtkTreeIter sel_iter;
-                if (store_path &&
-                    gtk_tree_model_get_iter(child_model,
-                                           &sel_iter, store_path)) {
-                    gint pid;
-                    gtk_tree_model_get(child_model, &sel_iter,
-                                       COL_PID, &pid, -1);
-                    sel_pid = (pid_t)pid;
-
-                    GdkRectangle cell_rect;
-                    gtk_tree_view_get_cell_area(ctx->view, sel_path, NULL, &cell_rect);
-
-                    GdkRectangle vis_rect;
-                    gtk_tree_view_get_visible_rect(ctx->view, &vis_rect);
-
-                    double vp_y = (double)(cell_rect.y - vis_rect.y);
-                    double vp_h = (double)vis_rect.height;
-                    if (vp_h > 0)
-                        sel_align = (float)(vp_y / vp_h);
-                    if (sel_align < 0.0f) sel_align = 0.0f;
-                    if (sel_align > 1.0f) sel_align = 1.0f;
-                    have_sel = TRUE;
-                }
-                if (store_path)
-                    gtk_tree_path_free(store_path);
-                g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+    {
+        GList *rows = gtk_tree_selection_get_selected_rows(tree_sel, NULL);
+        if (rows) {
+            GtkTreePath *sel_path = rows->data;
+            /* sel_path is a sort-model path; sort → underlying store */
+            GtkTreePath *store_path = gtk_tree_model_sort_convert_path_to_child_path(
+                ctx->sort_model, sel_path);
+            GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
+                ctx->sort_model);
+            GtkTreeIter sel_iter;
+            if (store_path &&
+                gtk_tree_model_get_iter(child_model,
+                                       &sel_iter, store_path)) {
+                gint pid, pr;
+                gtk_tree_model_get(child_model, &sel_iter,
+                                   COL_PID, &pid,
+                                   COL_PINNED_ROOT, &pr, -1);
+                sel_pid         = (pid_t)pid;
+                sel_pinned_root = (pid_t)pr;
+                have_sel = TRUE;
             }
+            if (store_path)
+                gtk_tree_path_free(store_path);
+            g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
         }
     }
 
@@ -706,8 +834,58 @@ static gboolean on_refresh(gpointer data)
             goto finish;
         }
     } else {
+        /* Remove pinned copies before the incremental update so that
+         * duplicate PIDs don't confuse the diff algorithm. */
+        remove_pinned_rows(ctx->store);
         /* Incremental: update in-place, no clear, no flash */
         update_store(ctx->store, ctx->view, local, count);
+    }
+
+    /* Rebuild pinned subtrees (copies of pinned PIDs at the top) */
+    rebuild_pinned_rows(ctx->store,
+                        ctx->pinned_pids, ctx->pinned_count);
+
+    /* Expand pinned subtrees according to stored collapse/expand state.
+     * Pinned rows are rebuilt from scratch every tick, so they default
+     * to collapsed in the view.  Walk top-level pinned rows in the
+     * sort model and apply the per-pinned-root expand state. */
+    if (ctx->pinned_count > 0) {
+        GtkTreeModel *sort = GTK_TREE_MODEL(ctx->sort_model);
+        GtkTreeIter sort_iter;
+        gboolean valid = gtk_tree_model_get_iter_first(sort, &sort_iter);
+        while (valid) {
+            GtkTreeIter store_iter;
+            gtk_tree_model_sort_convert_iter_to_child_iter(
+                ctx->sort_model, &store_iter, &sort_iter);
+            GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
+                ctx->sort_model);
+            gint pr = 0;
+            gtk_tree_model_get(child_model, &store_iter,
+                               COL_PINNED_ROOT, &pr, -1);
+            if (pr != (gint)PTREE_UNPINNED) {
+                /* This is a pinned top-level row – expand it and
+                 * its children according to stored state. */
+                GtkTreePath *sort_path = gtk_tree_model_get_path(
+                    sort, &sort_iter);
+                if (sort_path) {
+                    gint pid;
+                    gtk_tree_model_get(child_model, &store_iter,
+                                       COL_PID, &pid, -1);
+                    pid_t pinned_root = (pid_t)pr;
+                    if (get_process_tree_node(&ctx->ptree_nodes,
+                                              pinned_root, (pid_t)pid)
+                        != PTREE_COLLAPSED) {
+                        gtk_tree_view_expand_row(ctx->view, sort_path,
+                                                 FALSE);
+                        /* Recurse: expand children respecting state */
+                        expand_respecting_collapsed_recurse(
+                            ctx, sort, &sort_iter);
+                    }
+                    gtk_tree_path_free(sort_path);
+                }
+            }
+            valid = gtk_tree_model_iter_next(sort, &sort_iter);
+        }
     }
 
     /* Recompute group totals (self + all descendants) */
@@ -730,11 +908,18 @@ static gboolean on_refresh(gpointer data)
      * coordinate arithmetic which is unreliable across re-sorts.
      */
     if (have_sel && sel_pid > 0) {
-        /* Find the PID in whichever store the sort model is wrapping */
+        /* Find the PID+pinned_root in whichever store the sort model
+         * is wrapping.  This ensures that when a pinned copy was
+         * selected we re-select the pinned copy, not the original
+         * tree row (which has the same PID but a different
+         * COL_PINNED_ROOT).  Fall back to a plain PID match if the
+         * exact copy is gone (e.g. process exited). */
         GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
             ctx->sort_model);
         GtkTreeIter found_iter;
-        if (find_iter_by_pid(child_model, NULL,
+        if (find_iter_by_pid_and_pinned_root(child_model, NULL,
+                             sel_pid, sel_pinned_root, &found_iter) ||
+            find_iter_by_pid(child_model, NULL,
                              sel_pid, &found_iter)) {
             GtkTreePath *child_path = gtk_tree_model_get_path(
                 child_model, &found_iter);
@@ -747,18 +932,6 @@ static gboolean on_refresh(gpointer data)
                     GtkTreeSelection *sel =
                         gtk_tree_view_get_selection(ctx->view);
                     gtk_tree_selection_select_path(sel, sort_path);
-
-                    /* Only scroll if the row is not already visible */
-                    GdkRectangle cell_rect;
-                    gtk_tree_view_get_cell_area(ctx->view, sort_path,
-                                                NULL, &cell_rect);
-                    GdkRectangle vis_rect;
-                    gtk_tree_view_get_visible_rect(ctx->view, &vis_rect);
-                    int cy = cell_rect.y;
-                    if (cy < vis_rect.y ||
-                        cy + cell_rect.height > vis_rect.y + vis_rect.height)
-                        gtk_tree_view_scroll_to_cell(ctx->view, sort_path,
-                                                     NULL, TRUE, sel_align, 0.0f);
                     gtk_tree_path_free(sort_path);
                 }
                 gtk_tree_path_free(child_path);
@@ -768,6 +941,7 @@ static gboolean on_refresh(gpointer data)
 
     g_signal_handlers_unblock_by_func(ctx->view, on_row_collapsed, ctx);
     g_signal_handlers_unblock_by_func(ctx->view, on_row_expanded,  ctx);
+    g_signal_handlers_unblock_by_func(tree_sel, on_selection_changed, ctx);
 
     /* Update the sidebar detail panel for the selected process */
     sidebar_update(ctx);
@@ -805,17 +979,39 @@ static gboolean on_refresh(gpointer data)
     }
 
     /* Update status bar (left side) */
-    double snap_last = 0, snap_avg = 0, snap_max = 0;
+    long mem_total_kb = 0, mem_avail_kb = 0;
+    {
+        FILE *mf = fopen("/proc/meminfo", "r");
+        if (mf) {
+            char line[256];
+            while (fgets(line, sizeof(line), mf)) {
+                if (sscanf(line, "MemTotal: %ld kB", &mem_total_kb) == 1)
+                    continue;
+                if (sscanf(line, "MemAvailable: %ld kB", &mem_avail_kb) == 1)
+                    continue;
+            }
+            fclose(mf);
+        }
+    }
+    long mem_used_kb = mem_total_kb - mem_avail_kb;
+    if (mem_used_kb < 0) mem_used_kb = 0;
+
+    char mem_used_buf[32], mem_total_buf[32];
+    format_memory(mem_used_kb, mem_used_buf, sizeof(mem_used_buf));
+    format_memory(mem_total_kb, mem_total_buf, sizeof(mem_total_buf));
+
+    long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpus < 1) ncpus = 1;
+
     double ui_last = 0, ui_avg = 0, ui_max = 0;
-    profile_get("snapshot_build", &snap_last, &snap_avg, &snap_max);
-    profile_get("ui_render",     &ui_last,   &ui_avg,   &ui_max);
+    profile_get("ui_render", &ui_last, &ui_avg, &ui_max);
 
     char status[512];
     snprintf(status, sizeof(status),
-             " %zu processes  |  snapshot: %.1f ms (avg %.1f, max %.1f)  |  "
+             " %zu processes  |  %ld CPUs  |  memory: %s / %s  |  "
              "render: %.1f ms (avg %.1f, max %.1f)",
-             count,
-             snap_last, snap_avg, snap_max,
+             count, ncpus,
+             mem_used_buf, mem_total_buf,
              ui_last, ui_avg, ui_max);
     gtk_label_set_text(ctx->status_label, status);
 
@@ -823,23 +1019,46 @@ static gboolean on_refresh(gpointer data)
     return G_SOURCE_CONTINUE;
 
 finish:
-    /* Unblock collapse/expand signals that were blocked above */
+    /* Unblock signals that were blocked above */
     g_signal_handlers_unblock_by_func(ctx->view, on_row_collapsed, ctx);
     g_signal_handlers_unblock_by_func(ctx->view, on_row_expanded,  ctx);
+    g_signal_handlers_unblock_by_func(tree_sel, on_selection_changed, ctx);
 
     /* First refresh done – finish status update, then remove the fast timer */
     {
-        double snap_last = 0, snap_avg = 0, snap_max = 0;
+        long mem_total_kb = 0, mem_avail_kb = 0;
+        {
+            FILE *mf = fopen("/proc/meminfo", "r");
+            if (mf) {
+                char line[256];
+                while (fgets(line, sizeof(line), mf)) {
+                    if (sscanf(line, "MemTotal: %ld kB", &mem_total_kb) == 1)
+                        continue;
+                    if (sscanf(line, "MemAvailable: %ld kB", &mem_avail_kb) == 1)
+                        continue;
+                }
+                fclose(mf);
+            }
+        }
+        long mem_used_kb = mem_total_kb - mem_avail_kb;
+        if (mem_used_kb < 0) mem_used_kb = 0;
+
+        char mem_used_buf[32], mem_total_buf[32];
+        format_memory(mem_used_kb, mem_used_buf, sizeof(mem_used_buf));
+        format_memory(mem_total_kb, mem_total_buf, sizeof(mem_total_buf));
+
+        long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpus < 1) ncpus = 1;
+
         double ui_last = 0, ui_avg = 0, ui_max = 0;
-        profile_get("snapshot_build", &snap_last, &snap_avg, &snap_max);
-        profile_get("ui_render",     &ui_last,   &ui_avg,   &ui_max);
+        profile_get("ui_render", &ui_last, &ui_avg, &ui_max);
 
         char status[512];
         snprintf(status, sizeof(status),
-                 " %zu processes  |  snapshot: %.1f ms (avg %.1f, max %.1f)  |  "
+                 " %zu processes  |  %ld CPUs  |  memory: %s / %s  |  "
                  "render: %.1f ms (avg %.1f, max %.1f)",
-                 count,
-                 snap_last, snap_avg, snap_max,
+                 count, ncpus,
+                 mem_used_buf, mem_total_buf,
                  ui_last, ui_avg, ui_max);
         gtk_label_set_text(ctx->status_label, status);
     }
@@ -1203,7 +1422,7 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     gtk_tree_store_append(dst, &dst_iter, dst_parent);
 
     /* Copy all column values */
-    gint pid, ppid, cpu, rss, grp_rss, grp_cpu;
+    gint pid, ppid, cpu, rss, grp_rss, grp_cpu, pinned_root;
     gint64 start_time;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
@@ -1219,6 +1438,7 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
+        COL_PINNED_ROOT, &pinned_root,
         -1);
 
     gtk_tree_store_set(dst, &dst_iter,
@@ -1230,6 +1450,7 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
+        COL_PINNED_ROOT, pinned_root,
         -1);
 
     g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
@@ -1302,6 +1523,12 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
         -1);
 
+    /* Preserve the pinned_root value already in the filter store row
+     * (it was set when the row was created and should not change). */
+    gint pinned_root;
+    gtk_tree_model_get(GTK_TREE_MODEL(fs), fs_iter,
+                       COL_PINNED_ROOT, &pinned_root, -1);
+
     gtk_tree_store_set(fs, fs_iter,
         COL_PID, pid, COL_PPID, ppid, COL_USER, user, COL_NAME, name,
         COL_CPU, cpu, COL_CPU_TEXT, cpu_text,
@@ -1311,6 +1538,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
+        COL_PINNED_ROOT, pinned_root,
         -1);
 
     g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
@@ -1461,8 +1689,11 @@ static void expand_respecting_collapsed_recurse(ui_ctx_t *ctx,
             gint pid;
             gtk_tree_model_get(child_model, &child_it, COL_PID, &pid, -1);
 
+            /* Use the row's pinned root for collapse/expand lookup */
+            pid_t pinned_root = get_row_pinned_root(child_model, &child_it);
+
             GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
-            if (get_process_tree_node(&ctx->ptree_nodes, FALSE,
+            if (get_process_tree_node(&ctx->ptree_nodes, pinned_root,
                                       (pid_t)pid) == PTREE_COLLAPSED) {
                 gtk_tree_view_collapse_row(ctx->view, path);
             } else {
@@ -1519,7 +1750,7 @@ static void rebuild_filter_store(ui_ctx_t *ctx)
         G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
         G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
         G_TYPE_INT64, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
-        G_TYPE_STRING, G_TYPE_STRING);
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_INT);
 
     find_and_copy_matches(fs, GTK_TREE_MODEL(ctx->store), NULL,
                           filter_lower, FALSE);
@@ -1571,18 +1802,6 @@ static void rebuild_filter_store(ui_ctx_t *ctx)
                     GtkTreeSelection *sel =
                         gtk_tree_view_get_selection(ctx->view);
                     gtk_tree_selection_select_path(sel, sort_path);
-
-                    /* Only scroll if the row ended up off-screen */
-                    GdkRectangle cell_rect;
-                    gtk_tree_view_get_cell_area(ctx->view, sort_path,
-                                                NULL, &cell_rect);
-                    GdkRectangle vis_rect;
-                    gtk_tree_view_get_visible_rect(ctx->view, &vis_rect);
-                    int cy = cell_rect.y;
-                    if (cy < vis_rect.y ||
-                        cy + cell_rect.height > vis_rect.y + vis_rect.height)
-                        gtk_tree_view_scroll_to_cell(
-                            ctx->view, sort_path, NULL, FALSE, 0, 0);
                     gtk_tree_path_free(sort_path);
                 }
                 gtk_tree_path_free(child_path);
@@ -2045,13 +2264,79 @@ static void on_destroy(GtkWidget *w, gpointer data)
  * descending.  Most users expect ▲ = highest first.  We fix this by
  * negating the comparison so GTK's "ascending" actually sorts
  * descending-by-value, making the arrow intuitive.
+ *
+ * Pinned top-level rows (COL_PINNED_ROOT != PTREE_UNPINNED) always
+ * sort above normal top-level rows.  Among pinned rows the normal
+ * column sort order applies.
  */
+
+/* Helper: compare two top-level iters by pinned status.
+ *
+ * Pinned rows must always appear visually above non-pinned rows,
+ * regardless of the current sort column or direction.
+ *
+ * Because our sort functions invert the comparison (so GTK's
+ * "ascending" displays largest first) AND GTK itself negates
+ * the result when the direction is descending, the sign we
+ * need to return flips depending on the current sort order.
+ *
+ * GTK "ascending" + our inversion  → return  1 means a BEFORE b
+ * GTK "descending" + our inversion → return -1 means a BEFORE b
+ *
+ * Returns 0 when both rows have the same pinned status or when
+ * the rows are not both top-level (children sort normally).
+ */
+static inline int pinned_cmp(GtkTreeModel *model,
+                             GtkTreeIter  *a,
+                             GtkTreeIter  *b)
+{
+    /* Check depth: only top-level rows participate in pinned ordering.
+     * A quick way: see if the iter has a parent. */
+    GtkTreeIter parent_a, parent_b;
+    gboolean a_top = !gtk_tree_model_iter_parent(model, &parent_a, a);
+    gboolean b_top = !gtk_tree_model_iter_parent(model, &parent_b, b);
+
+    if (!a_top || !b_top)
+        return 0;  /* children within a subtree: normal sort */
+
+    gint pa = 0, pb = 0;
+    gtk_tree_model_get(model, a, COL_PINNED_ROOT, &pa, -1);
+    gtk_tree_model_get(model, b, COL_PINNED_ROOT, &pb, -1);
+
+    gboolean a_pinned = (pa != (gint)PTREE_UNPINNED);
+    gboolean b_pinned = (pb != (gint)PTREE_UNPINNED);
+
+    if (a_pinned == b_pinned)
+        return 0;  /* both pinned or both unpinned → normal sort */
+
+    /* Determine effective sign: we need "pinned row first" in both
+     * ascending and descending modes.
+     *
+     * Our sort funcs already invert (ascending → largest first).
+     * GTK applies an extra negation when direction == descending.
+     *
+     *   ascending:  return  1 → GTK displays a before b  (inverted)
+     *   descending: return -1 → GTK negates to 1 → a before b
+     *
+     * So: ascending needs +1 for "a first", descending needs -1.      */
+    GtkSortType order = GTK_SORT_ASCENDING;
+    gint sort_col = GTK_TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID;
+    gtk_tree_sortable_get_sort_column_id(GTK_TREE_SORTABLE(model),
+                                         &sort_col, &order);
+
+    int sign = (order == GTK_SORT_ASCENDING) ? 1 : -1;
+
+    return a_pinned ? sign : -sign;
+}
 
 static gint sort_int_inverted(GtkTreeModel *model,
                               GtkTreeIter  *a,
                               GtkTreeIter  *b,
                               gpointer      col_id_ptr)
 {
+    int pc = pinned_cmp(model, a, b);
+    if (pc) return pc;
+
     gint col = GPOINTER_TO_INT(col_id_ptr);
     gint va = 0, vb = 0;
     gtk_tree_model_get(model, a, col, &va, -1);
@@ -2065,6 +2350,9 @@ static gint sort_string_inverted(GtkTreeModel *model,
                                  GtkTreeIter  *b,
                                  gpointer      col_id_ptr)
 {
+    int pc = pinned_cmp(model, a, b);
+    if (pc) return pc;
+
     gint col = GPOINTER_TO_INT(col_id_ptr);
     gchar *sa = NULL, *sb = NULL;
     gtk_tree_model_get(model, a, col, &sa, -1);
@@ -2084,6 +2372,9 @@ static gint sort_int64_inverted(GtkTreeModel *model,
                                GtkTreeIter  *b,
                                gpointer      col_id_ptr)
 {
+    int pc = pinned_cmp(model, a, b);
+    if (pc) return pc;
+
     gint col = GPOINTER_TO_INT(col_id_ptr);
     gint64 va = 0, vb = 0;
     gtk_tree_model_get(model, a, col, &va, -1);
@@ -2127,6 +2418,35 @@ static void register_sort_funcs(GtkTreeModelSort *sm)
 }
 
 /* ── public entry point ──────────────────────────────────────── */
+
+/*
+ * Cell data function for the Name column: prepend "➡ " when the
+ * process is pinned.  The process is considered "pinned" when its
+ * own PID appears in the pinned set (regardless of whether the
+ * current row is the pinned copy or the original tree entry).
+ */
+static void name_cell_data_func(GtkTreeViewColumn *col,
+                                GtkCellRenderer   *cell,
+                                GtkTreeModel      *model,
+                                GtkTreeIter       *iter,
+                                gpointer           data)
+{
+    (void)col;
+    ui_ctx_t *ctx = data;
+
+    gchar *name = NULL;
+    gint pid = 0;
+    gtk_tree_model_get(model, iter, COL_NAME, &name, COL_PID, &pid, -1);
+
+    if (name && pid_is_pinned(ctx, (pid_t)pid)) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), "➡ %s", name);
+        g_object_set(cell, "text", buf, NULL);
+    } else {
+        g_object_set(cell, "text", name ? name : "", NULL);
+    }
+    g_free(name);
+}
 
 void *ui_thread(void *arg)
 {
@@ -2211,7 +2531,8 @@ void *ui_thread(void *arg)
                                              G_TYPE_STRING,   /* container    */
                                              G_TYPE_STRING,   /* service      */
                                              G_TYPE_STRING,   /* CWD          */
-                                             G_TYPE_STRING);  /* CMDLINE      */
+                                             G_TYPE_STRING,   /* CMDLINE      */
+                                             G_TYPE_INT);     /* PINNED_ROOT  */
 
     /* Sort model wraps the store directly (no filter model – we use
      * a shadow store approach for filtering instead). */
@@ -2630,7 +2951,7 @@ void *ui_thread(void *arg)
     ctx.fd_css       = fd_css;
     ctx.font_size    = FONT_SIZE_DEFAULT;
     ctx.auto_font    = FALSE;
-    ctx.ptree_nodes  = (ptree_node_set_t){ NULL, NULL, 0, 0 };
+    ctx.ptree_nodes  = (ptree_node_set_t){ NULL, NULL, NULL, 0, 0 };
     ctx.follow_selection = FALSE;
 
     /* Name filter */
@@ -2667,6 +2988,24 @@ void *ui_thread(void *arg)
     ctx.fd_group_dup_active = FALSE;
     ctx.fd_collapsed        = 0;
     ctx.fd_last_pid         = 0;
+
+    /* Pinned processes */
+    ctx.pinned_pids     = NULL;
+    ctx.pinned_count    = 0;
+    ctx.pinned_capacity = 0;
+
+    /* Set up the Name column cell data function so pinned processes
+     * get the ➡ prefix.  We need ctx to be initialised first. */
+    {
+        GList *renderers = gtk_cell_layout_get_cells(
+            GTK_CELL_LAYOUT(name_col));
+        if (renderers) {
+            GtkCellRenderer *name_r = renderers->data;
+            gtk_tree_view_column_set_cell_data_func(
+                name_col, name_r, name_cell_data_func, &ctx, NULL);
+            g_list_free(renderers);
+        }
+    }
 
     /* Font menu callbacks (need ctx address, so connect after ctx init) */
     g_signal_connect(font_inc,  "activate", G_CALLBACK(on_font_increase),    &ctx);
@@ -2771,10 +3110,18 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     }
 
     /* Free the process tree node set */
-    free(ctx->ptree_nodes.keys);
+    free(ctx->ptree_nodes.pinned_pids);
+    free(ctx->ptree_nodes.pids);
     free(ctx->ptree_nodes.states);
-    ctx->ptree_nodes.keys     = NULL;
-    ctx->ptree_nodes.states   = NULL;
-    ctx->ptree_nodes.count    = 0;
-    ctx->ptree_nodes.capacity = 0;
+    ctx->ptree_nodes.pinned_pids = NULL;
+    ctx->ptree_nodes.pids        = NULL;
+    ctx->ptree_nodes.states      = NULL;
+    ctx->ptree_nodes.count       = 0;
+    ctx->ptree_nodes.capacity    = 0;
+
+    /* Free the pinned PIDs set */
+    free(ctx->pinned_pids);
+    ctx->pinned_pids     = NULL;
+    ctx->pinned_count    = 0;
+    ctx->pinned_capacity = 0;
 }

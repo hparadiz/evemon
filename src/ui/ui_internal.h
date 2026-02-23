@@ -42,6 +42,7 @@ enum {
     COL_SERVICE,       /* systemd unit / openrc service name    */
     COL_CWD,
     COL_CMDLINE,
+    COL_PINNED_ROOT,   /* pid_t of the pinned root, or -1 for normal tree */
     NUM_COLS
 };
 
@@ -52,24 +53,22 @@ enum {
 #define PTREE_COLLAPSED 1
 
 /*
- * Pin bit: OR into the PID key to keep pinned and unpinned process
- * entries in separate key-spaces within the same set.
- *
- *   unpinned key = pid
- *   pinned   key = pid | PTREE_PIN_BIT
+ * Pinned-PID sentinel: used as the pinned_pid value for rows that
+ * belong to the main (unpinned) process tree.
  */
-#define PTREE_PIN_BIT   (1 << 30)
+#define PTREE_UNPINNED  ((pid_t)-1)
 
 typedef struct {
-    int   *keys;       /* PID (possibly | PTREE_PIN_BIT) */
-    int   *states;     /* PTREE_COLLAPSED or PTREE_EXPANDED */
+    pid_t *pinned_pids; /* owning pinned-process PID (PTREE_UNPINNED for main tree) */
+    pid_t *pids;        /* the actual process PID                                  */
+    int   *states;      /* PTREE_COLLAPSED or PTREE_EXPANDED                       */
     size_t count;
     size_t capacity;
 } ptree_node_set_t;
 
-void set_process_tree_node(ptree_node_set_t *s, gboolean pin,
+void set_process_tree_node(ptree_node_set_t *s, pid_t pinned_pid,
                            pid_t pid, int state);
-int  get_process_tree_node(const ptree_node_set_t *s, gboolean pin,
+int  get_process_tree_node(const ptree_node_set_t *s, pid_t pinned_pid,
                            pid_t pid);
 
 /* ── per-UI state ────────────────────────────────────────────── */
@@ -144,6 +143,11 @@ typedef struct {
     GtkTreeViewColumn  *name_col;
     char                filter_text[256];
     guint               filter_hide_timer; /* auto-hide after idle (0=none) */
+
+    /* pinned processes */
+    pid_t              *pinned_pids;     /* dynamic array of pinned PIDs  */
+    size_t              pinned_count;
+    size_t              pinned_capacity;
 } ui_ctx_t;
 
 /* ── fd types ────────────────────────────────────────────────── */
@@ -249,6 +253,11 @@ void populate_store_initial(GtkTreeStore *store, GtkTreeView *view,
 
 long compute_group_rss(GtkTreeStore *store, GtkTreeIter *parent);
 long compute_group_cpu(GtkTreeStore *store, GtkTreeIter *parent);
+
+void rebuild_pinned_rows(GtkTreeStore *store,
+                         const pid_t *pinned_pids, size_t pinned_count);
+
+void remove_pinned_rows(GtkTreeStore *store);
 
 /* ── helpers shared across modules ───────────────────────────── */
 
