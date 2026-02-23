@@ -4,6 +4,8 @@
 #include <sys/types.h>
 #include <pthread.h>
 
+#include "steam.h"
+
 /* Maximum lengths for process info strings */
 #define PROC_NAME_MAX  256
 #define PROC_CMD_MAX   4096
@@ -27,6 +29,7 @@ typedef struct {
     unsigned long long cpu_ticks;   /* utime + stime (USER_HZ ticks)  */
     double   cpu_percent;           /* CPU% since last snapshot        */
     unsigned long long start_time;  /* process start time (epoch secs) */
+    steam_info_t *steam;            /* Steam/Proton metadata (heap, NULL if not Steam) */
 } proc_entry_t;
 
 /* Snapshot of all processes at a point in time */
@@ -34,6 +37,9 @@ typedef struct {
     proc_entry_t *entries;
     size_t        count;
 } proc_snapshot_t;
+
+/* Free a snapshot and all heap-allocated per-entry data (e.g. steam info) */
+void proc_snapshot_free(proc_snapshot_t *snap);
 
 /* Thread-safe shared state between the monitor and the UI */
 typedef struct {

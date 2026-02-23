@@ -3,6 +3,7 @@
  */
 
 #include "ui_internal.h"
+#include "../steam.h"
 
 /* ── sidebar: update detail panel from selection ─────────────── */
 
@@ -30,6 +31,7 @@ void sidebar_update(ui_ctx_t *ctx)
         gtk_label_set_text(ctx->sb_service,   "–");
         gtk_label_set_text(ctx->sb_cwd,       "–");
         gtk_label_set_text(ctx->sb_cmdline,   "–");
+        gtk_widget_hide(ctx->sb_steam_frame);
         gtk_tree_store_clear(ctx->fd_store);
         return;
     }
@@ -53,7 +55,7 @@ void sidebar_update(ui_ctx_t *ctx)
     gchar *user = NULL, *name = NULL, *cpu_text = NULL;
     gchar *rss_text = NULL, *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *start_time_text = NULL, *container = NULL, *service = NULL,
-          *cwd = NULL, *cmdline = NULL;
+          *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
 
     gtk_tree_model_get(child_model, &iter,
                        COL_PID,            &pid,
@@ -70,6 +72,7 @@ void sidebar_update(ui_ctx_t *ctx)
                        COL_SERVICE,        &service,
                        COL_CWD,           &cwd,
                        COL_CMDLINE,        &cmdline,
+                       COL_STEAM_LABEL,    &steam_label,
                        -1);
     (void)cpu_raw; (void)rss; (void)grp_rss; (void)grp_cpu;
 
@@ -100,13 +103,93 @@ void sidebar_update(ui_ctx_t *ctx)
     gtk_label_set_text(ctx->sb_cwd,       cwd       ? cwd       : "–");
     gtk_label_set_text(ctx->sb_cmdline,   cmdline   ? cmdline   : "–");
 
+    /* ── Steam / Proton metadata ─────────────────────────────── */
+    {
+        /* The monitor already tagged this row via COL_STEAM_LABEL using
+         * multi-pass parent-inheritance.  Use that as the authoritative
+         * "is this a Steam process?" flag.  If it is, probe environ
+         * for the full metadata — trying the process itself first, then
+         * walking up ancestors until one has the Steam env vars. */
+        gboolean is_steam = (steam_label && steam_label[0]);
+        steam_info_t *si = NULL;
+
+        if (is_steam && pid > 0) {
+            si = steam_detect((pid_t)pid, name, cmdline, NULL);
+
+            /* If the process itself doesn't carry the env vars (common
+             * for Wine children that inherited via the process tree),
+             * walk up ancestors in the tree model until we find one
+             * whose environ does contain them, then re-detect with
+             * parent context so the child inherits. */
+            if (!si) {
+                GtkTreeIter ancestor = iter;
+                while (!si) {
+                    GtkTreeIter parent_iter;
+                    if (!gtk_tree_model_iter_parent(child_model, &parent_iter,
+                                                    &ancestor))
+                        break;
+                    ancestor = parent_iter;
+                    gint anc_pid = 0;
+                    gchar *anc_name = NULL, *anc_cmd = NULL;
+                    gtk_tree_model_get(child_model, &ancestor,
+                                       COL_PID, &anc_pid,
+                                       COL_NAME, &anc_name,
+                                       COL_CMDLINE, &anc_cmd, -1);
+                    steam_info_t *parent_si =
+                        steam_detect((pid_t)anc_pid, anc_name, anc_cmd, NULL);
+                    g_free(anc_name);
+                    g_free(anc_cmd);
+                    if (parent_si) {
+                        /* Re-detect the selected process with parent context */
+                        si = steam_detect((pid_t)pid, name, cmdline, parent_si);
+                        if (!si) {
+                            /* Fall back to using the parent's info directly */
+                            si = parent_si;
+                        } else {
+                            free(parent_si);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (si) {
+            gtk_label_set_text(ctx->sb_steam_game,
+                               si->game_name[0]      ? si->game_name      : "–");
+            gtk_label_set_text(ctx->sb_steam_appid,
+                               si->app_id[0]         ? si->app_id         : "–");
+            gtk_label_set_text(ctx->sb_steam_proton,
+                               si->proton_version[0] ? si->proton_version : "–");
+            gtk_label_set_text(ctx->sb_steam_runtime,
+                               si->runtime_layer[0]  ? si->runtime_layer  : "–");
+            gtk_label_set_text(ctx->sb_steam_compat,
+                               si->compat_data[0]    ? si->compat_data    : "–");
+            gtk_label_set_text(ctx->sb_steam_gamedir,
+                               si->game_dir[0]       ? si->game_dir       : "–");
+            /* Tooltip on game dir for long paths */
+            gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sb_steam_gamedir),
+                                        si->game_dir[0] ? si->game_dir : NULL);
+            gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sb_steam_compat),
+                                        si->compat_data[0] ? si->compat_data : NULL);
+            /* no_show_all is TRUE so that the parent's show_all doesn't
+             * reveal us prematurely.  Temporarily clear it so our own
+             * show_all actually propagates to children.               */
+            gtk_widget_set_no_show_all(ctx->sb_steam_frame, FALSE);
+            gtk_widget_show_all(ctx->sb_steam_frame);
+            gtk_widget_set_no_show_all(ctx->sb_steam_frame, TRUE);
+            free(si);
+        } else {
+            gtk_widget_hide(ctx->sb_steam_frame);
+        }
+    }
+
     /* ── populate file descriptor tree (async, off main thread) ── */
     fd_scan_start(ctx, (pid_t)pid);
 
     g_free(user); g_free(name); g_free(cpu_text);
     g_free(rss_text); g_free(grp_rss_text); g_free(grp_cpu_text);
     g_free(start_time_text); g_free(container); g_free(service);
-    g_free(cwd); g_free(cmdline);
+    g_free(cwd); g_free(cmdline); g_free(steam_label);
 
     g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
 }

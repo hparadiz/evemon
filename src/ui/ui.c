@@ -758,15 +758,27 @@ static gboolean on_refresh(gpointer data)
     proc_entry_t *local = NULL;
     if (count > 0) {
         local = malloc(count * sizeof(proc_entry_t));
-        if (local)
+        if (local) {
             memcpy(local, ctx->mon->snapshot.entries,
                    count * sizeof(proc_entry_t));
+            /* Deep-copy heap-allocated steam pointers so the UI's copy
+             * is independent of the monitor's snapshot lifecycle. */
+            for (size_t i = 0; i < count; i++) {
+                if (local[i].steam) {
+                    steam_info_t *copy = malloc(sizeof(steam_info_t));
+                    if (copy)
+                        memcpy(copy, local[i].steam, sizeof(steam_info_t));
+                    local[i].steam = copy;
+                }
+            }
+        }
     }
     pthread_mutex_unlock(&ctx->mon->lock);
 
     if (!running) {
         gtk_main_quit();
-        free(local);
+        proc_snapshot_t tmp = { local, count };
+        proc_snapshot_free(&tmp);
         return G_SOURCE_REMOVE;
     }
 
@@ -1015,7 +1027,7 @@ static gboolean on_refresh(gpointer data)
              ui_last, ui_avg, ui_max);
     gtk_label_set_text(ctx->status_label, status);
 
-    free(local);
+    { proc_snapshot_t tmp = { local, count }; proc_snapshot_free(&tmp); }
     return G_SOURCE_CONTINUE;
 
 finish:
@@ -1062,7 +1074,7 @@ finish:
                  ui_last, ui_avg, ui_max);
         gtk_label_set_text(ctx->status_label, status);
     }
-    free(local);
+    { proc_snapshot_t tmp = { local, count }; proc_snapshot_free(&tmp); }
     return G_SOURCE_REMOVE;
 }
 
@@ -1427,7 +1439,7 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
-          *cwd = NULL, *cmdline = NULL;
+          *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
 
     gtk_tree_model_get(src, src_iter,
         COL_PID, &pid, COL_PPID, &ppid, COL_USER, &user, COL_NAME, &name,
@@ -1438,6 +1450,7 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
+        COL_STEAM_LABEL, &steam_label,
         COL_PINNED_ROOT, &pinned_root,
         -1);
 
@@ -1450,12 +1463,14 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
+        COL_STEAM_LABEL, steam_label,
         COL_PINNED_ROOT, pinned_root,
         -1);
 
     g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
     g_free(grp_rss_text); g_free(grp_cpu_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
+    g_free(steam_label);
 
     /* Recurse into children */
     GtkTreeIter child;
@@ -1510,7 +1525,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
-          *cwd = NULL, *cmdline = NULL;
+          *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
 
     gtk_tree_model_get(real, real_iter,
         COL_PID, &pid, COL_PPID, &ppid, COL_USER, &user, COL_NAME, &name,
@@ -1521,6 +1536,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
+        COL_STEAM_LABEL, &steam_label,
         -1);
 
     /* Preserve the pinned_root value already in the filter store row
@@ -1538,12 +1554,14 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
+        COL_STEAM_LABEL, steam_label,
         COL_PINNED_ROOT, pinned_root,
         -1);
 
     g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
     g_free(grp_rss_text); g_free(grp_cpu_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
+    g_free(steam_label);
 }
 
 /*
@@ -1750,7 +1768,7 @@ static void rebuild_filter_store(ui_ctx_t *ctx)
         G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
         G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
         G_TYPE_INT64, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
-        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_INT);
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_INT);
 
     find_and_copy_matches(fs, GTK_TREE_MODEL(ctx->store), NULL,
                           filter_lower, FALSE);
@@ -2413,6 +2431,8 @@ static void register_sort_funcs(GtkTreeModelSort *sm)
         sort_string_inverted, GINT_TO_POINTER(COL_CONTAINER), NULL);
     gtk_tree_sortable_set_sort_func(sortable, COL_SERVICE,
         sort_string_inverted, GINT_TO_POINTER(COL_SERVICE), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_STEAM_LABEL,
+        sort_string_inverted, GINT_TO_POINTER(COL_STEAM_LABEL), NULL);
     gtk_tree_sortable_set_sort_func(sortable, COL_CWD,
         sort_string_inverted, GINT_TO_POINTER(COL_CWD), NULL);
 }
@@ -2435,17 +2455,28 @@ static void name_cell_data_func(GtkTreeViewColumn *col,
     ui_ctx_t *ctx = data;
 
     gchar *name = NULL;
+    gchar *steam_label = NULL;
     gint pid = 0;
-    gtk_tree_model_get(model, iter, COL_NAME, &name, COL_PID, &pid, -1);
+    gtk_tree_model_get(model, iter,
+                       COL_NAME, &name,
+                       COL_PID, &pid,
+                       COL_STEAM_LABEL, &steam_label,
+                       -1);
 
-    if (name && pid_is_pinned(ctx, (pid_t)pid)) {
+    /* Prefer Steam display label (e.g. "reaper (Steam) · Deadlock [Proton ...]") */
+    const char *display = name;
+    if (steam_label && steam_label[0])
+        display = steam_label;
+
+    if (display && pid_is_pinned(ctx, (pid_t)pid)) {
         char buf[512];
-        snprintf(buf, sizeof(buf), "➡ %s", name);
+        snprintf(buf, sizeof(buf), "➡ %s", display);
         g_object_set(cell, "text", buf, NULL);
     } else {
-        g_object_set(cell, "text", name ? name : "", NULL);
+        g_object_set(cell, "text", display ? display : "", NULL);
     }
     g_free(name);
+    g_free(steam_label);
 }
 
 void *ui_thread(void *arg)
@@ -2532,6 +2563,7 @@ void *ui_thread(void *arg)
                                              G_TYPE_STRING,   /* service      */
                                              G_TYPE_STRING,   /* CWD          */
                                              G_TYPE_STRING,   /* CMDLINE      */
+                                             G_TYPE_STRING,   /* STEAM_LABEL  */
                                              G_TYPE_INT);     /* PINNED_ROOT  */
 
     /* Sort model wraps the store directly (no filter model – we use
@@ -2759,9 +2791,66 @@ void *ui_thread(void *arg)
     SIDEBAR_ROW(12, "Command",         sb_cmdline);
     #undef SIDEBAR_ROW
 
+    /* ── Steam / Proton metadata section ──────────────────────── */
+    /* Wrap the entire Steam section in a GtkBox so we can show/hide
+     * it as a single unit from sidebar_update(). */
+    GtkWidget *steam_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    GtkWidget *steam_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(steam_box), steam_sep, FALSE, FALSE, 0);
+
+    GtkWidget *steam_header = gtk_label_new("Steam / Proton");
+    gtk_label_set_xalign(GTK_LABEL(steam_header), 0.0f);
+    {
+        PangoAttrList *a = pango_attr_list_new();
+        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(steam_header), a);
+        pango_attr_list_unref(a);
+    }
+    gtk_box_pack_start(GTK_BOX(steam_box), steam_header, FALSE, FALSE, 0);
+
+    GtkWidget *steam_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(steam_grid), 8);
+    gtk_box_pack_start(GTK_BOX(steam_box), steam_grid, FALSE, FALSE, 0);
+
+    /* Re-use the SIDEBAR_ROW pattern for Steam fields. */
+    #define SIDEBAR_ROW_S(row, key_str, label_var) do { \
+        GtkWidget *_k = gtk_label_new(key_str);                          \
+        gtk_label_set_xalign(GTK_LABEL(_k), 0.0f);                      \
+        gtk_widget_set_halign(_k, GTK_ALIGN_START);                      \
+        PangoAttrList *_a = pango_attr_list_new();                       \
+        pango_attr_list_insert(_a, pango_attr_weight_new(PANGO_WEIGHT_BOLD)); \
+        gtk_label_set_attributes(GTK_LABEL(_k), _a);                     \
+        pango_attr_list_unref(_a);                                       \
+        GtkWidget *_v = gtk_label_new("–");                              \
+        gtk_label_set_xalign(GTK_LABEL(_v), 0.0f);                      \
+        gtk_label_set_selectable(GTK_LABEL(_v), TRUE);                   \
+        gtk_label_set_ellipsize(GTK_LABEL(_v), PANGO_ELLIPSIZE_END);     \
+        gtk_widget_set_halign(_v, GTK_ALIGN_START);                      \
+        gtk_widget_set_hexpand(_v, TRUE);                                \
+        gtk_grid_attach(GTK_GRID(steam_grid), _k, 0, row, 1, 1);        \
+        gtk_grid_attach(GTK_GRID(steam_grid), _v, 1, row, 1, 1);        \
+        label_var = GTK_LABEL(_v);                                       \
+    } while (0)
+
+    GtkLabel *sb_steam_game, *sb_steam_appid, *sb_steam_proton;
+    GtkLabel *sb_steam_runtime, *sb_steam_compat, *sb_steam_gamedir;
+
+    SIDEBAR_ROW_S(0, "Game",            sb_steam_game);
+    SIDEBAR_ROW_S(1, "App ID",          sb_steam_appid);
+    SIDEBAR_ROW_S(2, "Proton",          sb_steam_proton);
+    SIDEBAR_ROW_S(3, "Runtime",         sb_steam_runtime);
+    SIDEBAR_ROW_S(4, "Compat Data",     sb_steam_compat);
+    SIDEBAR_ROW_S(5, "Game Directory",  sb_steam_gamedir);
+    #undef SIDEBAR_ROW_S
+
+    /* Hidden by default – sidebar_update shows it for Steam processes */
+    gtk_widget_set_no_show_all(steam_box, TRUE);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), steam_box, 0, 13, 2, 1);
+
     /* ── file descriptors section ─────────────────────────────── */
     GtkWidget *fd_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_sep, 0, 13, 2, 1);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_sep, 0, 14, 2, 1);
 
     /* Header label */
     GtkWidget *fd_header = gtk_label_new("Open File Descriptors");
@@ -2772,17 +2861,17 @@ void *ui_thread(void *arg)
         gtk_label_set_attributes(GTK_LABEL(fd_header), a);
         pango_attr_list_unref(a);
     }
-    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_header, 0, 14, 2, 1);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_header, 0, 15, 2, 1);
 
     /* "Include descendants" toggle */
     GtkWidget *fd_desc_toggle = gtk_check_button_new_with_label(
         "Include descendant tree");
-    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_desc_toggle, 0, 15, 1, 1);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_desc_toggle, 0, 16, 1, 1);
 
     /* "Group duplicates" toggle */
     GtkWidget *fd_group_dup_toggle = gtk_check_button_new_with_label(
         "Group duplicates");
-    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_group_dup_toggle, 1, 15, 1, 1);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_group_dup_toggle, 1, 16, 1, 1);
 
     /* Scrollable tree view for the fd list */
     GtkTreeStore *fd_store = gtk_tree_store_new(FD_NUM_COLS,
@@ -2824,7 +2913,7 @@ void *ui_thread(void *arg)
     gtk_widget_set_size_request(fd_scroll, -1, 200);
     gtk_widget_set_vexpand(fd_scroll, TRUE);
     gtk_container_add(GTK_CONTAINER(fd_scroll), fd_tree);
-    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_scroll, 0, 16, 2, 1);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_scroll, 0, 17, 2, 1);
 
     gtk_container_add(GTK_CONTAINER(sidebar_scroll), sidebar_grid);
 
@@ -2978,6 +3067,15 @@ void *ui_thread(void *arg)
     ctx.sb_service    = sb_service;
     ctx.sb_cwd        = sb_cwd;
     ctx.sb_cmdline    = sb_cmdline;
+
+    /* Steam/Proton sidebar */
+    ctx.sb_steam_game    = sb_steam_game;
+    ctx.sb_steam_appid   = sb_steam_appid;
+    ctx.sb_steam_proton  = sb_steam_proton;
+    ctx.sb_steam_runtime = sb_steam_runtime;
+    ctx.sb_steam_compat  = sb_steam_compat;
+    ctx.sb_steam_gamedir = sb_steam_gamedir;
+    ctx.sb_steam_frame   = steam_box;     /* show/hide entire Steam section */
 
     /* File descriptor list */
     ctx.fd_store        = fd_store;

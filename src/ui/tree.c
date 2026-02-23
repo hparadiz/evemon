@@ -145,6 +145,7 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
                        COL_SERVICE,    e->service[0]   ? e->service   : "",
                        COL_CWD,      e->cwd,
                        COL_CMDLINE,  e->cmdline,
+                       COL_STEAM_LABEL, (e->steam && e->steam->is_steam) ? e->steam->display_label : "",
                        COL_PINNED_ROOT, (gint)PTREE_UNPINNED,
                        -1);
 }
@@ -450,7 +451,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
-          *cwd = NULL, *cmdline = NULL;
+          *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
 
     gtk_tree_model_get(src, src_iter,
         COL_PID, &pid, COL_PPID, &ppid, COL_USER, &user, COL_NAME, &name,
@@ -461,6 +462,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
+        COL_STEAM_LABEL, &steam_label,
         -1);
 
     gtk_tree_store_set(dst, &dst_iter,
@@ -472,12 +474,14 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
+        COL_STEAM_LABEL, steam_label,
         COL_PINNED_ROOT, pinned_root,
         -1);
 
     g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
     g_free(grp_rss_text); g_free(grp_cpu_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
+    g_free(steam_label);
 
     /* Recurse into children */
     GtkTreeIter child;

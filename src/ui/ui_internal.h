@@ -42,6 +42,7 @@ enum {
     COL_SERVICE,       /* systemd unit / openrc service name    */
     COL_CWD,
     COL_CMDLINE,
+    COL_STEAM_LABEL,   /* Steam/Proton display label (string) */
     COL_PINNED_ROOT,   /* pid_t of the pinned root, or -1 for normal tree */
     NUM_COLS
 };
@@ -110,6 +111,15 @@ typedef struct {
     GtkLabel           *sb_service;
     GtkLabel           *sb_cwd;
     GtkLabel           *sb_cmdline;
+
+    /* Steam/Proton metadata in sidebar */
+    GtkLabel           *sb_steam_game;
+    GtkLabel           *sb_steam_appid;
+    GtkLabel           *sb_steam_proton;
+    GtkLabel           *sb_steam_runtime;
+    GtkLabel           *sb_steam_compat;
+    GtkLabel           *sb_steam_gamedir;
+    GtkWidget          *sb_steam_frame;     /* container to show/hide */
 
     /* file descriptor list in sidebar */
     GtkTreeStore       *fd_store;

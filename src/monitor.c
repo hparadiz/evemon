@@ -7,6 +7,7 @@
  */
 
 #include "proc.h"
+#include "steam.h"
 #include "profile.h"
 
 #include <stdio.h>
@@ -738,14 +739,89 @@ static proc_snapshot_t build_snapshot(void)
         read_service(pid, e->ppid, e->service, sizeof(e->service),
                      &openrc_map);
 
+        /* Steam/Proton metadata detection — deferred to second pass
+         * so parent entries are available for inheritance.  Zero-init
+         * for now. */
+        memset(&e->steam, 0, sizeof(e->steam));
+
         snap.count++;
     }
 
     closedir(dp);
+
+    /* ── Steam/Proton metadata: second pass ──────────────────── *
+     * We need parent entries to already exist so that children   *
+     * can inherit Steam metadata.  Build a PID→index hash, then *
+     * iterate in any order — each entry looks up its parent.     */
+    {
+        /* Reuse a simple open-addressing hash: PID → index */
+        #define STEAM_HT_SIZE 8192
+        typedef struct { pid_t pid; size_t idx; int used; } sht_entry_t;
+        sht_entry_t *sht = calloc(STEAM_HT_SIZE, sizeof(sht_entry_t));
+        if (sht) {
+            for (size_t i = 0; i < snap.count; i++) {
+                unsigned h = (unsigned)snap.entries[i].pid % STEAM_HT_SIZE;
+                while (sht[h].used)
+                    h = (h + 1) % STEAM_HT_SIZE;
+                sht[h].pid  = snap.entries[i].pid;
+                sht[h].idx  = i;
+                sht[h].used = 1;
+            }
+
+            /* Process entries in ancestor-first order.  A quick way
+             * is to iterate multiple times until no new detections
+             * occur, but in practice a single pass with parent-lookup
+             * handles 99% of cases because Steam trees are shallow. */
+            for (int pass = 0; pass < 4; pass++) {
+                int new_detections = 0;
+                for (size_t i = 0; i < snap.count; i++) {
+                    proc_entry_t *e = &snap.entries[i];
+                    if (e->steam)
+                        continue;  /* already detected */
+
+                    /* Find parent's steam info (if any) */
+                    const steam_info_t *parent_si = NULL;
+                    if (e->ppid > 0) {
+                        unsigned h = (unsigned)e->ppid % STEAM_HT_SIZE;
+                        for (int k = 0; k < STEAM_HT_SIZE; k++) {
+                            if (!sht[h].used) break;
+                            if (sht[h].pid == e->ppid) {
+                                parent_si = snap.entries[sht[h].idx].steam;
+                                break;
+                            }
+                            h = (h + 1) % STEAM_HT_SIZE;
+                        }
+                    }
+
+                    e->steam = steam_detect(e->pid, e->name, e->cmdline,
+                                            parent_si);
+                    if (e->steam)
+                        new_detections++;
+                }
+                if (new_detections == 0)
+                    break;
+            }
+
+            free(sht);
+        }
+        #undef STEAM_HT_SIZE
+    }
+
     return snap;
 }
 
 /* ── public API ──────────────────────────────────────────────── */
+
+void proc_snapshot_free(proc_snapshot_t *snap)
+{
+    if (snap->entries) {
+        for (size_t i = 0; i < snap->count; i++)
+            free(snap->entries[i].steam);   /* NULL-safe */
+        free(snap->entries);
+        snap->entries = NULL;
+        snap->count   = 0;
+    }
+}
 
 int monitor_state_init(monitor_state_t *state)
 {
@@ -764,9 +840,7 @@ int monitor_state_init(monitor_state_t *state)
 void monitor_state_destroy(monitor_state_t *state)
 {
     pthread_mutex_lock(&state->lock);
-    free(state->snapshot.entries);
-    state->snapshot.entries = NULL;
-    state->snapshot.count   = 0;
+    proc_snapshot_free(&state->snapshot);
     pthread_mutex_unlock(&state->lock);
 
     pthread_cond_destroy(&state->updated);
@@ -828,7 +902,7 @@ void *monitor_thread(void *arg)
 
         /* Swap it in */
         pthread_mutex_lock(&state->lock);
-        free(state->snapshot.entries);
+        proc_snapshot_free(&state->snapshot);
         state->snapshot = snap;
         pthread_cond_signal(&state->updated);
         pthread_mutex_unlock(&state->lock);
