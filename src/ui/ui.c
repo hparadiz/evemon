@@ -12,8 +12,11 @@
 
 #include "ui_internal.h"
 
+#include <fontconfig/fontconfig.h>
+#include <pango/pangocairo.h>
 #include <math.h>
 #include <signal.h>
+#include <unistd.h>
 #include <utmpx.h>
 
 /* Forward declarations for filter helpers */
@@ -1238,23 +1241,43 @@ static GtkWidget *build_theme_submenu(void)
     return menu;
 }
 
-static void on_menu_about(GtkMenuItem *item, gpointer data)
-{
-    (void)item;
-    GtkWidget *window = data;
+/* ── neofetch-style About dialog (from about.inc) ────────────── */
 
-    GtkWidget *dlg = gtk_message_dialog_new(
-        GTK_WINDOW(window),
-        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-        GTK_MESSAGE_INFO,
-        GTK_BUTTONS_OK,
-        "allmon – Process Monitor\n"
-        "Version 0.1.0\n\n"
-        "A lightweight Linux process monitor\n"
-        "with a hierarchical tree view.");
-    gtk_dialog_run(GTK_DIALOG(dlg));
-    gtk_widget_destroy(dlg);
+/*
+ * Read a value from /etc/os-release.  Looks for lines like:
+ *   KEY="value"   or   KEY=value
+ * Returns a strdup'd string (caller frees), or NULL if not found.
+ */
+static char *read_os_release_field(const char *key)
+{
+    FILE *f = fopen("/etc/os-release", "r");
+    if (!f) return NULL;
+
+    size_t klen = strlen(key);
+    char line[512];
+    char *result = NULL;
+
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, klen) == 0 && line[klen] == '=') {
+            char *val = line + klen + 1;
+            /* Strip trailing newline */
+            size_t vlen = strlen(val);
+            while (vlen > 0 && (val[vlen - 1] == '\n' || val[vlen - 1] == '\r'))
+                val[--vlen] = '\0';
+            /* Strip surrounding quotes */
+            if (vlen >= 2 && val[0] == '"' && val[vlen - 1] == '"') {
+                val[vlen - 1] = '\0';
+                val++;
+            }
+            result = strdup(val);
+            break;
+        }
+    }
+    fclose(f);
+    return result;
 }
+
+#include "about.inc"
 
 /* ── font helpers ─────────────────────────────────────────────── */
 

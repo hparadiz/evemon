@@ -2,5 +2,6 @@
 <gresources>
   <gresource prefix="/org/allmon">
     <file alias="icon.png">../icon.png</file>
+    <file alias="font-logos.ttf">../font-logos.ttf</file>
   </gresource>
 </gresources>

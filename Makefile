@@ -55,8 +55,8 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/ui/%.o: $(SRC_DIR)/ui/%.c | $(BUILD_DIR)/ui
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# GResource — compile XML + icon.png into a C source, then into .o
-$(GRES_C): $(GRES_XML) icon.png | $(BUILD_DIR)
+# GResource — compile XML + icon.png + font-logos.ttf into a C source, then into .o
+$(GRES_C): $(GRES_XML) icon.png font-logos.ttf | $(BUILD_DIR)
 	glib-compile-resources --sourcedir=$(SRC_DIR) --generate-source --target=$@ $<
 
 $(GRES_O): $(GRES_C)
