@@ -1289,6 +1289,16 @@ static void reload_font_css(ui_ctx_t *ctx)
                  fd_size);
         gtk_css_provider_load_from_data(ctx->fd_css, buf, -1, NULL);
     }
+
+    /* Env tree in sidebar (same size as fd tree) */
+    if (ctx->env_css) {
+        int env_size = ctx->font_size > FONT_SIZE_MIN
+                     ? ctx->font_size - 1 : ctx->font_size;
+        snprintf(buf, sizeof(buf),
+                 "treeview { font-family: Monospace; font-size: %dpt; }",
+                 env_size);
+        gtk_css_provider_load_from_data(ctx->env_css, buf, -1, NULL);
+    }
 }
 
 /* ── desktop-environment–aware modifier detection ─────────────── */
@@ -2915,6 +2925,60 @@ void *ui_thread(void *arg)
     gtk_container_add(GTK_CONTAINER(fd_scroll), fd_tree);
     gtk_grid_attach(GTK_GRID(sidebar_grid), fd_scroll, 0, 17, 2, 1);
 
+    /* ── environment variables section ────────────────────────── */
+    GtkWidget *env_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), env_sep, 0, 18, 2, 1);
+
+    GtkWidget *env_header = gtk_label_new("Environment Variables");
+    gtk_label_set_xalign(GTK_LABEL(env_header), 0.0f);
+    {
+        PangoAttrList *a = pango_attr_list_new();
+        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(env_header), a);
+        pango_attr_list_unref(a);
+    }
+    gtk_grid_attach(GTK_GRID(sidebar_grid), env_header, 0, 19, 2, 1);
+
+    GtkTreeStore *env_store = gtk_tree_store_new(ENV_NUM_COLS,
+                                                 G_TYPE_STRING,   /* ENV_COL_TEXT   */
+                                                 G_TYPE_STRING,   /* ENV_COL_MARKUP */
+                                                 G_TYPE_INT);     /* ENV_COL_CAT    */
+    GtkWidget *env_tree = gtk_tree_view_new_with_model(
+        GTK_TREE_MODEL(env_store));
+    g_object_unref(env_store);
+
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(env_tree), FALSE);
+    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(env_tree), TRUE);
+
+    GtkCellRenderer *env_r = gtk_cell_renderer_text_new();
+    g_object_set(env_r, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+    GtkTreeViewColumn *env_col = gtk_tree_view_column_new_with_attributes(
+        "Env", env_r, "markup", ENV_COL_MARKUP, NULL);
+    gtk_tree_view_column_set_expand(env_col, TRUE);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(env_tree), env_col);
+
+    /* Monospace CSS for the env tree (1pt smaller than main, like fd tree) */
+    GtkCssProvider *env_css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(env_css,
+        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(env_tree),
+        GTK_STYLE_PROVIDER(env_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    /* NOTE: don't unref env_css – kept alive for dynamic font changes */
+
+    GtkTreeSelection *env_sel = gtk_tree_view_get_selection(
+        GTK_TREE_VIEW(env_tree));
+    gtk_tree_selection_set_mode(env_sel, GTK_SELECTION_SINGLE);
+
+    GtkWidget *env_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(env_scroll),
+                                   GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(env_scroll, -1, 200);
+    gtk_widget_set_vexpand(env_scroll, TRUE);
+    gtk_container_add(GTK_CONTAINER(env_scroll), env_tree);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), env_scroll, 0, 20, 2, 1);
+
     gtk_container_add(GTK_CONTAINER(sidebar_scroll), sidebar_grid);
 
     GtkWidget *sidebar_frame = gtk_frame_new("Details");
@@ -3087,6 +3151,15 @@ void *ui_thread(void *arg)
     ctx.fd_collapsed        = 0;
     ctx.fd_last_pid         = 0;
 
+    /* Environment variable list */
+    ctx.env_store      = env_store;
+    ctx.env_view       = GTK_TREE_VIEW(env_tree);
+    ctx.env_css        = env_css;
+    ctx.env_collapsed  = 0;
+    ctx.env_last_pid   = 0;
+    ctx.env_generation = 0;
+    ctx.env_cancel     = NULL;
+
     /* Pinned processes */
     ctx.pinned_pids     = NULL;
     ctx.pinned_count    = 0;
@@ -3125,6 +3198,12 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_fd_row_expanded), &ctx);
     g_signal_connect(fd_tree, "key-press-event",
                      G_CALLBACK(on_fd_key_press), &ctx);
+    g_signal_connect(env_tree, "row-collapsed",
+                     G_CALLBACK(on_env_row_collapsed), &ctx);
+    g_signal_connect(env_tree, "row-expanded",
+                     G_CALLBACK(on_env_row_expanded), &ctx);
+    g_signal_connect(env_tree, "key-press-event",
+                     G_CALLBACK(on_env_key_press), &ctx);
     g_signal_connect(window,    "configure-event",
                      G_CALLBACK(on_window_configure), &ctx);
     g_signal_connect(window,    "notify::scale-factor",
@@ -3199,6 +3278,13 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
         g_cancellable_cancel(ctx->fd_cancel);
         g_object_unref(ctx->fd_cancel);
         ctx->fd_cancel = NULL;
+    }
+
+    /* Cancel any in-flight async env scan */
+    if (ctx->env_cancel) {
+        g_cancellable_cancel(ctx->env_cancel);
+        g_object_unref(ctx->env_cancel);
+        ctx->env_cancel = NULL;
     }
 
     /* Stop autoscroll timer */

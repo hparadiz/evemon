@@ -131,6 +131,15 @@ typedef struct {
     unsigned            fd_collapsed;      /* bitmask: 1 << cat */
     pid_t               fd_last_pid;
 
+    /* environment variable list in sidebar */
+    GtkTreeStore       *env_store;
+    GtkTreeView        *env_view;
+    GtkCssProvider     *env_css;
+    unsigned            env_collapsed;     /* bitmask: 1 << env_cat */
+    pid_t               env_last_pid;
+    guint               env_generation;
+    GCancellable       *env_cancel;
+
     /* middle-click autoscroll */
     gboolean            autoscroll;
     double              anchor_x;
@@ -248,6 +257,36 @@ char *fd_path_to_markup(const char *path);
 /* ── async fd scan ───────────────────────────────────────────── */
 
 void fd_scan_start(ui_ctx_t *ctx, pid_t pid);
+
+/* ── environment variable scanning ───────────────────────────── */
+
+typedef enum {
+    ENV_CAT_PATH,        /* PATH, LD_LIBRARY_PATH, etc.         */
+    ENV_CAT_DISPLAY,     /* DISPLAY, WAYLAND_DISPLAY, DBUS, etc */
+    ENV_CAT_LOCALE,      /* LANG, LC_*, LANGUAGE                */
+    ENV_CAT_XDG,         /* XDG_*                               */
+    ENV_CAT_STEAM,       /* STEAM_*, PROTON_*, WINE*, SteamApp* */
+    ENV_CAT_OTHER,       /* everything else                     */
+    ENV_CAT_COUNT
+} env_category_t;
+
+enum {
+    ENV_COL_TEXT,         /* plain text (KEY=value)              */
+    ENV_COL_MARKUP,       /* Pango markup for display            */
+    ENV_COL_CAT,          /* env_category_t (-1 for leaf rows)   */
+    ENV_NUM_COLS
+};
+
+extern const char *env_cat_label[ENV_CAT_COUNT];
+
+void env_scan_start(ui_ctx_t *ctx, pid_t pid);
+
+/* sidebar signal callbacks for env tree (connected in ui.c) */
+void on_env_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
+                          GtkTreePath *path, gpointer data);
+void on_env_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
+                         GtkTreePath *path, gpointer data);
+gboolean on_env_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
 
 /* ── device labelling ────────────────────────────────────────── */
 
