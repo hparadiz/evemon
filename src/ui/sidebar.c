@@ -34,6 +34,7 @@ void sidebar_update(ui_ctx_t *ctx)
         gtk_widget_hide(ctx->sb_steam_frame);
         gtk_tree_store_clear(ctx->fd_store);
         gtk_tree_store_clear(ctx->env_store);
+        gtk_tree_store_clear(ctx->mmap_store);
         return;
     }
 
@@ -189,6 +190,9 @@ void sidebar_update(ui_ctx_t *ctx)
 
     /* ── populate environment variable tree (async, off main thread) ── */
     env_scan_start(ctx, (pid_t)pid);
+
+    /* ── populate memory map tree (async, off main thread) ── */
+    mmap_scan_start(ctx, (pid_t)pid);
 
     g_free(user); g_free(name); g_free(cpu_text);
     g_free(rss_text); g_free(grp_rss_text); g_free(grp_cpu_text);

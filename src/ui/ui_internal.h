@@ -140,6 +140,15 @@ typedef struct {
     guint               env_generation;
     GCancellable       *env_cancel;
 
+    /* memory map list in sidebar */
+    GtkTreeStore       *mmap_store;
+    GtkTreeView        *mmap_view;
+    GtkCssProvider     *mmap_css;
+    unsigned            mmap_collapsed;    /* bitmask: 1 << mmap_cat */
+    pid_t               mmap_last_pid;
+    guint               mmap_generation;
+    GCancellable       *mmap_cancel;
+
     /* middle-click autoscroll */
     gboolean            autoscroll;
     double              anchor_x;
@@ -287,6 +296,38 @@ void on_env_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
 void on_env_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
                          GtkTreePath *path, gpointer data);
 gboolean on_env_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
+
+/* ── memory map scanning ─────────────────────────────────────── */
+
+typedef enum {
+    MMAP_CAT_CODE,       /* executable mappings (r-x)           */
+    MMAP_CAT_DATA,       /* read-write file-backed              */
+    MMAP_CAT_RODATA,     /* read-only file-backed               */
+    MMAP_CAT_HEAP,       /* [heap]                              */
+    MMAP_CAT_STACK,      /* [stack]                             */
+    MMAP_CAT_VDSO,       /* [vdso], [vvar], [vsyscall]          */
+    MMAP_CAT_ANON,       /* anonymous (no pathname)             */
+    MMAP_CAT_OTHER,      /* everything else                     */
+    MMAP_CAT_COUNT
+} mmap_category_t;
+
+enum {
+    MMAP_COL_TEXT,        /* plain text (display line)           */
+    MMAP_COL_MARKUP,      /* Pango markup for display            */
+    MMAP_COL_CAT,         /* mmap_category_t (-1 for leaf rows)  */
+    MMAP_NUM_COLS
+};
+
+extern const char *mmap_cat_label[MMAP_CAT_COUNT];
+
+void mmap_scan_start(ui_ctx_t *ctx, pid_t pid);
+
+/* sidebar signal callbacks for mmap tree (connected in ui.c) */
+void on_mmap_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
+                           GtkTreePath *path, gpointer data);
+void on_mmap_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
+                          GtkTreePath *path, gpointer data);
+gboolean on_mmap_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
 
 /* ── device labelling ────────────────────────────────────────── */
 

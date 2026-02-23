@@ -1299,6 +1299,16 @@ static void reload_font_css(ui_ctx_t *ctx)
                  env_size);
         gtk_css_provider_load_from_data(ctx->env_css, buf, -1, NULL);
     }
+
+    /* Mmap tree in sidebar (same size as fd/env tree) */
+    if (ctx->mmap_css) {
+        int mmap_size = ctx->font_size > FONT_SIZE_MIN
+                      ? ctx->font_size - 1 : ctx->font_size;
+        snprintf(buf, sizeof(buf),
+                 "treeview { font-family: Monospace; font-size: %dpt; }",
+                 mmap_size);
+        gtk_css_provider_load_from_data(ctx->mmap_css, buf, -1, NULL);
+    }
 }
 
 /* ── desktop-environment–aware modifier detection ─────────────── */
@@ -2788,6 +2798,8 @@ void *ui_thread(void *arg)
 
     SIDEBAR_ROW(0,  "PID",             sb_pid);
     SIDEBAR_ROW(1,  "PPID",            sb_ppid);
+    gtk_label_set_xalign(GTK_LABEL(sb_ppid), 1.0f);
+    gtk_widget_set_halign(GTK_WIDGET(sb_ppid), GTK_ALIGN_END);
     SIDEBAR_ROW(2,  "User",            sb_user);
     SIDEBAR_ROW(3,  "Name",            sb_name);
     SIDEBAR_ROW(4,  "CPU%",            sb_cpu);
@@ -2979,6 +2991,60 @@ void *ui_thread(void *arg)
     gtk_container_add(GTK_CONTAINER(env_scroll), env_tree);
     gtk_grid_attach(GTK_GRID(sidebar_grid), env_scroll, 0, 20, 2, 1);
 
+    /* ── memory map section ────────────────────────────────────── */
+    GtkWidget *mmap_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), mmap_sep, 0, 21, 2, 1);
+
+    GtkWidget *mmap_header = gtk_label_new("Memory Map");
+    gtk_label_set_xalign(GTK_LABEL(mmap_header), 0.0f);
+    {
+        PangoAttrList *a = pango_attr_list_new();
+        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(mmap_header), a);
+        pango_attr_list_unref(a);
+    }
+    gtk_grid_attach(GTK_GRID(sidebar_grid), mmap_header, 0, 22, 2, 1);
+
+    GtkTreeStore *mmap_store = gtk_tree_store_new(MMAP_NUM_COLS,
+                                                  G_TYPE_STRING,   /* MMAP_COL_TEXT   */
+                                                  G_TYPE_STRING,   /* MMAP_COL_MARKUP */
+                                                  G_TYPE_INT);     /* MMAP_COL_CAT    */
+    GtkWidget *mmap_tree = gtk_tree_view_new_with_model(
+        GTK_TREE_MODEL(mmap_store));
+    g_object_unref(mmap_store);
+
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(mmap_tree), FALSE);
+    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(mmap_tree), TRUE);
+
+    GtkCellRenderer *mmap_r = gtk_cell_renderer_text_new();
+    g_object_set(mmap_r, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+    GtkTreeViewColumn *mmap_col = gtk_tree_view_column_new_with_attributes(
+        "Map", mmap_r, "markup", MMAP_COL_MARKUP, NULL);
+    gtk_tree_view_column_set_expand(mmap_col, TRUE);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(mmap_tree), mmap_col);
+
+    /* Monospace CSS for the mmap tree (1pt smaller than main, like fd/env) */
+    GtkCssProvider *mmap_css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(mmap_css,
+        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(mmap_tree),
+        GTK_STYLE_PROVIDER(mmap_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    /* NOTE: don't unref mmap_css – kept alive for dynamic font changes */
+
+    GtkTreeSelection *mmap_sel = gtk_tree_view_get_selection(
+        GTK_TREE_VIEW(mmap_tree));
+    gtk_tree_selection_set_mode(mmap_sel, GTK_SELECTION_SINGLE);
+
+    GtkWidget *mmap_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(mmap_scroll),
+                                   GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(mmap_scroll, -1, 200);
+    gtk_widget_set_vexpand(mmap_scroll, TRUE);
+    gtk_container_add(GTK_CONTAINER(mmap_scroll), mmap_tree);
+    gtk_grid_attach(GTK_GRID(sidebar_grid), mmap_scroll, 0, 23, 2, 1);
+
     gtk_container_add(GTK_CONTAINER(sidebar_scroll), sidebar_grid);
 
     GtkWidget *sidebar_frame = gtk_frame_new("Details");
@@ -3160,6 +3226,15 @@ void *ui_thread(void *arg)
     ctx.env_generation = 0;
     ctx.env_cancel     = NULL;
 
+    /* Memory map list */
+    ctx.mmap_store      = mmap_store;
+    ctx.mmap_view       = GTK_TREE_VIEW(mmap_tree);
+    ctx.mmap_css        = mmap_css;
+    ctx.mmap_collapsed  = 0;
+    ctx.mmap_last_pid   = 0;
+    ctx.mmap_generation = 0;
+    ctx.mmap_cancel     = NULL;
+
     /* Pinned processes */
     ctx.pinned_pids     = NULL;
     ctx.pinned_count    = 0;
@@ -3204,6 +3279,12 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_env_row_expanded), &ctx);
     g_signal_connect(env_tree, "key-press-event",
                      G_CALLBACK(on_env_key_press), &ctx);
+    g_signal_connect(mmap_tree, "row-collapsed",
+                     G_CALLBACK(on_mmap_row_collapsed), &ctx);
+    g_signal_connect(mmap_tree, "row-expanded",
+                     G_CALLBACK(on_mmap_row_expanded), &ctx);
+    g_signal_connect(mmap_tree, "key-press-event",
+                     G_CALLBACK(on_mmap_key_press), &ctx);
     g_signal_connect(window,    "configure-event",
                      G_CALLBACK(on_window_configure), &ctx);
     g_signal_connect(window,    "notify::scale-factor",
@@ -3285,6 +3366,13 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
         g_cancellable_cancel(ctx->env_cancel);
         g_object_unref(ctx->env_cancel);
         ctx->env_cancel = NULL;
+    }
+
+    /* Cancel any in-flight async mmap scan */
+    if (ctx->mmap_cancel) {
+        g_cancellable_cancel(ctx->mmap_cancel);
+        g_object_unref(ctx->mmap_cancel);
+        ctx->mmap_cancel = NULL;
     }
 
     /* Stop autoscroll timer */
