@@ -34,49 +34,6 @@
 /* ── helpers ─────────────────────────────────────────────────── */
 
 /*
- * Read /proc/<pid>/environ (NUL-delimited) and extract env var `key`.
- * Returns 1 on success, 0 if not found.
- */
-static int __attribute__((unused)) read_env_var(pid_t pid, const char *key,
-                        char *buf, size_t bufsz)
-{
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/environ", pid);
-
-    FILE *f = fopen(path, "r");
-    if (!f)
-        return 0;
-
-    size_t keylen = strlen(key);
-    char line[4096];
-    size_t pos = 0;
-    int found = 0;
-
-    /* environ is NUL-delimited.  Read raw bytes. */
-    size_t nread = fread(line, 1, sizeof(line) - 1, f);
-    fclose(f);
-
-    if (nread == 0)
-        return 0;
-
-    while (pos < nread) {
-        const char *entry = line + pos;
-        size_t elen = strnlen(entry, nread - pos);
-
-        if (elen > keylen && entry[keylen] == '=' &&
-            memcmp(entry, key, keylen) == 0) {
-            const char *val = entry + keylen + 1;
-            snprintf(buf, bufsz, "%s", val);
-            found = 1;
-            break;
-        }
-        pos += elen + 1;
-    }
-
-    return found;
-}
-
-/*
  * Read /proc/<pid>/environ in larger chunks for processes with big
  * environments.  Searches for multiple keys at once.
  */
@@ -421,28 +378,6 @@ static int is_steam_launcher_process(const char *comm)
     }
 
     return 0;
-}
-
-/* Wine/Proton child processes */
-static int __attribute__((unused)) is_wine_process(const char *comm)
-{
-    if (!comm) return 0;
-    return (strcmp(comm, "wineserver") == 0 ||
-            strcmp(comm, "wine") == 0 ||
-            strcmp(comm, "wine64") == 0 ||
-            strcmp(comm, "wine-preloader") == 0 ||
-            strcmp(comm, "wine64-preloa") == 0 ||   /* truncated */
-            strncmp(comm, "winedevice", 10) == 0 ||
-            strncmp(comm, "wineboot", 8) == 0 ||
-            strcmp(comm, "explorer.exe") == 0 ||
-            strcmp(comm, "services.exe") == 0 ||
-            strcmp(comm, "plugplay.exe") == 0 ||
-            strcmp(comm, "svchost.exe") == 0 ||
-            strcmp(comm, "rpcss.exe") == 0 ||
-            strcmp(comm, "tabtip.exe") == 0 ||
-            strcmp(comm, "start.exe") == 0 ||
-            strcmp(comm, "conhost.exe") == 0 ||
-            strcmp(comm, "crashhandler") == 0);   /* proton crashhandler */
 }
 
 /* ── public API ──────────────────────────────────────────────── */
