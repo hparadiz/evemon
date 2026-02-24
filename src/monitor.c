@@ -685,6 +685,54 @@ typedef struct {
 
 static io_prev_entry_t g_prev_io[CPU_HT_SIZE];
 
+/* ── per-PID I/O history ring buffer (persists across snapshots) ─ */
+
+typedef struct {
+    pid_t   pid;
+    float   samples[IO_HISTORY_LEN];
+    int     count;      /* number of valid samples (≤ IO_HISTORY_LEN) */
+    int     used;
+} io_hist_entry_t;
+
+static io_hist_entry_t g_io_history[CPU_HT_SIZE];
+
+static io_hist_entry_t *io_hist_get(io_hist_entry_t *ht, pid_t pid)
+{
+    unsigned h = (unsigned)pid % CPU_HT_SIZE;
+    for (int k = 0; k < CPU_HT_SIZE; k++) {
+        if (!ht[h].used) return NULL;
+        if (ht[h].pid == pid) return &ht[h];
+        h = (h + 1) % CPU_HT_SIZE;
+    }
+    return NULL;
+}
+
+static io_hist_entry_t *io_hist_get_or_create(io_hist_entry_t *ht, pid_t pid)
+{
+    unsigned h = (unsigned)pid % CPU_HT_SIZE;
+    while (ht[h].used && ht[h].pid != pid)
+        h = (h + 1) % CPU_HT_SIZE;
+    if (!ht[h].used) {
+        ht[h].pid   = pid;
+        ht[h].count = 0;
+        ht[h].used  = 1;
+        memset(ht[h].samples, 0, sizeof(ht[h].samples));
+    }
+    return &ht[h];
+}
+
+static void io_hist_push(io_hist_entry_t *entry, float value)
+{
+    /* Shift samples left to make room for the new one at the end */
+    if (entry->count >= IO_HISTORY_LEN) {
+        memmove(entry->samples, entry->samples + 1,
+                (IO_HISTORY_LEN - 1) * sizeof(float));
+        entry->samples[IO_HISTORY_LEN - 1] = value;
+    } else {
+        entry->samples[entry->count++] = value;
+    }
+}
+
 static void io_ht_get(const io_prev_entry_t *ht, pid_t pid,
                       unsigned long long *rd, unsigned long long *wr)
 {
@@ -812,6 +860,8 @@ static proc_snapshot_t build_snapshot(void)
         }
         e->io_read_rate  = 0.0;
         e->io_write_rate = 0.0;
+        e->io_history_len = 0;
+        memset(e->io_history, 0, sizeof(e->io_history));
 
         /* Process start time */
         e->start_time = read_start_time(pid);
@@ -1003,6 +1053,23 @@ void *monitor_thread(void *arg)
             io_ht_set(g_prev_io, snap.entries[i].pid,
                       snap.entries[i].io_read_bytes,
                       snap.entries[i].io_write_bytes);
+
+        /* Update per-PID I/O history ring buffers and copy into snapshot */
+        for (size_t i = 0; i < snap.count; i++) {
+            float combined = (float)(snap.entries[i].io_read_rate
+                                   + snap.entries[i].io_write_rate);
+            io_hist_entry_t *hist = io_hist_get_or_create(
+                g_io_history, snap.entries[i].pid);
+            if (hist) {
+                io_hist_push(hist, combined);
+                /* Copy the history into the snapshot entry */
+                snap.entries[i].io_history_len = hist->count;
+                memcpy(snap.entries[i].io_history, hist->samples,
+                       hist->count * sizeof(float));
+            } else {
+                snap.entries[i].io_history_len = 0;
+            }
+        }
 
         g_prev_valid = 1;
         prev_ts = now_ts;

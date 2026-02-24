@@ -1896,6 +1896,8 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
           *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
+    gchar *spark_data = NULL;
+    gint spark_peak;
 
     gtk_tree_model_get(src, src_iter,
         COL_PID, &pid, COL_PPID, &ppid, COL_USER, &user, COL_NAME, &name,
@@ -1909,6 +1911,8 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
         COL_STEAM_LABEL, &steam_label,
+        COL_IO_SPARKLINE, &spark_data,
+        COL_IO_SPARKLINE_PEAK, &spark_peak,
         COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
         COL_PINNED_ROOT, &pinned_root,
         -1);
@@ -1925,6 +1929,8 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
         COL_STEAM_LABEL, steam_label,
+        COL_IO_SPARKLINE, spark_data,
+        COL_IO_SPARKLINE_PEAK, spark_peak,
         COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
         COL_PINNED_ROOT, pinned_root,
         -1);
@@ -1933,7 +1939,7 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     g_free(grp_rss_text); g_free(grp_cpu_text);
     g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
-    g_free(steam_label);
+    g_free(steam_label); g_free(spark_data);
 
     /* Recurse into children */
     GtkTreeIter child;
@@ -1991,6 +1997,8 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
     gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
           *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
+    gchar *spark_data = NULL;
+    gint spark_peak;
 
     gtk_tree_model_get(real, real_iter,
         COL_PID, &pid, COL_PPID, &ppid, COL_USER, &user, COL_NAME, &name,
@@ -2004,6 +2012,8 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
         COL_STEAM_LABEL, &steam_label,
+        COL_IO_SPARKLINE, &spark_data,
+        COL_IO_SPARKLINE_PEAK, &spark_peak,
         COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
         -1);
 
@@ -2025,6 +2035,8 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
         COL_STEAM_LABEL, steam_label,
+        COL_IO_SPARKLINE, spark_data,
+        COL_IO_SPARKLINE_PEAK, spark_peak,
         COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
         COL_PINNED_ROOT, pinned_root,
         -1);
@@ -2033,7 +2045,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
     g_free(grp_rss_text); g_free(grp_cpu_text);
     g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
-    g_free(steam_label);
+    g_free(steam_label); g_free(spark_data);
 }
 
 /*
@@ -2242,6 +2254,7 @@ static void rebuild_filter_store(ui_ctx_t *ctx)
         G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
         G_TYPE_INT64, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
         G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_STRING, G_TYPE_INT,
         G_TYPE_INT64, G_TYPE_INT64, G_TYPE_INT);
 
     find_and_copy_matches(fs, GTK_TREE_MODEL(ctx->store), NULL,
@@ -3226,6 +3239,8 @@ void *ui_thread(void *arg)
                                              G_TYPE_STRING,   /* CWD          */
                                              G_TYPE_STRING,   /* CMDLINE      */
                                              G_TYPE_STRING,   /* STEAM_LABEL  */
+                                             G_TYPE_STRING,   /* IO_SPARKLINE */
+                                             G_TYPE_INT,      /* IO_SPARKLINE_PEAK */
                                              G_TYPE_INT64,    /* HIGHLIGHT_BORN */
                                              G_TYPE_INT64,    /* HIGHLIGHT_DIED */
                                              G_TYPE_INT);     /* PINNED_ROOT  */
@@ -3333,6 +3348,20 @@ void *ui_thread(void *arg)
     gtk_tree_view_column_set_resizable(col, TRUE);
     gtk_tree_view_column_set_min_width(col, 90);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    /* I/O Sparkline — custom cell renderer with animated bar chart */
+    {
+        GtkCellRenderer *spark_r = sparkline_cell_renderer_new();
+        col = gtk_tree_view_column_new_with_attributes("I/O History", spark_r,
+                                                       "spark-data", COL_IO_SPARKLINE,
+                                                       "spark-peak", COL_IO_SPARKLINE_PEAK,
+                                                       NULL);
+        gtk_tree_view_column_set_resizable(col, TRUE);
+        gtk_tree_view_column_set_min_width(col, 86);
+        gtk_tree_view_column_set_fixed_width(col, 86);
+        gtk_tree_view_column_set_sizing(col, GTK_TREE_VIEW_COLUMN_FIXED);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+    }
 
     r = gtk_cell_renderer_text_new();
     col = gtk_tree_view_column_new_with_attributes("Start Time", r,

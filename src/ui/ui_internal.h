@@ -47,6 +47,8 @@ enum {
     COL_CWD,
     COL_CMDLINE,
     COL_STEAM_LABEL,   /* Steam/Proton display label (string) */
+    COL_IO_SPARKLINE,  /* packed sparkline data (string of semicolon-sep floats) */
+    COL_IO_SPARKLINE_PEAK, /* current I/O peak × 1000 for glow animation (int) */
     COL_HIGHLIGHT_BORN,/* monotonic µs when row first appeared (gint64, 0=none)  */
     COL_HIGHLIGHT_DIED,/* monotonic µs when process vanished (gint64, 0=alive)   */
     COL_PINNED_ROOT,   /* pid_t of the pinned root, or -1 for normal tree */
@@ -537,5 +539,9 @@ gboolean on_fd_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
 /* ── cleanup (fix 6) ─────────────────────────────────────────── */
 
 void ui_ctx_destroy(ui_ctx_t *ctx);
+
+/* ── I/O sparkline custom cell renderer ──────────────────────── */
+
+GtkCellRenderer *sparkline_cell_renderer_new(void);
 
 #endif /* UI_INTERNAL_H */

@@ -16,6 +16,9 @@
 #define PROC_SVC_MAX   128
 #define PROC_LIST_MAX  2048
 
+/* Number of I/O rate history samples kept per process (sparkline depth) */
+#define IO_HISTORY_LEN 20
+
 /* A single process entry */
 typedef struct {
     pid_t    pid;
@@ -34,6 +37,8 @@ typedef struct {
     unsigned long long io_write_bytes; /* cumulative write_bytes from /proc/<pid>/io */
     double   io_read_rate;          /* disk read  bytes/sec since last snapshot    */
     double   io_write_rate;         /* disk write bytes/sec since last snapshot    */
+    float    io_history[IO_HISTORY_LEN]; /* ring buffer of combined I/O rate samples */
+    int      io_history_len;        /* number of valid samples in io_history       */
     steam_info_t *steam;            /* Steam/Proton metadata (heap, NULL if not Steam) */
 } proc_entry_t;
 

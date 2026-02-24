@@ -190,6 +190,26 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
         strftime(start_text, sizeof(start_text), "%Y-%m-%d %H:%M:%S", &tm);
     }
 
+    /* Build sparkline data string: semicolon-separated float values */
+    char spark_buf[IO_HISTORY_LEN * 16 + 1];
+    spark_buf[0] = '\0';
+    if (e->io_history_len > 0) {
+        char *p = spark_buf;
+        size_t remaining = sizeof(spark_buf);
+        for (int i = 0; i < e->io_history_len && remaining > 16; i++) {
+            int n = snprintf(p, remaining, "%.0f;", (double)e->io_history[i]);
+            if (n < 0 || (size_t)n >= remaining) break;
+            p += n;
+            remaining -= (size_t)n;
+        }
+    }
+
+    /* Current combined I/O rate as peak for glow animation */
+    double combined_rate = e->io_read_rate + e->io_write_rate;
+    /* Normalise: 10 MiB/s → peak of 1000 */
+    int spark_peak = (int)(combined_rate / (10.0 * 1024.0 * 1024.0) * 1000.0);
+    if (spark_peak > 1000) spark_peak = 1000;
+
     gtk_tree_store_set(store, iter,
                        COL_PID,      (gint)e->pid,
                        COL_PPID,     (gint)e->ppid,
@@ -214,6 +234,8 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
                        COL_CWD,      e->cwd,
                        COL_CMDLINE,  e->cmdline,
                        COL_STEAM_LABEL, (e->steam && e->steam->is_steam) ? e->steam->display_label : "",
+                       COL_IO_SPARKLINE, spark_buf,
+                       COL_IO_SPARKLINE_PEAK, spark_peak,
                        COL_HIGHLIGHT_BORN, (gint64)0,
                        COL_HIGHLIGHT_DIED, (gint64)0,
                        COL_PINNED_ROOT, (gint)PTREE_UNPINNED,
@@ -537,6 +559,8 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
           *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
+    gchar *spark_data = NULL;
+    gint spark_peak;
 
     gtk_tree_model_get(src, src_iter,
         COL_PID, &pid, COL_PPID, &ppid, COL_USER, &user, COL_NAME, &name,
@@ -550,6 +574,8 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
         COL_STEAM_LABEL, &steam_label,
+        COL_IO_SPARKLINE, &spark_data,
+        COL_IO_SPARKLINE_PEAK, &spark_peak,
         COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
         -1);
 
@@ -565,6 +591,8 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
         COL_STEAM_LABEL, steam_label,
+        COL_IO_SPARKLINE, spark_data,
+        COL_IO_SPARKLINE_PEAK, spark_peak,
         COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
         COL_PINNED_ROOT, pinned_root,
         -1);
@@ -573,7 +601,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     g_free(grp_rss_text); g_free(grp_cpu_text);
     g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
-    g_free(steam_label);
+    g_free(steam_label); g_free(spark_data);
 
     /* Recurse into children */
     GtkTreeIter child;
