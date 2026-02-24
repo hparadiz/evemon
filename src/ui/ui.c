@@ -299,6 +299,50 @@ static void on_end_process(GtkMenuItem *item, gpointer data)
         kill(pid, SIGTERM);
 }
 
+/* Send an arbitrary signal to a process. */
+typedef struct {
+    pid_t pid;
+    int   signo;
+} send_signal_data_t;
+
+static void on_send_signal(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    send_signal_data_t *d = data;
+    if (d->pid > 1)
+        kill(d->pid, d->signo);
+    free(d);
+}
+
+/* Send an arbitrary signal to a process tree (children first). */
+typedef struct {
+    ui_ctx_t *ctx;
+    pid_t     pid;
+    int       signo;
+} send_signal_tree_data_t;
+
+static void on_send_signal_tree(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    send_signal_tree_data_t *d = data;
+    GtkTreeModel *model = GTK_TREE_MODEL(d->ctx->store);
+
+    GtkTreeIter iter;
+    if (find_iter_by_pid(model, NULL, d->pid, &iter)) {
+        pid_t *kids = NULL;
+        size_t nkids = 0, cap = 0;
+        collect_tree_descendants(model, &iter, &kids, &nkids, &cap);
+        for (size_t i = nkids; i > 0; i--) {
+            if (kids[i - 1] > 1)
+                kill(kids[i - 1], d->signo);
+        }
+        free(kids);
+    }
+    if (d->pid > 1)
+        kill(d->pid, d->signo);
+    free(d);
+}
+
 typedef struct {
     ui_ctx_t *ctx;
     pid_t     pid;
@@ -455,9 +499,75 @@ static void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
     }
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi2);
 
+    /* ── Send Signal submenu ── */
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu),
+                          gtk_separator_menu_item_new());
 
+    static const struct { const char *label; int signo; } signals[] = {
+        { "SIGTERM (15) – Terminate",  SIGTERM },
+        { "SIGKILL (9)  – Kill",       SIGKILL },
+        { "SIGSTOP (19) – Stop",       SIGSTOP },
+        { "SIGCONT (18) – Continue",   SIGCONT },
+        { NULL, 0 },   /* separator */
+        { "SIGINT  (2)  – Interrupt",  SIGINT  },
+        { "SIGHUP  (1)  – Hangup",    SIGHUP  },
+        { "SIGUSR1 (10)",             SIGUSR1 },
+        { "SIGUSR2 (12)",             SIGUSR2 },
+        { NULL, 0 },   /* separator */
+        { "SIGABRT (6)  – Abort",     SIGABRT },
+        { "SIGQUIT (3)  – Quit",      SIGQUIT },
+    };
 
+    {
+        GtkWidget *sig_menu = gtk_menu_new();
+        GtkWidget *sig_item = gtk_menu_item_new_with_label("Send Signal");
+        gtk_menu_item_set_submenu(GTK_MENU_ITEM(sig_item), sig_menu);
 
+        for (size_t i = 0; i < sizeof(signals)/sizeof(signals[0]); i++) {
+            if (!signals[i].label) {
+                gtk_menu_shell_append(GTK_MENU_SHELL(sig_menu),
+                                      gtk_separator_menu_item_new());
+                continue;
+            }
+            GtkWidget *mi = gtk_menu_item_new_with_label(signals[i].label);
+            send_signal_data_t *sd = malloc(sizeof(*sd));
+            if (sd) {
+                sd->pid   = pid;
+                sd->signo = signals[i].signo;
+                g_signal_connect(mi, "activate",
+                                 G_CALLBACK(on_send_signal), sd);
+            }
+            gtk_menu_shell_append(GTK_MENU_SHELL(sig_menu), mi);
+        }
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), sig_item);
+    }
+
+    /* ── Send Signal to Tree submenu ── */
+    {
+        GtkWidget *sig_tree_menu = gtk_menu_new();
+        GtkWidget *sig_tree_item = gtk_menu_item_new_with_label(
+            "Send Signal to Tree");
+        gtk_menu_item_set_submenu(GTK_MENU_ITEM(sig_tree_item), sig_tree_menu);
+
+        for (size_t i = 0; i < sizeof(signals)/sizeof(signals[0]); i++) {
+            if (!signals[i].label) {
+                gtk_menu_shell_append(GTK_MENU_SHELL(sig_tree_menu),
+                                      gtk_separator_menu_item_new());
+                continue;
+            }
+            GtkWidget *mi = gtk_menu_item_new_with_label(signals[i].label);
+            send_signal_tree_data_t *sd = malloc(sizeof(*sd));
+            if (sd) {
+                sd->ctx   = ctx;
+                sd->pid   = pid;
+                sd->signo = signals[i].signo;
+                g_signal_connect(mi, "activate",
+                                 G_CALLBACK(on_send_signal_tree), sd);
+            }
+            gtk_menu_shell_append(GTK_MENU_SHELL(sig_tree_menu), mi);
+        }
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), sig_tree_item);
+    }
 
     gtk_widget_show_all(menu);
     gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
@@ -2244,11 +2354,22 @@ static gboolean on_overlay_get_child_position(GtkOverlay   *overlay,
     (void)overlay;
     ui_ctx_t *ctx = data;
 
-    if (child != ctx->filter_entry)
-        return FALSE;   /* let GTK handle other overlay children */
+    /* Determine which column header to anchor to */
+    GtkTreeViewColumn *target_col = NULL;
+    const char        *label_text = NULL;
 
-    /* Get the header button widget for the Name column */
-    GtkWidget *btn = gtk_tree_view_column_get_button(ctx->name_col);
+    if (child == ctx->filter_entry) {
+        target_col = ctx->name_col;
+        label_text = "Name";
+    } else if (child == ctx->pid_entry) {
+        target_col = ctx->pid_col;
+        label_text = "PID";
+    } else {
+        return FALSE;   /* let GTK handle other overlay children */
+    }
+
+    /* Get the header button widget for the target column */
+    GtkWidget *btn = gtk_tree_view_column_get_button(target_col);
     if (!btn || !gtk_widget_get_realized(btn))
         return FALSE;
 
@@ -2261,8 +2382,8 @@ static gboolean on_overlay_get_child_position(GtkOverlay   *overlay,
     GtkWidget *overlay_widget = GTK_WIDGET(overlay);
     gtk_widget_translate_coordinates(btn, overlay_widget, 0, 0, &ox, &oy);
 
-    /* Measure the "Name" label text width using the button's Pango context */
-    PangoLayout *layout = gtk_widget_create_pango_layout(btn, "Name");
+    /* Measure the label text width using the button's Pango context */
+    PangoLayout *layout = gtk_widget_create_pango_layout(btn, label_text);
     int text_w = 0, text_h = 0;
     pango_layout_get_pixel_size(layout, &text_w, &text_h);
     g_object_unref(layout);
@@ -2364,6 +2485,103 @@ static gboolean on_filter_entry_key_release(GtkWidget *widget,
     return FALSE;
 }
 
+/* ── Go-to-PID entry helpers ──────────────────────────────────── */
+
+/* Reject any non-digit characters typed into the PID entry. */
+static void on_pid_entry_insert_text(GtkEditable *editable,
+                                     const gchar *text,
+                                     gint         length,
+                                     gint        *position,
+                                     gpointer     data)
+{
+    (void)editable; (void)position; (void)data;
+    for (gint i = 0; i < length; i++) {
+        if (text[i] < '0' || text[i] > '9') {
+            g_signal_stop_emission_by_name(editable, "insert-text");
+            return;
+        }
+    }
+}
+
+/*
+ * Navigate to a PID in the tree view.  Exact match only —
+ * typing "2" matches PID 2, not PID 22 or 200.
+ */
+static void goto_pid(ui_ctx_t *ctx, pid_t target)
+{
+    GtkTreeModel *child = gtk_tree_model_sort_get_model(ctx->sort_model);
+    GtkTreeIter child_iter;
+
+    if (!find_iter_by_pid(child, NULL, target, &child_iter))
+        return;
+
+    GtkTreePath *child_path = gtk_tree_model_get_path(child, &child_iter);
+    if (!child_path)
+        return;
+
+    GtkTreePath *sort_path =
+        gtk_tree_model_sort_convert_child_path_to_path(
+            ctx->sort_model, child_path);
+    gtk_tree_path_free(child_path);
+    if (!sort_path)
+        return;
+
+    /* Expand all ancestors so the row is visible */
+    GtkTreePath *parent_path = gtk_tree_path_copy(sort_path);
+    while (gtk_tree_path_up(parent_path) &&
+           gtk_tree_path_get_depth(parent_path) > 0) {
+        gtk_tree_view_expand_row(ctx->view, parent_path, FALSE);
+    }
+    gtk_tree_path_free(parent_path);
+
+    /* Select and scroll to the row */
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
+    gtk_tree_selection_select_path(sel, sort_path);
+    gtk_tree_view_scroll_to_cell(ctx->view, sort_path,
+                                 NULL, TRUE, 0.5f, 0.0f);
+    gtk_tree_path_free(sort_path);
+}
+
+static gboolean on_pid_entry_key_release(GtkWidget *widget,
+                                         GdkEventKey *ev,
+                                         gpointer data)
+{
+    ui_ctx_t *ctx = data;
+
+    if (ev->keyval == GDK_KEY_Escape) {
+        gtk_entry_set_text(GTK_ENTRY(ctx->pid_entry), "");
+        gtk_widget_hide(ctx->pid_entry);
+        gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
+        return TRUE;
+    }
+
+    /* Enter/Return → dismiss the entry, keep current selection */
+    if (ev->keyval == GDK_KEY_Return || ev->keyval == GDK_KEY_KP_Enter) {
+        gtk_entry_set_text(GTK_ENTRY(ctx->pid_entry), "");
+        gtk_widget_hide(ctx->pid_entry);
+        gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
+        return TRUE;
+    }
+
+    /* Ignore modifier-only releases */
+    guint state = ev->state & gtk_accelerator_get_default_mod_mask();
+    if (state & (GDK_CONTROL_MASK | GDK_META_MASK))
+        return FALSE;
+
+    /* Live search: navigate on every keystroke (exact PID match) */
+    const char *text = gtk_entry_get_text(GTK_ENTRY(widget));
+    if (!text || !text[0])
+        return FALSE;
+
+    char *end = NULL;
+    long val = strtol(text, &end, 10);
+    if (end == text || *end != '\0' || val <= 0)
+        return FALSE;   /* not a clean integer yet */
+
+    goto_pid(ctx, (pid_t)val);
+    return FALSE;
+}
+
 /* ── keyboard shortcuts ──────────────────────────────────────── */
 
 static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
@@ -2447,6 +2665,22 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
                 filter_cancel_hide_timer(ctx);
                 gtk_widget_show(ctx->filter_entry);
                 gtk_widget_grab_focus(ctx->filter_entry);
+            }
+        }
+        return TRUE;
+    }
+
+    /* Ctrl+G or Meta+G → toggle Go-to-PID entry */
+    if (ev->keyval == GDK_KEY_g &&
+        (state == GDK_CONTROL_MASK || state == GDK_META_MASK)) {
+        if (ctx->pid_entry) {
+            if (gtk_widget_get_visible(ctx->pid_entry)) {
+                gtk_entry_set_text(GTK_ENTRY(ctx->pid_entry), "");
+                gtk_widget_hide(ctx->pid_entry);
+                gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
+            } else {
+                gtk_widget_show(ctx->pid_entry);
+                gtk_widget_grab_focus(ctx->pid_entry);
             }
         }
         return TRUE;
@@ -3019,6 +3253,7 @@ void *ui_thread(void *arg)
     gtk_tree_view_column_set_resizable(col, TRUE);
     gtk_tree_view_column_set_min_width(col, 70);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+    GtkTreeViewColumn *pid_col = col;   /* save for Go-to-PID positioning */
 
     r = gtk_cell_renderer_text_new();
     col = gtk_tree_view_column_new_with_attributes("PPID", r,
@@ -3201,6 +3436,33 @@ void *ui_thread(void *arg)
     GtkWidget *tree_overlay = gtk_overlay_new();
     gtk_container_add(GTK_CONTAINER(tree_overlay), scroll);
     gtk_overlay_add_overlay(GTK_OVERLAY(tree_overlay), name_filter_entry);
+
+    /* ── Go-to-PID entry (overlaid on the PID column header) ──── */
+    GtkWidget *pid_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(pid_entry), "PID…");
+    gtk_entry_set_width_chars(GTK_ENTRY(pid_entry), 8);
+    gtk_entry_set_input_purpose(GTK_ENTRY(pid_entry), GTK_INPUT_PURPOSE_DIGITS);
+    gtk_widget_set_no_show_all(pid_entry, TRUE);
+    gtk_widget_set_valign(pid_entry, GTK_ALIGN_START);
+    gtk_widget_set_halign(pid_entry, GTK_ALIGN_START);
+
+    {
+        GtkCssProvider *pid_css = gtk_css_provider_new();
+        gtk_css_provider_load_from_data(pid_css,
+            "entry {"
+            "  font-size: 8pt;"
+            "  min-height: 0;"
+            "  padding: 1px 4px;"
+            "  border-radius: 3px;"
+            "}", -1, NULL);
+        gtk_style_context_add_provider(
+            gtk_widget_get_style_context(pid_entry),
+            GTK_STYLE_PROVIDER(pid_css),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        g_object_unref(pid_css);
+    }
+
+    gtk_overlay_add_overlay(GTK_OVERLAY(tree_overlay), pid_entry);
 
     /* ── sidebar (detail panel) ───────────────────────────────── */
 
@@ -3803,6 +4065,10 @@ void *ui_thread(void *arg)
     ctx.name_col     = name_col;
     ctx.filter_text[0] = '\0';
 
+    /* Go-to-PID */
+    ctx.pid_entry = pid_entry;
+    ctx.pid_col   = pid_col;
+
     /* Sidebar detail panel */
     ctx.sidebar            = sidebar_frame;
     ctx.sidebar_menu_item  = GTK_CHECK_MENU_ITEM(sidebar_toggle);
@@ -4014,6 +4280,10 @@ void *ui_thread(void *arg)
 
     g_signal_connect(name_filter_entry, "key-release-event",
                      G_CALLBACK(on_filter_entry_key_release), &ctx);
+    g_signal_connect(pid_entry, "key-release-event",
+                     G_CALLBACK(on_pid_entry_key_release), &ctx);
+    g_signal_connect(pid_entry, "insert-text",
+                     G_CALLBACK(on_pid_entry_insert_text), NULL);
     g_signal_connect(tree_overlay, "get-child-position",
                      G_CALLBACK(on_overlay_get_child_position), &ctx);
     g_signal_connect(fd_tree, "row-collapsed",

@@ -251,6 +251,10 @@ typedef struct {
     char                filter_text[256];
     guint               filter_hide_timer; /* auto-hide after idle (0=none) */
 
+    /* Go-to-PID (Ctrl+G) */
+    GtkWidget          *pid_entry;
+    GtkTreeViewColumn  *pid_col;
+
     /* scroll widgets for drag-to-resize (stored for window-resize clamping) */
     GtkWidget          *sb_fd_scroll;
     GtkWidget          *sb_env_scroll;
