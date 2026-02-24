@@ -10,6 +10,7 @@
 
 #include "fdmon.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 /* ── PID set ─────────────────────────────────────────────────── */
@@ -94,7 +95,7 @@ struct fdmon_ctx {
     /* fanotify backend */
     int               fan_fd;
     pthread_t         fan_thread;
-    volatile int      fan_running;
+    atomic_int        fan_running;
 
     /* eBPF backend (opaque to fanotify side) */
     void             *ebpf_state;

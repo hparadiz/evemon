@@ -15,11 +15,17 @@ typedef struct { pid_t pid; size_t idx; int used; } ht_entry_t;
 static void ht_insert(ht_entry_t *ht, pid_t pid, size_t idx)
 {
     unsigned h = (unsigned)pid % HT_SIZE;
-    while (ht[h].used)
+    for (int k = 0; k < HT_SIZE; k++) {
+        if (!ht[h].used) {
+            ht[h].pid  = pid;
+            ht[h].idx  = idx;
+            ht[h].used = 1;
+            return;
+        }
         h = (h + 1) % HT_SIZE;
-    ht[h].pid  = pid;
-    ht[h].idx  = idx;
-    ht[h].used = 1;
+    }
+    /* Table full — silently drop.  With 8192 slots this only
+     * happens on systems with >8192 simultaneous processes. */
 }
 
 static size_t ht_find(const ht_entry_t *ht, pid_t pid)

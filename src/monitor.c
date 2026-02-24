@@ -710,15 +710,19 @@ static io_hist_entry_t *io_hist_get(io_hist_entry_t *ht, pid_t pid)
 static io_hist_entry_t *io_hist_get_or_create(io_hist_entry_t *ht, pid_t pid)
 {
     unsigned h = (unsigned)pid % CPU_HT_SIZE;
-    while (ht[h].used && ht[h].pid != pid)
+    for (int k = 0; k < CPU_HT_SIZE; k++) {
+        if (!ht[h].used) {
+            ht[h].pid   = pid;
+            ht[h].count = 0;
+            ht[h].used  = 1;
+            memset(ht[h].samples, 0, sizeof(ht[h].samples));
+            return &ht[h];
+        }
+        if (ht[h].pid == pid)
+            return &ht[h];
         h = (h + 1) % CPU_HT_SIZE;
-    if (!ht[h].used) {
-        ht[h].pid   = pid;
-        ht[h].count = 0;
-        ht[h].used  = 1;
-        memset(ht[h].samples, 0, sizeof(ht[h].samples));
     }
-    return &ht[h];
+    return NULL;  /* table full */
 }
 
 static void io_hist_push(io_hist_entry_t *entry, float value)
@@ -754,12 +758,17 @@ static void io_ht_set(io_prev_entry_t *ht, pid_t pid,
                       unsigned long long rd, unsigned long long wr)
 {
     unsigned h = (unsigned)pid % CPU_HT_SIZE;
-    while (ht[h].used && ht[h].pid != pid)
+    for (int k = 0; k < CPU_HT_SIZE; k++) {
+        if (!ht[h].used || ht[h].pid == pid) {
+            ht[h].pid         = pid;
+            ht[h].read_bytes  = rd;
+            ht[h].write_bytes = wr;
+            ht[h].used        = 1;
+            return;
+        }
         h = (h + 1) % CPU_HT_SIZE;
-    ht[h].pid         = pid;
-    ht[h].read_bytes  = rd;
-    ht[h].write_bytes = wr;
-    ht[h].used        = 1;
+    }
+    /* Table full — silently drop. */
 }
 
 static unsigned long long cpu_ht_get(const cpu_prev_entry_t *ht, pid_t pid)
@@ -776,11 +785,16 @@ static unsigned long long cpu_ht_get(const cpu_prev_entry_t *ht, pid_t pid)
 static void cpu_ht_set(cpu_prev_entry_t *ht, pid_t pid, unsigned long long ticks)
 {
     unsigned h = (unsigned)pid % CPU_HT_SIZE;
-    while (ht[h].used && ht[h].pid != pid)
+    for (int k = 0; k < CPU_HT_SIZE; k++) {
+        if (!ht[h].used || ht[h].pid == pid) {
+            ht[h].pid   = pid;
+            ht[h].ticks = ticks;
+            ht[h].used  = 1;
+            return;
+        }
         h = (h + 1) % CPU_HT_SIZE;
-    ht[h].pid   = pid;
-    ht[h].ticks = ticks;
-    ht[h].used  = 1;
+    }
+    /* Table full — silently drop. */
 }
 
 /* ── snapshot builder ────────────────────────────────────────── */
@@ -895,11 +909,18 @@ static proc_snapshot_t build_snapshot(void)
         if (sht) {
             for (size_t i = 0; i < snap.count; i++) {
                 unsigned h = (unsigned)snap.entries[i].pid % STEAM_HT_SIZE;
-                while (sht[h].used)
+                int inserted = 0;
+                for (int k = 0; k < STEAM_HT_SIZE; k++) {
+                    if (!sht[h].used) {
+                        sht[h].pid  = snap.entries[i].pid;
+                        sht[h].idx  = i;
+                        sht[h].used = 1;
+                        inserted = 1;
+                        break;
+                    }
                     h = (h + 1) % STEAM_HT_SIZE;
-                sht[h].pid  = snap.entries[i].pid;
-                sht[h].idx  = i;
-                sht[h].used = 1;
+                }
+                if (!inserted) break;  /* table full */
             }
 
             /* Process entries in ancestor-first order.  A quick way
@@ -1053,6 +1074,16 @@ void *monitor_thread(void *arg)
             io_ht_set(g_prev_io, snap.entries[i].pid,
                       snap.entries[i].io_read_bytes,
                       snap.entries[i].io_write_bytes);
+
+        /* GC stale entries from g_io_history: mark entries whose PID
+         * is not in the current snapshot as unused.  g_prev_ticks was
+         * just rebuilt from this snapshot so we reuse it as a lookup. */
+        for (int i = 0; i < CPU_HT_SIZE; i++) {
+            if (!g_io_history[i].used) continue;
+            if (cpu_ht_get(g_prev_ticks, g_io_history[i].pid) == 0 &&
+                g_io_history[i].pid != 0)
+                g_io_history[i].used = 0;
+        }
 
         /* Update per-PID I/O history ring buffers and copy into snapshot */
         for (size_t i = 0; i < snap.count; i++) {

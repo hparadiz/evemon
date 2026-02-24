@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,7 +65,7 @@ typedef struct {
     struct bpf_link       *link_tcp_recvmsg_ret;
     struct perf_buffer    *pb;
     pthread_t              reader_thread;
-    volatile int           running;
+    atomic_int             running;
 } ebpf_state_t;
 
 /* ── extern declarations ─────────────────────────────────────── */
@@ -126,7 +127,7 @@ static void handle_lost(void *cookie, int cpu, __u64 count)
 static void *ebpf_reader_thread(void *arg)
 {
     ebpf_state_t *st = arg;
-    while (st->running) {
+    while (atomic_load_explicit(&st->running, memory_order_relaxed)) {
         /* poll for 200ms then check running flag */
         perf_buffer__poll(st->pb, 200);
     }
@@ -263,7 +264,7 @@ int fdmon_ebpf_init(struct fdmon_ctx *ctx)
     }
 
     /* Start reader thread. */
-    st->running = 1;
+    atomic_store_explicit(&st->running, 1, memory_order_relaxed);
     if (pthread_create(&st->reader_thread, NULL,
                        ebpf_reader_thread, st) != 0)
         goto fail;
@@ -298,7 +299,7 @@ void fdmon_ebpf_destroy(struct fdmon_ctx *ctx)
 
     ebpf_state_t *st = ctx->ebpf_state;
 
-    st->running = 0;
+    atomic_store_explicit(&st->running, 0, memory_order_relaxed);
     pthread_join(st->reader_thread, NULL);
 
     if (st->pb)                     perf_buffer__free(st->pb);

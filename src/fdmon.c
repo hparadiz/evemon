@@ -521,7 +521,7 @@ static void *fanotify_reader_thread(void *arg)
     fdmon_ctx_t *ctx = arg;
     char buf[8192] __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
 
-    while (ctx->fan_running) {
+    while (atomic_load_explicit(&ctx->fan_running, memory_order_relaxed)) {
         struct pollfd pfd = { .fd = ctx->fan_fd, .events = POLLIN };
         int rc = poll(&pfd, 1, 200);  /* 200 ms timeout for shutdown check */
         if (rc <= 0) continue;
@@ -589,7 +589,7 @@ static int fanotify_backend_init(fdmon_ctx_t *ctx)
     }
 
     ctx->fan_fd      = fan_fd;
-    ctx->fan_running = 1;
+    atomic_store_explicit(&ctx->fan_running, 1, memory_order_relaxed);
 
     if (pthread_create(&ctx->fan_thread, NULL,
                        fanotify_reader_thread, ctx) != 0) {
@@ -606,7 +606,7 @@ static void fanotify_backend_destroy(fdmon_ctx_t *ctx)
 {
     if (ctx->fan_fd < 0) return;
 
-    ctx->fan_running = 0;
+    atomic_store_explicit(&ctx->fan_running, 0, memory_order_relaxed);
     pthread_join(ctx->fan_thread, NULL);
     close(ctx->fan_fd);
     ctx->fan_fd = -1;
