@@ -41,8 +41,8 @@ typedef struct {
     pthread_mutex_t lock;
 } profile_state_t;
 
-/* Single global profiler instance */
-static profile_state_t g_profile;
+/* Single global profiler instance (defined in profile.c) */
+extern profile_state_t g_profile;
 
 /* ── helpers (static, header-only) ───────────────────────────── */
 

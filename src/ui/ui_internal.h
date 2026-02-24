@@ -272,6 +272,9 @@ typedef struct {
     /* startup: fast-poll until first snapshot arrives */
     gboolean            initial_refresh;
 
+    /* set when on_destroy fires so timers don't touch dead widgets */
+    gboolean            shutting_down;
+
     /* highlight animation timer: fires ~60 fps while rows are highlighted */
     guint               highlight_timer;
 

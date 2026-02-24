@@ -61,13 +61,15 @@ void set_process_tree_node(ptree_node_set_t *s, pid_t pinned_pid,
     if (s->count >= s->capacity) {
         size_t newcap = s->capacity ? s->capacity * 2 : 64;
         pid_t *tp = realloc(s->pinned_pids, newcap * sizeof(pid_t));
-        pid_t *tk = realloc(s->pids,        newcap * sizeof(pid_t));
-        int   *ts = realloc(s->states,       newcap * sizeof(int));
-        if (!tp || !tk || !ts) { free(tp); free(tk); return; }   /* OOM – silently drop */
+        if (!tp) return;   /* OOM – silently drop */
         s->pinned_pids = tp;
-        s->pids        = tk;
-        s->states      = ts;
-        s->capacity    = newcap;
+        pid_t *tk = realloc(s->pids, newcap * sizeof(pid_t));
+        if (!tk) return;
+        s->pids = tk;
+        int *ts = realloc(s->states, newcap * sizeof(int));
+        if (!ts) return;
+        s->states   = ts;
+        s->capacity = newcap;
     }
     s->pinned_pids[s->count] = pinned_pid;
     s->pids       [s->count] = pid;
@@ -243,7 +245,7 @@ static void stop_autoscroll(ui_ctx_t *ctx)
 static gboolean autoscroll_tick(gpointer data)
 {
     ui_ctx_t *ctx = data;
-    if (!ctx->autoscroll) return G_SOURCE_REMOVE;
+    if (!ctx->autoscroll || ctx->shutting_down) return G_SOURCE_REMOVE;
 
     GtkAdjustment *hadj = gtk_scrolled_window_get_hadjustment(ctx->scroll);
     GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(ctx->scroll);
@@ -1107,6 +1109,11 @@ static gboolean on_highlight_tick(gpointer data)
 {
     ui_ctx_t *ctx = data;
 
+    if (ctx->shutting_down) {
+        ctx->highlight_timer = 0;
+        return G_SOURCE_REMOVE;
+    }
+
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     gint64 now = (gint64)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
@@ -1164,8 +1171,9 @@ static gboolean on_refresh(gpointer data)
     }
     pthread_mutex_unlock(&ctx->mon->lock);
 
-    if (!running) {
-        gtk_main_quit();
+    if (!running || ctx->shutting_down) {
+        if (!running)
+            gtk_main_quit();
         proc_snapshot_t tmp = { local, count };
         proc_snapshot_free(&tmp);
         return G_SOURCE_REMOVE;
@@ -2885,7 +2893,10 @@ static gboolean on_status_button_press(GtkWidget *widget, GdkEventButton *ev,
 static void on_destroy(GtkWidget *w, gpointer data)
 {
     (void)w;
-    monitor_state_t *mon = data;
+    ui_ctx_t *ctx = data;
+    monitor_state_t *mon = ctx->mon;
+
+    ctx->shutting_down = TRUE;
 
     pthread_mutex_lock(&mon->lock);
     mon->running = 0;
@@ -3222,7 +3233,23 @@ void *ui_thread(void *arg)
         }
     }
 
-    g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), mon);
+    /* NOTE: the "destroy" signal is connected later, after ctx is
+     * initialised, so the callback can set ctx.shutting_down. */
+
+    /* Reduce the heavy backdrop dimming that GTK themes apply when a
+     * modal dialog (e.g. the About splash) steals focus.  We override
+     * the :backdrop pseudo-class at the screen level so the main
+     * window stays nearly fully opaque. */
+    {
+        GtkCssProvider *bd_css = gtk_css_provider_new();
+        gtk_css_provider_load_from_data(bd_css,
+            "window:backdrop { opacity: 0.92; }", -1, NULL);
+        gtk_style_context_add_provider_for_screen(
+            gdk_screen_get_default(),
+            GTK_STYLE_PROVIDER(bd_css),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        g_object_unref(bd_css);
+    }
 
     /* ── tree store & view ───────────────────────────────────── */
     GtkTreeStore *store = gtk_tree_store_new(NUM_COLS,
@@ -4563,6 +4590,8 @@ void *ui_thread(void *arg)
 
     ctx.initial_refresh = TRUE;
     ctx.highlight_timer = 0;
+
+    g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), &ctx);
     g_timeout_add(50, on_refresh, &ctx);
 
     /* ── show & run ──────────────────────────────────────────── */

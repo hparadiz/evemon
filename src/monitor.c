@@ -239,7 +239,7 @@ static void read_container(pid_t pid, char *buf, size_t bufsz)
 
     FILE *f = fopen(path, "r");
     if (f) {
-        char line[512];
+        char line[1024]; // k8s pods can have very long cgroup paths
         while (fgets(line, sizeof(line), f)) {
             if (strstr(line, "docker") || strstr(line, "/moby/")) {
                 snprintf(buf, bufsz, "docker");
@@ -336,7 +336,7 @@ static void read_service_systemd(pid_t pid, char *buf, size_t bufsz)
     if (!f)
         return;
 
-    char line[512];
+    char line[1024];
     while (fgets(line, sizeof(line), f)) {
         /* Prefer the unified hierarchy (v2): starts with "0::" */
         if (strncmp(line, "0::", 3) == 0) {

@@ -76,15 +76,14 @@ typedef struct {
  * so we can access ctx->ebpf_state directly.
  */
 
-/* Global context pointer — one eBPF backend per process is fine. */
-static fdmon_ctx_t *g_ebpf_ctx;
+
 
 /* ── perf buffer callback ────────────────────────────────────── */
 
 static void handle_event(void *cookie, int cpu, void *data, __u32 size)
 {
     (void)cpu;
-    (void)cookie;
+    fdmon_ctx_t *ctx = cookie;
 
     if (size < sizeof(struct fdmon_bpf_event))
         return;
@@ -93,9 +92,9 @@ static void handle_event(void *cookie, int cpu, void *data, __u32 size)
 
     if (ev->type == FDMON_BPF_NET_SEND || ev->type == FDMON_BPF_NET_RECV) {
         /* Network I/O event: accumulate bytes per TGID and per socket */
-        submit_net_event(g_ebpf_ctx, (pid_t)ev->pid, ev->net.bytes,
+        submit_net_event(ctx, (pid_t)ev->pid, ev->net.bytes,
                          ev->type == FDMON_BPF_NET_SEND);
-        submit_sock_event(g_ebpf_ctx, (pid_t)ev->pid,
+        submit_sock_event(ctx, (pid_t)ev->pid,
                           ev->net.laddr, ev->net.lport,
                           ev->net.raddr, ev->net.rport,
                           ev->net.bytes,
@@ -112,7 +111,7 @@ static void handle_event(void *cookie, int cpu, void *data, __u32 size)
         return;
 
     /* submit_event handles PID filtering. */
-    submit_event(g_ebpf_ctx, type, (pid_t)ev->tid, (pid_t)ev->pid,
+    submit_event(ctx, type, (pid_t)ev->tid, (pid_t)ev->pid,
                  ev->fd, ev->path);
 }
 
@@ -254,10 +253,8 @@ int fdmon_ebpf_init(struct fdmon_ctx *ctx)
     int map_fd = bpf_object__find_map_fd_by_name(st->obj, "events");
     if (map_fd < 0) goto fail;
 
-    g_ebpf_ctx = ctx;
-
     st->pb = perf_buffer__new(map_fd, 64 /* pages per cpu */,
-                              handle_event, handle_lost, NULL, NULL);
+                              handle_event, handle_lost, ctx, NULL);
     if (!st->pb || libbpf_get_error(st->pb)) {
         st->pb = NULL;
         goto fail;
