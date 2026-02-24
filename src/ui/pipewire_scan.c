@@ -34,12 +34,19 @@
 
 typedef struct {
     uint32_t id;
+    uint32_t client_id;         /* client.id (owning client object)    */
     pid_t    pid;               /* application.process.id, or 0       */
     char     app_name[128];     /* application.name                   */
     char     node_name[128];    /* node.name                          */
     char     node_desc[256];    /* node.description                   */
     char     media_class[64];   /* media.class (e.g. Stream/Output/Audio) */
+    char     media_name[256];   /* media.name (e.g. tab title, song)  */
 } pw_snap_node_t;
+
+typedef struct {
+    uint32_t id;
+    pid_t    pid;               /* application.process.id or pipewire.sec.pid */
+} pw_snap_client_t;
 
 typedef struct {
     uint32_t id;
@@ -70,6 +77,10 @@ typedef struct {
     pw_snap_link_t *links;
     size_t          link_count;
     size_t          link_cap;
+
+    pw_snap_client_t *clients;
+    size_t            client_count;
+    size_t            client_cap;
 } pw_graph_t;
 
 static void pw_graph_init(pw_graph_t *g)
@@ -82,6 +93,7 @@ static void pw_graph_free(pw_graph_t *g)
     free(g->nodes);
     free(g->ports);
     free(g->links);
+    free(g->clients);
     memset(g, 0, sizeof(*g));
 }
 
@@ -125,6 +137,20 @@ static pw_snap_link_t *pw_graph_push_link(pw_graph_t *g)
     pw_snap_link_t *l = &g->links[g->link_count++];
     memset(l, 0, sizeof(*l));
     return l;
+}
+
+static pw_snap_client_t *pw_graph_push_client(pw_graph_t *g)
+{
+    if (g->client_count >= g->client_cap) {
+        size_t nc = g->client_cap ? g->client_cap * 2 : 64;
+        pw_snap_client_t *tmp = realloc(g->clients, nc * sizeof(*tmp));
+        if (!tmp) return NULL;
+        g->clients    = tmp;
+        g->client_cap = nc;
+    }
+    pw_snap_client_t *c = &g->clients[g->client_count++];
+    memset(c, 0, sizeof(*c));
+    return c;
 }
 
 static const pw_snap_node_t *pw_graph_find_node(const pw_graph_t *g,
@@ -207,6 +233,7 @@ static void on_node_info(void *data, const struct pw_node_info *info)
     dict_copy(props, PW_KEY_NODE_NAME,         n->node_name,   sizeof(n->node_name));
     dict_copy(props, PW_KEY_NODE_DESCRIPTION,  n->node_desc,   sizeof(n->node_desc));
     dict_copy(props, PW_KEY_MEDIA_CLASS,       n->media_class, sizeof(n->media_class));
+    dict_copy(props, PW_KEY_MEDIA_NAME,        n->media_name,  sizeof(n->media_name));
 }
 
 static const struct pw_node_events node_events = {
@@ -239,10 +266,14 @@ static void on_global(void *data, uint32_t id,
                 pid_str = dict_get(props, "pipewire.sec.pid");
             n->pid = pid_str ? (pid_t)atoi(pid_str) : 0;
 
+            const char *cid_str = dict_get(props, PW_KEY_CLIENT_ID);
+            n->client_id = cid_str ? (uint32_t)atoi(cid_str) : 0;
+
             dict_copy(props, PW_KEY_APP_NAME,          n->app_name,    sizeof(n->app_name));
             dict_copy(props, PW_KEY_NODE_NAME,         n->node_name,   sizeof(n->node_name));
             dict_copy(props, PW_KEY_NODE_DESCRIPTION,  n->node_desc,   sizeof(n->node_desc));
             dict_copy(props, PW_KEY_MEDIA_CLASS,       n->media_class, sizeof(n->media_class));
+            dict_copy(props, PW_KEY_MEDIA_NAME,        n->media_name,  sizeof(n->media_name));
         }
 
         /* Record that we need to bind this node later */
@@ -265,6 +296,17 @@ static void on_global(void *data, uint32_t id,
                                          &bn->listener,
                                          &node_events, bn);
         }
+
+    } else if (strcmp(type, PW_TYPE_INTERFACE_Client) == 0) {
+        if (!props) return;
+        pw_snap_client_t *c = pw_graph_push_client(&e->graph);
+        if (!c) return;
+        c->id = id;
+
+        const char *pid_str = dict_get(props, PW_KEY_APP_PROCESS_ID);
+        if (!pid_str)
+            pid_str = dict_get(props, "pipewire.sec.pid");
+        c->pid = pid_str ? (pid_t)atoi(pid_str) : 0;
 
     } else if (strcmp(type, PW_TYPE_INTERFACE_Port) == 0) {
         if (!props) return;
@@ -430,6 +472,24 @@ static int pw_snapshot(pw_graph_t *out)
     pw_context_destroy(e.context);
     pw_main_loop_destroy(e.loop);
 
+    /*
+     * Resolve node PIDs via client objects.  Native PipeWire clients
+     * (e.g. mpv) don't set application.process.id on their nodes —
+     * the PID only lives on the client object.  Cross-reference using
+     * the node's client.id.
+     */
+    for (size_t i = 0; i < e.graph.node_count; i++) {
+        pw_snap_node_t *n = &e.graph.nodes[i];
+        if (n->pid != 0 || n->client_id == 0)
+            continue;
+        for (size_t j = 0; j < e.graph.client_count; j++) {
+            if (e.graph.clients[j].id == n->client_id) {
+                n->pid = e.graph.clients[j].pid;
+                break;
+            }
+        }
+    }
+
     *out = e.graph;   /* move ownership */
     return 0;
 }
@@ -459,6 +519,7 @@ static const char *pw_cat_label[PW_CAT_COUNT] = {
 typedef struct {
     char text[512];
     pw_scan_category_t cat;
+    uint32_t node_id;    /* PipeWire node ID (for spectrogram selection) */
 } pw_result_entry_t;
 
 typedef struct {
@@ -476,7 +537,7 @@ static void pw_result_free(pw_result_list_t *l)
 }
 
 static void pw_result_push(pw_result_list_t *l, pw_scan_category_t cat,
-                           const char *text)
+                           const char *text, uint32_t node_id)
 {
     if (l->count >= l->capacity) {
         size_t nc = l->capacity ? l->capacity * 2 : 32;
@@ -487,6 +548,7 @@ static void pw_result_push(pw_result_list_t *l, pw_scan_category_t cat,
     }
     pw_result_entry_t *e = &l->entries[l->count++];
     e->cat = cat;
+    e->node_id = node_id;
     snprintf(e->text, sizeof(e->text), "%s", text);
 }
 
@@ -504,13 +566,15 @@ static pw_scan_category_t classify_media_class(const char *mc)
 
 /*
  * Get the best human-readable label for a node.
- * Prefer node_desc, then app_name, then node_name.
+ * For streams: prefer media_name (tab title, song name),
+ * then node_desc, then app_name, then node_name.
  */
 static const char *node_label(const pw_snap_node_t *n)
 {
-    if (n->node_desc[0]) return n->node_desc;
-    if (n->app_name[0])  return n->app_name;
-    if (n->node_name[0]) return n->node_name;
+    if (n->media_name[0])  return n->media_name;
+    if (n->node_desc[0])   return n->node_desc;
+    if (n->app_name[0])    return n->app_name;
+    if (n->node_name[0])   return n->node_name;
     return "(unknown)";
 }
 
@@ -570,7 +634,7 @@ static void build_pid_results(const pw_graph_t *g, pid_t pid,
             /* Node exists but has no active links */
             char buf[512];
             snprintf(buf, sizeof(buf), "%s  (not connected)", self_label);
-            pw_result_push(out, cat, buf);
+            pw_result_push(out, cat, buf, node->id);
         } else {
             for (size_t pi = 0; pi < npeer; pi++) {
                 const pw_snap_node_t *peer = pw_graph_find_node(g, peers[pi]);
@@ -589,7 +653,7 @@ static void build_pid_results(const pw_graph_t *g, pid_t pid,
                     snprintf(buf, sizeof(buf), "%s ↔ %s",
                              self_label, peer_label);
                 }
-                pw_result_push(out, cat, buf);
+                pw_result_push(out, cat, buf, node->id);
             }
         }
     }
@@ -625,6 +689,9 @@ typedef struct {
     pid_t              pid;
     guint              generation;
     pw_result_list_t   buckets[PW_CAT_COUNT];
+    uint32_t           audio_node_id;   /* first Stream/Output/Audio node for pid, or 0 */
+    uint32_t           audio_node_ids[64]; /* all audio output node IDs for this pid */
+    size_t             audio_node_count;
     ui_ctx_t          *ctx;
 } pw_scan_task_t;
 
@@ -663,6 +730,22 @@ static void pw_scan_thread_func(GTask        *task,
     pw_result_list_t all;
     pw_result_init(&all);
     build_pid_results(&graph, t->pid, &all);
+
+    /* Find all audio output nodes for the spectrogram */
+    t->audio_node_id = 0;
+    t->audio_node_count = 0;
+    for (size_t i = 0; i < graph.node_count; i++) {
+        if (graph.nodes[i].pid == t->pid &&
+            strstr(graph.nodes[i].media_class, "Stream") &&
+            strstr(graph.nodes[i].media_class, "Output") &&
+            strstr(graph.nodes[i].media_class, "Audio")) {
+            if (t->audio_node_count < 64)
+                t->audio_node_ids[t->audio_node_count++] = graph.nodes[i].id;
+            if (t->audio_node_id == 0)
+                t->audio_node_id = graph.nodes[i].id;
+        }
+    }
+
     pw_graph_free(&graph);
 
     /* Split into per-category buckets */
@@ -671,7 +754,8 @@ static void pw_scan_thread_func(GTask        *task,
 
     for (size_t i = 0; i < all.count; i++) {
         pw_scan_category_t cat = all.entries[i].cat;
-        pw_result_push(&t->buckets[cat], cat, all.entries[i].text);
+        pw_result_push(&t->buckets[cat], cat, all.entries[i].text,
+                       all.entries[i].node_id);
     }
     pw_result_free(&all);
 
@@ -767,7 +851,8 @@ static void pw_scan_complete(GObject      *source_object,
             gtk_tree_store_set(ctx->pw_store, &child,
                                PW_COL_TEXT, t->buckets[c].entries[bi].text,
                                PW_COL_MARKUP, markup,
-                               PW_COL_CAT, (gint)-1, -1);
+                               PW_COL_CAT, (gint)-1,
+                               PW_COL_NODE_ID, (guint)t->buckets[c].entries[bi].node_id, -1);
             g_free(markup);
             bi++;
             child_valid = gtk_tree_model_iter_next(model, &child);
@@ -781,7 +866,8 @@ static void pw_scan_complete(GObject      *source_object,
             gtk_tree_store_set(ctx->pw_store, &new_child,
                                PW_COL_TEXT, t->buckets[c].entries[bi].text,
                                PW_COL_MARKUP, markup,
-                               PW_COL_CAT, (gint)-1, -1);
+                               PW_COL_CAT, (gint)-1,
+                               PW_COL_NODE_ID, (guint)t->buckets[c].entries[bi].node_id, -1);
             g_free(markup);
             bi++;
         }
@@ -802,6 +888,34 @@ static void pw_scan_complete(GObject      *source_object,
     }
 
     gtk_adjustment_set_value(vadj, scroll_pos);
+
+    /* Start (or stop) the spectrogram based on audio node availability.
+     *
+     * If we're already capturing one of this PID's audio nodes,
+     * keep it (the user may have explicitly selected it).
+     * Otherwise, auto-start on the first available audio output node.
+     */
+    if (t->audio_node_count > 0) {
+        /* Only auto-start spectrogram if user has explicitly shown it */
+        if (ctx->sb_spectro_user_shown) {
+            uint32_t current_node = spectrogram_get_target_node(ctx);
+            int found_current = 0;
+            for (size_t i = 0; i < t->audio_node_count; i++) {
+                if (t->audio_node_ids[i] == current_node) {
+                    found_current = 1;
+                    break;
+                }
+            }
+            if (!found_current)
+                spectrogram_start_for_node(ctx, t->audio_node_ids[0]);
+        }
+
+        /* Start peak meters for all audio output nodes */
+        pw_meter_start(ctx, t->audio_node_ids, t->audio_node_count);
+    } else {
+        spectrogram_stop(ctx);
+        pw_meter_stop(ctx);
+    }
 }
 
 /* ── public API ──────────────────────────────────────────────── */
@@ -891,6 +1005,37 @@ gboolean on_pw_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data)
 
     gtk_tree_path_free(path);
     return TRUE;
+}
+
+/*
+ * Double-click (or Enter on) a leaf row in the PipeWire tree to
+ * switch the spectrogram to that specific audio stream.
+ */
+void on_pw_row_activated(GtkTreeView *view, GtkTreePath *path,
+                         GtkTreeViewColumn *col, gpointer data)
+{
+    (void)col;
+    ui_ctx_t *ctx = data;
+
+    GtkTreeModel *model = gtk_tree_view_get_model(view);
+    GtkTreeIter iter;
+    if (!gtk_tree_model_get_iter(model, &iter, path))
+        return;
+
+    /* Only act on leaf rows (cat == -1) */
+    gint cat_id = -1;
+    gtk_tree_model_get(model, &iter, PW_COL_CAT, &cat_id, -1);
+    if (cat_id >= 0)
+        return;   /* category header row — handled by expand/collapse */
+
+    guint node_id = 0;
+    gtk_tree_model_get(model, &iter, PW_COL_NODE_ID, &node_id, -1);
+    if (node_id == 0)
+        return;
+
+    /* Mark that the user explicitly wants the spectrogram visible */
+    ctx->sb_spectro_user_shown = TRUE;
+    spectrogram_start_for_node(ctx, (uint32_t)node_id);
 }
 
 #endif /* HAVE_PIPEWIRE */

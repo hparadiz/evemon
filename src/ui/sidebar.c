@@ -37,6 +37,11 @@ void sidebar_update(ui_ctx_t *ctx)
         gtk_tree_store_clear(ctx->mmap_store);
 #ifdef HAVE_PIPEWIRE
         gtk_tree_store_clear(ctx->pw_store);
+        spectrogram_stop(ctx);
+        pw_meter_stop(ctx);
+        /* Hide the spectrogram section and reset user-shown flag */
+        gtk_widget_hide(ctx->sb_spectro_section);
+        ctx->sb_spectro_user_shown = FALSE;
 #endif
         return;
     }
@@ -198,6 +203,7 @@ void sidebar_update(ui_ctx_t *ctx)
     mmap_scan_start(ctx, (pid_t)pid);
 
     /* ── populate PipeWire audio connections (async, off main thread) ── */
+    /* (also triggers spectrogram capture when an audio output node is found) */
     pipewire_scan_start(ctx, (pid_t)pid);
 
     g_free(user); g_free(name); g_free(cpu_text);

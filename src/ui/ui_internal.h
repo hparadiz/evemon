@@ -98,6 +98,35 @@ typedef struct {
     GtkWidget          *sidebar;
     GtkCheckMenuItem   *sidebar_menu_item;
     GtkWidget          *sidebar_grid;
+
+    /* sidebar section collapse state & containers */
+    gboolean            sb_info_collapsed;
+    GtkWidget          *sb_info_content;     /* process info grid          */
+    GtkWidget          *sb_info_header_arrow; /* ▼/▶ indicator             */
+
+    gboolean            sb_fd_collapsed;
+    GtkWidget          *sb_fd_content;       /* fd scroll + toggles box    */
+    GtkWidget          *sb_fd_header_arrow;
+
+    gboolean            sb_env_collapsed;
+    GtkWidget          *sb_env_content;      /* env scroll                 */
+    GtkWidget          *sb_env_header_arrow;
+
+    gboolean            sb_mmap_collapsed;
+    GtkWidget          *sb_mmap_content;     /* mmap scroll                */
+    GtkWidget          *sb_mmap_header_arrow;
+
+#ifdef HAVE_PIPEWIRE
+    gboolean            sb_pw_collapsed;
+    GtkWidget          *sb_pw_content;       /* pw scroll                  */
+    GtkWidget          *sb_pw_header_arrow;
+
+    gboolean            sb_spectro_collapsed;
+    GtkWidget          *sb_spectro_content;
+    GtkWidget          *sb_spectro_section;   /* entire section (show/hide) */
+    GtkWidget          *sb_spectro_header_arrow;
+    gboolean            sb_spectro_user_shown; /* user explicitly opened    */
+#endif
     GtkLabel           *sb_pid;
     GtkLabel           *sb_ppid;
     GtkLabel           *sb_user;
@@ -158,7 +187,12 @@ typedef struct {
     pid_t               pw_last_pid;
     guint               pw_generation;
     GCancellable       *pw_cancel;
-    GtkWidget          *pw_frame;          /* container to show/hide */
+    void               *pw_meter;          /* opaque pw_meter_state_t */
+    guint               pw_meter_timer;    /* GTK timer for meter updates */
+
+    /* Spectrogram (real-time FFT visualisation of audio stream) */
+    GtkWidget          *spectro_draw;      /* GtkDrawingArea         */
+    void               *spectro;           /* opaque spectro_state_t */
 #endif
 
     /* middle-click autoscroll */
@@ -183,6 +217,14 @@ typedef struct {
     GtkTreeViewColumn  *name_col;
     char                filter_text[256];
     guint               filter_hide_timer; /* auto-hide after idle (0=none) */
+
+    /* scroll widgets for drag-to-resize (stored for window-resize clamping) */
+    GtkWidget          *sb_fd_scroll;
+    GtkWidget          *sb_env_scroll;
+    GtkWidget          *sb_mmap_scroll;
+#ifdef HAVE_PIPEWIRE
+    GtkWidget          *sb_pw_scroll;
+#endif
 
     /* pinned processes */
     pid_t              *pinned_pids;     /* dynamic array of pinned PIDs  */
@@ -342,10 +384,25 @@ enum {
     PW_COL_TEXT,          /* plain text (display line)           */
     PW_COL_MARKUP,        /* Pango markup for display            */
     PW_COL_CAT,           /* category (-1 for leaf rows)         */
+    PW_COL_NODE_ID,       /* PipeWire node ID (uint, leaf rows)  */
+    PW_COL_LEVEL_L,       /* left  peak level, 0..1000 (int)     */
+    PW_COL_LEVEL_R,       /* right peak level, 0..1000 (int)     */
     PW_NUM_COLS
 };
 
 void pipewire_scan_start(ui_ctx_t *ctx, pid_t pid);
+
+/* peak meter – real-time L/R level monitoring for audio nodes */
+void pw_meter_start(ui_ctx_t *ctx, const uint32_t *node_ids, size_t count);
+void pw_meter_stop(ui_ctx_t *ctx);
+void pw_meter_read(ui_ctx_t *ctx, uint32_t node_id, int *level_l, int *level_r);
+GtkCellRenderer *pw_cell_renderer_meter_new(void);
+
+/* spectrogram – real-time audio FFT visualisation */
+void spectrogram_start_for_node(ui_ctx_t *ctx, uint32_t node_id);
+void spectrogram_stop(ui_ctx_t *ctx);
+uint32_t spectrogram_get_target_node(ui_ctx_t *ctx);
+gboolean spectrogram_on_draw(GtkWidget *widget, cairo_t *cr, gpointer data);
 
 /* sidebar signal callbacks for PipeWire tree (connected in ui.c) */
 void on_pw_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
@@ -353,11 +410,20 @@ void on_pw_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
 void on_pw_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
                         GtkTreePath *path, gpointer data);
 gboolean on_pw_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
+void on_pw_row_activated(GtkTreeView *view, GtkTreePath *path,
+                         GtkTreeViewColumn *col, gpointer data);
 
 #else
 
 static inline void pipewire_scan_start(void *ctx, pid_t pid)
 { (void)ctx; (void)pid; }
+
+static inline void spectrogram_start_for_node(void *ctx, uint32_t node_id)
+{ (void)ctx; (void)node_id; }
+static inline void spectrogram_stop(void *ctx)
+{ (void)ctx; }
+static inline uint32_t spectrogram_get_target_node(void *ctx)
+{ (void)ctx; return 0; }
 
 #endif /* HAVE_PIPEWIRE */
 

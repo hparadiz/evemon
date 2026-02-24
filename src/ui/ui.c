@@ -698,6 +698,33 @@ static void on_selection_changed(GtkTreeSelection *sel, gpointer data)
     sidebar_update((ui_ctx_t *)data);
 }
 
+/* ── Collapsible section types / constants ───────────────────── */
+#define SECTION_ARROW_EXPANDED  "▼"
+#define SECTION_ARROW_COLLAPSED "▶"
+
+/* Animation duration for section reveal transitions (ms) */
+#define SECTION_TRANSITION_MS  200
+
+typedef struct {
+    GtkWidget *content;          /* widget inside the revealer          */
+    GtkWidget *revealer;         /* GtkRevealer wrapping the content    */
+    GtkWidget *arrow;            /* ▼/▶ label                          */
+    GtkWidget *section;          /* outermost section box               */
+    GtkWidget *sidebar_vbox;     /* parent container (for reordering)   */
+    GtkWidget *scroll_widget;    /* scrolled window to resize (or NULL) */
+    gboolean  *collapsed_flag;
+    gboolean   is_expandable;    /* TRUE for fd/env/mmap/pw sections    */
+    gboolean   dragging;         /* drag-to-resize in progress          */
+    double     drag_start_y;     /* root-Y at drag start                */
+    int        drag_start_height;/* scroll_widget height at drag start  */
+} section_toggle_t;
+
+/* Minimum / maximum height bounds for drag-to-resize */
+#define SECTION_MIN_HEIGHT       60
+#define SECTION_MAX_HEIGHT_FRAC  0.50   /* max = 50% of sidebar height   */
+#define SECTION_DEFAULT_HEIGHT   200    /* default scroll area min-height */
+#define SECTION_DRAG_MIN_WIN_H   900    /* window must be >= this tall    */
+
 static void on_toggle_sidebar(GtkCheckMenuItem *item, gpointer data)
 {
     ui_ctx_t *ctx = data;
@@ -707,6 +734,195 @@ static void on_toggle_sidebar(GtkCheckMenuItem *item, gpointer data)
     } else {
         gtk_widget_hide(ctx->sidebar);
     }
+}
+
+
+/* ── callback when revealer collapse animation finishes ─────────── */
+static void on_revealer_collapse_done(GObject *obj, GParamSpec *pspec,
+                                      gpointer data)
+{
+    (void)pspec;
+    GtkRevealer *rv = GTK_REVEALER(obj);
+    section_toggle_t *t = data;
+
+    /* Only act when the animation is fully finished (child-revealed
+     * becomes FALSE) and the section is still logically collapsed. */
+    if (gtk_revealer_get_child_revealed(rv))
+        return;
+    if (!(*t->collapsed_flag))
+        return;
+
+    /* Disconnect ourselves so we don't fire on future transitions */
+    g_signal_handlers_disconnect_by_func(rv, on_revealer_collapse_done, t);
+}
+
+/* ── drag-to-resize section height ────────────────────────────── */
+
+/* Set resize cursor on section header after it's realized */
+static void on_section_header_realize(GtkWidget *eb, gpointer data)
+{
+    (void)data;
+    GdkDisplay *display = gdk_display_get_default();
+    GdkCursor *cursor = gdk_cursor_new_from_name(display, "ns-resize");
+    if (!cursor)
+        cursor = gdk_cursor_new_from_name(display, "sb_v_double_arrow");
+    if (cursor) {
+        gdk_window_set_cursor(gtk_widget_get_window(eb), cursor);
+        g_object_unref(cursor);
+    }
+}
+
+static gboolean on_section_header_button_press(GtkWidget *eb,
+                                               GdkEventButton *ev,
+                                               gpointer data)
+{
+    section_toggle_t *t = data;
+
+    /* Double-click → collapse / expand (handled below) */
+    if (ev->type == GDK_2BUTTON_PRESS && ev->button == 1) {
+        /* Cancel any drag that the first click of the double-click started */
+        t->dragging = FALSE;
+        GdkDisplay *d = gdk_display_get_default();
+        gdk_seat_ungrab(gdk_display_get_default_seat(d));
+        return FALSE;   /* fall through to the dblclick handler */
+    }
+
+    /* Single press with left button → begin drag-to-resize.
+     * Only allow when the window is tall enough that extra space exists. */
+    if (ev->type == GDK_BUTTON_PRESS && ev->button == 1 &&
+        t->scroll_widget && !(*t->collapsed_flag)) {
+        GtkWidget *toplevel = gtk_widget_get_toplevel(eb);
+        if (!GTK_IS_WINDOW(toplevel) ||
+            gtk_widget_get_allocated_height(toplevel) < SECTION_DRAG_MIN_WIN_H)
+            return FALSE;
+        t->dragging          = TRUE;
+        t->drag_start_y      = ev->y_root;
+        t->drag_start_height = gtk_widget_get_allocated_height(t->scroll_widget);
+        /* Grab pointer so we get motion events even outside the header */
+        GdkDisplay *display = gdk_display_get_default();
+        GdkSeat    *seat    = gdk_display_get_default_seat(display);
+        GdkWindow  *win     = gtk_widget_get_window(eb);
+        GdkCursor  *cursor  = gdk_cursor_new_from_name(display, "ns-resize");
+        if (!cursor)
+            cursor = gdk_cursor_new_from_name(display, "sb_v_double_arrow");
+        gdk_seat_grab(seat, win,
+                      GDK_SEAT_CAPABILITY_POINTER,
+                      FALSE, cursor, (GdkEvent *)ev, NULL, NULL);
+        if (cursor) g_object_unref(cursor);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean on_section_header_button_release(GtkWidget *eb,
+                                                 GdkEventButton *ev,
+                                                 gpointer data)
+{
+    (void)eb; (void)ev;
+    section_toggle_t *t = data;
+    /* Always ungrab if we were dragging (or if a grab is still held
+     * from a drag that was cancelled by a double-click). */
+    gboolean was_dragging = t->dragging;
+    t->dragging = FALSE;
+    GdkDisplay *display = gdk_display_get_default();
+    GdkSeat    *seat    = gdk_display_get_default_seat(display);
+    gdk_seat_ungrab(seat);
+    return was_dragging;
+}
+
+static gboolean on_section_header_motion(GtkWidget *eb,
+                                         GdkEventMotion *ev,
+                                         gpointer data)
+{
+    (void)eb;
+    section_toggle_t *t = data;
+    if (!t->dragging || !t->scroll_widget)
+        return FALSE;
+
+    /* Safety: if the button was released but we missed the event, stop */
+    if (!(ev->state & GDK_BUTTON1_MASK)) {
+        t->dragging = FALSE;
+        GdkDisplay *d = gdk_display_get_default();
+        gdk_seat_ungrab(gdk_display_get_default_seat(d));
+        return TRUE;
+    }
+
+    double dy = ev->y_root - t->drag_start_y;
+    /* Dragging header UP (dy<0) → grow section, DOWN → shrink */
+    int new_height = t->drag_start_height - (int)dy;
+
+    /* Clamp to bounds */
+    if (new_height < SECTION_MIN_HEIGHT)
+        new_height = SECTION_MIN_HEIGHT;
+
+    /* Cap at a fraction of the sidebar's current height */
+    GtkWidget *sidebar = gtk_widget_get_toplevel(t->scroll_widget);
+    if (GTK_IS_WINDOW(sidebar)) {
+        int win_h = gtk_widget_get_allocated_height(sidebar);
+        int max_h = (int)(win_h * SECTION_MAX_HEIGHT_FRAC);
+        if (max_h < SECTION_MIN_HEIGHT) max_h = SECTION_MIN_HEIGHT;
+        if (new_height > max_h) new_height = max_h;
+    }
+
+    gtk_widget_set_size_request(t->scroll_widget, -1, new_height);
+    return TRUE;
+}
+
+/* ── clamp section heights when window shrinks ──────────────── */
+static void on_sidebar_win_size_allocate(GtkWidget *widget,
+                                        GdkRectangle *alloc,
+                                        gpointer data)
+{
+    (void)widget;
+    ui_ctx_t *ctx = data;
+    if (alloc->height >= SECTION_DRAG_MIN_WIN_H)
+        return;   /* window is large enough – keep custom heights */
+
+    /* Window is small: reset any sections whose min-height exceeds the
+     * default back to the default so they don't fight for space.  */
+    GtkWidget *scrolls[] = {
+        ctx->sb_fd_scroll, ctx->sb_env_scroll, ctx->sb_mmap_scroll,
+#ifdef HAVE_PIPEWIRE
+        ctx->sb_pw_scroll,
+#endif
+    };
+    for (size_t i = 0; i < sizeof(scrolls)/sizeof(scrolls[0]); i++) {
+        if (scrolls[i]) {
+            int cur_min;
+            gtk_widget_get_size_request(scrolls[i], NULL, &cur_min);
+            if (cur_min > SECTION_DEFAULT_HEIGHT)
+                gtk_widget_set_size_request(scrolls[i], -1,
+                                            SECTION_DEFAULT_HEIGHT);
+        }
+    }
+}
+
+/* ── double-click a section header to collapse / expand it ────── */
+static gboolean on_section_header_dblclick(GtkWidget *eb,
+                                           GdkEventButton *ev,
+                                           gpointer data)
+{
+    (void)eb;
+    if (ev->type != GDK_2BUTTON_PRESS || ev->button != 1)
+        return FALSE;
+
+    section_toggle_t *t = data;
+    gboolean collapsed = !(*t->collapsed_flag);
+    *t->collapsed_flag = collapsed;
+
+    if (collapsed) {
+        /* Update the arrow immediately, then animate content closed.
+         * Defer vexpand removal and reorder until the animation ends
+         * so the section smoothly shrinks instead of jumping. */
+        gtk_label_set_text(GTK_LABEL(t->arrow), SECTION_ARROW_COLLAPSED);
+        g_signal_connect(t->revealer, "notify::child-revealed",
+                         G_CALLBACK(on_revealer_collapse_done), t);
+        gtk_revealer_set_reveal_child(GTK_REVEALER(t->revealer), FALSE);
+    } else {
+        gtk_label_set_text(GTK_LABEL(t->arrow), SECTION_ARROW_EXPANDED);
+        gtk_revealer_set_reveal_child(GTK_REVEALER(t->revealer), TRUE);
+    }
+    return TRUE;   /* event consumed */
 }
 
 /* ── double-click: open sidebar for the activated row ─────────── */
@@ -2793,21 +3009,36 @@ void *ui_thread(void *arg)
     gtk_overlay_add_overlay(GTK_OVERLAY(tree_overlay), name_filter_entry);
 
     /* ── sidebar (detail panel) ───────────────────────────────── */
+
+    /*
+     * Helper: create a collapsible sidebar section.
+     *
+     * Returns a GtkBox (vertical) containing:
+     *   [0] separator
+     *   [1] event-box header (double-click to toggle)
+     *   [2] content_widget (shown/hidden on collapse)
+     *
+     * *out_arrow receives the arrow label widget (▼/▶).
+     * The event-box has "sb-section-header" as widget name for CSS.
+     */
     GtkWidget *sidebar_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sidebar_scroll),
                                    GTK_POLICY_NEVER,
                                    GTK_POLICY_AUTOMATIC);
     gtk_widget_set_size_request(sidebar_scroll, 240, -1);
 
-    GtkWidget *sidebar_grid = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(sidebar_grid), 4);
-    gtk_grid_set_column_spacing(GTK_GRID(sidebar_grid), 8);
-    gtk_widget_set_margin_start(sidebar_grid, 8);
-    gtk_widget_set_margin_end(sidebar_grid, 8);
-    gtk_widget_set_margin_top(sidebar_grid, 8);
-    gtk_widget_set_margin_bottom(sidebar_grid, 8);
+    GtkWidget *sidebar_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_margin_start(sidebar_vbox, 8);
+    gtk_widget_set_margin_end(sidebar_vbox, 8);
+    gtk_widget_set_margin_top(sidebar_vbox, 8);
+    gtk_widget_set_margin_bottom(sidebar_vbox, 8);
 
-    /* Helper macro to add a label row to the sidebar grid */
+    /* ── Process Info section (non-scrollable grid) ───────────── */
+    GtkWidget *info_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(info_grid), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(info_grid), 8);
+
+    /* Helper macro to add a label row to the info grid */
     #define SIDEBAR_ROW(row, key_str, label_var) do { \
         GtkWidget *_k = gtk_label_new(key_str);                          \
         gtk_label_set_xalign(GTK_LABEL(_k), 0.0f);                      \
@@ -2822,8 +3053,8 @@ void *ui_thread(void *arg)
         gtk_label_set_ellipsize(GTK_LABEL(_v), PANGO_ELLIPSIZE_END);     \
         gtk_widget_set_halign(_v, GTK_ALIGN_START);                      \
         gtk_widget_set_hexpand(_v, TRUE);                                \
-        gtk_grid_attach(GTK_GRID(sidebar_grid), _k, 0, row, 1, 1);      \
-        gtk_grid_attach(GTK_GRID(sidebar_grid), _v, 1, row, 1, 1);      \
+        gtk_grid_attach(GTK_GRID(info_grid), _k, 0, row, 1, 1);         \
+        gtk_grid_attach(GTK_GRID(info_grid), _v, 1, row, 1, 1);         \
         label_var = GTK_LABEL(_v);                                       \
     } while (0)
 
@@ -2849,8 +3080,6 @@ void *ui_thread(void *arg)
     #undef SIDEBAR_ROW
 
     /* ── Steam / Proton metadata section ──────────────────────── */
-    /* Wrap the entire Steam section in a GtkBox so we can show/hide
-     * it as a single unit from sidebar_update(). */
     GtkWidget *steam_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
     GtkWidget *steam_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
@@ -2870,7 +3099,6 @@ void *ui_thread(void *arg)
     gtk_grid_set_column_spacing(GTK_GRID(steam_grid), 8);
     gtk_box_pack_start(GTK_BOX(steam_box), steam_grid, FALSE, FALSE, 0);
 
-    /* Re-use the SIDEBAR_ROW pattern for Steam fields. */
     #define SIDEBAR_ROW_S(row, key_str, label_var) do { \
         GtkWidget *_k = gtk_label_new(key_str);                          \
         gtk_label_set_xalign(GTK_LABEL(_k), 0.0f);                      \
@@ -2901,44 +3129,112 @@ void *ui_thread(void *arg)
     SIDEBAR_ROW_S(5, "Game Directory",  sb_steam_gamedir);
     #undef SIDEBAR_ROW_S
 
-    /* Hidden by default – sidebar_update shows it for Steam processes */
     gtk_widget_set_no_show_all(steam_box, TRUE);
-    gtk_grid_attach(GTK_GRID(sidebar_grid), steam_box, 0, 13, 2, 1);
 
-    /* ── file descriptors section ─────────────────────────────── */
-    GtkWidget *fd_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_sep, 0, 14, 2, 1);
+    /*
+     * ── Collapsible section header helper ───────────────────────
+     *
+     * Creates a horizontal box with an arrow label (▼/▶) and a bold
+     * title, wrapped in a GtkEventBox that responds to double-click.
+     * Returns the event box.  *out_arrow receives the arrow label.
+     */
+    /*
+     * MAKE_SECTION: Build a complete collapsible section.
+     *
+     * section_var  – GtkWidget* to receive the outer section GtkBox
+     * header_var   – GtkWidget* to receive the header event box
+     * revealer_var – GtkWidget* to receive the GtkRevealer
+     * arrow_var    – GtkWidget* to receive the arrow label
+     * title        – section title string
+     * content_w    – GtkWidget* of the content to place inside the revealer
+     * expandable   – TRUE if this section should vexpand when open
+     */
+    #define MAKE_SECTION(section_var, header_var, revealer_var,         \
+                         arrow_var, title, content_w, expandable)       \
+    do {                                                                \
+        /* Header: arrow + bold label in an event box */                \
+        GtkWidget *_hb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);   \
+        gtk_widget_set_margin_top(_hb, 2);                             \
+        gtk_widget_set_margin_bottom(_hb, 2);                          \
+        GtkWidget *_ar = gtk_label_new(SECTION_ARROW_EXPANDED);        \
+        gtk_label_set_xalign(GTK_LABEL(_ar), 0.0f);                   \
+        gtk_box_pack_start(GTK_BOX(_hb), _ar, FALSE, FALSE, 0);       \
+        GtkWidget *_lbl = gtk_label_new(title);                        \
+        gtk_label_set_xalign(GTK_LABEL(_lbl), 0.0f);                  \
+        {                                                              \
+            PangoAttrList *_a = pango_attr_list_new();                 \
+            pango_attr_list_insert(_a,                                 \
+                pango_attr_weight_new(PANGO_WEIGHT_BOLD));             \
+            gtk_label_set_attributes(GTK_LABEL(_lbl), _a);            \
+            pango_attr_list_unref(_a);                                 \
+        }                                                              \
+        gtk_box_pack_start(GTK_BOX(_hb), _lbl, TRUE, TRUE, 0);        \
+        GtkWidget *_eb = gtk_event_box_new();                          \
+        gtk_container_add(GTK_CONTAINER(_eb), _hb);                    \
+        gtk_widget_add_events(_eb, GDK_BUTTON_PRESS_MASK              \
+                                 | GDK_BUTTON_RELEASE_MASK            \
+                                 | GDK_POINTER_MOTION_MASK);          \
+        (arrow_var)  = _ar;                                            \
+        (header_var) = _eb;                                            \
+                                                                       \
+        /* Revealer: smooth animated show/hide of content */           \
+        GtkWidget *_rv = gtk_revealer_new();                           \
+        gtk_revealer_set_transition_type(GTK_REVEALER(_rv),            \
+            GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);                  \
+        gtk_revealer_set_transition_duration(GTK_REVEALER(_rv),        \
+            SECTION_TRANSITION_MS);                                    \
+        gtk_revealer_set_reveal_child(GTK_REVEALER(_rv), TRUE);       \
+        gtk_container_add(GTK_CONTAINER(_rv), (content_w));            \
+        (revealer_var) = _rv;                                          \
+                                                                       \
+        /* Section box: separator + header + revealer */               \
+        GtkWidget *_sec = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);    \
+        gtk_box_pack_start(GTK_BOX(_sec),                              \
+            gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),             \
+            FALSE, FALSE, 0);                                          \
+        gtk_box_pack_start(GTK_BOX(_sec), _eb, FALSE, FALSE, 0);      \
+        gtk_box_pack_start(GTK_BOX(_sec), _rv,                         \
+            (expandable), (expandable), 0);                            \
+        (section_var) = _sec;                                          \
+    } while (0)
 
-    /* Header label */
-    GtkWidget *fd_header = gtk_label_new("Open File Descriptors");
-    gtk_label_set_xalign(GTK_LABEL(fd_header), 0.0f);
-    {
-        PangoAttrList *a = pango_attr_list_new();
-        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-        gtk_label_set_attributes(GTK_LABEL(fd_header), a);
-        pango_attr_list_unref(a);
-    }
-    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_header, 0, 15, 2, 1);
+    /* ── Process Info collapsible section ─────────────────────── */
+    /* Info section is special: always expanded, content = info_grid + steam_box
+     * wrapped together in a vertical box.  We still use a revealer for
+     * visual consistency when collapsing. */
+    GtkWidget *info_content_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(info_content_box), info_grid, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(info_content_box), steam_box, FALSE, FALSE, 0);
 
-    /* "Include descendants" toggle */
+    GtkWidget *info_section, *info_header_eb, *info_revealer, *info_arrow;
+    MAKE_SECTION(info_section, info_header_eb, info_revealer,
+                 info_arrow, "Process Info", info_content_box, FALSE);
+    (void)info_header_eb; (void)info_revealer;
+    gtk_widget_set_name(info_section, "info-section");
+    /* Info always participates in equal vertical space sharing */
+    gtk_widget_set_vexpand(info_section, TRUE);
+    /* Info section is never collapsible – hide the arrow */
+    gtk_widget_hide(info_arrow);
+    gtk_widget_set_no_show_all(info_arrow, TRUE);
+
+    /* ── File Descriptors collapsible section ─────────────────── */
+    GtkWidget *fd_content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    GtkWidget *fd_toggle_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     GtkWidget *fd_desc_toggle = gtk_check_button_new_with_label(
         "Include descendant tree");
-    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_desc_toggle, 0, 16, 1, 1);
-
-    /* "Group duplicates" toggle */
     GtkWidget *fd_group_dup_toggle = gtk_check_button_new_with_label(
         "Group duplicates");
-    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_group_dup_toggle, 1, 16, 1, 1);
+    gtk_box_pack_start(GTK_BOX(fd_toggle_hbox), fd_desc_toggle, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(fd_toggle_hbox), fd_group_dup_toggle, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(fd_content), fd_toggle_hbox, FALSE, FALSE, 0);
 
-    /* Scrollable tree view for the fd list */
     GtkTreeStore *fd_store = gtk_tree_store_new(FD_NUM_COLS,
-                                                G_TYPE_STRING,   /* FD_COL_TEXT */
-                                                G_TYPE_STRING,   /* FD_COL_MARKUP */
-                                                G_TYPE_INT);     /* FD_COL_CAT  */
-    GtkWidget *fd_tree = gtk_tree_view_new_with_model(
-        GTK_TREE_MODEL(fd_store));
+                                                G_TYPE_STRING,
+                                                G_TYPE_STRING,
+                                                G_TYPE_INT);
+    GtkWidget *fd_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(fd_store));
     g_object_unref(fd_store);
-
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(fd_tree), FALSE);
     gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(fd_tree), TRUE);
 
@@ -2949,51 +3245,34 @@ void *ui_thread(void *arg)
     gtk_tree_view_column_set_expand(fd_col, TRUE);
     gtk_tree_view_append_column(GTK_TREE_VIEW(fd_tree), fd_col);
 
-    /* Apply the same monospace CSS to the fd tree */
     GtkCssProvider *fd_css = gtk_css_provider_new();
     gtk_css_provider_load_from_data(fd_css,
         "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
     gtk_style_context_add_provider(gtk_widget_get_style_context(fd_tree),
         GTK_STYLE_PROVIDER(fd_css),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    /* NOTE: don't unref fd_css – kept alive for dynamic font changes */
 
-    /* Enable selection so user can copy paths */
-    GtkTreeSelection *fd_sel = gtk_tree_view_get_selection(
-        GTK_TREE_VIEW(fd_tree));
+    GtkTreeSelection *fd_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(fd_tree));
     gtk_tree_selection_set_mode(fd_sel, GTK_SELECTION_SINGLE);
 
     GtkWidget *fd_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(fd_scroll),
-                                   GTK_POLICY_AUTOMATIC,
-                                   GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(fd_scroll, -1, 200);
-    gtk_widget_set_vexpand(fd_scroll, TRUE);
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(fd_scroll, -1, SECTION_DEFAULT_HEIGHT);
     gtk_container_add(GTK_CONTAINER(fd_scroll), fd_tree);
-    gtk_grid_attach(GTK_GRID(sidebar_grid), fd_scroll, 0, 17, 2, 1);
+    gtk_box_pack_start(GTK_BOX(fd_content), fd_scroll, TRUE, TRUE, 0);
 
-    /* ── environment variables section ────────────────────────── */
-    GtkWidget *env_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_grid_attach(GTK_GRID(sidebar_grid), env_sep, 0, 18, 2, 1);
+    GtkWidget *fd_section, *fd_header_eb, *fd_revealer, *fd_arrow;
+    MAKE_SECTION(fd_section, fd_header_eb, fd_revealer,
+                 fd_arrow, "Open File Descriptors", fd_content, TRUE);
 
-    GtkWidget *env_header = gtk_label_new("Environment Variables");
-    gtk_label_set_xalign(GTK_LABEL(env_header), 0.0f);
-    {
-        PangoAttrList *a = pango_attr_list_new();
-        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-        gtk_label_set_attributes(GTK_LABEL(env_header), a);
-        pango_attr_list_unref(a);
-    }
-    gtk_grid_attach(GTK_GRID(sidebar_grid), env_header, 0, 19, 2, 1);
-
+    /* ── Environment Variables collapsible section ────────────── */
     GtkTreeStore *env_store = gtk_tree_store_new(ENV_NUM_COLS,
-                                                 G_TYPE_STRING,   /* ENV_COL_TEXT   */
-                                                 G_TYPE_STRING,   /* ENV_COL_MARKUP */
-                                                 G_TYPE_INT);     /* ENV_COL_CAT    */
-    GtkWidget *env_tree = gtk_tree_view_new_with_model(
-        GTK_TREE_MODEL(env_store));
+                                                 G_TYPE_STRING,
+                                                 G_TYPE_STRING,
+                                                 G_TYPE_INT);
+    GtkWidget *env_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(env_store));
     g_object_unref(env_store);
-
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(env_tree), FALSE);
     gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(env_tree), TRUE);
 
@@ -3004,50 +3283,33 @@ void *ui_thread(void *arg)
     gtk_tree_view_column_set_expand(env_col, TRUE);
     gtk_tree_view_append_column(GTK_TREE_VIEW(env_tree), env_col);
 
-    /* Monospace CSS for the env tree (1pt smaller than main, like fd tree) */
     GtkCssProvider *env_css = gtk_css_provider_new();
     gtk_css_provider_load_from_data(env_css,
         "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
     gtk_style_context_add_provider(gtk_widget_get_style_context(env_tree),
         GTK_STYLE_PROVIDER(env_css),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    /* NOTE: don't unref env_css – kept alive for dynamic font changes */
 
-    GtkTreeSelection *env_sel = gtk_tree_view_get_selection(
-        GTK_TREE_VIEW(env_tree));
+    GtkTreeSelection *env_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(env_tree));
     gtk_tree_selection_set_mode(env_sel, GTK_SELECTION_SINGLE);
 
     GtkWidget *env_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(env_scroll),
-                                   GTK_POLICY_AUTOMATIC,
-                                   GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(env_scroll, -1, 200);
-    gtk_widget_set_vexpand(env_scroll, TRUE);
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(env_scroll, -1, SECTION_DEFAULT_HEIGHT);
     gtk_container_add(GTK_CONTAINER(env_scroll), env_tree);
-    gtk_grid_attach(GTK_GRID(sidebar_grid), env_scroll, 0, 20, 2, 1);
 
-    /* ── memory map section ────────────────────────────────────── */
-    GtkWidget *mmap_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_grid_attach(GTK_GRID(sidebar_grid), mmap_sep, 0, 21, 2, 1);
+    GtkWidget *env_section, *env_header_eb, *env_revealer, *env_arrow;
+    MAKE_SECTION(env_section, env_header_eb, env_revealer,
+                 env_arrow, "Environment Variables", env_scroll, TRUE);
 
-    GtkWidget *mmap_header = gtk_label_new("Memory Map");
-    gtk_label_set_xalign(GTK_LABEL(mmap_header), 0.0f);
-    {
-        PangoAttrList *a = pango_attr_list_new();
-        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-        gtk_label_set_attributes(GTK_LABEL(mmap_header), a);
-        pango_attr_list_unref(a);
-    }
-    gtk_grid_attach(GTK_GRID(sidebar_grid), mmap_header, 0, 22, 2, 1);
-
+    /* ── Memory Map collapsible section ───────────────────────── */
     GtkTreeStore *mmap_store = gtk_tree_store_new(MMAP_NUM_COLS,
-                                                  G_TYPE_STRING,   /* MMAP_COL_TEXT   */
-                                                  G_TYPE_STRING,   /* MMAP_COL_MARKUP */
-                                                  G_TYPE_INT);     /* MMAP_COL_CAT    */
-    GtkWidget *mmap_tree = gtk_tree_view_new_with_model(
-        GTK_TREE_MODEL(mmap_store));
+                                                  G_TYPE_STRING,
+                                                  G_TYPE_STRING,
+                                                  G_TYPE_INT);
+    GtkWidget *mmap_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(mmap_store));
     g_object_unref(mmap_store);
-
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(mmap_tree), FALSE);
     gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(mmap_tree), TRUE);
 
@@ -3058,51 +3320,37 @@ void *ui_thread(void *arg)
     gtk_tree_view_column_set_expand(mmap_col, TRUE);
     gtk_tree_view_append_column(GTK_TREE_VIEW(mmap_tree), mmap_col);
 
-    /* Monospace CSS for the mmap tree (1pt smaller than main, like fd/env) */
     GtkCssProvider *mmap_css = gtk_css_provider_new();
     gtk_css_provider_load_from_data(mmap_css,
         "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
     gtk_style_context_add_provider(gtk_widget_get_style_context(mmap_tree),
         GTK_STYLE_PROVIDER(mmap_css),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    /* NOTE: don't unref mmap_css – kept alive for dynamic font changes */
 
-    GtkTreeSelection *mmap_sel = gtk_tree_view_get_selection(
-        GTK_TREE_VIEW(mmap_tree));
+    GtkTreeSelection *mmap_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(mmap_tree));
     gtk_tree_selection_set_mode(mmap_sel, GTK_SELECTION_SINGLE);
 
     GtkWidget *mmap_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(mmap_scroll),
-                                   GTK_POLICY_AUTOMATIC,
-                                   GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(mmap_scroll, -1, 200);
-    gtk_widget_set_vexpand(mmap_scroll, TRUE);
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(mmap_scroll, -1, SECTION_DEFAULT_HEIGHT);
     gtk_container_add(GTK_CONTAINER(mmap_scroll), mmap_tree);
-    gtk_grid_attach(GTK_GRID(sidebar_grid), mmap_scroll, 0, 23, 2, 1);
 
-    /* ── PipeWire audio connections section ─────────────────────── */
+    GtkWidget *mmap_section, *mmap_header_eb, *mmap_revealer, *mmap_arrow;
+    MAKE_SECTION(mmap_section, mmap_header_eb, mmap_revealer,
+                 mmap_arrow, "Memory Map", mmap_scroll, TRUE);
+
+    /* ── PipeWire Audio collapsible section ────────────────────── */
 #ifdef HAVE_PIPEWIRE
-    GtkWidget *pw_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_grid_attach(GTK_GRID(sidebar_grid), pw_sep, 0, 24, 2, 1);
-
-    GtkWidget *pw_header = gtk_label_new("PipeWire Audio");
-    gtk_label_set_xalign(GTK_LABEL(pw_header), 0.0f);
-    {
-        PangoAttrList *a = pango_attr_list_new();
-        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-        gtk_label_set_attributes(GTK_LABEL(pw_header), a);
-        pango_attr_list_unref(a);
-    }
-    gtk_grid_attach(GTK_GRID(sidebar_grid), pw_header, 0, 25, 2, 1);
-
     GtkTreeStore *pw_store = gtk_tree_store_new(PW_NUM_COLS,
-                                                G_TYPE_STRING,   /* PW_COL_TEXT   */
-                                                G_TYPE_STRING,   /* PW_COL_MARKUP */
-                                                G_TYPE_INT);     /* PW_COL_CAT    */
-    GtkWidget *pw_tree = gtk_tree_view_new_with_model(
-        GTK_TREE_MODEL(pw_store));
+                                                G_TYPE_STRING,
+                                                G_TYPE_STRING,
+                                                G_TYPE_INT,
+                                                G_TYPE_UINT,
+                                                G_TYPE_INT,
+                                                G_TYPE_INT);
+    GtkWidget *pw_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(pw_store));
     g_object_unref(pw_store);
-
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(pw_tree), FALSE);
     gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(pw_tree), TRUE);
 
@@ -3113,30 +3361,68 @@ void *ui_thread(void *arg)
     gtk_tree_view_column_set_expand(pw_col, TRUE);
     gtk_tree_view_append_column(GTK_TREE_VIEW(pw_tree), pw_col);
 
-    /* Monospace CSS for the PipeWire tree (1pt smaller than main) */
+    GtkCellRenderer *meter_r = pw_cell_renderer_meter_new();
+    GtkTreeViewColumn *meter_col = gtk_tree_view_column_new_with_attributes(
+        "Level", meter_r,
+        "level-l", PW_COL_LEVEL_L,
+        "level-r", PW_COL_LEVEL_R,
+        NULL);
+    gtk_tree_view_column_set_fixed_width(meter_col, 66);
+    gtk_tree_view_column_set_sizing(meter_col, GTK_TREE_VIEW_COLUMN_FIXED);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(pw_tree), meter_col);
+
     GtkCssProvider *pw_css = gtk_css_provider_new();
     gtk_css_provider_load_from_data(pw_css,
         "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
     gtk_style_context_add_provider(gtk_widget_get_style_context(pw_tree),
         GTK_STYLE_PROVIDER(pw_css),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    /* NOTE: don't unref pw_css – kept alive for dynamic font changes */
 
-    GtkTreeSelection *pw_sel = gtk_tree_view_get_selection(
-        GTK_TREE_VIEW(pw_tree));
+    GtkTreeSelection *pw_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(pw_tree));
     gtk_tree_selection_set_mode(pw_sel, GTK_SELECTION_SINGLE);
 
     GtkWidget *pw_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(pw_scroll),
-                                   GTK_POLICY_AUTOMATIC,
-                                   GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(pw_scroll, -1, 150);
-    gtk_widget_set_vexpand(pw_scroll, TRUE);
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(pw_scroll, -1, SECTION_DEFAULT_HEIGHT);
     gtk_container_add(GTK_CONTAINER(pw_scroll), pw_tree);
-    gtk_grid_attach(GTK_GRID(sidebar_grid), pw_scroll, 0, 26, 2, 1);
+
+    GtkWidget *pw_section, *pw_header_eb, *pw_revealer, *pw_arrow;
+    MAKE_SECTION(pw_section, pw_header_eb, pw_revealer,
+                 pw_arrow, "PipeWire Audio", pw_scroll, TRUE);
+
+    /* ── Spectrogram collapsible section (hidden until user opens it) ── */
+    GtkWidget *spectro_content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    GtkWidget *spectro_draw = gtk_drawing_area_new();
+    gtk_widget_set_size_request(spectro_draw, -1, 180);
+    gtk_widget_set_hexpand(spectro_draw, TRUE);
+
+    GtkWidget *spectro_inner = gtk_frame_new(NULL);
+    gtk_container_add(GTK_CONTAINER(spectro_inner), spectro_draw);
+    gtk_box_pack_start(GTK_BOX(spectro_content), spectro_inner, FALSE, FALSE, 0);
+
+    GtkWidget *spectro_section, *spectro_header_eb, *spectro_revealer, *spectro_arrow;
+    MAKE_SECTION(spectro_section, spectro_header_eb, spectro_revealer,
+                 spectro_arrow, "Audio Spectrogram", spectro_content, FALSE);
+    /* Hidden by default; shown only when user activates a PW audio node */
+    gtk_widget_set_no_show_all(spectro_section, TRUE);
 #endif /* HAVE_PIPEWIRE */
 
-    gtk_container_add(GTK_CONTAINER(sidebar_scroll), sidebar_grid);
+    #undef MAKE_SECTION
+
+    /* ── Pack all sections into the sidebar vbox ─────────────── */
+    /* Info section expands to fill extra space; other sections stay
+     * compact at the bottom, sized by their minimum height. */
+    gtk_box_pack_start(GTK_BOX(sidebar_vbox), info_section, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(sidebar_vbox), fd_section, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sidebar_vbox), env_section, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sidebar_vbox), mmap_section, FALSE, FALSE, 0);
+#ifdef HAVE_PIPEWIRE
+    gtk_box_pack_start(GTK_BOX(sidebar_vbox), pw_section, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sidebar_vbox), spectro_section, FALSE, FALSE, 0);
+#endif
+
+    gtk_container_add(GTK_CONTAINER(sidebar_scroll), sidebar_vbox);
 
     GtkWidget *sidebar_frame = gtk_frame_new("Details");
     gtk_container_add(GTK_CONTAINER(sidebar_frame), sidebar_scroll);
@@ -3153,7 +3439,6 @@ void *ui_thread(void *arg)
     gtk_style_context_add_provider(gtk_widget_get_style_context(sidebar_frame),
         GTK_STYLE_PROVIDER(sidebar_css),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    /* NOTE: don't unref sidebar_css – kept alive for dynamic font changes */
 
     /* ── horizontal paned: tree | sidebar ─────────────────────── */
     GtkWidget *hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
@@ -3274,7 +3559,41 @@ void *ui_thread(void *arg)
     /* Sidebar detail panel */
     ctx.sidebar            = sidebar_frame;
     ctx.sidebar_menu_item  = GTK_CHECK_MENU_ITEM(sidebar_toggle);
-    ctx.sidebar_grid       = sidebar_grid;
+    ctx.sidebar_grid       = sidebar_vbox;
+
+    /* Collapsible section state */
+    ctx.sb_info_collapsed     = FALSE;
+    ctx.sb_info_content       = info_content_box;
+    ctx.sb_info_header_arrow  = info_arrow;
+
+    ctx.sb_fd_collapsed       = FALSE;
+    ctx.sb_fd_content         = fd_content;
+    ctx.sb_fd_header_arrow    = fd_arrow;
+    ctx.sb_fd_scroll          = fd_scroll;
+
+    ctx.sb_env_collapsed      = FALSE;
+    ctx.sb_env_content        = env_scroll;
+    ctx.sb_env_header_arrow   = env_arrow;
+    ctx.sb_env_scroll         = env_scroll;
+
+    ctx.sb_mmap_collapsed     = FALSE;
+    ctx.sb_mmap_content       = mmap_scroll;
+    ctx.sb_mmap_header_arrow  = mmap_arrow;
+    ctx.sb_mmap_scroll        = mmap_scroll;
+
+#ifdef HAVE_PIPEWIRE
+    ctx.sb_pw_collapsed       = FALSE;
+    ctx.sb_pw_content         = pw_scroll;
+    ctx.sb_pw_header_arrow    = pw_arrow;
+    ctx.sb_pw_scroll          = pw_scroll;
+
+    ctx.sb_spectro_collapsed  = FALSE;
+    ctx.sb_spectro_content    = spectro_content;
+    ctx.sb_spectro_section    = spectro_section;
+    ctx.sb_spectro_header_arrow = spectro_arrow;
+    ctx.sb_spectro_user_shown = FALSE;
+#endif
+
     ctx.sb_pid        = sb_pid;
     ctx.sb_ppid       = sb_ppid;
     ctx.sb_user       = sb_user;
@@ -3335,6 +3654,13 @@ void *ui_thread(void *arg)
     ctx.pw_last_pid   = 0;
     ctx.pw_generation = 0;
     ctx.pw_cancel     = NULL;
+
+    ctx.pw_meter       = NULL;
+    ctx.pw_meter_timer = 0;
+
+    /* Spectrogram */
+    ctx.spectro_draw  = spectro_draw;
+    ctx.spectro       = NULL;
 #endif
 
     /* Pinned processes */
@@ -3365,6 +3691,57 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_fd_desc_toggled), &ctx);
     g_signal_connect(fd_group_dup_toggle, "toggled",
                      G_CALLBACK(on_fd_group_dup_toggled), &ctx);
+
+    /* Collapsible section header double-click signals.
+     * Each section_toggle_t is heap-allocated and lives for the entire
+     * program lifetime (never freed – intentional). */
+    #define CONNECT_SECTION(eb, content_w, rev_w, arrow_w, sec_w,        \
+                            vbox_w, flag_ptr, expand, scroll_w)           \
+    do {                                                                  \
+        section_toggle_t *_st = g_new(section_toggle_t, 1);              \
+        _st->content        = (content_w);                                \
+        _st->revealer       = (rev_w);                                    \
+        _st->arrow          = (arrow_w);                                  \
+        _st->section        = (sec_w);                                    \
+        _st->sidebar_vbox   = (vbox_w);                                   \
+        _st->scroll_widget  = (scroll_w);                                 \
+        _st->collapsed_flag = (flag_ptr);                                 \
+        _st->is_expandable  = (expand);                                   \
+        _st->dragging       = FALSE;                                      \
+        g_signal_connect((eb), "button-press-event",                      \
+                         G_CALLBACK(on_section_header_button_press), _st); \
+        g_signal_connect((eb), "button-press-event",                      \
+                         G_CALLBACK(on_section_header_dblclick), _st);    \
+        g_signal_connect((eb), "button-release-event",                    \
+                         G_CALLBACK(on_section_header_button_release), _st); \
+        g_signal_connect((eb), "motion-notify-event",                     \
+                         G_CALLBACK(on_section_header_motion), _st);      \
+        /* Set resize cursor on header to hint it's draggable */          \
+        if ((scroll_w))                                                   \
+            g_signal_connect((eb), "realize",                             \
+                             G_CALLBACK(on_section_header_realize), NULL); \
+    } while (0)
+
+    /* info section is not collapsible – no CONNECT_SECTION for it */
+    CONNECT_SECTION(fd_header_eb, fd_content, fd_revealer,
+                    fd_arrow, fd_section, sidebar_vbox,
+                    &ctx.sb_fd_collapsed, TRUE, fd_scroll);
+    CONNECT_SECTION(env_header_eb, env_scroll, env_revealer,
+                    env_arrow, env_section, sidebar_vbox,
+                    &ctx.sb_env_collapsed, TRUE, env_scroll);
+    CONNECT_SECTION(mmap_header_eb, mmap_scroll, mmap_revealer,
+                    mmap_arrow, mmap_section, sidebar_vbox,
+                    &ctx.sb_mmap_collapsed, TRUE, mmap_scroll);
+#ifdef HAVE_PIPEWIRE
+    CONNECT_SECTION(pw_header_eb, pw_scroll, pw_revealer,
+                    pw_arrow, pw_section, sidebar_vbox,
+                    &ctx.sb_pw_collapsed, TRUE, pw_scroll);
+    CONNECT_SECTION(spectro_header_eb, spectro_content, spectro_revealer,
+                    spectro_arrow, spectro_section, sidebar_vbox,
+                    &ctx.sb_spectro_collapsed, FALSE, NULL);
+#endif
+    #undef CONNECT_SECTION
+
     g_signal_connect(name_filter_entry, "key-release-event",
                      G_CALLBACK(on_filter_entry_key_release), &ctx);
     g_signal_connect(tree_overlay, "get-child-position",
@@ -3394,9 +3771,15 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_pw_row_expanded), &ctx);
     g_signal_connect(pw_tree, "key-press-event",
                      G_CALLBACK(on_pw_key_press), &ctx);
+    g_signal_connect(pw_tree, "row-activated",
+                     G_CALLBACK(on_pw_row_activated), &ctx);
+    g_signal_connect(spectro_draw, "draw",
+                     G_CALLBACK(spectrogram_on_draw), &ctx);
 #endif
     g_signal_connect(window,    "configure-event",
                      G_CALLBACK(on_window_configure), &ctx);
+    g_signal_connect(window,    "size-allocate",
+                     G_CALLBACK(on_sidebar_win_size_allocate), &ctx);
     g_signal_connect(window,    "notify::scale-factor",
                      G_CALLBACK(on_scale_factor_changed), &ctx);
 
@@ -3492,6 +3875,11 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
         g_object_unref(ctx->pw_cancel);
         ctx->pw_cancel = NULL;
     }
+
+    /* Stop the spectrogram capture */
+    spectrogram_stop(ctx);
+    /* Stop the peak meters */
+    pw_meter_stop(ctx);
 #endif
 
     /* Stop autoscroll timer */
