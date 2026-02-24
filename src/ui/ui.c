@@ -3561,8 +3561,6 @@ void *ui_thread(void *arg)
 
     SIDEBAR_ROW(0,  "PID",             sb_pid);
     SIDEBAR_ROW(1,  "PPID",            sb_ppid);
-    gtk_label_set_xalign(GTK_LABEL(sb_ppid), 1.0f);
-    gtk_widget_set_halign(GTK_WIDGET(sb_ppid), GTK_ALIGN_END);
     SIDEBAR_ROW(2,  "User",            sb_user);
     SIDEBAR_ROW(3,  "Name",            sb_name);
     SIDEBAR_ROW(4,  "CPU%",            sb_cpu);
@@ -3631,6 +3629,84 @@ void *ui_thread(void *arg)
     #undef SIDEBAR_ROW_S
 
     gtk_widget_set_no_show_all(steam_box, TRUE);
+
+    /* ── cgroup resource limits section (conditionally visible) ── */
+    GtkWidget *cgroup_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    GtkWidget *cgroup_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(cgroup_box), cgroup_sep, FALSE, FALSE, 0);
+
+    GtkWidget *cgroup_header = gtk_label_new("cgroup Limits");
+    gtk_label_set_xalign(GTK_LABEL(cgroup_header), 0.0f);
+    {
+        PangoAttrList *a = pango_attr_list_new();
+        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(cgroup_header), a);
+        pango_attr_list_unref(a);
+    }
+    gtk_box_pack_start(GTK_BOX(cgroup_box), cgroup_header, FALSE, FALSE, 0);
+
+    GtkWidget *cgroup_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(cgroup_grid), 8);
+    gtk_box_pack_start(GTK_BOX(cgroup_box), cgroup_grid, FALSE, FALSE, 0);
+
+    /* Cgroup row helper macro (same pattern as SIDEBAR_ROW_S) */
+    #define CGROUP_ROW(row, key_str, label_var) do { \
+        GtkWidget *_k = gtk_label_new(key_str);                          \
+        gtk_label_set_xalign(GTK_LABEL(_k), 0.0f);                      \
+        gtk_widget_set_halign(_k, GTK_ALIGN_START);                      \
+        PangoAttrList *_a = pango_attr_list_new();                       \
+        pango_attr_list_insert(_a, pango_attr_weight_new(PANGO_WEIGHT_BOLD)); \
+        gtk_label_set_attributes(GTK_LABEL(_k), _a);                     \
+        pango_attr_list_unref(_a);                                       \
+        GtkWidget *_v = gtk_label_new("–");                              \
+        gtk_label_set_xalign(GTK_LABEL(_v), 0.0f);                      \
+        gtk_label_set_selectable(GTK_LABEL(_v), TRUE);                   \
+        gtk_label_set_ellipsize(GTK_LABEL(_v), PANGO_ELLIPSIZE_MIDDLE);  \
+        gtk_widget_set_halign(_v, GTK_ALIGN_START);                      \
+        gtk_widget_set_hexpand(_v, TRUE);                                \
+        gtk_grid_attach(GTK_GRID(cgroup_grid), _k, 0, row, 1, 1);       \
+        gtk_grid_attach(GTK_GRID(cgroup_grid), _v, 1, row, 1, 1);       \
+        label_var = GTK_LABEL(_v);                                       \
+    } while (0)
+
+    /* Variant that also stores the key widget for hide/show */
+    #define CGROUP_ROW_K(row, key_str, label_var, key_var) do { \
+        GtkWidget *_k = gtk_label_new(key_str);                          \
+        gtk_label_set_xalign(GTK_LABEL(_k), 0.0f);                      \
+        gtk_widget_set_halign(_k, GTK_ALIGN_START);                      \
+        PangoAttrList *_a = pango_attr_list_new();                       \
+        pango_attr_list_insert(_a, pango_attr_weight_new(PANGO_WEIGHT_BOLD)); \
+        gtk_label_set_attributes(GTK_LABEL(_k), _a);                     \
+        pango_attr_list_unref(_a);                                       \
+        GtkWidget *_v = gtk_label_new("–");                              \
+        gtk_label_set_xalign(GTK_LABEL(_v), 0.0f);                      \
+        gtk_label_set_selectable(GTK_LABEL(_v), TRUE);                   \
+        gtk_label_set_ellipsize(GTK_LABEL(_v), PANGO_ELLIPSIZE_MIDDLE);  \
+        gtk_widget_set_halign(_v, GTK_ALIGN_START);                      \
+        gtk_widget_set_hexpand(_v, TRUE);                                \
+        gtk_grid_attach(GTK_GRID(cgroup_grid), _k, 0, row, 1, 1);       \
+        gtk_grid_attach(GTK_GRID(cgroup_grid), _v, 1, row, 1, 1);       \
+        label_var = GTK_LABEL(_v);                                       \
+        key_var = _k;                                                    \
+    } while (0)
+
+    GtkLabel *sb_cgroup_path, *sb_cgroup_mem;
+    GtkLabel *sb_cgroup_mem_high, *sb_cgroup_swap;
+    GtkLabel *sb_cgroup_cpu, *sb_cgroup_pids, *sb_cgroup_io;
+    GtkWidget *sb_cgroup_mem_high_key, *sb_cgroup_swap_key, *sb_cgroup_io_key;
+
+    CGROUP_ROW(0, "Path",     sb_cgroup_path);
+    CGROUP_ROW(1, "Memory",   sb_cgroup_mem);
+    CGROUP_ROW_K(2, "Mem High", sb_cgroup_mem_high, sb_cgroup_mem_high_key);
+    CGROUP_ROW_K(3, "Swap",    sb_cgroup_swap, sb_cgroup_swap_key);
+    CGROUP_ROW(4, "CPU",      sb_cgroup_cpu);
+    CGROUP_ROW(5, "PIDs",     sb_cgroup_pids);
+    CGROUP_ROW_K(6, "I/O",     sb_cgroup_io, sb_cgroup_io_key);
+    #undef CGROUP_ROW
+    #undef CGROUP_ROW_K
+
+    gtk_widget_set_no_show_all(cgroup_box, TRUE);
 
     /*
      * ── Collapsible section header helper ───────────────────────
@@ -3706,6 +3782,7 @@ void *ui_thread(void *arg)
     GtkWidget *info_content_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_pack_start(GTK_BOX(info_content_box), info_grid, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(info_content_box), steam_box, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(info_content_box), cgroup_box, FALSE, FALSE, 0);
 
     GtkWidget *info_section, *info_header_eb, *info_revealer, *info_arrow;
     MAKE_SECTION(info_section, info_header_eb, info_revealer,
@@ -4217,6 +4294,21 @@ void *ui_thread(void *arg)
     ctx.sb_steam_gamedir = sb_steam_gamedir;
     ctx.sb_steam_frame   = steam_box;     /* show/hide entire Steam section */
 
+    /* cgroup resource limits */
+    ctx.sb_cgroup_path         = sb_cgroup_path;
+    ctx.sb_cgroup_mem          = sb_cgroup_mem;
+    ctx.sb_cgroup_mem_high     = sb_cgroup_mem_high;
+    ctx.sb_cgroup_mem_high_key = sb_cgroup_mem_high_key;
+    ctx.sb_cgroup_swap         = sb_cgroup_swap;
+    ctx.sb_cgroup_swap_key     = sb_cgroup_swap_key;
+    ctx.sb_cgroup_cpu          = sb_cgroup_cpu;
+    ctx.sb_cgroup_pids         = sb_cgroup_pids;
+    ctx.sb_cgroup_io           = sb_cgroup_io;
+    ctx.sb_cgroup_io_key       = sb_cgroup_io_key;
+    ctx.sb_cgroup_frame        = cgroup_box;
+    ctx.cgroup_generation      = 0;
+    ctx.cgroup_cancel          = NULL;
+
     /* File descriptor list */
     ctx.fd_store        = fd_store;
     ctx.fd_view         = GTK_TREE_VIEW(fd_tree);
@@ -4523,6 +4615,13 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
         g_cancellable_cancel(ctx->lib_cancel);
         g_object_unref(ctx->lib_cancel);
         ctx->lib_cancel = NULL;
+    }
+
+    /* Cancel any in-flight async cgroup scan */
+    if (ctx->cgroup_cancel) {
+        g_cancellable_cancel(ctx->cgroup_cancel);
+        g_object_unref(ctx->cgroup_cancel);
+        ctx->cgroup_cancel = NULL;
     }
 
     /* Cancel any in-flight async net scan */

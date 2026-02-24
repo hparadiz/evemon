@@ -166,6 +166,21 @@ typedef struct {
     GtkLabel           *sb_steam_gamedir;
     GtkWidget          *sb_steam_frame;     /* container to show/hide */
 
+    /* cgroup resource limits in sidebar */
+    GtkLabel           *sb_cgroup_path;
+    GtkLabel           *sb_cgroup_mem;
+    GtkLabel           *sb_cgroup_mem_high;
+    GtkWidget          *sb_cgroup_mem_high_key;  /* key label (hide/show) */
+    GtkLabel           *sb_cgroup_swap;
+    GtkWidget          *sb_cgroup_swap_key;
+    GtkLabel           *sb_cgroup_cpu;
+    GtkLabel           *sb_cgroup_pids;
+    GtkLabel           *sb_cgroup_io;
+    GtkWidget          *sb_cgroup_io_key;
+    GtkWidget          *sb_cgroup_frame;     /* container to show/hide */
+    guint               cgroup_generation;
+    GCancellable       *cgroup_cancel;
+
     /* file descriptor list in sidebar */
     GtkTreeStore       *fd_store;
     GtkTreeView        *fd_view;
@@ -472,6 +487,10 @@ enum {
 extern const char *lib_cat_label[LIB_CAT_COUNT];
 
 void lib_scan_start(ui_ctx_t *ctx, pid_t pid);
+
+/* ── cgroup resource limits scanning ──────────────────────────── */
+
+void cgroup_scan_start(ui_ctx_t *ctx, pid_t pid);
 
 /* sidebar signal callbacks for library tree */
 void on_lib_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,

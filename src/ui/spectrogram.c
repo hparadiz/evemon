@@ -30,6 +30,31 @@
 #define WATERFALL_COLS  400     /* horizontal pixels = time slices  */
 #define WATERFALL_ROWS  FFT_HALF /* vertical pixels = freq bins     */
 
+/* ── frequency cutoff detection ──────────────────────────────── */
+
+/*
+ * Known lossy codec frequency cutoffs (from spectral analysis guides).
+ * Sorted highest-first so the first match wins.
+ */
+typedef struct {
+    int    cutoff_hz;
+    const char *label;
+} codec_cutoff_t;
+
+static const codec_cutoff_t codec_table[] = {
+    { 18500, "Lossless"    },  /* 44.1→48k PW resample: ~2-3k rolloff */
+    { 17500, "~MP3 320"    },  /* MP3 320 CBR: ~20.5k → ~17.5k post-PW */
+    { 17000, "~MP3 256"    },  /* MP3 256 CBR                     */
+    { 16500, "~MP3 V0"     },  /* LAME V0                         */
+    { 16000, "~MP3 192"    },  /* MP3 192 CBR                     */
+    { 15000, "~MP3 V2"     },  /* LAME V2                         */
+    { 14000, "~Lossy 160"  },  /* Various ~160 kbps               */
+    { 12500, "~MP3 128"    },  /* MP3 128 CBR                     */
+    { 10000, "~AAC 96"     },  /* Low bitrate AAC                 */
+    {  8000, "~Low bitrate"},  /* Very low quality                */
+    {     0, NULL          },
+};
+
 /* ── radix-2 Cooley–Tukey FFT (in-place, decimation-in-time) ── */
 
 static void fft_dit(float *re, float *im, int n)
@@ -128,7 +153,80 @@ typedef struct {
 
     /* Running flag */
     int                    running;
+
+    /* ── frequency cutoff detection ──────────────────────────── */
+    float                  cutoff_freq;     /* detected cutoff in Hz    */
+    int                    cutoff_bin;      /* FFT bin index of cutoff  */
+    char                   cutoff_label[64];/* codec label string       */
+    float                  cutoff_ema;      /* EMA-smoothed cutoff bin  */
+    int                    detect_counter;  /* frames since last detect */
 } spectro_state_t;
+
+/* ── frequency cutoff detection ───────────────────────────────
+ *
+ * Scan the most recent waterfall columns from the top (Nyquist)
+ * downward to find the highest bin where average energy is above a
+ * noise-floor threshold.  That is the "cliff" – the point where
+ * the lossy codec's low-pass filter kicks in.
+ *
+ * We use an exponential moving average to smooth the result and
+ * avoid jitter.
+ * ──────────────────────────────────────────────────────────── */
+
+#define CUTOFF_SCAN_COLS   60      /* look at the last N time slices   */
+#define CUTOFF_NOISE_FLOOR 0.06f   /* normalised dB threshold (~-75 dB)*/
+#define CUTOFF_EMA_ALPHA   0.08f   /* smoothing factor (lower = slower)*/
+#define CUTOFF_DETECT_INTERVAL 8   /* run detection every N FFT frames */
+
+static void detect_cutoff(spectro_state_t *st)
+{
+    /*
+     * Average each frequency bin across the most recent columns.
+     */
+    int start_col = st->wf_write_col - CUTOFF_SCAN_COLS;
+    if (start_col < 0) start_col += WATERFALL_COLS;
+
+    /* Scan from top bin down; find the highest with any significant energy.
+     * The "cliff" is a hard cutoff — if *any* column has content at a bin,
+     * the codec hasn't filtered it, so we use max, not mean. */
+    int top_bin = 0;
+    for (int bin = FFT_HALF - 1; bin >= 0; bin--) {
+        float peak = 0.0f;
+        int   col = start_col;
+        for (int c = 0; c < CUTOFF_SCAN_COLS; c++) {
+            if (st->waterfall[col][bin] > peak)
+                peak = st->waterfall[col][bin];
+            col = (col + 1) % WATERFALL_COLS;
+        }
+        if (peak > CUTOFF_NOISE_FLOOR) {
+            top_bin = bin;
+            break;
+        }
+    }
+
+    /* Apply EMA smoothing to the detected bin. */
+    if (st->cutoff_ema < 1.0f)
+        st->cutoff_ema = (float)top_bin;        /* first time: seed      */
+    else
+        st->cutoff_ema += CUTOFF_EMA_ALPHA * ((float)top_bin - st->cutoff_ema);
+
+    int smoothed_bin = (int)(st->cutoff_ema + 0.5f);
+    float freq = (float)smoothed_bin * (float)SAMPLE_RATE / (float)FFT_SIZE;
+
+    st->cutoff_bin  = smoothed_bin;
+    st->cutoff_freq = freq;
+
+    /* Map to a codec label. */
+    const char *lbl = "Unknown";
+    for (int i = 0; codec_table[i].label; i++) {
+        if (freq >= (float)codec_table[i].cutoff_hz) {
+            lbl = codec_table[i].label;
+            break;
+        }
+    }
+    snprintf(st->cutoff_label, sizeof(st->cutoff_label),
+             "%s  (%.1f kHz)", lbl, freq / 1000.0f);
+}
 
 /* ── PipeWire stream process callback ────────────────────────── */
 
@@ -295,6 +393,45 @@ static gboolean on_spectro_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
         cairo_show_text(cr, label);
     }
 
+    /* ── Cutoff frequency line and codec label ──────────────── */
+    if (st->cutoff_freq > 0.0f && st->cutoff_label[0]) {
+        double bin = (double)st->cutoff_freq * FFT_SIZE / SAMPLE_RATE;
+        double y_cut = h - (bin / FFT_HALF) * h;
+
+        if (y_cut > 2 && y_cut < h - 2) {
+            /* Dashed horizontal line */
+            double dashes[] = { 4.0, 3.0 };
+            cairo_set_dash(cr, dashes, 2, 0);
+            cairo_set_source_rgba(cr, 1.0, 0.85, 0.0, 0.8);
+            cairo_set_line_width(cr, 1.0);
+            cairo_move_to(cr, 0, y_cut);
+            cairo_line_to(cr, w, y_cut);
+            cairo_stroke(cr);
+            cairo_set_dash(cr, NULL, 0, 0);
+        }
+
+        /* Label in the top-right corner */
+        cairo_select_font_face(cr, "Monospace",
+                               CAIRO_FONT_SLANT_NORMAL,
+                               CAIRO_FONT_WEIGHT_BOLD);
+        cairo_set_font_size(cr, 11.0);
+
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, st->cutoff_label, &ext);
+        double lx = w - ext.width - 6;
+        double ly = 14;
+
+        /* Background pill for readability */
+        cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.55);
+        cairo_rectangle(cr, lx - 4, ly - ext.height - 2,
+                        ext.width + 8, ext.height + 6);
+        cairo_fill(cr);
+
+        cairo_set_source_rgba(cr, 1.0, 0.85, 0.0, 0.95);
+        cairo_move_to(cr, lx, ly);
+        cairo_show_text(cr, st->cutoff_label);
+    }
+
     return FALSE;
 }
 
@@ -355,8 +492,16 @@ static gboolean spectro_tick(gpointer data)
     }
     atomic_store_explicit(&st->ring.read_pos, rp, memory_order_release);
 
-    if (did_fft && st->draw_area)
-        gtk_widget_queue_draw(GTK_WIDGET(st->draw_area));
+    if (did_fft) {
+        /* Run cutoff detection periodically to avoid wasting cycles */
+        st->detect_counter += fft_count;
+        if (st->detect_counter >= CUTOFF_DETECT_INTERVAL) {
+            st->detect_counter = 0;
+            detect_cutoff(st);
+        }
+        if (st->draw_area)
+            gtk_widget_queue_draw(GTK_WIDGET(st->draw_area));
+    }
 
     return G_SOURCE_CONTINUE;
 }
