@@ -4,6 +4,7 @@
  */
 
 #include "ui_internal.h"
+#include "../fdmon.h"
 
 #include <unistd.h>
 
@@ -34,6 +35,7 @@ void fd_list_push(fd_list_t *l, int fd, const char *path)
         l->capacity = newcap;
     }
     l->entries[l->count].fd = fd;
+    l->entries[l->count].net_sort_key = 0;
     snprintf(l->entries[l->count].path, sizeof(l->entries[0].path), "%s", path);
     l->count++;
 }
@@ -484,7 +486,7 @@ void read_pid_fds(pid_t pid, fd_list_t *out)
 
 /* ── async fd scan infrastructure ────────────────────────────── */
 
-static void collect_descendant_pids(GtkTreeModel *model, GtkTreeIter *parent,
+void collect_descendant_pids(GtkTreeModel *model, GtkTreeIter *parent,
                                     pid_t **out, size_t *out_count, size_t *out_cap)
 {
     GtkTreeIter child;
@@ -511,6 +513,9 @@ typedef struct {
     guint    generation;
     fd_list_t buckets[FD_CAT_COUNT];
     ui_ctx_t *ctx;
+    fdmon_ctx_t *fdmon;        /* for per-PID network throughput */
+    uint64_t net_send_bytes;   /* delta send bytes this snapshot */
+    uint64_t net_recv_bytes;   /* delta recv bytes this snapshot */
 } fd_scan_task_t;
 
 static void fd_scan_task_free(fd_scan_task_t *t)
@@ -520,6 +525,18 @@ static void fd_scan_task_free(fd_scan_task_t *t)
     for (int c = 0; c < FD_CAT_COUNT; c++)
         fd_list_free(&t->buckets[c]);
     free(t);
+}
+
+/* Sort network socket entries by traffic (highest first). */
+static int fd_entry_net_sort_cmp(const void *a, const void *b)
+{
+    const fd_entry_t *ea = (const fd_entry_t *)a;
+    const fd_entry_t *eb = (const fd_entry_t *)b;
+    /* Descending by net_sort_key */
+    if (eb->net_sort_key > ea->net_sort_key) return  1;
+    if (eb->net_sort_key < ea->net_sort_key) return -1;
+    /* Fall back to path comparison for stability */
+    return strcmp(ea->path, eb->path);
 }
 
 static void fd_scan_thread_func(GTask        *task,
@@ -580,10 +597,33 @@ static void fd_scan_thread_func(GTask        *task,
     sock_table_free(&socktbl);
     fd_list_free(&fds);
 
+    /* Query per-PID network throughput from eBPF (if available) and
+     * annotate all network socket entries with ↑/↓ rate strings.
+     * The per-PID counters give us aggregate send/recv for the whole
+     * process, not per-socket, so we store the total on every socket
+     * entry and use it as the sort key.                             */
+    {
+        uint64_t send_b = 0, recv_b = 0;
+        if (t->fdmon)
+            fdmon_net_io_get(t->fdmon, t->pid, &send_b, &recv_b);
+        t->net_send_bytes = send_b;
+        t->net_recv_bytes = recv_b;
+
+        uint64_t total_net = send_b + recv_b;
+        /* Stamp the sort key on every network socket entry */
+        for (size_t i = 0; i < t->buckets[FD_CAT_NET_SOCKETS].count; i++)
+            t->buckets[FD_CAT_NET_SOCKETS].entries[i].net_sort_key = total_net;
+    }
+
     for (int c = 0; c < FD_CAT_COUNT; c++) {
-        if (t->buckets[c].count > 1)
-            qsort(t->buckets[c].entries, t->buckets[c].count,
-                  sizeof(fd_entry_t), fd_entry_path_cmp);
+        if (t->buckets[c].count > 1) {
+            if (c == FD_CAT_NET_SOCKETS)
+                qsort(t->buckets[c].entries, t->buckets[c].count,
+                      sizeof(fd_entry_t), fd_entry_net_sort_cmp);
+            else
+                qsort(t->buckets[c].entries, t->buckets[c].count,
+                      sizeof(fd_entry_t), fd_entry_path_cmp);
+        }
     }
 
     g_task_return_boolean(task, TRUE);
@@ -640,7 +680,10 @@ static void fd_scan_complete(GObject      *source_object,
     for (int c = 0; c < FD_CAT_COUNT; c++) {
         if (t->buckets[c].count == 0) continue;
 
-        char hdr[128];
+        /* Network sockets are shown in their own sidebar section now */
+        if (c == FD_CAT_NET_SOCKETS) continue;
+
+        char hdr[256];
         snprintf(hdr, sizeof(hdr), "%s (%zu)",
                  fd_cat_label[c], t->buckets[c].count);
 
@@ -780,6 +823,7 @@ void fd_scan_start(ui_ctx_t *ctx, pid_t pid)
     t->pid        = pid;
     t->generation = ctx->fd_generation;
     t->ctx        = ctx;
+    t->fdmon      = ctx->mon ? ctx->mon->fdmon : NULL;
 
     if (ctx->fd_include_desc) {
         GtkTreeIter fd_iter;

@@ -5,6 +5,7 @@
 #include <pthread.h>
 
 #include "steam.h"
+#include "fdmon.h"
 
 /* Maximum lengths for process info strings */
 #define PROC_NAME_MAX  256
@@ -51,6 +52,7 @@ typedef struct {
     pthread_mutex_t  lock;       /* protects snapshot               */
     pthread_cond_t   updated;    /* signalled when snapshot changes */
     int              running;    /* 0 = shutdown requested          */
+    fdmon_ctx_t     *fdmon;      /* eBPF fd/network monitor (may be NULL) */
 } monitor_state_t;
 
 /* ── Monitor (backend) API ──────────────────────────────────── */

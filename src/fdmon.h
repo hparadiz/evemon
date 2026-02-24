@@ -47,8 +47,10 @@ extern "C" {
 /* ── event types ─────────────────────────────────────────────── */
 
 typedef enum {
-    FDMON_OPEN  = 1,    /* a file descriptor was opened   */
-    FDMON_CLOSE = 2,    /* a file descriptor was closed    */
+    FDMON_OPEN     = 1,    /* a file descriptor was opened     */
+    FDMON_CLOSE    = 2,    /* a file descriptor was closed      */
+    FDMON_NET_SEND = 3,    /* TCP data sent (bytes in .net_bytes) */
+    FDMON_NET_RECV = 4,    /* TCP data received                  */
 } fdmon_event_type_t;
 
 /* Describes a single fd lifecycle event. */
@@ -58,6 +60,7 @@ typedef struct {
     pid_t              tgid;        /* thread-group leader (main PID) */
     int                fd;          /* file descriptor number         */
     uint64_t           timestamp;   /* CLOCK_MONOTONIC nanoseconds    */
+    uint32_t           net_bytes;   /* bytes sent/received (NET_SEND/RECV) */
     char               path[1024];  /* resolved path (best effort,
                                        may be empty for sockets etc.) */
 } fdmon_event_t;
@@ -162,6 +165,52 @@ typedef struct {
 } fdmon_stats_t;
 
 void fdmon_get_stats(const fdmon_ctx_t *ctx, fdmon_stats_t *stats);
+
+/* ── per-PID network I/O throughput ──────────────────────────── */
+
+/*
+ * Retrieve accumulated network send/recv bytes for a process since
+ * the last call to fdmon_net_io_snapshot().  The library tracks
+ * per-PID byte counters from eBPF tcp_sendmsg / tcp_recvmsg probes.
+ *
+ * Call fdmon_net_io_snapshot() periodically (e.g. once per second)
+ * to latch the current counters.  Then fdmon_net_io_get() returns
+ * the delta (bytes/interval) for any PID.
+ *
+ * Returns 0 on success, -1 if PID has no recorded traffic.
+ */
+int fdmon_net_io_get(const fdmon_ctx_t *ctx, pid_t tgid,
+                     uint64_t *send_bytes, uint64_t *recv_bytes);
+
+/*
+ * Latch the current per-PID network byte counters and compute deltas.
+ * Must be called periodically from the UI refresh loop.
+ */
+void fdmon_net_io_snapshot(fdmon_ctx_t *ctx);
+
+/* ── per-socket (connection) network I/O ─────────────────────── */
+
+/*
+ * Query result for per-socket throughput.
+ * Matches a network connection by its 4-tuple (local/remote addr:port).
+ */
+typedef struct {
+    uint32_t laddr;      /* local  IPv4 (network order)   */
+    uint32_t raddr;      /* remote IPv4 (network order)   */
+    uint16_t lport;      /* local  port (host order)      */
+    uint16_t rport;      /* remote port (network order)   */
+    uint64_t delta_send; /* bytes sent since last snapshot */
+    uint64_t delta_recv; /* bytes recv since last snapshot */
+} fdmon_sock_io_t;
+
+/*
+ * Retrieve per-socket throughput data for a given PID.
+ * Caller provides an output buffer and its capacity.  The function
+ * fills up to *count entries and sets *count to the number returned.
+ * Returns 0 on success.
+ */
+int fdmon_sock_io_list(const fdmon_ctx_t *ctx, pid_t tgid,
+                       fdmon_sock_io_t *out, size_t *count);
 
 #ifdef __cplusplus
 }

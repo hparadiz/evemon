@@ -4,6 +4,7 @@
 
 #include "ui_internal.h"
 #include "../steam.h"
+#include "../fdmon.h"
 
 /* ── sidebar: update detail panel from selection ─────────────── */
 
@@ -28,6 +29,8 @@ void sidebar_update(ui_ctx_t *ctx)
         gtk_label_set_text(ctx->sb_group_cpu, "–");
         gtk_label_set_text(ctx->sb_io_read,   "–");
         gtk_label_set_text(ctx->sb_io_write,  "–");
+        gtk_label_set_text(ctx->sb_net_send,  "–");
+        gtk_label_set_text(ctx->sb_net_recv,  "–");
         gtk_label_set_text(ctx->sb_start_time, "–");
         gtk_label_set_text(ctx->sb_container, "–");
         gtk_label_set_text(ctx->sb_service,   "–");
@@ -37,6 +40,7 @@ void sidebar_update(ui_ctx_t *ctx)
         gtk_tree_store_clear(ctx->fd_store);
         gtk_tree_store_clear(ctx->env_store);
         gtk_tree_store_clear(ctx->mmap_store);
+        gtk_tree_store_clear(ctx->net_store);
 #ifdef HAVE_PIPEWIRE
         gtk_tree_store_clear(ctx->pw_store);
         spectrogram_stop(ctx);
@@ -106,6 +110,42 @@ void sidebar_update(ui_ctx_t *ctx)
     gtk_label_set_text(ctx->sb_group_cpu, grp_cpu_text ? grp_cpu_text : "–");
     gtk_label_set_text(ctx->sb_io_read,   io_read_text  ? io_read_text  : "–");
     gtk_label_set_text(ctx->sb_io_write,  io_write_text ? io_write_text : "–");
+
+    /* Per-PID network throughput from eBPF tcp_sendmsg/tcp_recvmsg */
+    {
+        fdmon_ctx_t *fdmon = ctx->mon ? ctx->mon->fdmon : NULL;
+        uint64_t send_b = 0, recv_b = 0;
+        if (fdmon && pid > 0)
+            fdmon_net_io_get(fdmon, (pid_t)pid, &send_b, &recv_b);
+
+        /* Format as rate (interval ≈ 2 s from monitor thread) */
+        char net_buf[64];
+        double interval = 2.0;
+        #define FMT_NET_RATE(bytes) do { \
+            double _r = (interval > 0.01) ? (double)(bytes) / interval \
+                                          : (double)(bytes); \
+            if (_r < 1.0) \
+                snprintf(net_buf, sizeof(net_buf), "0 B/s"); \
+            else if (_r < 1024.0) \
+                snprintf(net_buf, sizeof(net_buf), "%.0f B/s", _r); \
+            else if (_r < 1024.0 * 1024.0) \
+                snprintf(net_buf, sizeof(net_buf), "%.1f KiB/s", \
+                         _r / 1024.0); \
+            else if (_r < 1024.0 * 1024.0 * 1024.0) \
+                snprintf(net_buf, sizeof(net_buf), "%.1f MiB/s", \
+                         _r / (1024.0 * 1024.0)); \
+            else \
+                snprintf(net_buf, sizeof(net_buf), "%.2f GiB/s", \
+                         _r / (1024.0 * 1024.0 * 1024.0)); \
+        } while (0)
+
+        FMT_NET_RATE(send_b);
+        gtk_label_set_text(ctx->sb_net_send, net_buf);
+        FMT_NET_RATE(recv_b);
+        gtk_label_set_text(ctx->sb_net_recv, net_buf);
+        #undef FMT_NET_RATE
+    }
+
     if (start_time_text && start_epoch > 0) {
         char fuzzy[64];
         format_fuzzy_time((time_t)start_epoch, fuzzy, sizeof(fuzzy));
@@ -208,6 +248,9 @@ void sidebar_update(ui_ctx_t *ctx)
 
     /* ── populate memory map tree (async, off main thread) ── */
     mmap_scan_start(ctx, (pid_t)pid);
+
+    /* ── populate network sockets tree (async, off main thread) ── */
+    net_scan_start(ctx, (pid_t)pid);
 
     /* ── populate PipeWire audio connections (async, off main thread) ── */
     /* (also triggers spectrogram capture when an audio output node is found) */

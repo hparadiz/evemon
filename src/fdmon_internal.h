@@ -39,6 +39,40 @@ typedef struct {
 #define MAX_ROOTS       64
 #define MAX_DESCENDANTS 8192
 
+/* ── per-PID network I/O accumulator ─────────────────────────── */
+
+#define NET_IO_HT_SIZE  4096
+
+typedef struct {
+    pid_t    tgid;
+    uint64_t send_bytes;     /* cumulative bytes sent              */
+    uint64_t recv_bytes;     /* cumulative bytes received          */
+    uint64_t prev_send;      /* send_bytes at last snapshot        */
+    uint64_t prev_recv;      /* recv_bytes at last snapshot        */
+    uint64_t delta_send;     /* bytes sent since last snapshot     */
+    uint64_t delta_recv;     /* bytes received since last snapshot */
+    int      used;
+} net_io_entry_t;
+
+/* ── per-socket (4-tuple) network I/O accumulator ────────────── */
+
+#define SOCK_IO_HT_SIZE  8192
+
+typedef struct {
+    pid_t    tgid;
+    uint32_t laddr;          /* local  IPv4 (network order)        */
+    uint32_t raddr;          /* remote IPv4 (network order)        */
+    uint16_t lport;          /* local  port (host order)           */
+    uint16_t rport;          /* remote port (network order)        */
+    uint64_t send_bytes;
+    uint64_t recv_bytes;
+    uint64_t prev_send;
+    uint64_t prev_recv;
+    uint64_t delta_send;
+    uint64_t delta_recv;
+    int      used;
+} sock_io_entry_t;
+
 /* ── context layout (full definition) ────────────────────────── */
 
 struct fdmon_ctx {
@@ -64,10 +98,29 @@ struct fdmon_ctx {
 
     /* eBPF backend (opaque to fanotify side) */
     void             *ebpf_state;
+
+    /* Per-PID network I/O counters (populated by eBPF backend) */
+    pthread_mutex_t   net_io_lock;
+    net_io_entry_t    net_io[NET_IO_HT_SIZE];
+
+    /* Per-socket (4-tuple) network I/O counters */
+    sock_io_entry_t   sock_io[SOCK_IO_HT_SIZE];
 };
 
 /* Push a filtered event into the ring.  Defined in fdmon.c. */
 void submit_event(fdmon_ctx_t *ctx, fdmon_event_type_t type,
                   pid_t pid, pid_t tgid, int fd, const char *path);
+
+/* Accumulate network I/O bytes for a PID.  Defined in fdmon.c.
+ * Called from the eBPF perf buffer callback. */
+void submit_net_event(fdmon_ctx_t *ctx, pid_t tgid, uint32_t bytes,
+                      int is_send);
+
+/* Accumulate per-socket (4-tuple) I/O bytes.  Defined in fdmon.c.
+ * Called from the eBPF perf buffer callback with connection details. */
+void submit_sock_event(fdmon_ctx_t *ctx, pid_t tgid,
+                       uint32_t laddr, uint16_t lport,
+                       uint32_t raddr, uint16_t rport,
+                       uint32_t bytes, int is_send);
 
 #endif /* ALLMON_FDMON_INTERNAL_H */

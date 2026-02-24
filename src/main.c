@@ -7,6 +7,7 @@
 
 #include "proc.h"
 #include "profile.h"
+#include "fdmon.h"
 
 #include <gtk/gtk.h>
 #include <fontconfig/fontconfig.h>
@@ -64,6 +65,9 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /* Create the eBPF fd/network monitor (best-effort: NULL on failure) */
+    g_state.fdmon = fdmon_create(FDMON_BACKEND_AUTO);
+
     /* Handle Ctrl-C gracefully */
     struct sigaction sa = { .sa_handler = on_sigint };
     sigemptyset(&sa.sa_mask);
@@ -96,6 +100,8 @@ int main(int argc, char *argv[])
     pthread_mutex_unlock(&g_state.lock);
 
     pthread_join(mon_tid, NULL);
+    if (g_state.fdmon)
+        fdmon_destroy(g_state.fdmon);
     monitor_state_destroy(&g_state);
 
     return EXIT_SUCCESS;

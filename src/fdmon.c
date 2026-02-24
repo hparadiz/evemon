@@ -337,6 +337,166 @@ void submit_event(fdmon_ctx_t *ctx, fdmon_event_type_t type,
     __atomic_add_fetch(&ctx->stat_delivered, 1, __ATOMIC_RELAXED);
 }
 
+/* ── per-PID network I/O accumulation ────────────────────────── */
+
+static net_io_entry_t *net_io_ht_find_or_create(net_io_entry_t *ht,
+                                                 pid_t tgid)
+{
+    unsigned h = (unsigned)tgid % NET_IO_HT_SIZE;
+    for (int k = 0; k < NET_IO_HT_SIZE; k++) {
+        if (!ht[h].used) {
+            ht[h].tgid = tgid;
+            ht[h].used = 1;
+            return &ht[h];
+        }
+        if (ht[h].tgid == tgid)
+            return &ht[h];
+        h = (h + 1) % NET_IO_HT_SIZE;
+    }
+    return NULL;  /* table full */
+}
+
+void submit_net_event(fdmon_ctx_t *ctx, pid_t tgid, uint32_t bytes,
+                      int is_send)
+{
+    pthread_mutex_lock(&ctx->net_io_lock);
+    net_io_entry_t *e = net_io_ht_find_or_create(ctx->net_io, tgid);
+    if (e) {
+        if (is_send)
+            e->send_bytes += bytes;
+        else
+            e->recv_bytes += bytes;
+    }
+    pthread_mutex_unlock(&ctx->net_io_lock);
+}
+
+int fdmon_net_io_get(const fdmon_ctx_t *ctx, pid_t tgid,
+                     uint64_t *send_bytes, uint64_t *recv_bytes)
+{
+    if (!ctx) return -1;
+    *send_bytes = 0;
+    *recv_bytes = 0;
+
+    /* Read under lock (snapshot deltas are stable between snapshots) */
+    pthread_mutex_lock((pthread_mutex_t *)&ctx->net_io_lock);
+    unsigned h = (unsigned)tgid % NET_IO_HT_SIZE;
+    for (int k = 0; k < NET_IO_HT_SIZE; k++) {
+        if (!ctx->net_io[h].used) {
+            pthread_mutex_unlock((pthread_mutex_t *)&ctx->net_io_lock);
+            return -1;
+        }
+        if (ctx->net_io[h].tgid == tgid) {
+            *send_bytes = ctx->net_io[h].delta_send;
+            *recv_bytes = ctx->net_io[h].delta_recv;
+            pthread_mutex_unlock((pthread_mutex_t *)&ctx->net_io_lock);
+            return 0;
+        }
+        h = (h + 1) % NET_IO_HT_SIZE;
+    }
+    pthread_mutex_unlock((pthread_mutex_t *)&ctx->net_io_lock);
+    return -1;
+}
+
+void fdmon_net_io_snapshot(fdmon_ctx_t *ctx)
+{
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->net_io_lock);
+
+    /* Snapshot per-PID counters */
+    for (int i = 0; i < NET_IO_HT_SIZE; i++) {
+        if (!ctx->net_io[i].used) continue;
+        net_io_entry_t *e = &ctx->net_io[i];
+        e->delta_send = e->send_bytes - e->prev_send;
+        e->delta_recv = e->recv_bytes - e->prev_recv;
+        e->prev_send  = e->send_bytes;
+        e->prev_recv  = e->recv_bytes;
+    }
+
+    /* Snapshot per-socket (4-tuple) counters */
+    for (int i = 0; i < SOCK_IO_HT_SIZE; i++) {
+        if (!ctx->sock_io[i].used) continue;
+        sock_io_entry_t *e = &ctx->sock_io[i];
+        e->delta_send = e->send_bytes - e->prev_send;
+        e->delta_recv = e->recv_bytes - e->prev_recv;
+        e->prev_send  = e->send_bytes;
+        e->prev_recv  = e->recv_bytes;
+    }
+
+    pthread_mutex_unlock(&ctx->net_io_lock);
+}
+
+/* ── per-socket (4-tuple) hash table ─────────────────────────── */
+
+static sock_io_entry_t *sock_io_ht_find_or_create(sock_io_entry_t *ht,
+                                                    pid_t tgid,
+                                                    uint32_t laddr, uint16_t lport,
+                                                    uint32_t raddr, uint16_t rport)
+{
+    /* Hash by PID + ports for decent distribution */
+    unsigned h = ((unsigned)tgid * 2654435761u)
+               ^ ((unsigned)lport << 16 | (unsigned)rport);
+    h %= SOCK_IO_HT_SIZE;
+    for (int k = 0; k < SOCK_IO_HT_SIZE; k++) {
+        sock_io_entry_t *e = &ht[h];
+        if (!e->used) {
+            e->tgid  = tgid;
+            e->laddr = laddr;
+            e->lport = lport;
+            e->raddr = raddr;
+            e->rport = rport;
+            e->used  = 1;
+            return e;
+        }
+        if (e->tgid == tgid && e->laddr == laddr && e->lport == lport &&
+            e->raddr == raddr && e->rport == rport)
+            return e;
+        h = (h + 1) % SOCK_IO_HT_SIZE;
+    }
+    return NULL;  /* table full */
+}
+
+void submit_sock_event(fdmon_ctx_t *ctx, pid_t tgid,
+                       uint32_t laddr, uint16_t lport,
+                       uint32_t raddr, uint16_t rport,
+                       uint32_t bytes, int is_send)
+{
+    pthread_mutex_lock(&ctx->net_io_lock);
+    sock_io_entry_t *e = sock_io_ht_find_or_create(
+        ctx->sock_io, tgid, laddr, lport, raddr, rport);
+    if (e) {
+        if (is_send)
+            e->send_bytes += bytes;
+        else
+            e->recv_bytes += bytes;
+    }
+    pthread_mutex_unlock(&ctx->net_io_lock);
+}
+
+int fdmon_sock_io_list(const fdmon_ctx_t *ctx, pid_t tgid,
+                       fdmon_sock_io_t *out, size_t *count)
+{
+    if (!ctx || !out || !count) return -1;
+    size_t max = *count;
+    *count = 0;
+
+    pthread_mutex_lock((pthread_mutex_t *)&ctx->net_io_lock);
+    for (int i = 0; i < SOCK_IO_HT_SIZE && *count < max; i++) {
+        const sock_io_entry_t *e = &ctx->sock_io[i];
+        if (!e->used || e->tgid != tgid) continue;
+        if (e->delta_send == 0 && e->delta_recv == 0) continue;
+        fdmon_sock_io_t *o = &out[*count];
+        o->laddr      = e->laddr;
+        o->raddr      = e->raddr;
+        o->lport      = e->lport;
+        o->rport      = e->rport;
+        o->delta_send = e->delta_send;
+        o->delta_recv = e->delta_recv;
+        (*count)++;
+    }
+    pthread_mutex_unlock((pthread_mutex_t *)&ctx->net_io_lock);
+    return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  *  FANOTIFY BACKEND
  * ═══════════════════════════════════════════════════════════════ */
@@ -473,8 +633,11 @@ fdmon_ctx_t *fdmon_create(fdmon_backend_t backend)
     ctx->fan_fd    = -1;
     ctx->ebpf_state = NULL;
     pthread_mutex_init(&ctx->group_lock, NULL);
+    pthread_mutex_init(&ctx->net_io_lock, NULL);
     pid_set_init(&ctx->watched);
     ring_init(&ctx->ring);
+    memset(ctx->net_io, 0, sizeof(ctx->net_io));
+    memset(ctx->sock_io, 0, sizeof(ctx->sock_io));
 
     int ok = -1;
 
@@ -491,6 +654,7 @@ fdmon_ctx_t *fdmon_create(fdmon_backend_t backend)
 
     if (ok != 0) {
         pthread_mutex_destroy(&ctx->group_lock);
+        pthread_mutex_destroy(&ctx->net_io_lock);
         pid_set_free(&ctx->watched);
         ring_destroy(&ctx->ring);
         free(ctx);
@@ -511,6 +675,7 @@ void fdmon_destroy(fdmon_ctx_t *ctx)
         fanotify_backend_destroy(ctx);
 
     pthread_mutex_destroy(&ctx->group_lock);
+    pthread_mutex_destroy(&ctx->net_io_lock);
     pid_set_free(&ctx->watched);
     ring_destroy(&ctx->ring);
     free(ctx);

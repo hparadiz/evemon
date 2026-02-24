@@ -882,6 +882,7 @@ static void on_sidebar_win_size_allocate(GtkWidget *widget,
      * default back to the default so they don't fight for space.  */
     GtkWidget *scrolls[] = {
         ctx->sb_fd_scroll, ctx->sb_env_scroll, ctx->sb_mmap_scroll,
+        ctx->sb_net_scroll,
 #ifdef HAVE_PIPEWIRE
         ctx->sb_pw_scroll,
 #endif
@@ -1609,6 +1610,16 @@ static void reload_font_css(ui_ctx_t *ctx)
                  "treeview { font-family: Monospace; font-size: %dpt; }",
                  mmap_size);
         gtk_css_provider_load_from_data(ctx->mmap_css, buf, -1, NULL);
+    }
+
+    /* Net tree in sidebar (same size as fd/env/mmap tree) */
+    if (ctx->net_css) {
+        int net_size = ctx->font_size > FONT_SIZE_MIN
+                     ? ctx->font_size - 1 : ctx->font_size;
+        snprintf(buf, sizeof(buf),
+                 "treeview { font-family: Monospace; font-size: %dpt; }",
+                 net_size);
+        gtk_css_provider_load_from_data(ctx->net_css, buf, -1, NULL);
     }
 
 #ifdef HAVE_PIPEWIRE
@@ -3244,6 +3255,7 @@ void *ui_thread(void *arg)
     GtkLabel *sb_pid, *sb_ppid, *sb_user, *sb_name;
     GtkLabel *sb_cpu, *sb_rss, *sb_group_rss, *sb_group_cpu;
     GtkLabel *sb_io_read, *sb_io_write;
+    GtkLabel *sb_net_send, *sb_net_recv;
     GtkLabel *sb_start_time, *sb_container, *sb_service, *sb_cwd, *sb_cmdline;
 
     SIDEBAR_ROW(0,  "PID",             sb_pid);
@@ -3258,11 +3270,13 @@ void *ui_thread(void *arg)
     SIDEBAR_ROW(7,  "Group CPU%",      sb_group_cpu);
     SIDEBAR_ROW(8,  "Disk Read",       sb_io_read);
     SIDEBAR_ROW(9,  "Disk Write",      sb_io_write);
-    SIDEBAR_ROW(10, "Start Time",      sb_start_time);
-    SIDEBAR_ROW(11, "Container",       sb_container);
-    SIDEBAR_ROW(12, "Service",         sb_service);
-    SIDEBAR_ROW(13, "CWD",            sb_cwd);
-    SIDEBAR_ROW(14, "Command",         sb_cmdline);
+    SIDEBAR_ROW(10, "Net Send",        sb_net_send);
+    SIDEBAR_ROW(11, "Net Recv",        sb_net_recv);
+    SIDEBAR_ROW(12, "Start Time",      sb_start_time);
+    SIDEBAR_ROW(13, "Container",       sb_container);
+    SIDEBAR_ROW(14, "Service",         sb_service);
+    SIDEBAR_ROW(15, "CWD",            sb_cwd);
+    SIDEBAR_ROW(16, "Command",         sb_cmdline);
     #undef SIDEBAR_ROW
 
     /* ── Steam / Proton metadata section ──────────────────────── */
@@ -3526,6 +3540,52 @@ void *ui_thread(void *arg)
     MAKE_SECTION(mmap_section, mmap_header_eb, mmap_revealer,
                  mmap_arrow, "Memory Map", mmap_scroll, TRUE);
 
+    /* ── Network Sockets collapsible section ──────────────────── */
+    GtkWidget *net_content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    GtkWidget *net_toggle_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    GtkWidget *net_desc_toggle = gtk_check_button_new_with_label(
+        "Include descendant tree");
+    gtk_box_pack_start(GTK_BOX(net_toggle_hbox), net_desc_toggle, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(net_content), net_toggle_hbox, FALSE, FALSE, 0);
+
+    GtkTreeStore *net_store = gtk_tree_store_new(NET_NUM_COLS,
+                                                 G_TYPE_STRING,
+                                                 G_TYPE_STRING,
+                                                 G_TYPE_INT64);
+    GtkWidget *net_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(net_store));
+    g_object_unref(net_store);
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(net_tree), FALSE);
+    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(net_tree), TRUE);
+
+    GtkCellRenderer *net_r = gtk_cell_renderer_text_new();
+    g_object_set(net_r, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
+    GtkTreeViewColumn *net_col = gtk_tree_view_column_new_with_attributes(
+        "Net", net_r, "markup", NET_COL_MARKUP, NULL);
+    gtk_tree_view_column_set_expand(net_col, TRUE);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(net_tree), net_col);
+
+    GtkCssProvider *net_css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(net_css,
+        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(net_tree),
+        GTK_STYLE_PROVIDER(net_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    GtkTreeSelection *net_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(net_tree));
+    gtk_tree_selection_set_mode(net_sel, GTK_SELECTION_SINGLE);
+
+    GtkWidget *net_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(net_scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(net_scroll, -1, SECTION_DEFAULT_HEIGHT);
+    gtk_container_add(GTK_CONTAINER(net_scroll), net_tree);
+    gtk_box_pack_start(GTK_BOX(net_content), net_scroll, TRUE, TRUE, 0);
+
+    GtkWidget *net_section, *net_header_eb, *net_revealer, *net_arrow;
+    MAKE_SECTION(net_section, net_header_eb, net_revealer,
+                 net_arrow, "Network Sockets", net_content, TRUE);
+
     /* ── PipeWire Audio collapsible section ────────────────────── */
 #ifdef HAVE_PIPEWIRE
     GtkTreeStore *pw_store = gtk_tree_store_new(PW_NUM_COLS,
@@ -3601,6 +3661,7 @@ void *ui_thread(void *arg)
      * compact at the bottom, sized by their minimum height. */
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), info_section, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), fd_section, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sidebar_vbox), net_section, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), env_section, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), mmap_section, FALSE, FALSE, 0);
 #ifdef HAVE_PIPEWIRE
@@ -3790,6 +3851,8 @@ void *ui_thread(void *arg)
     ctx.sb_group_cpu  = sb_group_cpu;
     ctx.sb_io_read    = sb_io_read;
     ctx.sb_io_write   = sb_io_write;
+    ctx.sb_net_send   = sb_net_send;
+    ctx.sb_net_recv   = sb_net_recv;
     ctx.sb_start_time = sb_start_time;
     ctx.sb_container  = sb_container;
     ctx.sb_service    = sb_service;
@@ -3832,6 +3895,20 @@ void *ui_thread(void *arg)
     ctx.mmap_last_pid   = 0;
     ctx.mmap_generation = 0;
     ctx.mmap_cancel     = NULL;
+
+    /* Network sockets list */
+    ctx.net_store          = net_store;
+    ctx.net_view           = GTK_TREE_VIEW(net_tree);
+    ctx.net_css            = net_css;
+    ctx.net_last_pid       = 0;
+    ctx.net_generation     = 0;
+    ctx.net_cancel         = NULL;
+    ctx.net_desc_toggle    = net_desc_toggle;
+    ctx.net_include_desc   = FALSE;
+    ctx.sb_net_collapsed   = FALSE;
+    ctx.sb_net_content     = net_content;
+    ctx.sb_net_header_arrow = net_arrow;
+    ctx.sb_net_scroll      = net_scroll;
 
 #ifdef HAVE_PIPEWIRE
     /* PipeWire audio connections */
@@ -3879,6 +3956,8 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_fd_desc_toggled), &ctx);
     g_signal_connect(fd_group_dup_toggle, "toggled",
                      G_CALLBACK(on_fd_group_dup_toggled), &ctx);
+    g_signal_connect(net_desc_toggle, "toggled",
+                     G_CALLBACK(on_net_desc_toggled), &ctx);
 
     /* Collapsible section header double-click signals.
      * Each section_toggle_t is heap-allocated and lives for the entire
@@ -3920,6 +3999,9 @@ void *ui_thread(void *arg)
     CONNECT_SECTION(mmap_header_eb, mmap_scroll, mmap_revealer,
                     mmap_arrow, mmap_section, sidebar_vbox,
                     &ctx.sb_mmap_collapsed, TRUE, mmap_scroll);
+    CONNECT_SECTION(net_header_eb, net_content, net_revealer,
+                    net_arrow, net_section, sidebar_vbox,
+                    &ctx.sb_net_collapsed, TRUE, net_scroll);
 #ifdef HAVE_PIPEWIRE
     CONNECT_SECTION(pw_header_eb, pw_scroll, pw_revealer,
                     pw_arrow, pw_section, sidebar_vbox,
@@ -3952,6 +4034,12 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_mmap_row_expanded), &ctx);
     g_signal_connect(mmap_tree, "key-press-event",
                      G_CALLBACK(on_mmap_key_press), &ctx);
+    g_signal_connect(net_tree, "row-collapsed",
+                     G_CALLBACK(on_net_row_collapsed), &ctx);
+    g_signal_connect(net_tree, "row-expanded",
+                     G_CALLBACK(on_net_row_expanded), &ctx);
+    g_signal_connect(net_tree, "key-press-event",
+                     G_CALLBACK(on_net_key_press), &ctx);
 #ifdef HAVE_PIPEWIRE
     g_signal_connect(pw_tree, "row-collapsed",
                      G_CALLBACK(on_pw_row_collapsed), &ctx);
@@ -4055,6 +4143,13 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
         g_cancellable_cancel(ctx->mmap_cancel);
         g_object_unref(ctx->mmap_cancel);
         ctx->mmap_cancel = NULL;
+    }
+
+    /* Cancel any in-flight async net scan */
+    if (ctx->net_cancel) {
+        g_cancellable_cancel(ctx->net_cancel);
+        g_object_unref(ctx->net_cancel);
+        ctx->net_cancel = NULL;
     }
 
 #ifdef HAVE_PIPEWIRE

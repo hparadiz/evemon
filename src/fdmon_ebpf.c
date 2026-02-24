@@ -28,8 +28,10 @@
 
 /* ── BPF event structure (must match fdmon_ebpf_kern.c) ──────── */
 
-#define FDMON_BPF_OPEN  1
-#define FDMON_BPF_CLOSE 2
+#define FDMON_BPF_OPEN     1
+#define FDMON_BPF_CLOSE    2
+#define FDMON_BPF_NET_SEND 3
+#define FDMON_BPF_NET_RECV 4
 #define FDMON_BPF_PATH_MAX 256
 
 struct fdmon_bpf_event {
@@ -38,7 +40,16 @@ struct fdmon_bpf_event {
     uint32_t tid;
     int32_t  fd;
     uint64_t timestamp;
-    char     path[FDMON_BPF_PATH_MAX];
+    union {
+        char     path[FDMON_BPF_PATH_MAX];
+        struct {
+            uint32_t bytes;
+            uint32_t laddr;
+            uint32_t raddr;
+            uint16_t lport;
+            uint16_t rport;
+        } net;
+    };
 };
 
 /* ── internal state ──────────────────────────────────────────── */
@@ -48,6 +59,9 @@ typedef struct {
     struct bpf_link       *link_enter_openat;
     struct bpf_link       *link_exit_openat;
     struct bpf_link       *link_enter_close;
+    struct bpf_link       *link_tcp_sendmsg;
+    struct bpf_link       *link_tcp_recvmsg_entry;
+    struct bpf_link       *link_tcp_recvmsg_ret;
     struct perf_buffer    *pb;
     pthread_t              reader_thread;
     volatile int           running;
@@ -75,6 +89,18 @@ static void handle_event(void *cookie, int cpu, void *data, __u32 size)
         return;
 
     const struct fdmon_bpf_event *ev = data;
+
+    if (ev->type == FDMON_BPF_NET_SEND || ev->type == FDMON_BPF_NET_RECV) {
+        /* Network I/O event: accumulate bytes per TGID and per socket */
+        submit_net_event(g_ebpf_ctx, (pid_t)ev->pid, ev->net.bytes,
+                         ev->type == FDMON_BPF_NET_SEND);
+        submit_sock_event(g_ebpf_ctx, (pid_t)ev->pid,
+                          ev->net.laddr, ev->net.lport,
+                          ev->net.raddr, ev->net.rport,
+                          ev->net.bytes,
+                          ev->type == FDMON_BPF_NET_SEND);
+        return;
+    }
 
     fdmon_event_type_t type;
     if (ev->type == FDMON_BPF_OPEN)
@@ -199,6 +225,30 @@ int fdmon_ebpf_init(struct fdmon_ctx *ctx)
         goto fail;
     }
 
+    /* Attach tcp_sendmsg kprobe (optional – don't fail if unavailable) */
+    prog = bpf_object__find_program_by_name(st->obj, "trace_tcp_sendmsg");
+    if (prog) {
+        st->link_tcp_sendmsg = bpf_program__attach(prog);
+        if (!st->link_tcp_sendmsg || libbpf_get_error(st->link_tcp_sendmsg))
+            st->link_tcp_sendmsg = NULL;
+    }
+
+    /* Attach tcp_recvmsg kprobe entry (stashes sock pointer) */
+    prog = bpf_object__find_program_by_name(st->obj, "trace_tcp_recvmsg");
+    if (prog) {
+        st->link_tcp_recvmsg_entry = bpf_program__attach(prog);
+        if (!st->link_tcp_recvmsg_entry || libbpf_get_error(st->link_tcp_recvmsg_entry))
+            st->link_tcp_recvmsg_entry = NULL;
+    }
+
+    /* Attach tcp_recvmsg kretprobe (captures bytes + 4-tuple) */
+    prog = bpf_object__find_program_by_name(st->obj, "trace_tcp_recvmsg_ret");
+    if (prog) {
+        st->link_tcp_recvmsg_ret = bpf_program__attach(prog);
+        if (!st->link_tcp_recvmsg_ret || libbpf_get_error(st->link_tcp_recvmsg_ret))
+            st->link_tcp_recvmsg_ret = NULL;
+    }
+
     /* Open the perf buffer on the "events" map. */
     int map_fd = bpf_object__find_map_fd_by_name(st->obj, "events");
     if (map_fd < 0) goto fail;
@@ -227,6 +277,9 @@ int fdmon_ebpf_init(struct fdmon_ctx *ctx)
 fail:
     if (st) {
         if (st->pb)               perf_buffer__free(st->pb);
+        if (st->link_tcp_recvmsg_ret)   bpf_link__destroy(st->link_tcp_recvmsg_ret);
+        if (st->link_tcp_recvmsg_entry) bpf_link__destroy(st->link_tcp_recvmsg_entry);
+        if (st->link_tcp_sendmsg) bpf_link__destroy(st->link_tcp_sendmsg);
         if (st->link_enter_close) bpf_link__destroy(st->link_enter_close);
         if (st->link_exit_openat) bpf_link__destroy(st->link_exit_openat);
         if (st->link_enter_openat)bpf_link__destroy(st->link_enter_openat);
@@ -248,7 +301,10 @@ void fdmon_ebpf_destroy(struct fdmon_ctx *ctx)
     st->running = 0;
     pthread_join(st->reader_thread, NULL);
 
-    if (st->pb)               perf_buffer__free(st->pb);
+    if (st->pb)                     perf_buffer__free(st->pb);
+    if (st->link_tcp_recvmsg_ret)   bpf_link__destroy(st->link_tcp_recvmsg_ret);
+    if (st->link_tcp_recvmsg_entry) bpf_link__destroy(st->link_tcp_recvmsg_entry);
+    if (st->link_tcp_sendmsg)       bpf_link__destroy(st->link_tcp_sendmsg);
     if (st->link_enter_close) bpf_link__destroy(st->link_enter_close);
     if (st->link_exit_openat) bpf_link__destroy(st->link_exit_openat);
     if (st->link_enter_openat)bpf_link__destroy(st->link_enter_openat);

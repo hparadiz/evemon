@@ -147,6 +147,8 @@ typedef struct {
     GtkLabel           *sb_group_cpu;
     GtkLabel           *sb_io_read;
     GtkLabel           *sb_io_write;
+    GtkLabel           *sb_net_send;
+    GtkLabel           *sb_net_recv;
     GtkLabel           *sb_start_time;
     GtkLabel           *sb_container;
     GtkLabel           *sb_service;
@@ -189,6 +191,22 @@ typedef struct {
     pid_t               mmap_last_pid;
     guint               mmap_generation;
     GCancellable       *mmap_cancel;
+
+    /* network sockets in sidebar (dedicated section) */
+    GtkTreeStore       *net_store;
+    GtkTreeView        *net_view;
+    GtkCssProvider     *net_css;
+    pid_t               net_last_pid;
+    guint               net_generation;
+    GCancellable       *net_cancel;
+    GtkWidget          *net_desc_toggle;
+    gboolean            net_include_desc;
+
+    /* net section collapse/expand */
+    gboolean            sb_net_collapsed;
+    GtkWidget          *sb_net_content;
+    GtkWidget          *sb_net_header_arrow;
+    GtkWidget          *sb_net_scroll;
 
 #ifdef HAVE_PIPEWIRE
     /* PipeWire audio connections in sidebar */
@@ -252,6 +270,7 @@ typedef struct {
 typedef struct {
     int   fd;
     char  path[512];
+    uint64_t net_sort_key;   /* total send+recv bytes for network sort (0 = unsorted) */
 } fd_entry_t;
 
 typedef struct {
@@ -335,6 +354,25 @@ char *fd_path_to_markup(const char *path);
 /* ── async fd scan ───────────────────────────────────────────── */
 
 void fd_scan_start(ui_ctx_t *ctx, pid_t pid);
+
+/* ── async network socket scan ───────────────────────────────── */
+
+enum {
+    NET_COL_TEXT,        /* plain text (display line)            */
+    NET_COL_MARKUP,      /* Pango markup for display             */
+    NET_COL_SORT_KEY,    /* sort key: total bytes (gint64)       */
+    NET_NUM_COLS
+};
+
+void net_scan_start(ui_ctx_t *ctx, pid_t pid);
+void on_net_desc_toggled(GtkToggleButton *btn, gpointer data);
+
+/* sidebar signal callbacks for network tree */
+void on_net_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
+                          GtkTreePath *path, gpointer data);
+void on_net_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
+                         GtkTreePath *path, gpointer data);
+gboolean on_net_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
 
 /* ── environment variable scanning ───────────────────────────── */
 
@@ -475,6 +513,9 @@ void     format_memory(long kb, char *buf, size_t bufsz);
 void     format_fuzzy_time(time_t epoch, char *buf, size_t bufsz);
 gboolean find_iter_by_pid(GtkTreeModel *model, GtkTreeIter *parent,
                           pid_t target, GtkTreeIter *result);
+void     collect_descendant_pids(GtkTreeModel *model, GtkTreeIter *parent,
+                                pid_t **out, size_t *out_count,
+                                size_t *out_cap);
 
 /* ── sidebar ─────────────────────────────────────────────────── */
 

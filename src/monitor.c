@@ -1007,6 +1007,10 @@ void *monitor_thread(void *arg)
         g_prev_valid = 1;
         prev_ts = now_ts;
 
+        /* Latch per-PID network byte counters (eBPF tcp_sendmsg/recvmsg) */
+        if (state->fdmon)
+            fdmon_net_io_snapshot(state->fdmon);
+
         /* Swap it in */
         pthread_mutex_lock(&state->lock);
         proc_snapshot_free(&state->snapshot);
