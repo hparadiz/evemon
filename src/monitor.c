@@ -625,6 +625,42 @@ static int is_pid_dir(const char *s)
     return 1;
 }
 
+/*
+ * Read read_bytes and write_bytes from /proc/<pid>/io.
+ * These are cumulative counters of actual disk I/O (post-page-cache).
+ * Stores results in *out_read and *out_write; returns 0 on success.
+ */
+static int read_io_bytes(pid_t pid,
+                         unsigned long long *out_read,
+                         unsigned long long *out_write)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/io", pid);
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    *out_read  = 0;
+    *out_write = 0;
+
+    char line[128];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "read_bytes:", 11) == 0) {
+            *out_read = strtoull(line + 11, NULL, 10);
+            found++;
+        } else if (strncmp(line, "write_bytes:", 12) == 0) {
+            *out_write = strtoull(line + 12, NULL, 10);
+            found++;
+        }
+        if (found == 2)
+            break;
+    }
+    fclose(f);
+    return (found == 2) ? 0 : -1;
+}
+
 /* ── previous CPU tick tracking for delta computation ────────── */
 
 #define CPU_HT_SIZE 8192
@@ -637,6 +673,46 @@ typedef struct {
 
 static cpu_prev_entry_t g_prev_ticks[CPU_HT_SIZE];
 static int              g_prev_valid = 0;  /* has a previous sample? */
+
+/* ── previous I/O byte tracking for delta computation ────────── */
+
+typedef struct {
+    pid_t              pid;
+    unsigned long long read_bytes;
+    unsigned long long write_bytes;
+    int                used;
+} io_prev_entry_t;
+
+static io_prev_entry_t g_prev_io[CPU_HT_SIZE];
+
+static void io_ht_get(const io_prev_entry_t *ht, pid_t pid,
+                      unsigned long long *rd, unsigned long long *wr)
+{
+    *rd = 0;
+    *wr = 0;
+    unsigned h = (unsigned)pid % CPU_HT_SIZE;
+    for (int k = 0; k < CPU_HT_SIZE; k++) {
+        if (!ht[h].used) return;
+        if (ht[h].pid == pid) {
+            *rd = ht[h].read_bytes;
+            *wr = ht[h].write_bytes;
+            return;
+        }
+        h = (h + 1) % CPU_HT_SIZE;
+    }
+}
+
+static void io_ht_set(io_prev_entry_t *ht, pid_t pid,
+                      unsigned long long rd, unsigned long long wr)
+{
+    unsigned h = (unsigned)pid % CPU_HT_SIZE;
+    while (ht[h].used && ht[h].pid != pid)
+        h = (h + 1) % CPU_HT_SIZE;
+    ht[h].pid         = pid;
+    ht[h].read_bytes  = rd;
+    ht[h].write_bytes = wr;
+    ht[h].used        = 1;
+}
 
 static unsigned long long cpu_ht_get(const cpu_prev_entry_t *ht, pid_t pid)
 {
@@ -728,6 +804,14 @@ static proc_snapshot_t build_snapshot(void)
         /* CPU ticks and percentage */
         e->cpu_ticks = read_cpu_ticks(pid);
         e->cpu_percent = 0.0;
+
+        /* Disk I/O counters (cumulative) */
+        if (read_io_bytes(pid, &e->io_read_bytes, &e->io_write_bytes) != 0) {
+            e->io_read_bytes  = 0;
+            e->io_write_bytes = 0;
+        }
+        e->io_read_rate  = 0.0;
+        e->io_write_rate = 0.0;
 
         /* Process start time */
         e->start_time = read_start_time(pid);
@@ -888,6 +972,21 @@ void *monitor_thread(void *arg)
                         double delta = (double)(snap.entries[i].cpu_ticks - prev);
                         snap.entries[i].cpu_percent = (delta / total_ticks) * 100.0;
                     }
+
+                    /* I/O rate (bytes/sec) from delta */
+                    unsigned long long prev_rd, prev_wr;
+                    io_ht_get(g_prev_io, snap.entries[i].pid,
+                              &prev_rd, &prev_wr);
+                    if (prev_rd > 0 || prev_wr > 0) {
+                        if (snap.entries[i].io_read_bytes >= prev_rd)
+                            snap.entries[i].io_read_rate =
+                                (double)(snap.entries[i].io_read_bytes - prev_rd)
+                                / elapsed;
+                        if (snap.entries[i].io_write_bytes >= prev_wr)
+                            snap.entries[i].io_write_rate =
+                                (double)(snap.entries[i].io_write_bytes - prev_wr)
+                                / elapsed;
+                    }
                 }
             }
         }
@@ -897,6 +996,14 @@ void *monitor_thread(void *arg)
         for (size_t i = 0; i < snap.count; i++)
             cpu_ht_set(g_prev_ticks, snap.entries[i].pid,
                        snap.entries[i].cpu_ticks);
+
+        /* Store current I/O bytes as "previous" for next iteration */
+        memset(g_prev_io, 0, sizeof(g_prev_io));
+        for (size_t i = 0; i < snap.count; i++)
+            io_ht_set(g_prev_io, snap.entries[i].pid,
+                      snap.entries[i].io_read_bytes,
+                      snap.entries[i].io_write_bytes);
+
         g_prev_valid = 1;
         prev_ts = now_ts;
 

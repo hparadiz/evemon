@@ -36,6 +36,10 @@ enum {
     COL_GROUP_RSS_TEXT,/* formatted group RSS string            */
     COL_GROUP_CPU,     /* sum of self + children CPU% × 10000  */
     COL_GROUP_CPU_TEXT,/* formatted group CPU% string           */
+    COL_IO_READ_RATE,  /* raw disk read  rate in bytes/sec for sorting  */
+    COL_IO_READ_RATE_TEXT, /* formatted disk read rate string              */
+    COL_IO_WRITE_RATE, /* raw disk write rate in bytes/sec for sorting  */
+    COL_IO_WRITE_RATE_TEXT,/* formatted disk write rate string             */
     COL_START_TIME,    /* epoch seconds (gint64) for sorting   */
     COL_START_TIME_TEXT,/* formatted start-time string          */
     COL_CONTAINER,     /* container runtime label (string)      */
@@ -135,6 +139,8 @@ typedef struct {
     GtkLabel           *sb_rss;
     GtkLabel           *sb_group_rss;
     GtkLabel           *sb_group_cpu;
+    GtkLabel           *sb_io_read;
+    GtkLabel           *sb_io_write;
     GtkLabel           *sb_start_time;
     GtkLabel           *sb_container;
     GtkLabel           *sb_service;

@@ -29,6 +29,10 @@ typedef struct {
     unsigned long long cpu_ticks;   /* utime + stime (USER_HZ ticks)  */
     double   cpu_percent;           /* CPU% since last snapshot        */
     unsigned long long start_time;  /* process start time (epoch secs) */
+    unsigned long long io_read_bytes;  /* cumulative read_bytes from /proc/<pid>/io  */
+    unsigned long long io_write_bytes; /* cumulative write_bytes from /proc/<pid>/io */
+    double   io_read_rate;          /* disk read  bytes/sec since last snapshot    */
+    double   io_write_rate;         /* disk write bytes/sec since last snapshot    */
     steam_info_t *steam;            /* Steam/Proton metadata (heap, NULL if not Steam) */
 } proc_entry_t;
 

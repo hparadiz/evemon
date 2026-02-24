@@ -118,6 +118,35 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
     else
         snprintf(cpu_text, sizeof(cpu_text), "%.1f%%", e->cpu_percent);
 
+    /* Format I/O rates as human-readable byte/s strings */
+    char io_read_text[64], io_write_text[64];
+    {
+        double r = e->io_read_rate;
+        if (r < 0.5)
+            snprintf(io_read_text, sizeof(io_read_text), "0 B/s");
+        else if (r < 1024.0)
+            snprintf(io_read_text, sizeof(io_read_text), "%.0f B/s", r);
+        else if (r < 1024.0 * 1024.0)
+            snprintf(io_read_text, sizeof(io_read_text), "%.1f KiB/s", r / 1024.0);
+        else if (r < 1024.0 * 1024.0 * 1024.0)
+            snprintf(io_read_text, sizeof(io_read_text), "%.1f MiB/s", r / (1024.0 * 1024.0));
+        else
+            snprintf(io_read_text, sizeof(io_read_text), "%.2f GiB/s", r / (1024.0 * 1024.0 * 1024.0));
+    }
+    {
+        double w = e->io_write_rate;
+        if (w < 0.5)
+            snprintf(io_write_text, sizeof(io_write_text), "0 B/s");
+        else if (w < 1024.0)
+            snprintf(io_write_text, sizeof(io_write_text), "%.0f B/s", w);
+        else if (w < 1024.0 * 1024.0)
+            snprintf(io_write_text, sizeof(io_write_text), "%.1f KiB/s", w / 1024.0);
+        else if (w < 1024.0 * 1024.0 * 1024.0)
+            snprintf(io_write_text, sizeof(io_write_text), "%.1f MiB/s", w / (1024.0 * 1024.0));
+        else
+            snprintf(io_write_text, sizeof(io_write_text), "%.2f GiB/s", w / (1024.0 * 1024.0 * 1024.0));
+    }
+
     char start_text[64] = "–";
     if (e->start_time > 0) {
         time_t t = (time_t)e->start_time;
@@ -139,6 +168,10 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
                        COL_GROUP_RSS_TEXT, "–",
                        COL_GROUP_CPU,      (gint)0,
                        COL_GROUP_CPU_TEXT, "0.0%",
+                       COL_IO_READ_RATE,      (gint)(e->io_read_rate),
+                       COL_IO_READ_RATE_TEXT,  io_read_text,
+                       COL_IO_WRITE_RATE,      (gint)(e->io_write_rate),
+                       COL_IO_WRITE_RATE_TEXT,  io_write_text,
                        COL_START_TIME,      (gint64)e->start_time,
                        COL_START_TIME_TEXT, start_text,
                        COL_CONTAINER,  e->container[0] ? e->container : "",
@@ -447,9 +480,11 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     gtk_tree_store_append(dst, &dst_iter, dst_parent);
 
     gint pid, ppid, cpu, rss, grp_rss, grp_cpu;
+    gint io_read_rate, io_write_rate;
     gint64 start_time;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
+    gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
           *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
 
@@ -459,6 +494,8 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_RSS, &rss, COL_RSS_TEXT, &rss_text,
         COL_GROUP_RSS, &grp_rss, COL_GROUP_RSS_TEXT, &grp_rss_text,
         COL_GROUP_CPU, &grp_cpu, COL_GROUP_CPU_TEXT, &grp_cpu_text,
+        COL_IO_READ_RATE, &io_read_rate, COL_IO_READ_RATE_TEXT, &io_read_text,
+        COL_IO_WRITE_RATE, &io_write_rate, COL_IO_WRITE_RATE_TEXT, &io_write_text,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
@@ -471,6 +508,8 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_RSS, rss, COL_RSS_TEXT, rss_text,
         COL_GROUP_RSS, grp_rss, COL_GROUP_RSS_TEXT, grp_rss_text,
         COL_GROUP_CPU, grp_cpu, COL_GROUP_CPU_TEXT, grp_cpu_text,
+        COL_IO_READ_RATE, io_read_rate, COL_IO_READ_RATE_TEXT, io_read_text,
+        COL_IO_WRITE_RATE, io_write_rate, COL_IO_WRITE_RATE_TEXT, io_write_text,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
@@ -479,7 +518,8 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         -1);
 
     g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
-    g_free(grp_rss_text); g_free(grp_cpu_text); g_free(start_text);
+    g_free(grp_rss_text); g_free(grp_cpu_text);
+    g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
     g_free(steam_label);
 

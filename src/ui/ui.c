@@ -1706,9 +1706,11 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
 
     /* Copy all column values */
     gint pid, ppid, cpu, rss, grp_rss, grp_cpu, pinned_root;
+    gint io_read_rate, io_write_rate;
     gint64 start_time;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
+    gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
           *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
 
@@ -1718,6 +1720,8 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_RSS, &rss, COL_RSS_TEXT, &rss_text,
         COL_GROUP_RSS, &grp_rss, COL_GROUP_RSS_TEXT, &grp_rss_text,
         COL_GROUP_CPU, &grp_cpu, COL_GROUP_CPU_TEXT, &grp_cpu_text,
+        COL_IO_READ_RATE, &io_read_rate, COL_IO_READ_RATE_TEXT, &io_read_text,
+        COL_IO_WRITE_RATE, &io_write_rate, COL_IO_WRITE_RATE_TEXT, &io_write_text,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
@@ -1731,6 +1735,8 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_RSS, rss, COL_RSS_TEXT, rss_text,
         COL_GROUP_RSS, grp_rss, COL_GROUP_RSS_TEXT, grp_rss_text,
         COL_GROUP_CPU, grp_cpu, COL_GROUP_CPU_TEXT, grp_cpu_text,
+        COL_IO_READ_RATE, io_read_rate, COL_IO_READ_RATE_TEXT, io_read_text,
+        COL_IO_WRITE_RATE, io_write_rate, COL_IO_WRITE_RATE_TEXT, io_write_text,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
@@ -1739,7 +1745,8 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         -1);
 
     g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
-    g_free(grp_rss_text); g_free(grp_cpu_text); g_free(start_text);
+    g_free(grp_rss_text); g_free(grp_cpu_text);
+    g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
     g_free(steam_label);
 
@@ -1792,9 +1799,11 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
                                GtkTreeModel *real, GtkTreeIter *real_iter)
 {
     gint pid, ppid, cpu, rss, grp_rss, grp_cpu;
+    gint io_read_rate, io_write_rate;
     gint64 start_time;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
+    gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
           *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
 
@@ -1804,6 +1813,8 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_RSS, &rss, COL_RSS_TEXT, &rss_text,
         COL_GROUP_RSS, &grp_rss, COL_GROUP_RSS_TEXT, &grp_rss_text,
         COL_GROUP_CPU, &grp_cpu, COL_GROUP_CPU_TEXT, &grp_cpu_text,
+        COL_IO_READ_RATE, &io_read_rate, COL_IO_READ_RATE_TEXT, &io_read_text,
+        COL_IO_WRITE_RATE, &io_write_rate, COL_IO_WRITE_RATE_TEXT, &io_write_text,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
@@ -1822,6 +1833,8 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_RSS, rss, COL_RSS_TEXT, rss_text,
         COL_GROUP_RSS, grp_rss, COL_GROUP_RSS_TEXT, grp_rss_text,
         COL_GROUP_CPU, grp_cpu, COL_GROUP_CPU_TEXT, grp_cpu_text,
+        COL_IO_READ_RATE, io_read_rate, COL_IO_READ_RATE_TEXT, io_read_text,
+        COL_IO_WRITE_RATE, io_write_rate, COL_IO_WRITE_RATE_TEXT, io_write_text,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
@@ -1830,7 +1843,8 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         -1);
 
     g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
-    g_free(grp_rss_text); g_free(grp_cpu_text); g_free(start_text);
+    g_free(grp_rss_text); g_free(grp_cpu_text);
+    g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
     g_free(steam_label);
 }
@@ -2036,6 +2050,7 @@ static void rebuild_filter_store(ui_ctx_t *ctx)
     /* Create a fresh filter store */
     GtkTreeStore *fs = gtk_tree_store_new(NUM_COLS,
         G_TYPE_INT, G_TYPE_INT, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
         G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
         G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
         G_TYPE_INT64, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
@@ -2696,6 +2711,10 @@ static void register_sort_funcs(GtkTreeModelSort *sm)
         sort_int_inverted, GINT_TO_POINTER(COL_GROUP_RSS), NULL);
     gtk_tree_sortable_set_sort_func(sortable, COL_GROUP_CPU,
         sort_int_inverted, GINT_TO_POINTER(COL_GROUP_CPU), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_IO_READ_RATE,
+        sort_int_inverted, GINT_TO_POINTER(COL_IO_READ_RATE), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_IO_WRITE_RATE,
+        sort_int_inverted, GINT_TO_POINTER(COL_IO_WRITE_RATE), NULL);
     gtk_tree_sortable_set_sort_func(sortable, COL_START_TIME,
         sort_int64_inverted, GINT_TO_POINTER(COL_START_TIME), NULL);
     gtk_tree_sortable_set_sort_func(sortable, COL_CONTAINER,
@@ -2828,6 +2847,10 @@ void *ui_thread(void *arg)
                                              G_TYPE_STRING,   /* group RSS txt*/
                                              G_TYPE_INT,      /* group CPU%   */
                                              G_TYPE_STRING,   /* group CPU txt*/
+                                             G_TYPE_INT,      /* IO read rate */
+                                             G_TYPE_STRING,   /* IO read text */
+                                             G_TYPE_INT,      /* IO write rate*/
+                                             G_TYPE_STRING,   /* IO write text*/
                                              G_TYPE_INT64,    /* start time   */
                                              G_TYPE_STRING,   /* start time txt*/
                                              G_TYPE_STRING,   /* container    */
@@ -2918,6 +2941,24 @@ void *ui_thread(void *arg)
     col = gtk_tree_view_column_new_with_attributes("Group CPU%", r,
                                                    "text", COL_GROUP_CPU_TEXT, NULL);
     gtk_tree_view_column_set_sort_column_id(col, COL_GROUP_CPU);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 90);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    g_object_set(r, "xalign", 1.0f, NULL);
+    col = gtk_tree_view_column_new_with_attributes("Disk Read", r,
+                                                   "text", COL_IO_READ_RATE_TEXT, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_IO_READ_RATE);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 90);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    g_object_set(r, "xalign", 1.0f, NULL);
+    col = gtk_tree_view_column_new_with_attributes("Disk Write", r,
+                                                   "text", COL_IO_WRITE_RATE_TEXT, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_IO_WRITE_RATE);
     gtk_tree_view_column_set_resizable(col, TRUE);
     gtk_tree_view_column_set_min_width(col, 90);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
@@ -3060,6 +3101,7 @@ void *ui_thread(void *arg)
 
     GtkLabel *sb_pid, *sb_ppid, *sb_user, *sb_name;
     GtkLabel *sb_cpu, *sb_rss, *sb_group_rss, *sb_group_cpu;
+    GtkLabel *sb_io_read, *sb_io_write;
     GtkLabel *sb_start_time, *sb_container, *sb_service, *sb_cwd, *sb_cmdline;
 
     SIDEBAR_ROW(0,  "PID",             sb_pid);
@@ -3072,11 +3114,13 @@ void *ui_thread(void *arg)
     SIDEBAR_ROW(5,  "Memory (RSS)",    sb_rss);
     SIDEBAR_ROW(6,  "Group Memory",    sb_group_rss);
     SIDEBAR_ROW(7,  "Group CPU%",      sb_group_cpu);
-    SIDEBAR_ROW(8,  "Start Time",      sb_start_time);
-    SIDEBAR_ROW(9,  "Container",       sb_container);
-    SIDEBAR_ROW(10, "Service",         sb_service);
-    SIDEBAR_ROW(11, "CWD",            sb_cwd);
-    SIDEBAR_ROW(12, "Command",         sb_cmdline);
+    SIDEBAR_ROW(8,  "Disk Read",       sb_io_read);
+    SIDEBAR_ROW(9,  "Disk Write",      sb_io_write);
+    SIDEBAR_ROW(10, "Start Time",      sb_start_time);
+    SIDEBAR_ROW(11, "Container",       sb_container);
+    SIDEBAR_ROW(12, "Service",         sb_service);
+    SIDEBAR_ROW(13, "CWD",            sb_cwd);
+    SIDEBAR_ROW(14, "Command",         sb_cmdline);
     #undef SIDEBAR_ROW
 
     /* ── Steam / Proton metadata section ──────────────────────── */
@@ -3602,6 +3646,8 @@ void *ui_thread(void *arg)
     ctx.sb_rss        = sb_rss;
     ctx.sb_group_rss  = sb_group_rss;
     ctx.sb_group_cpu  = sb_group_cpu;
+    ctx.sb_io_read    = sb_io_read;
+    ctx.sb_io_write   = sb_io_write;
     ctx.sb_start_time = sb_start_time;
     ctx.sb_container  = sb_container;
     ctx.sb_service    = sb_service;

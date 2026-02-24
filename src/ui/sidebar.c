@@ -26,6 +26,8 @@ void sidebar_update(ui_ctx_t *ctx)
         gtk_label_set_text(ctx->sb_rss,       "–");
         gtk_label_set_text(ctx->sb_group_rss, "–");
         gtk_label_set_text(ctx->sb_group_cpu, "–");
+        gtk_label_set_text(ctx->sb_io_read,   "–");
+        gtk_label_set_text(ctx->sb_io_write,  "–");
         gtk_label_set_text(ctx->sb_start_time, "–");
         gtk_label_set_text(ctx->sb_container, "–");
         gtk_label_set_text(ctx->sb_service,   "–");
@@ -64,6 +66,7 @@ void sidebar_update(ui_ctx_t *ctx)
     gint64 start_epoch = 0;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL;
     gchar *rss_text = NULL, *grp_rss_text = NULL, *grp_cpu_text = NULL;
+    gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_time_text = NULL, *container = NULL, *service = NULL,
           *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
 
@@ -76,6 +79,8 @@ void sidebar_update(ui_ctx_t *ctx)
                        COL_RSS_TEXT,       &rss_text,
                        COL_GROUP_RSS_TEXT, &grp_rss_text,
                        COL_GROUP_CPU_TEXT, &grp_cpu_text,
+                       COL_IO_READ_RATE_TEXT,  &io_read_text,
+                       COL_IO_WRITE_RATE_TEXT, &io_write_text,
                        COL_START_TIME,     &start_epoch,
                        COL_START_TIME_TEXT, &start_time_text,
                        COL_CONTAINER,      &container,
@@ -99,6 +104,8 @@ void sidebar_update(ui_ctx_t *ctx)
     gtk_label_set_text(ctx->sb_rss,       rss_text  ? rss_text  : "–");
     gtk_label_set_text(ctx->sb_group_rss, grp_rss_text ? grp_rss_text : "–");
     gtk_label_set_text(ctx->sb_group_cpu, grp_cpu_text ? grp_cpu_text : "–");
+    gtk_label_set_text(ctx->sb_io_read,   io_read_text  ? io_read_text  : "–");
+    gtk_label_set_text(ctx->sb_io_write,  io_write_text ? io_write_text : "–");
     if (start_time_text && start_epoch > 0) {
         char fuzzy[64];
         format_fuzzy_time((time_t)start_epoch, fuzzy, sizeof(fuzzy));
@@ -208,6 +215,7 @@ void sidebar_update(ui_ctx_t *ctx)
 
     g_free(user); g_free(name); g_free(cpu_text);
     g_free(rss_text); g_free(grp_rss_text); g_free(grp_cpu_text);
+    g_free(io_read_text); g_free(io_write_text);
     g_free(start_time_text); g_free(container); g_free(service);
     g_free(cwd); g_free(cmdline); g_free(steam_label);
 
