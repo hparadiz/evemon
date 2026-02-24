@@ -964,6 +964,65 @@ static gboolean on_tree_scroll_event(GtkWidget *widget, GdkEventScroll *ev,
 
 /* ── periodic refresh callback ───────────────────────────────── */
 
+/* ── highlight animation timer ────────────────────────────────── */
+
+/*
+ * Check whether any row in the store has an active highlight
+ * (born or died timestamp that hasn't expired yet).
+ */
+static gboolean store_has_active_highlights(GtkTreeModel *model,
+                                            GtkTreeIter  *parent,
+                                            gint64        now)
+{
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
+    while (valid) {
+        gint64 born = 0, died = 0;
+        gtk_tree_model_get(model, &iter,
+                           COL_HIGHLIGHT_BORN, &born,
+                           COL_HIGHLIGHT_DIED, &died, -1);
+        if ((born > 0 && now - born < HIGHLIGHT_FADE_US) ||
+            (died > 0 && now - died < HIGHLIGHT_FADE_US))
+            return TRUE;
+        if (store_has_active_highlights(model, &iter, now))
+            return TRUE;
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+    return FALSE;
+}
+
+/* Timer callback: redraw the tree while highlights are active */
+static gboolean on_highlight_tick(gpointer data)
+{
+    ui_ctx_t *ctx = data;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    gint64 now = (gint64)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+
+    GtkTreeModel *model = gtk_tree_view_get_model(ctx->view);
+    GtkTreeModel *underlying = model;
+    if (GTK_IS_TREE_MODEL_SORT(model))
+        underlying = gtk_tree_model_sort_get_model(GTK_TREE_MODEL_SORT(model));
+
+    if (store_has_active_highlights(underlying, NULL, now)) {
+        gtk_widget_queue_draw(GTK_WIDGET(ctx->view));
+        return G_SOURCE_CONTINUE;
+    }
+
+    /* No more active highlights — stop the timer */
+    ctx->highlight_timer = 0;
+    return G_SOURCE_REMOVE;
+}
+
+/* Start the highlight timer if not already running */
+static void ensure_highlight_timer(ui_ctx_t *ctx)
+{
+    if (ctx->highlight_timer == 0)
+        ctx->highlight_timer = g_timeout_add(33, on_highlight_tick, ctx);
+                                              /* ~30 fps for smooth fade */
+}
+
 static int g_first_refresh = 1;
 
 static gboolean on_refresh(gpointer data)
@@ -1129,6 +1188,9 @@ static gboolean on_refresh(gpointer data)
      * of matching processes has structurally changed. */
     if (ctx->filter_text[0] != '\0')
         sync_filter_store(ctx);
+
+    /* Kick the highlight fade timer if any rows are newly born/dying */
+    ensure_highlight_timer(ctx);
 
     PROFILE_END(ui_render);
 
@@ -1707,7 +1769,7 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     /* Copy all column values */
     gint pid, ppid, cpu, rss, grp_rss, grp_cpu, pinned_root;
     gint io_read_rate, io_write_rate;
-    gint64 start_time;
+    gint64 start_time, hl_born, hl_died;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *io_read_text = NULL, *io_write_text = NULL;
@@ -1726,6 +1788,7 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
         COL_STEAM_LABEL, &steam_label,
+        COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
         COL_PINNED_ROOT, &pinned_root,
         -1);
 
@@ -1741,6 +1804,7 @@ static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
         COL_STEAM_LABEL, steam_label,
+        COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
         COL_PINNED_ROOT, pinned_root,
         -1);
 
@@ -1800,7 +1864,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
 {
     gint pid, ppid, cpu, rss, grp_rss, grp_cpu;
     gint io_read_rate, io_write_rate;
-    gint64 start_time;
+    gint64 start_time, hl_born, hl_died;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *io_read_text = NULL, *io_write_text = NULL;
@@ -1819,6 +1883,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
         COL_STEAM_LABEL, &steam_label,
+        COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
         -1);
 
     /* Preserve the pinned_root value already in the filter store row
@@ -1839,6 +1904,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
         COL_STEAM_LABEL, steam_label,
+        COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
         COL_PINNED_ROOT, pinned_root,
         -1);
 
@@ -2054,7 +2120,8 @@ static void rebuild_filter_store(ui_ctx_t *ctx)
         G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
         G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
         G_TYPE_INT64, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
-        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_INT);
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_INT64, G_TYPE_INT64, G_TYPE_INT);
 
     find_and_copy_matches(fs, GTK_TREE_MODEL(ctx->store), NULL,
                           filter_lower, FALSE);
@@ -2730,6 +2797,60 @@ static void register_sort_funcs(GtkTreeModelSort *sm)
 /* ── public entry point ──────────────────────────────────────── */
 
 /*
+ * Cell data function for row highlighting: computes a fading
+ * background colour for newly spawned (green) or dying (red)
+ * processes.  Applied to every column renderer so the entire row
+ * is coloured.
+ *
+ * The sort model exposes the underlying store's data, so we read
+ * COL_HIGHLIGHT_BORN / COL_HIGHLIGHT_DIED directly from `model`.
+ */
+static void highlight_cell_data_func(GtkTreeViewColumn *col,
+                                     GtkCellRenderer   *cell,
+                                     GtkTreeModel      *model,
+                                     GtkTreeIter       *iter,
+                                     gpointer           data)
+{
+    (void)col; (void)data;
+
+    gint64 born = 0, died = 0;
+    gtk_tree_model_get(model, iter,
+                       COL_HIGHLIGHT_BORN, &born,
+                       COL_HIGHLIGHT_DIED, &died, -1);
+
+    /* Get current monotonic time */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    gint64 now = (gint64)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+
+    GdkRGBA rgba = { 0, 0, 0, 0 };   /* fully transparent = no background */
+    gboolean set_bg = FALSE;
+
+    if (died > 0) {
+        /* Dying process: red fade-out */
+        gint64 age = now - died;
+        if (age < HIGHLIGHT_FADE_US) {
+            double alpha = 0.35 * (1.0 - (double)age / HIGHLIGHT_FADE_US);
+            rgba = (GdkRGBA){ 0.95, 0.25, 0.20, alpha };
+            set_bg = TRUE;
+        }
+    } else if (born > 0) {
+        /* New process: green fade-out */
+        gint64 age = now - born;
+        if (age < HIGHLIGHT_FADE_US) {
+            double alpha = 0.30 * (1.0 - (double)age / HIGHLIGHT_FADE_US);
+            rgba = (GdkRGBA){ 0.20, 0.80, 0.30, alpha };
+            set_bg = TRUE;
+        }
+    }
+
+    if (set_bg)
+        g_object_set(cell, "cell-background-rgba", &rgba, NULL);
+    else
+        g_object_set(cell, "cell-background-set", FALSE, NULL);
+}
+
+/*
  * Cell data function for the Name column: prepend "➡ " when the
  * process is pinned.  The process is considered "pinned" when its
  * own PID appears in the pinned set (regardless of whether the
@@ -2741,8 +2862,10 @@ static void name_cell_data_func(GtkTreeViewColumn *col,
                                 GtkTreeIter       *iter,
                                 gpointer           data)
 {
-    (void)col;
     ui_ctx_t *ctx = data;
+
+    /* Apply highlight background (same logic as highlight_cell_data_func) */
+    highlight_cell_data_func(col, cell, model, iter, NULL);
 
     gchar *name = NULL;
     gchar *steam_label = NULL;
@@ -2858,6 +2981,8 @@ void *ui_thread(void *arg)
                                              G_TYPE_STRING,   /* CWD          */
                                              G_TYPE_STRING,   /* CMDLINE      */
                                              G_TYPE_STRING,   /* STEAM_LABEL  */
+                                             G_TYPE_INT64,    /* HIGHLIGHT_BORN */
+                                             G_TYPE_INT64,    /* HIGHLIGHT_DIED */
                                              G_TYPE_INT);     /* PINNED_ROOT  */
 
     /* Sort model wraps the store directly (no filter model – we use
@@ -3001,6 +3126,23 @@ void *ui_thread(void *arg)
     gtk_tree_view_column_set_resizable(col, TRUE);
     gtk_tree_view_column_set_min_width(col, 300);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    /* Wire the highlight cell-data function to every column so that
+     * newly spawned (green) and dying (red) rows get a full-row
+     * background colour that fades over HIGHLIGHT_FADE_US.          */
+    {
+        GList *cols = gtk_tree_view_get_columns(GTK_TREE_VIEW(tree));
+        for (GList *c = cols; c; c = c->next) {
+            GtkTreeViewColumn *tv_col = c->data;
+            GList *renderers = gtk_cell_layout_get_cells(GTK_CELL_LAYOUT(tv_col));
+            for (GList *r2 = renderers; r2; r2 = r2->next) {
+                gtk_tree_view_column_set_cell_data_func(
+                    tv_col, r2->data, highlight_cell_data_func, NULL, NULL);
+            }
+            g_list_free(renderers);
+        }
+        g_list_free(cols);
+    }
 
     /* Register inverted sort functions so ▲ = largest/highest first. */
     register_sort_funcs(GTK_TREE_MODEL_SORT(sort_model));
@@ -3867,6 +4009,7 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_tree_scroll_event), &ctx);
 
     ctx.initial_refresh = TRUE;
+    ctx.highlight_timer = 0;
     g_timeout_add(50, on_refresh, &ctx);
 
     /* ── show & run ──────────────────────────────────────────── */
@@ -3932,6 +4075,12 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     if (ctx->scroll_timer) {
         g_source_remove(ctx->scroll_timer);
         ctx->scroll_timer = 0;
+    }
+
+    /* Stop highlight fade timer */
+    if (ctx->highlight_timer) {
+        g_source_remove(ctx->highlight_timer);
+        ctx->highlight_timer = 0;
     }
 
     /* Free the process tree node set */

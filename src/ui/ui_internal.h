@@ -47,11 +47,17 @@ enum {
     COL_CWD,
     COL_CMDLINE,
     COL_STEAM_LABEL,   /* Steam/Proton display label (string) */
+    COL_HIGHLIGHT_BORN,/* monotonic µs when row first appeared (gint64, 0=none)  */
+    COL_HIGHLIGHT_DIED,/* monotonic µs when process vanished (gint64, 0=alive)   */
     COL_PINNED_ROOT,   /* pid_t of the pinned root, or -1 for normal tree */
     NUM_COLS
 };
 
 /* ── process tree node state tracking ─────────────────────────── */
+
+/* Highlight fade duration (microseconds).  New/dying rows are
+ * highlighted for this many µs before the colour fades completely. */
+#define HIGHLIGHT_FADE_US  (2 * 1000000LL)   /* 2 seconds */
 
 /* Node states (stored per-PID in the set) */
 #define PTREE_EXPANDED  0
@@ -215,6 +221,9 @@ typedef struct {
 
     /* startup: fast-poll until first snapshot arrives */
     gboolean            initial_refresh;
+
+    /* highlight animation timer: fires ~60 fps while rows are highlighted */
+    guint               highlight_timer;
 
     /* name-filter (Ctrl+F / Meta+F) */
     GtkWidget          *filter_entry;

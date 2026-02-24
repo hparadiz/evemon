@@ -4,6 +4,7 @@
  */
 
 #include "ui_internal.h"
+#include <time.h>
 
 /* ── hash table for PID lookups ──────────────────────────────── */
 
@@ -81,24 +82,58 @@ static void collect_iters(GtkTreeModel *model, GtkTreeIter *parent,
 
 /* ── remove dead rows (recursive, bottom-up) ─────────────────── */
 
+/* Helper: current monotonic time in microseconds */
+static gint64 mono_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (gint64)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+}
+
+/*
+ * Mark dead rows (process no longer in snapshot) with a death
+ * timestamp instead of removing them immediately.  Rows whose
+ * death timestamp is older than HIGHLIGHT_FADE_US are removed.
+ * This gives the UI time to show a red fade-out highlight.
+ */
 static void remove_dead_rows(GtkTreeStore *store, GtkTreeIter *parent,
                              const ht_entry_t *new_ht)
 {
     GtkTreeModel *model = GTK_TREE_MODEL(store);
     GtkTreeIter iter;
     gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
+    gint64 now = mono_now_us();
 
     while (valid) {
         /* Recurse into children first (bottom-up removal) */
         remove_dead_rows(store, &iter, new_ht);
 
         gint pid;
-        gtk_tree_model_get(model, &iter, COL_PID, &pid, -1);
+        gint64 died;
+        gtk_tree_model_get(model, &iter,
+                           COL_PID, &pid,
+                           COL_HIGHLIGHT_DIED, &died, -1);
 
         if (ht_find(new_ht, (pid_t)pid) == (size_t)-1) {
-            /* Process gone – remove row (invalidates iter, returns next) */
-            valid = gtk_tree_store_remove(store, &iter);
+            /* Process gone */
+            if (died == 0) {
+                /* First time we see it missing – stamp with death time */
+                gtk_tree_store_set(store, &iter,
+                                   COL_HIGHLIGHT_DIED, now, -1);
+                valid = gtk_tree_model_iter_next(model, &iter);
+            } else if (now - died > HIGHLIGHT_FADE_US) {
+                /* Fade period expired – remove the row */
+                valid = gtk_tree_store_remove(store, &iter);
+            } else {
+                /* Still fading – keep it */
+                valid = gtk_tree_model_iter_next(model, &iter);
+            }
         } else {
+            /* Process is alive – clear any lingering death stamp
+             * (can happen if a PID is rapidly recycled). */
+            if (died != 0)
+                gtk_tree_store_set(store, &iter,
+                                   COL_HIGHLIGHT_DIED, (gint64)0, -1);
             valid = gtk_tree_model_iter_next(model, &iter);
         }
     }
@@ -179,6 +214,8 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
                        COL_CWD,      e->cwd,
                        COL_CMDLINE,  e->cmdline,
                        COL_STEAM_LABEL, (e->steam && e->steam->is_steam) ? e->steam->display_label : "",
+                       COL_HIGHLIGHT_BORN, (gint64)0,
+                       COL_HIGHLIGHT_DIED, (gint64)0,
                        COL_PINNED_ROOT, (gint)PTREE_UNPINNED,
                        -1);
 }
@@ -229,8 +266,17 @@ void update_store(GtkTreeStore       *store,
     for (size_t i = 0; i < existing.count; i++) {
         pid_t pid = existing.entries[i].pid;
         size_t sidx = ht_find(new_ht, pid);
-        if (sidx != (size_t)-1)
+        if (sidx != (size_t)-1) {
+            /* Preserve highlight timestamps across data refresh */
+            gint64 born = 0, died = 0;
+            gtk_tree_model_get(GTK_TREE_MODEL(store), &existing.entries[i].iter,
+                               COL_HIGHLIGHT_BORN, &born,
+                               COL_HIGHLIGHT_DIED, &died, -1);
             set_row_data(store, &existing.entries[i].iter, &entries[sidx]);
+            gtk_tree_store_set(store, &existing.entries[i].iter,
+                               COL_HIGHLIGHT_BORN, born,
+                               COL_HIGHLIGHT_DIED, died, -1);
+        }
     }
 
     /* Phase 4: Insert new processes.
@@ -281,6 +327,10 @@ void update_store(GtkTreeStore       *store,
             GtkTreeIter new_iter;
             gtk_tree_store_append(store, &new_iter, parent_iter);
             set_row_data(store, &new_iter, e);
+
+            /* Stamp newly inserted process with a birth highlight */
+            gtk_tree_store_set(store, &new_iter,
+                               COL_HIGHLIGHT_BORN, mono_now_us(), -1);
 
             /* Add to existing map so children can find us */
             iter_map_add(&existing, e->pid, &new_iter);
@@ -481,7 +531,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
 
     gint pid, ppid, cpu, rss, grp_rss, grp_cpu;
     gint io_read_rate, io_write_rate;
-    gint64 start_time;
+    gint64 start_time, hl_born, hl_died;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *io_read_text = NULL, *io_write_text = NULL;
@@ -500,6 +550,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
         COL_STEAM_LABEL, &steam_label,
+        COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
         -1);
 
     gtk_tree_store_set(dst, &dst_iter,
@@ -514,6 +565,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
         COL_STEAM_LABEL, steam_label,
+        COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
         COL_PINNED_ROOT, pinned_root,
         -1);
 
