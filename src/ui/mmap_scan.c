@@ -158,11 +158,14 @@ static void read_maps(pid_t pid, mmap_list_t *out)
                        &addr_start, &addr_end, perms, &offset, dev, &inode);
         if (n < 5) continue;
 
-        /* Extract pathname: skip the first 5 fields and any whitespace */
+        /* Extract pathname: skip the first 5 whitespace-delimited
+         * tokens (addr-range, perms, offset, dev, inode) and then the
+         * inode value itself, leaving p at the pathname. */
         {
             const char *p = line;
             int fields = 0;
-            while (fields < 5 && *p) {
+            /* Skip tokens 1..5: addr-range, perms, offset, dev */
+            while (fields < 4 && *p) {
                 while (*p && *p != ' ' && *p != '\t') p++;
                 while (*p == ' ' || *p == '\t') p++;
                 fields++;

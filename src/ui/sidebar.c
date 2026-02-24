@@ -40,6 +40,7 @@ void sidebar_update(ui_ctx_t *ctx)
         gtk_tree_store_clear(ctx->fd_store);
         gtk_tree_store_clear(ctx->env_store);
         gtk_tree_store_clear(ctx->mmap_store);
+        gtk_tree_store_clear(ctx->lib_store);
         gtk_tree_store_clear(ctx->net_store);
 #ifdef HAVE_PIPEWIRE
         gtk_tree_store_clear(ctx->pw_store);
@@ -248,6 +249,9 @@ void sidebar_update(ui_ctx_t *ctx)
 
     /* ── populate memory map tree (async, off main thread) ── */
     mmap_scan_start(ctx, (pid_t)pid);
+
+    /* ── populate library list (async, off main thread) ── */
+    lib_scan_start(ctx, (pid_t)pid);
 
     /* ── populate network sockets tree (async, off main thread) ── */
     net_scan_start(ctx, (pid_t)pid);

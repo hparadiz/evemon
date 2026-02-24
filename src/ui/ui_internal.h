@@ -194,6 +194,21 @@ typedef struct {
     guint               mmap_generation;
     GCancellable       *mmap_cancel;
 
+    /* shared library / DLL list in sidebar */
+    GtkTreeStore       *lib_store;
+    GtkTreeView        *lib_view;
+    GtkCssProvider     *lib_css;
+    unsigned            lib_collapsed;     /* bitmask: 1 << lib_cat */
+    pid_t               lib_last_pid;
+    guint               lib_generation;
+    GCancellable       *lib_cancel;
+
+    /* lib section collapse/expand */
+    gboolean            sb_lib_collapsed;
+    GtkWidget          *sb_lib_content;
+    GtkWidget          *sb_lib_header_arrow;
+    GtkWidget          *sb_lib_scroll;
+
     /* network sockets in sidebar (dedicated section) */
     GtkTreeStore       *net_store;
     GtkTreeView        *net_view;
@@ -434,6 +449,39 @@ enum {
 extern const char *mmap_cat_label[MMAP_CAT_COUNT];
 
 void mmap_scan_start(ui_ctx_t *ctx, pid_t pid);
+
+/* ── shared library / DLL scanning ────────────────────────────── */
+
+typedef enum {
+    LIB_CAT_RUNTIME,       /* ld-linux, libc, libm, libgcc_s, etc.  */
+    LIB_CAT_SYSTEM,        /* system-installed .so files             */
+    LIB_CAT_APPLICATION,   /* app-shipped .so files                  */
+    LIB_CAT_WINE_BUILTIN,  /* Wine/Proton built-in DLLs (.so + .dll)*/
+    LIB_CAT_WINDOWS_DLL,   /* real Windows .dll under Wine/Proton    */
+    LIB_CAT_OTHER,         /* anything else                          */
+    LIB_CAT_COUNT
+} lib_category_t;
+
+enum {
+    LIB_COL_TEXT,          /* plain text (full path for leaves, header for cats) */
+    LIB_COL_MARKUP,        /* Pango markup for display              */
+    LIB_COL_CAT,           /* lib_category_t (-1 for leaf rows)     */
+    LIB_NUM_COLS
+};
+
+extern const char *lib_cat_label[LIB_CAT_COUNT];
+
+void lib_scan_start(ui_ctx_t *ctx, pid_t pid);
+
+/* sidebar signal callbacks for library tree */
+void on_lib_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
+                          GtkTreePath *path, gpointer data);
+void on_lib_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
+                         GtkTreePath *path, gpointer data);
+gboolean on_lib_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
+gboolean on_lib_query_tooltip(GtkWidget *widget, gint x, gint y,
+                              gboolean keyboard_mode, GtkTooltip *tooltip,
+                              gpointer data);
 
 /* ── PipeWire audio connection scanning ───────────────────────── */
 

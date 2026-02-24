@@ -992,7 +992,7 @@ static void on_sidebar_win_size_allocate(GtkWidget *widget,
      * default back to the default so they don't fight for space.  */
     GtkWidget *scrolls[] = {
         ctx->sb_fd_scroll, ctx->sb_env_scroll, ctx->sb_mmap_scroll,
-        ctx->sb_net_scroll,
+        ctx->sb_lib_scroll, ctx->sb_net_scroll,
 #ifdef HAVE_PIPEWIRE
         ctx->sb_pw_scroll,
 #endif
@@ -1720,6 +1720,16 @@ static void reload_font_css(ui_ctx_t *ctx)
                  "treeview { font-family: Monospace; font-size: %dpt; }",
                  mmap_size);
         gtk_css_provider_load_from_data(ctx->mmap_css, buf, -1, NULL);
+    }
+
+    /* Library tree in sidebar (same size as fd/env/mmap tree) */
+    if (ctx->lib_css) {
+        int lib_size = ctx->font_size > FONT_SIZE_MIN
+                     ? ctx->font_size - 1 : ctx->font_size;
+        snprintf(buf, sizeof(buf),
+                 "treeview { font-family: Monospace; font-size: %dpt; }",
+                 lib_size);
+        gtk_css_provider_load_from_data(ctx->lib_css, buf, -1, NULL);
     }
 
     /* Net tree in sidebar (same size as fd/env/mmap tree) */
@@ -3831,6 +3841,44 @@ void *ui_thread(void *arg)
     MAKE_SECTION(mmap_section, mmap_header_eb, mmap_revealer,
                  mmap_arrow, "Memory Map", mmap_scroll, TRUE);
 
+    /* ── Libraries (shared .so / DLL) collapsible section ─────── */
+    GtkTreeStore *lib_store = gtk_tree_store_new(LIB_NUM_COLS,
+                                                 G_TYPE_STRING,
+                                                 G_TYPE_STRING,
+                                                 G_TYPE_INT);
+    GtkWidget *lib_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(lib_store));
+    g_object_unref(lib_store);
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(lib_tree), FALSE);
+    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(lib_tree), TRUE);
+    gtk_widget_set_has_tooltip(lib_tree, TRUE);
+
+    GtkCellRenderer *lib_r = gtk_cell_renderer_text_new();
+    g_object_set(lib_r, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+    GtkTreeViewColumn *lib_col = gtk_tree_view_column_new_with_attributes(
+        "Lib", lib_r, "markup", LIB_COL_MARKUP, NULL);
+    gtk_tree_view_column_set_expand(lib_col, TRUE);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(lib_tree), lib_col);
+
+    GtkCssProvider *lib_css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(lib_css,
+        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(lib_tree),
+        GTK_STYLE_PROVIDER(lib_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    GtkTreeSelection *lib_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(lib_tree));
+    gtk_tree_selection_set_mode(lib_sel, GTK_SELECTION_SINGLE);
+
+    GtkWidget *lib_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(lib_scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(lib_scroll, -1, SECTION_DEFAULT_HEIGHT);
+    gtk_container_add(GTK_CONTAINER(lib_scroll), lib_tree);
+
+    GtkWidget *lib_section, *lib_header_eb, *lib_revealer, *lib_arrow;
+    MAKE_SECTION(lib_section, lib_header_eb, lib_revealer,
+                 lib_arrow, "Libraries", lib_scroll, TRUE);
+
     /* ── Network Sockets collapsible section ──────────────────── */
     GtkWidget *net_content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
@@ -3955,6 +4003,7 @@ void *ui_thread(void *arg)
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), net_section, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), env_section, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), mmap_section, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sidebar_vbox), lib_section, FALSE, FALSE, 0);
 #ifdef HAVE_PIPEWIRE
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), pw_section, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), spectro_section, FALSE, FALSE, 0);
@@ -4123,6 +4172,11 @@ void *ui_thread(void *arg)
     ctx.sb_mmap_header_arrow  = mmap_arrow;
     ctx.sb_mmap_scroll        = mmap_scroll;
 
+    ctx.sb_lib_collapsed      = FALSE;
+    ctx.sb_lib_content        = lib_scroll;
+    ctx.sb_lib_header_arrow   = lib_arrow;
+    ctx.sb_lib_scroll         = lib_scroll;
+
 #ifdef HAVE_PIPEWIRE
     ctx.sb_pw_collapsed       = FALSE;
     ctx.sb_pw_content         = pw_scroll;
@@ -4190,6 +4244,15 @@ void *ui_thread(void *arg)
     ctx.mmap_last_pid   = 0;
     ctx.mmap_generation = 0;
     ctx.mmap_cancel     = NULL;
+
+    /* Library list */
+    ctx.lib_store       = lib_store;
+    ctx.lib_view        = GTK_TREE_VIEW(lib_tree);
+    ctx.lib_css         = lib_css;
+    ctx.lib_collapsed   = 0;
+    ctx.lib_last_pid    = 0;
+    ctx.lib_generation  = 0;
+    ctx.lib_cancel      = NULL;
 
     /* Network sockets list */
     ctx.net_store          = net_store;
@@ -4294,6 +4357,9 @@ void *ui_thread(void *arg)
     CONNECT_SECTION(mmap_header_eb, mmap_scroll, mmap_revealer,
                     mmap_arrow, mmap_section, sidebar_vbox,
                     &ctx.sb_mmap_collapsed, TRUE, mmap_scroll);
+    CONNECT_SECTION(lib_header_eb, lib_scroll, lib_revealer,
+                    lib_arrow, lib_section, sidebar_vbox,
+                    &ctx.sb_lib_collapsed, TRUE, lib_scroll);
     CONNECT_SECTION(net_header_eb, net_content, net_revealer,
                     net_arrow, net_section, sidebar_vbox,
                     &ctx.sb_net_collapsed, TRUE, net_scroll);
@@ -4333,6 +4399,14 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_mmap_row_expanded), &ctx);
     g_signal_connect(mmap_tree, "key-press-event",
                      G_CALLBACK(on_mmap_key_press), &ctx);
+    g_signal_connect(lib_tree, "row-collapsed",
+                     G_CALLBACK(on_lib_row_collapsed), &ctx);
+    g_signal_connect(lib_tree, "row-expanded",
+                     G_CALLBACK(on_lib_row_expanded), &ctx);
+    g_signal_connect(lib_tree, "key-press-event",
+                     G_CALLBACK(on_lib_key_press), &ctx);
+    g_signal_connect(lib_tree, "query-tooltip",
+                     G_CALLBACK(on_lib_query_tooltip), &ctx);
     g_signal_connect(net_tree, "row-collapsed",
                      G_CALLBACK(on_net_row_collapsed), &ctx);
     g_signal_connect(net_tree, "row-expanded",
@@ -4442,6 +4516,13 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
         g_cancellable_cancel(ctx->mmap_cancel);
         g_object_unref(ctx->mmap_cancel);
         ctx->mmap_cancel = NULL;
+    }
+
+    /* Cancel any in-flight async lib scan */
+    if (ctx->lib_cancel) {
+        g_cancellable_cancel(ctx->lib_cancel);
+        g_object_unref(ctx->lib_cancel);
+        ctx->lib_cancel = NULL;
     }
 
     /* Cancel any in-flight async net scan */
