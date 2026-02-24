@@ -2,7 +2,8 @@ CC      := gcc
 CFLAGS  := -Wall -Wextra -std=c11 -O2 -pthread -D_GNU_SOURCE \
            -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
            -Wformat -Wformat-security -fPIE
-LDFLAGS := -pthread -lm -pie -Wl,-z,relro,-z,now
+LDFLAGS := -pthread -lm -pie -Wl,-z,relro,-z,now \
+           -rdynamic -ldl
 
 # GTK3 flags
 GTK_CFLAGS  := $(shell pkg-config --cflags gtk+-3.0)
@@ -56,7 +57,7 @@ TARGET := $(BUILD_DIR)/allmon
 
 .PHONY: all clean run
 
-all: $(TARGET) $(BPF_OBJ)
+all: $(TARGET) $(BPF_OBJ) plugins
 
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -84,8 +85,34 @@ $(BUILD_DIR):
 $(BUILD_DIR)/ui:
 	mkdir -p $(BUILD_DIR)/ui
 
+# ── Plugin shared objects ────────────────────────────────────────
+PLUGIN_DIR     := $(BUILD_DIR)/plugins
+PLUGIN_CFLAGS  := -Wall -Wextra -std=c11 -O2 -D_GNU_SOURCE -fPIC -shared \
+                  $(GTK_CFLAGS) $(FC_CFLAGS)
+PLUGIN_LDFLAGS := $(GTK_LDFLAGS) $(FC_LDFLAGS)
+
+PLUGIN_SRCS := $(wildcard $(SRC_DIR)/plugins/*.c)
+PLUGIN_SOS  := $(patsubst $(SRC_DIR)/plugins/%.c,$(PLUGIN_DIR)/allmon_%.so,$(PLUGIN_SRCS))
+
+$(PLUGIN_DIR):
+	mkdir -p $(PLUGIN_DIR)
+
+$(PLUGIN_DIR)/allmon_%.so: $(SRC_DIR)/plugins/%.c $(SRC_DIR)/allmon_plugin.h | $(PLUGIN_DIR)
+	$(CC) $(PLUGIN_CFLAGS) -o $@ $< $(PLUGIN_LDFLAGS)
+
+# PipeWire plugin needs PW flags (only built when PW is available)
+ifneq ($(PW_LDFLAGS),)
+$(PLUGIN_DIR)/allmon_pipewire_plugin.so: $(SRC_DIR)/plugins/pipewire_plugin.c $(SRC_DIR)/allmon_plugin.h | $(PLUGIN_DIR)
+	$(CC) $(PLUGIN_CFLAGS) $(PW_CFLAGS) -DHAVE_PIPEWIRE -o $@ $< $(PLUGIN_LDFLAGS) $(PW_LDFLAGS)
+else
+# If PipeWire is not available, skip the PipeWire plugin
+PLUGIN_SOS := $(filter-out $(PLUGIN_DIR)/allmon_pipewire_plugin.so,$(PLUGIN_SOS))
+endif
+
+plugins: $(PLUGIN_SOS)
+
 clean:
 	rm -rf $(BUILD_DIR)
 
-run: $(TARGET) $(BPF_OBJ)
+run: $(TARGET) $(BPF_OBJ) plugins
 	./$(TARGET)

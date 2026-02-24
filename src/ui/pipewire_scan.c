@@ -16,6 +16,7 @@
 #ifdef HAVE_PIPEWIRE
 
 #include "ui_internal.h"
+#include "pipewire_graph.h"
 
 #include <pipewire/pipewire.h>
 #include <spa/utils/dict.h>
@@ -23,72 +24,12 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* ── in-memory graph snapshot ────────────────────────────────── */
-
-/*
- * We collect the entire PipeWire graph into flat arrays, then
- * disconnect.  The worker thread queries these arrays to build
- * the per-PID view.  This avoids holding a PipeWire connection
- * open across ticks or doing async round-trips on the main loop.
- */
-
-typedef struct {
-    uint32_t id;
-    uint32_t client_id;         /* client.id (owning client object)    */
-    pid_t    pid;               /* application.process.id, or 0       */
-    char     app_name[128];     /* application.name                   */
-    char     node_name[128];    /* node.name                          */
-    char     node_desc[256];    /* node.description                   */
-    char     media_class[64];   /* media.class (e.g. Stream/Output/Audio) */
-    char     media_name[256];   /* media.name (e.g. tab title, song)  */
-} pw_snap_node_t;
-
-typedef struct {
-    uint32_t id;
-    pid_t    pid;               /* application.process.id or pipewire.sec.pid */
-} pw_snap_client_t;
-
-typedef struct {
-    uint32_t id;
-    uint32_t node_id;           /* owning node                        */
-    char     port_name[128];    /* port.name                          */
-    char     port_alias[256];   /* port.alias                         */
-    char     direction[8];      /* "in" or "out"                      */
-    char     format_dsp[64];    /* format.dsp                         */
-} pw_snap_port_t;
-
-typedef struct {
-    uint32_t id;
-    uint32_t output_node_id;
-    uint32_t output_port_id;
-    uint32_t input_node_id;
-    uint32_t input_port_id;
-} pw_snap_link_t;
-
-typedef struct {
-    pw_snap_node_t *nodes;
-    size_t          node_count;
-    size_t          node_cap;
-
-    pw_snap_port_t *ports;
-    size_t          port_count;
-    size_t          port_cap;
-
-    pw_snap_link_t *links;
-    size_t          link_count;
-    size_t          link_cap;
-
-    pw_snap_client_t *clients;
-    size_t            client_count;
-    size_t            client_cap;
-} pw_graph_t;
-
 static void pw_graph_init(pw_graph_t *g)
 {
     memset(g, 0, sizeof(*g));
 }
 
-static void pw_graph_free(pw_graph_t *g)
+void pw_graph_free(pw_graph_t *g)
 {
     free(g->nodes);
     free(g->ports);
@@ -169,14 +110,47 @@ static const char *dict_get(const struct spa_dict *d, const char *key)
     return spa_dict_lookup(d, key);
 }
 
+/*
+ * Ensure a NUL-terminated buffer doesn't end with a truncated
+ * multi-byte UTF-8 sequence (as can happen after snprintf).
+ */
+static void utf8_safe_truncate(char *buf, size_t bufsz)
+{
+    if (!buf || bufsz == 0) return;
+    buf[bufsz - 1] = '\0';
+    size_t len = strlen(buf);
+    if (len == 0) return;
+
+    /* Walk backwards past continuation bytes (10xxxxxx) */
+    size_t pos = len;
+    while (pos > 0 && ((unsigned char)buf[pos - 1] & 0xC0) == 0x80)
+        pos--;
+
+    if (pos == 0) { buf[0] = '\0'; return; }
+
+    unsigned char lead = (unsigned char)buf[pos - 1];
+    int expected;
+    if (lead < 0x80)      expected = 1;
+    else if (lead < 0xC0) { buf[pos - 1] = '\0'; return; }
+    else if (lead < 0xE0) expected = 2;
+    else if (lead < 0xF0) expected = 3;
+    else                  expected = 4;
+
+    size_t actual = len - (pos - 1);
+    if (actual < (size_t)expected)
+        buf[pos - 1] = '\0';   /* incomplete sequence — remove it */
+}
+
 static void dict_copy(const struct spa_dict *d, const char *key,
                       char *buf, size_t bufsz)
 {
     const char *v = dict_get(d, key);
-    if (v)
+    if (v) {
         snprintf(buf, bufsz, "%s", v);
-    else
+        utf8_safe_truncate(buf, bufsz);
+    } else {
         buf[0] = '\0';
+    }
 }
 
 /* ── registry enumeration ────────────────────────────────────── */
@@ -393,7 +367,7 @@ static const struct pw_core_events core_events = {
  * Must be called from a thread that is NOT the PipeWire main loop
  * (i.e. from our GTask worker thread).
  */
-static int pw_snapshot(pw_graph_t *out)
+int pw_snapshot(pw_graph_t *out)
 {
     pw_graph_init(out);
 
@@ -922,30 +896,12 @@ static void pw_scan_complete(GObject      *source_object,
 
 void pipewire_scan_start(ui_ctx_t *ctx, pid_t pid)
 {
-    /* Cancel any in-flight scan */
-    if (ctx->pw_cancel) {
-        g_cancellable_cancel(ctx->pw_cancel);
-        g_object_unref(ctx->pw_cancel);
-    }
-    ctx->pw_cancel = g_cancellable_new();
-    ctx->pw_generation++;
-
-    /* Reset collapse state when switching to a different process */
-    if (pid != ctx->pw_last_pid) {
-        ctx->pw_collapsed = 0;
-        ctx->pw_last_pid  = pid;
-    }
-
-    pw_scan_task_t *t = calloc(1, sizeof(*t));
-    if (!t) return;
-    t->pid        = pid;
-    t->generation = ctx->pw_generation;
-    t->ctx        = ctx;
-
-    GTask *task = g_task_new(NULL, ctx->pw_cancel, pw_scan_complete, ctx);
-    g_task_set_task_data(task, t, (GDestroyNotify)pw_scan_task_free);
-    g_task_run_in_thread(task, pw_scan_thread_func);
-    g_object_unref(task);
+    /* Disabled: PipeWire audio is now handled entirely by the
+     * PipeWire plugin (src/plugins/pipewire_plugin.c).  The old
+     * sidebar scanner is kept compiled but not called to avoid
+     * conflicting PipeWire sink creation. */
+    (void)ctx;
+    (void)pid;
 }
 
 /* ── signal callbacks ────────────────────────────────────────── */

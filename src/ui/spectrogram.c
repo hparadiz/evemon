@@ -154,6 +154,9 @@ typedef struct {
     /* Running flag */
     int                    running;
 
+    /* Signal handler id for the "draw" callback (so we can disconnect) */
+    gulong                 draw_handler_id;
+
     /* ── frequency cutoff detection ──────────────────────────── */
     float                  cutoff_freq;     /* detected cutoff in Hz    */
     int                    cutoff_bin;      /* FFT bin index of cutoff  */
@@ -519,6 +522,13 @@ static void spectro_stop_internal(spectro_state_t *st)
         st->timer_id = 0;
     }
 
+    /* Disconnect our draw handler from the plugin's drawing area
+     * BEFORE freeing the state, so no dangling-pointer callbacks. */
+    if (st->draw_handler_id && st->draw_area) {
+        g_signal_handler_disconnect(st->draw_area, st->draw_handler_id);
+        st->draw_handler_id = 0;
+    }
+
     if (st->loop) {
         pw_thread_loop_stop(st->loop);
 
@@ -688,10 +698,13 @@ void spectrogram_start_for_node(ui_ctx_t *ctx, uint32_t node_id)
 
     ctx->spectro = st;
 
-    /* Show the spectrogram section */
-    gtk_widget_set_no_show_all(ctx->sb_spectro_section, FALSE);
-    gtk_widget_show_all(ctx->sb_spectro_section);
-    gtk_widget_set_no_show_all(ctx->sb_spectro_section, TRUE);
+    /* Connect our draw handler to the plugin's drawing area.
+     * The plugin may have its own placeholder handler; ours renders
+     * the actual waterfall and returns FALSE so both can coexist.
+     * Store the handler ID so spectrogram_stop can disconnect it. */
+    st->draw_handler_id = g_signal_connect(st->draw_area, "draw",
+                                           G_CALLBACK(on_spectro_draw), st);
+
     return;
 
 fail:

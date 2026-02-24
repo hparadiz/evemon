@@ -1,5 +1,11 @@
 /*
- * sidebar.c – detail panel: show selected-process info & fd tree.
+ * sidebar.c – process detail sidebar: show selected-process info.
+ *
+ * The sidebar now only contains the "Process Info" section with
+ * basic metadata (PID, name, CPU%, RSS, etc.), Steam/Proton info,
+ * and cgroup limits.  The old per-section data scanners (FD, env,
+ * mmap, libs, network) have been retired in favour of the plugin
+ * tab system in the detail panel.
  */
 
 #include "ui_internal.h"
@@ -38,19 +44,6 @@ void sidebar_update(ui_ctx_t *ctx)
         gtk_label_set_text(ctx->sb_cmdline,   "–");
         gtk_widget_hide(ctx->sb_steam_frame);
         gtk_widget_hide(ctx->sb_cgroup_frame);
-        gtk_tree_store_clear(ctx->fd_store);
-        gtk_tree_store_clear(ctx->env_store);
-        gtk_tree_store_clear(ctx->mmap_store);
-        gtk_tree_store_clear(ctx->lib_store);
-        gtk_tree_store_clear(ctx->net_store);
-#ifdef HAVE_PIPEWIRE
-        gtk_tree_store_clear(ctx->pw_store);
-        spectrogram_stop(ctx);
-        pw_meter_stop(ctx);
-        /* Hide the spectrogram section and reset user-shown flag */
-        gtk_widget_hide(ctx->sb_spectro_section);
-        ctx->sb_spectro_user_shown = FALSE;
-#endif
         return;
     }
 
@@ -242,27 +235,9 @@ void sidebar_update(ui_ctx_t *ctx)
         }
     }
 
-    /* ── populate file descriptor tree (async, off main thread) ── */
-    fd_scan_start(ctx, (pid_t)pid);
-
-    /* ── populate environment variable tree (async, off main thread) ── */
-    env_scan_start(ctx, (pid_t)pid);
-
-    /* ── populate memory map tree (async, off main thread) ── */
-    mmap_scan_start(ctx, (pid_t)pid);
-
-    /* ── populate library list (async, off main thread) ── */
-    lib_scan_start(ctx, (pid_t)pid);
-
-    /* ── populate cgroup resource limits (async, off main thread) ── */
-    cgroup_scan_start(ctx, (pid_t)pid);
-
-    /* ── populate network sockets tree (async, off main thread) ── */
-    net_scan_start(ctx, (pid_t)pid);
-
-    /* ── populate PipeWire audio connections (async, off main thread) ── */
-    /* (also triggers spectrogram capture when an audio output node is found) */
-    pipewire_scan_start(ctx, (pid_t)pid);
+    /* Scanning of FDs, environment, memory maps, libraries, network
+     * sockets, and cgroups is now handled entirely by the plugin
+     * system via the detail panel tabs. */
 
     g_free(user); g_free(name); g_free(cpu_text);
     g_free(rss_text); g_free(grp_rss_text); g_free(grp_cpu_text);

@@ -84,6 +84,15 @@ void set_process_tree_node(ptree_node_set_t *s, pid_t pinned_pid,
 int  get_process_tree_node(const ptree_node_set_t *s, pid_t pinned_pid,
                            pid_t pid);
 
+/* ── detail panel dock position ───────────────────────────────── */
+
+typedef enum {
+    PANEL_POS_BOTTOM,
+    PANEL_POS_TOP,
+    PANEL_POS_LEFT,
+    PANEL_POS_RIGHT,
+} panel_position_t;
+
 /* ── per-UI state ────────────────────────────────────────────── */
 
 typedef struct {
@@ -302,6 +311,21 @@ typedef struct {
     pid_t              *pinned_pids;     /* dynamic array of pinned PIDs  */
     size_t              pinned_count;
     size_t              pinned_capacity;
+
+    /* plugin system */
+    void               *plugin_registry; /* plugin_registry_t* (opaque to avoid header dep) */
+    GtkWidget          *plugin_notebook; /* GtkNotebook holding plugin tabs */
+    void               *plugin_broker;   /* broker state (opaque void*)     */
+
+    /* detail panel (detachable plugin notebook) */
+    GtkWidget          *detail_panel;         /* the frame wrapping the notebook  */
+    panel_position_t    detail_panel_pos;      /* current dock position            */
+    GtkCheckMenuItem   *detail_panel_menu_item;/* View → Detail Panel toggle       */
+    GtkWidget          *detail_paned;          /* current GtkPaned holding panel   */
+    GtkWidget          *main_content;          /* tree_overlay (stable reference)  */
+    GtkWidget          *content_box;           /* vbox holding menubar+content+status */
+    GtkWidget          *hpaned;                /* sidebar paned (tree | sidebar)   */
+    GSList             *panel_pos_group;        /* radio group for position items   */
 } ui_ctx_t;
 
 /* ── fd types ────────────────────────────────────────────────── */

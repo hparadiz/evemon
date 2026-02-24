@@ -183,7 +183,13 @@ static gboolean meter_tick(gpointer data)
             ms->display_r[i] = ms->display_r[i] * METER_DECAY;
     }
 
-    /* Update tree store levels for all audio output leaf rows */
+    /* Update tree store levels for all audio output leaf rows.
+     * pw_store may be NULL when PipeWire is handled entirely by the
+     * plugin — in that case the plugin's own meter_tick updates its
+     * private store; we just skip the legacy tree-store update here. */
+    if (!ctx->pw_store)
+        return G_SOURCE_CONTINUE;
+
     GtkTreeModel *model = GTK_TREE_MODEL(ctx->pw_store);
     GtkTreeIter parent;
     gboolean pvalid = gtk_tree_model_iter_children(model, &parent, NULL);

@@ -12,6 +12,9 @@
 
 #include "ui_internal.h"
 
+#include "../plugin_loader.h"
+#include "../plugin_broker.h"
+
 #include <fontconfig/fontconfig.h>
 #include <pango/pangocairo.h>
 #include <math.h>
@@ -848,6 +851,146 @@ static void on_toggle_sidebar(GtkCheckMenuItem *item, gpointer data)
     }
 }
 
+/* ── detail panel: toggle visibility ─────────────────────────── */
+
+static void detail_panel_relayout(ui_ctx_t *ctx);
+
+static void on_toggle_detail_panel(GtkCheckMenuItem *item, gpointer data)
+{
+    ui_ctx_t *ctx = data;
+    if (gtk_check_menu_item_get_active(item)) {
+        gtk_widget_show_all(ctx->detail_panel);
+    } else {
+        gtk_widget_hide(ctx->detail_panel);
+    }
+}
+
+/* ── detail panel: change dock position ──────────────────────── */
+
+typedef struct {
+    ui_ctx_t        *ctx;
+    panel_position_t pos;
+} panel_pos_data_t;
+
+static void on_panel_position_changed(GtkCheckMenuItem *item, gpointer data)
+{
+    panel_pos_data_t *d = data;
+    if (!gtk_check_menu_item_get_active(item))
+        return;   /* ignore radio deactivation */
+    if (d->ctx->detail_panel_pos == d->pos)
+        return;   /* no change */
+    d->ctx->detail_panel_pos = d->pos;
+    detail_panel_relayout(d->ctx);
+}
+
+/*
+ * Reparent the detail panel into the correct paned position.
+ *
+ * The layout hierarchy is:
+ *   content_box (vbox):
+ *     [0] menubar
+ *     [1] outer_paned (vertical or horizontal depending on position)
+ *           pack1 = tree area (hpaned containing tree_overlay + sidebar)
+ *           pack2 = detail_panel
+ *     [2] status_ebox
+ *
+ * When the position changes, we destroy the old paned, create a new one
+ * with the correct orientation, and re-pack everything.
+ */
+static void detail_panel_relayout(ui_ctx_t *ctx)
+{
+    gboolean was_visible = gtk_widget_get_visible(ctx->detail_panel);
+
+    /* Remove detail_panel and hpaned from their current parent.
+     * g_object_ref ensures they survive the container removal. */
+    g_object_ref(ctx->detail_panel);
+    g_object_ref(ctx->hpaned);
+
+    GtkWidget *old_paned = ctx->detail_paned;
+    if (old_paned) {
+        /* The old paned is child [1] of content_box */
+        gtk_container_remove(GTK_CONTAINER(old_paned), ctx->hpaned);
+        gtk_container_remove(GTK_CONTAINER(old_paned), ctx->detail_panel);
+        gtk_container_remove(GTK_CONTAINER(ctx->content_box), old_paned);
+    }
+
+    /* Create a new paned with the correct orientation */
+    GtkOrientation orient;
+    gboolean panel_is_child1;  /* TRUE = panel is pack1 (top/left) */
+
+    switch (ctx->detail_panel_pos) {
+    case PANEL_POS_TOP:
+        orient = GTK_ORIENTATION_VERTICAL;
+        panel_is_child1 = TRUE;
+        break;
+    case PANEL_POS_BOTTOM:
+        orient = GTK_ORIENTATION_VERTICAL;
+        panel_is_child1 = FALSE;
+        break;
+    case PANEL_POS_LEFT:
+        orient = GTK_ORIENTATION_HORIZONTAL;
+        panel_is_child1 = TRUE;
+        break;
+    case PANEL_POS_RIGHT:
+        orient = GTK_ORIENTATION_HORIZONTAL;
+        panel_is_child1 = FALSE;
+        break;
+    default:
+        orient = GTK_ORIENTATION_VERTICAL;
+        panel_is_child1 = FALSE;
+        break;
+    }
+
+    GtkWidget *new_paned = gtk_paned_new(orient);
+
+    if (panel_is_child1) {
+        gtk_paned_pack1(GTK_PANED(new_paned), ctx->detail_panel, FALSE, FALSE);
+        gtk_paned_pack2(GTK_PANED(new_paned), ctx->hpaned, TRUE, FALSE);
+    } else {
+        gtk_paned_pack1(GTK_PANED(new_paned), ctx->hpaned, TRUE, FALSE);
+        gtk_paned_pack2(GTK_PANED(new_paned), ctx->detail_panel, FALSE, FALSE);
+    }
+
+    /* Set a reasonable default position for the divider */
+    if (orient == GTK_ORIENTATION_VERTICAL) {
+        /* For top/bottom, give the panel ~250px */
+        GtkAllocation alloc;
+        gtk_widget_get_allocation(ctx->content_box, &alloc);
+        int total_h = alloc.height > 100 ? alloc.height : 700;
+        int panel_h = 250;
+        if (panel_is_child1)
+            gtk_paned_set_position(GTK_PANED(new_paned), panel_h);
+        else
+            gtk_paned_set_position(GTK_PANED(new_paned), total_h - panel_h);
+    } else {
+        /* For left/right, give the panel ~350px */
+        GtkAllocation alloc;
+        gtk_widget_get_allocation(ctx->content_box, &alloc);
+        int total_w = alloc.width > 100 ? alloc.width : 1100;
+        int panel_w = 350;
+        if (panel_is_child1)
+            gtk_paned_set_position(GTK_PANED(new_paned), panel_w);
+        else
+            gtk_paned_set_position(GTK_PANED(new_paned), total_w - panel_w);
+    }
+
+    ctx->detail_paned = new_paned;
+
+    g_object_unref(ctx->detail_panel);
+    g_object_unref(ctx->hpaned);
+
+    /* Insert the new paned into content_box at position [1]
+     * (between menubar [0] and status [2]).  pack_start appends,
+     * so we use gtk_box_reorder_child to place it correctly. */
+    gtk_box_pack_start(GTK_BOX(ctx->content_box), new_paned, TRUE, TRUE, 0);
+    gtk_box_reorder_child(GTK_BOX(ctx->content_box), new_paned, 1);
+
+    gtk_widget_show_all(new_paned);
+
+    if (!was_visible)
+        gtk_widget_hide(ctx->detail_panel);
+}
+
 
 /* ── callback when revealer collapse animation finishes ─────────── */
 static void on_revealer_collapse_done(GObject *obj, GParamSpec *pspec,
@@ -1048,10 +1191,9 @@ static void on_row_activated(GtkTreeView       *view,
     (void)view; (void)path; (void)col;
     ui_ctx_t *ctx = data;
 
-    if (!gtk_widget_get_visible(ctx->sidebar)) {
-        /* Toggling the menu item fires the "toggled" signal, which
-         * calls on_toggle_sidebar → show + update.                 */
-        gtk_check_menu_item_set_active(ctx->sidebar_menu_item, TRUE);
+    /* Double-click opens the detail panel (plugin tabs), not the sidebar */
+    if (!gtk_widget_get_visible(ctx->detail_panel)) {
+        gtk_check_menu_item_set_active(ctx->detail_panel_menu_item, TRUE);
     }
 }
 
@@ -1357,6 +1499,57 @@ static gboolean on_refresh(gpointer data)
 
     /* Update the sidebar detail panel for the selected process */
     sidebar_update(ctx);
+
+    /* ── Plugin broker dispatch ──────────────────────────────── */
+    /* After the sidebar updates, kick off the plugin data broker.
+     * Non-pinned instances follow the tree selection. */
+    {
+        plugin_registry_t *preg = ctx->plugin_registry;
+        if (preg && preg->count > 0) {
+            /* Determine the currently selected PID */
+            pid_t sel_pid = 0;
+            GtkTreeSelection *psel =
+                gtk_tree_view_get_selection(ctx->view);
+            if (psel) {
+                GList *prows =
+                    gtk_tree_selection_get_selected_rows(psel, NULL);
+                if (prows) {
+                    GtkTreePath *pp = prows->data;
+                    GtkTreePath *cpath =
+                        gtk_tree_model_sort_convert_path_to_child_path(
+                            ctx->sort_model, pp);
+                    GtkTreeModel *cmodel =
+                        gtk_tree_model_sort_get_model(ctx->sort_model);
+                    GtkTreeIter citer;
+                    if (cpath && gtk_tree_model_get_iter(cmodel, &citer,
+                                                         cpath)) {
+                        gint v = 0;
+                        gtk_tree_model_get(cmodel, &citer,
+                                           COL_PID, &v, -1);
+                        sel_pid = (pid_t)v;
+                    }
+                    if (cpath) gtk_tree_path_free(cpath);
+                    g_list_free_full(prows,
+                                     (GDestroyNotify)gtk_tree_path_free);
+                }
+            }
+
+            /* Update follow-selection instances to the selected PID */
+            for (size_t i = 0; i < preg->count; i++) {
+                plugin_instance_t *inst = &preg->instances[i];
+                if (!inst->pinned)
+                    plugin_instance_set_pid(inst, sel_pid, FALSE);
+            }
+
+            /* If nothing is selected, clear all plugins */
+            if (sel_pid <= 0) {
+                plugin_dispatch_clear_all(preg);
+            } else {
+                /* Start the broker gather (cancels any in-flight cycle) */
+                broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
+            }
+        }
+    }
 
     /* Update system info (right side of status bar) */
     {
@@ -3171,6 +3364,54 @@ static void name_cell_data_func(GtkTreeViewColumn *col,
     g_free(steam_label);
 }
 
+/* ── Host service forwarding functions for PipeWire plugins ──── */
+#ifdef HAVE_PIPEWIRE
+/*
+ * These bridge from the plugin API to the sidebar's pw_meter.c
+ * and spectrogram.c implementations.  The host_ctx is a ui_ctx_t*.
+ */
+static void host_pw_meter_start(void *host_ctx,
+                                const uint32_t *node_ids, size_t count)
+{
+    ui_ctx_t *c = host_ctx;
+    pw_meter_start(c, node_ids, count);
+}
+
+static void host_pw_meter_stop(void *host_ctx)
+{
+    ui_ctx_t *c = host_ctx;
+    pw_meter_stop(c);
+}
+
+static void host_pw_meter_read(void *host_ctx, uint32_t node_id,
+                               int *level_l, int *level_r)
+{
+    ui_ctx_t *c = host_ctx;
+    pw_meter_read(c, node_id, level_l, level_r);
+}
+
+static void host_spectro_start(void *host_ctx, GtkDrawingArea *draw_area,
+                               uint32_t node_id)
+{
+    ui_ctx_t *c = host_ctx;
+    /* Point the host's spectrogram draw widget at the plugin's area */
+    c->spectro_draw = GTK_WIDGET(draw_area);
+    spectrogram_start_for_node(c, node_id);
+}
+
+static void host_spectro_stop(void *host_ctx)
+{
+    ui_ctx_t *c = host_ctx;
+    spectrogram_stop(c);
+}
+
+static uint32_t host_spectro_get_target(void *host_ctx)
+{
+    ui_ctx_t *c = host_ctx;
+    return spectrogram_get_target_node(c);
+}
+#endif /* HAVE_PIPEWIRE */
+
 void *ui_thread(void *arg)
 {
     monitor_state_t *mon = (monitor_state_t *)arg;
@@ -3822,300 +4063,28 @@ void *ui_thread(void *arg)
     gtk_widget_hide(info_arrow);
     gtk_widget_set_no_show_all(info_arrow, TRUE);
 
-    /* ── File Descriptors collapsible section ─────────────────── */
-    GtkWidget *fd_content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    /* Old sidebar data-scanner sections (FD, Environment Variables,
+     * Memory Map, Libraries, Network Sockets) have been retired.
+     * Their functionality is now provided by plugin tabs in the
+     * detail panel.  See src/plugins/ for the new implementations. */
 
-    GtkWidget *fd_toggle_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    GtkWidget *fd_desc_toggle = gtk_check_button_new_with_label(
-        "Include descendant tree");
-    GtkWidget *fd_group_dup_toggle = gtk_check_button_new_with_label(
-        "Group duplicates");
-    gtk_box_pack_start(GTK_BOX(fd_toggle_hbox), fd_desc_toggle, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(fd_toggle_hbox), fd_group_dup_toggle, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(fd_content), fd_toggle_hbox, FALSE, FALSE, 0);
-
-    GtkTreeStore *fd_store = gtk_tree_store_new(FD_NUM_COLS,
-                                                G_TYPE_STRING,
-                                                G_TYPE_STRING,
-                                                G_TYPE_INT);
-    GtkWidget *fd_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(fd_store));
-    g_object_unref(fd_store);
-    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(fd_tree), FALSE);
-    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(fd_tree), TRUE);
-
-    GtkCellRenderer *fd_r = gtk_cell_renderer_text_new();
-    g_object_set(fd_r, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
-    GtkTreeViewColumn *fd_col = gtk_tree_view_column_new_with_attributes(
-        "Path", fd_r, "markup", FD_COL_MARKUP, NULL);
-    gtk_tree_view_column_set_expand(fd_col, TRUE);
-    gtk_tree_view_append_column(GTK_TREE_VIEW(fd_tree), fd_col);
-
-    GtkCssProvider *fd_css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(fd_css,
-        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
-    gtk_style_context_add_provider(gtk_widget_get_style_context(fd_tree),
-        GTK_STYLE_PROVIDER(fd_css),
-        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-    GtkTreeSelection *fd_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(fd_tree));
-    gtk_tree_selection_set_mode(fd_sel, GTK_SELECTION_SINGLE);
-
-    GtkWidget *fd_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(fd_scroll),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(fd_scroll, -1, SECTION_DEFAULT_HEIGHT);
-    gtk_container_add(GTK_CONTAINER(fd_scroll), fd_tree);
-    gtk_box_pack_start(GTK_BOX(fd_content), fd_scroll, TRUE, TRUE, 0);
-
-    GtkWidget *fd_section, *fd_header_eb, *fd_revealer, *fd_arrow;
-    MAKE_SECTION(fd_section, fd_header_eb, fd_revealer,
-                 fd_arrow, "Open File Descriptors", fd_content, TRUE);
-
-    /* ── Environment Variables collapsible section ────────────── */
-    GtkTreeStore *env_store = gtk_tree_store_new(ENV_NUM_COLS,
-                                                 G_TYPE_STRING,
-                                                 G_TYPE_STRING,
-                                                 G_TYPE_INT);
-    GtkWidget *env_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(env_store));
-    g_object_unref(env_store);
-    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(env_tree), FALSE);
-    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(env_tree), TRUE);
-
-    GtkCellRenderer *env_r = gtk_cell_renderer_text_new();
-    g_object_set(env_r, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
-    GtkTreeViewColumn *env_col = gtk_tree_view_column_new_with_attributes(
-        "Env", env_r, "markup", ENV_COL_MARKUP, NULL);
-    gtk_tree_view_column_set_expand(env_col, TRUE);
-    gtk_tree_view_append_column(GTK_TREE_VIEW(env_tree), env_col);
-
-    GtkCssProvider *env_css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(env_css,
-        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
-    gtk_style_context_add_provider(gtk_widget_get_style_context(env_tree),
-        GTK_STYLE_PROVIDER(env_css),
-        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-    GtkTreeSelection *env_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(env_tree));
-    gtk_tree_selection_set_mode(env_sel, GTK_SELECTION_SINGLE);
-
-    GtkWidget *env_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(env_scroll),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(env_scroll, -1, SECTION_DEFAULT_HEIGHT);
-    gtk_container_add(GTK_CONTAINER(env_scroll), env_tree);
-
-    GtkWidget *env_section, *env_header_eb, *env_revealer, *env_arrow;
-    MAKE_SECTION(env_section, env_header_eb, env_revealer,
-                 env_arrow, "Environment Variables", env_scroll, TRUE);
-
-    /* ── Memory Map collapsible section ───────────────────────── */
-    GtkTreeStore *mmap_store = gtk_tree_store_new(MMAP_NUM_COLS,
-                                                  G_TYPE_STRING,
-                                                  G_TYPE_STRING,
-                                                  G_TYPE_INT);
-    GtkWidget *mmap_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(mmap_store));
-    g_object_unref(mmap_store);
-    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(mmap_tree), FALSE);
-    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(mmap_tree), TRUE);
-
-    GtkCellRenderer *mmap_r = gtk_cell_renderer_text_new();
-    g_object_set(mmap_r, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
-    GtkTreeViewColumn *mmap_col = gtk_tree_view_column_new_with_attributes(
-        "Map", mmap_r, "markup", MMAP_COL_MARKUP, NULL);
-    gtk_tree_view_column_set_expand(mmap_col, TRUE);
-    gtk_tree_view_append_column(GTK_TREE_VIEW(mmap_tree), mmap_col);
-
-    GtkCssProvider *mmap_css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(mmap_css,
-        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
-    gtk_style_context_add_provider(gtk_widget_get_style_context(mmap_tree),
-        GTK_STYLE_PROVIDER(mmap_css),
-        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-    GtkTreeSelection *mmap_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(mmap_tree));
-    gtk_tree_selection_set_mode(mmap_sel, GTK_SELECTION_SINGLE);
-
-    GtkWidget *mmap_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(mmap_scroll),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(mmap_scroll, -1, SECTION_DEFAULT_HEIGHT);
-    gtk_container_add(GTK_CONTAINER(mmap_scroll), mmap_tree);
-
-    GtkWidget *mmap_section, *mmap_header_eb, *mmap_revealer, *mmap_arrow;
-    MAKE_SECTION(mmap_section, mmap_header_eb, mmap_revealer,
-                 mmap_arrow, "Memory Map", mmap_scroll, TRUE);
-
-    /* ── Libraries (shared .so / DLL) collapsible section ─────── */
-    GtkTreeStore *lib_store = gtk_tree_store_new(LIB_NUM_COLS,
-                                                 G_TYPE_STRING,
-                                                 G_TYPE_STRING,
-                                                 G_TYPE_INT);
-    GtkWidget *lib_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(lib_store));
-    g_object_unref(lib_store);
-    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(lib_tree), FALSE);
-    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(lib_tree), TRUE);
-    gtk_widget_set_has_tooltip(lib_tree, TRUE);
-
-    GtkCellRenderer *lib_r = gtk_cell_renderer_text_new();
-    g_object_set(lib_r, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
-    GtkTreeViewColumn *lib_col = gtk_tree_view_column_new_with_attributes(
-        "Lib", lib_r, "markup", LIB_COL_MARKUP, NULL);
-    gtk_tree_view_column_set_expand(lib_col, TRUE);
-    gtk_tree_view_append_column(GTK_TREE_VIEW(lib_tree), lib_col);
-
-    GtkCssProvider *lib_css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(lib_css,
-        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
-    gtk_style_context_add_provider(gtk_widget_get_style_context(lib_tree),
-        GTK_STYLE_PROVIDER(lib_css),
-        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-    GtkTreeSelection *lib_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(lib_tree));
-    gtk_tree_selection_set_mode(lib_sel, GTK_SELECTION_SINGLE);
-
-    GtkWidget *lib_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(lib_scroll),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(lib_scroll, -1, SECTION_DEFAULT_HEIGHT);
-    gtk_container_add(GTK_CONTAINER(lib_scroll), lib_tree);
-
-    GtkWidget *lib_section, *lib_header_eb, *lib_revealer, *lib_arrow;
-    MAKE_SECTION(lib_section, lib_header_eb, lib_revealer,
-                 lib_arrow, "Libraries", lib_scroll, TRUE);
-
-    /* ── Network Sockets collapsible section ──────────────────── */
-    GtkWidget *net_content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-
-    GtkWidget *net_toggle_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    GtkWidget *net_desc_toggle = gtk_check_button_new_with_label(
-        "Include descendant tree");
-    gtk_box_pack_start(GTK_BOX(net_toggle_hbox), net_desc_toggle, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(net_content), net_toggle_hbox, FALSE, FALSE, 0);
-
-    GtkTreeStore *net_store = gtk_tree_store_new(NET_NUM_COLS,
-                                                 G_TYPE_STRING,
-                                                 G_TYPE_STRING,
-                                                 G_TYPE_INT64);
-    GtkWidget *net_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(net_store));
-    g_object_unref(net_store);
-    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(net_tree), FALSE);
-    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(net_tree), TRUE);
-
-    GtkCellRenderer *net_r = gtk_cell_renderer_text_new();
-    g_object_set(net_r, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
-    GtkTreeViewColumn *net_col = gtk_tree_view_column_new_with_attributes(
-        "Net", net_r, "markup", NET_COL_MARKUP, NULL);
-    gtk_tree_view_column_set_expand(net_col, TRUE);
-    gtk_tree_view_append_column(GTK_TREE_VIEW(net_tree), net_col);
-
-    GtkCssProvider *net_css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(net_css,
-        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
-    gtk_style_context_add_provider(gtk_widget_get_style_context(net_tree),
-        GTK_STYLE_PROVIDER(net_css),
-        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-    GtkTreeSelection *net_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(net_tree));
-    gtk_tree_selection_set_mode(net_sel, GTK_SELECTION_SINGLE);
-
-    GtkWidget *net_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(net_scroll),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(net_scroll, -1, SECTION_DEFAULT_HEIGHT);
-    gtk_container_add(GTK_CONTAINER(net_scroll), net_tree);
-    gtk_box_pack_start(GTK_BOX(net_content), net_scroll, TRUE, TRUE, 0);
-
-    GtkWidget *net_section, *net_header_eb, *net_revealer, *net_arrow;
-    MAKE_SECTION(net_section, net_header_eb, net_revealer,
-                 net_arrow, "Network Sockets", net_content, TRUE);
-
-    /* ── PipeWire Audio collapsible section ────────────────────── */
-#ifdef HAVE_PIPEWIRE
-    GtkTreeStore *pw_store = gtk_tree_store_new(PW_NUM_COLS,
-                                                G_TYPE_STRING,
-                                                G_TYPE_STRING,
-                                                G_TYPE_INT,
-                                                G_TYPE_UINT,
-                                                G_TYPE_INT,
-                                                G_TYPE_INT);
-    GtkWidget *pw_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(pw_store));
-    g_object_unref(pw_store);
-    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(pw_tree), FALSE);
-    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(pw_tree), TRUE);
-
-    GtkCellRenderer *pw_r = gtk_cell_renderer_text_new();
-    g_object_set(pw_r, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
-    GtkTreeViewColumn *pw_col = gtk_tree_view_column_new_with_attributes(
-        "Audio", pw_r, "markup", PW_COL_MARKUP, NULL);
-    gtk_tree_view_column_set_expand(pw_col, TRUE);
-    gtk_tree_view_append_column(GTK_TREE_VIEW(pw_tree), pw_col);
-
-    GtkCellRenderer *meter_r = pw_cell_renderer_meter_new();
-    GtkTreeViewColumn *meter_col = gtk_tree_view_column_new_with_attributes(
-        "Level", meter_r,
-        "level-l", PW_COL_LEVEL_L,
-        "level-r", PW_COL_LEVEL_R,
-        NULL);
-    gtk_tree_view_column_set_fixed_width(meter_col, 66);
-    gtk_tree_view_column_set_sizing(meter_col, GTK_TREE_VIEW_COLUMN_FIXED);
-    gtk_tree_view_append_column(GTK_TREE_VIEW(pw_tree), meter_col);
-
-    GtkCssProvider *pw_css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(pw_css,
-        "treeview { font-family: Monospace; font-size: 8pt; }", -1, NULL);
-    gtk_style_context_add_provider(gtk_widget_get_style_context(pw_tree),
-        GTK_STYLE_PROVIDER(pw_css),
-        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-    GtkTreeSelection *pw_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(pw_tree));
-    gtk_tree_selection_set_mode(pw_sel, GTK_SELECTION_SINGLE);
-
-    GtkWidget *pw_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(pw_scroll),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(pw_scroll, -1, SECTION_DEFAULT_HEIGHT);
-    gtk_container_add(GTK_CONTAINER(pw_scroll), pw_tree);
-
-    GtkWidget *pw_section, *pw_header_eb, *pw_revealer, *pw_arrow;
-    MAKE_SECTION(pw_section, pw_header_eb, pw_revealer,
-                 pw_arrow, "PipeWire Audio", pw_scroll, TRUE);
-
-    /* ── Spectrogram collapsible section (hidden until user opens it) ── */
-    GtkWidget *spectro_content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    GtkWidget *spectro_draw = gtk_drawing_area_new();
-    gtk_widget_set_size_request(spectro_draw, -1, 180);
-    gtk_widget_set_hexpand(spectro_draw, TRUE);
-
-    GtkWidget *spectro_inner = gtk_frame_new(NULL);
-    gtk_container_add(GTK_CONTAINER(spectro_inner), spectro_draw);
-    gtk_box_pack_start(GTK_BOX(spectro_content), spectro_inner, FALSE, FALSE, 0);
-
-    GtkWidget *spectro_section, *spectro_header_eb, *spectro_revealer, *spectro_arrow;
-    MAKE_SECTION(spectro_section, spectro_header_eb, spectro_revealer,
-                 spectro_arrow, "Audio Spectrogram", spectro_content, FALSE);
-    /* Hidden by default; shown only when user activates a PW audio node */
-    gtk_widget_set_no_show_all(spectro_section, TRUE);
-#endif /* HAVE_PIPEWIRE */
+    /* PipeWire Audio sidebar section removed — now handled by the
+     * PipeWire plugin (src/plugins/pipewire_plugin.c).  The host
+     * still provides pw_meter and spectrogram services via
+     * allmon_host_services_t for the plugin to use. */
 
     #undef MAKE_SECTION
 
-    /* ── Pack all sections into the sidebar vbox ─────────────── */
-    /* Info section expands to fill extra space; other sections stay
-     * compact at the bottom, sized by their minimum height. */
+    /* ── Pack Process Info into the sidebar vbox ─────────────── */
+    /* The sidebar now only contains the Process Info section (with
+     * Steam/Proton and cgroup subsections).  Old data-scanner sections
+     * (FD, env, mmap, libs, network) are retired — those are handled
+     * by plugin tabs in the detail panel. */
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), info_section, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(sidebar_vbox), fd_section, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(sidebar_vbox), net_section, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(sidebar_vbox), env_section, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(sidebar_vbox), mmap_section, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(sidebar_vbox), lib_section, FALSE, FALSE, 0);
-#ifdef HAVE_PIPEWIRE
-    gtk_box_pack_start(GTK_BOX(sidebar_vbox), pw_section, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(sidebar_vbox), spectro_section, FALSE, FALSE, 0);
-#endif
 
     gtk_container_add(GTK_CONTAINER(sidebar_scroll), sidebar_vbox);
 
-    GtkWidget *sidebar_frame = gtk_frame_new("Details");
+    GtkWidget *sidebar_frame = gtk_frame_new("Process");
     gtk_container_add(GTK_CONTAINER(sidebar_frame), sidebar_scroll);
 
     /* Live CSS provider for sidebar font size (cascades to all children) */
@@ -4131,10 +4100,11 @@ void *ui_thread(void *arg)
         GTK_STYLE_PROVIDER(sidebar_css),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-    /* ── horizontal paned: tree | sidebar ─────────────────────── */
-    GtkWidget *hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_paned_pack1(GTK_PANED(hpaned), tree_overlay, TRUE, FALSE);
-    gtk_paned_pack2(GTK_PANED(hpaned), sidebar_frame, FALSE, FALSE);
+    /* ── layout: tree occupies the main area (no sidebar paned) ── */
+    /* The old sidebar was packed to the right of the tree in an
+     * hpaned.  Now the sidebar lives INSIDE the detail panel,
+     * so the tree overlay is the sole child of the main content. */
+    GtkWidget *hpaned = tree_overlay;  /* no sidebar pane needed */
 
     /* ── menu bar (hidden by default) ─────────────────────────── */
     GtkWidget *menubar = gtk_menu_bar_new();
@@ -4155,9 +4125,43 @@ void *ui_thread(void *arg)
     GtkWidget *view_item = gtk_menu_item_new_with_label("View");
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(view_item), view_menu);
 
+    /* Sidebar toggle removed — sidebar is now embedded in the detail panel.
+     * A dummy widget satisfies references in ctx initialization. */
     GtkWidget *sidebar_toggle = gtk_check_menu_item_new_with_label("Sidebar");
-    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(sidebar_toggle), FALSE);
-    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), sidebar_toggle);
+    (void)sidebar_toggle;  /* not added to any menu */
+
+    /* Detail Panel toggle */
+    GtkWidget *detail_panel_toggle = gtk_check_menu_item_new_with_label("Detail Panel");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(detail_panel_toggle), FALSE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), detail_panel_toggle);
+
+    /* Detail Panel → Position submenu (radio items) */
+    GtkWidget *panel_pos_menu = gtk_menu_new();
+    GtkWidget *panel_pos_item = gtk_menu_item_new_with_label("Panel Position");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(panel_pos_item), panel_pos_menu);
+
+    GSList *pos_group = NULL;
+    static panel_pos_data_t pos_data_bottom, pos_data_top, pos_data_left, pos_data_right;
+
+    GtkWidget *pos_bottom = gtk_radio_menu_item_new_with_label(pos_group, "Bottom");
+    pos_group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(pos_bottom));
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(pos_bottom), TRUE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(panel_pos_menu), pos_bottom);
+
+    GtkWidget *pos_top = gtk_radio_menu_item_new_with_label(pos_group, "Top");
+    pos_group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(pos_top));
+    gtk_menu_shell_append(GTK_MENU_SHELL(panel_pos_menu), pos_top);
+
+    GtkWidget *pos_left = gtk_radio_menu_item_new_with_label(pos_group, "Left");
+    pos_group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(pos_left));
+    gtk_menu_shell_append(GTK_MENU_SHELL(panel_pos_menu), pos_left);
+
+    GtkWidget *pos_right = gtk_radio_menu_item_new_with_label(pos_group, "Right");
+    pos_group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(pos_right));
+    gtk_menu_shell_append(GTK_MENU_SHELL(panel_pos_menu), pos_right);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), panel_pos_item);
+
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),
                           gtk_separator_menu_item_new());
 
@@ -4213,10 +4217,31 @@ void *ui_thread(void *arg)
     gtk_container_add(GTK_CONTAINER(status_ebox), status_hbox);
     gtk_widget_add_events(status_ebox, GDK_BUTTON_PRESS_MASK);
 
+    /* ── detail panel (wraps sidebar + plugin notebook) ──────── */
+    /* The detail panel now contains a horizontal paned:
+     *   pack1 = sidebar_frame  (Process Info / Steam / cgroup)
+     *   pack2 = plugin notebook (tabs for FD, Env, Mmap, Libs, Net, …)
+     * Opening the detail panel reveals both process info and plugin tabs. */
+    GtkWidget *detail_panel = gtk_frame_new(NULL);
+    gtk_widget_set_size_request(detail_panel, -1, 200);
+
+    /* Inner horizontal paned: sidebar | notebook */
+    GtkWidget *detail_hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_widget_set_size_request(sidebar_frame, 280, -1);
+    gtk_paned_pack1(GTK_PANED(detail_hpaned), sidebar_frame, FALSE, FALSE);
+    /* The notebook will be added to pack2 after plugin loading below. */
+    gtk_container_add(GTK_CONTAINER(detail_panel), detail_hpaned);
+
     /* ── layout ──────────────────────────────────────────────── */
+    /* Default: detail panel docked at bottom.
+     * outer_paned (vertical): pack1 = hpaned, pack2 = detail_panel */
+    GtkWidget *outer_paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+    gtk_paned_pack1(GTK_PANED(outer_paned), hpaned, TRUE, FALSE);
+    gtk_paned_pack2(GTK_PANED(outer_paned), detail_panel, FALSE, FALSE);
+
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_pack_start(GTK_BOX(vbox), menubar, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(vbox), hpaned, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), outer_paned, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), status_ebox, FALSE, FALSE, 4);
     gtk_container_add(GTK_CONTAINER(window), vbox);
 
@@ -4234,7 +4259,7 @@ void *ui_thread(void *arg)
     ctx.alt_pressed    = FALSE;
     ctx.css          = css;
     ctx.sidebar_css  = sidebar_css;
-    ctx.fd_css       = fd_css;
+    ctx.fd_css       = NULL;  /* old FD section removed */
     ctx.font_size    = FONT_SIZE_DEFAULT;
     ctx.auto_font    = FALSE;
     ctx.ptree_nodes  = (ptree_node_set_t){ NULL, NULL, NULL, 0, 0 };
@@ -4261,38 +4286,10 @@ void *ui_thread(void *arg)
     ctx.sb_info_content       = info_content_box;
     ctx.sb_info_header_arrow  = info_arrow;
 
-    ctx.sb_fd_collapsed       = FALSE;
-    ctx.sb_fd_content         = fd_content;
-    ctx.sb_fd_header_arrow    = fd_arrow;
-    ctx.sb_fd_scroll          = fd_scroll;
+    /* Old sidebar sections (FD, env, mmap, lib, net) removed —
+     * now handled by plugin tabs. */
 
-    ctx.sb_env_collapsed      = FALSE;
-    ctx.sb_env_content        = env_scroll;
-    ctx.sb_env_header_arrow   = env_arrow;
-    ctx.sb_env_scroll         = env_scroll;
-
-    ctx.sb_mmap_collapsed     = FALSE;
-    ctx.sb_mmap_content       = mmap_scroll;
-    ctx.sb_mmap_header_arrow  = mmap_arrow;
-    ctx.sb_mmap_scroll        = mmap_scroll;
-
-    ctx.sb_lib_collapsed      = FALSE;
-    ctx.sb_lib_content        = lib_scroll;
-    ctx.sb_lib_header_arrow   = lib_arrow;
-    ctx.sb_lib_scroll         = lib_scroll;
-
-#ifdef HAVE_PIPEWIRE
-    ctx.sb_pw_collapsed       = FALSE;
-    ctx.sb_pw_content         = pw_scroll;
-    ctx.sb_pw_header_arrow    = pw_arrow;
-    ctx.sb_pw_scroll          = pw_scroll;
-
-    ctx.sb_spectro_collapsed  = FALSE;
-    ctx.sb_spectro_content    = spectro_content;
-    ctx.sb_spectro_section    = spectro_section;
-    ctx.sb_spectro_header_arrow = spectro_arrow;
-    ctx.sb_spectro_user_shown = FALSE;
-#endif
+    /* Old PipeWire sidebar state removed — handled by plugin now */
 
     ctx.sb_pid        = sb_pid;
     ctx.sb_ppid       = sb_ppid;
@@ -4336,79 +4333,165 @@ void *ui_thread(void *arg)
     ctx.cgroup_generation      = 0;
     ctx.cgroup_cancel          = NULL;
 
-    /* File descriptor list */
-    ctx.fd_store        = fd_store;
-    ctx.fd_view         = GTK_TREE_VIEW(fd_tree);
-    ctx.fd_desc_toggle      = fd_desc_toggle;
-    ctx.fd_include_desc     = FALSE;
-    ctx.fd_group_dup_toggle = fd_group_dup_toggle;
-    ctx.fd_group_dup_active = FALSE;
-    ctx.fd_collapsed        = 0;
-    ctx.fd_last_pid         = 0;
-
-    /* Environment variable list */
-    ctx.env_store      = env_store;
-    ctx.env_view       = GTK_TREE_VIEW(env_tree);
-    ctx.env_css        = env_css;
-    ctx.env_collapsed  = 0;
-    ctx.env_last_pid   = 0;
-    ctx.env_generation = 0;
-    ctx.env_cancel     = NULL;
-
-    /* Memory map list */
-    ctx.mmap_store      = mmap_store;
-    ctx.mmap_view       = GTK_TREE_VIEW(mmap_tree);
-    ctx.mmap_css        = mmap_css;
-    ctx.mmap_collapsed  = 0;
-    ctx.mmap_last_pid   = 0;
-    ctx.mmap_generation = 0;
-    ctx.mmap_cancel     = NULL;
-
-    /* Library list */
-    ctx.lib_store       = lib_store;
-    ctx.lib_view        = GTK_TREE_VIEW(lib_tree);
-    ctx.lib_css         = lib_css;
-    ctx.lib_collapsed   = 0;
-    ctx.lib_last_pid    = 0;
-    ctx.lib_generation  = 0;
-    ctx.lib_cancel      = NULL;
-
-    /* Network sockets list */
-    ctx.net_store          = net_store;
-    ctx.net_view           = GTK_TREE_VIEW(net_tree);
-    ctx.net_css            = net_css;
-    ctx.net_last_pid       = 0;
-    ctx.net_generation     = 0;
-    ctx.net_cancel         = NULL;
-    ctx.net_desc_toggle    = net_desc_toggle;
-    ctx.net_include_desc   = FALSE;
-    ctx.sb_net_collapsed   = FALSE;
-    ctx.sb_net_content     = net_content;
-    ctx.sb_net_header_arrow = net_arrow;
-    ctx.sb_net_scroll      = net_scroll;
+    /* Old scanner stores/views removed — handled by plugins now.
+     * Fields zeroed by static initialisation of ctx. */
 
 #ifdef HAVE_PIPEWIRE
-    /* PipeWire audio connections */
-    ctx.pw_store      = pw_store;
-    ctx.pw_view       = GTK_TREE_VIEW(pw_tree);
-    ctx.pw_css        = pw_css;
-    ctx.pw_collapsed  = 0;
-    ctx.pw_last_pid   = 0;
-    ctx.pw_generation = 0;
-    ctx.pw_cancel     = NULL;
-
+    /* Old PipeWire sidebar store/view removed — now handled by plugin.
+     * Meter and spectrogram state are still used by host services. */
     ctx.pw_meter       = NULL;
     ctx.pw_meter_timer = 0;
-
-    /* Spectrogram */
-    ctx.spectro_draw  = spectro_draw;
-    ctx.spectro       = NULL;
+    ctx.spectro_draw   = NULL;
+    ctx.spectro        = NULL;
 #endif
 
     /* Pinned processes */
     ctx.pinned_pids     = NULL;
     ctx.pinned_count    = 0;
     ctx.pinned_capacity = 0;
+
+    /* ── Plugin system ───────────────────────────────────────── */
+    {
+        /* Allocate the registry on the heap so we have a stable pointer */
+        plugin_registry_t *preg = calloc(1, sizeof(plugin_registry_t));
+        if (preg) {
+            plugin_registry_init(preg);
+
+#ifdef HAVE_PIPEWIRE
+            /* Build host services table on the heap so it outlives this block */
+            allmon_host_services_t *hsvc = calloc(1, sizeof(allmon_host_services_t));
+            if (hsvc) {
+                hsvc->host_ctx          = &ctx;
+                hsvc->pw_meter_start    = host_pw_meter_start;
+                hsvc->pw_meter_stop     = host_pw_meter_stop;
+                hsvc->pw_meter_read     = host_pw_meter_read;
+                hsvc->spectro_start     = host_spectro_start;
+                hsvc->spectro_stop      = host_spectro_stop;
+                hsvc->spectro_get_target = host_spectro_get_target;
+                plugin_registry_set_host_services(preg, hsvc);
+            }
+#endif
+
+            /* Resolve plugins directory relative to the executable.
+             * Look for ./plugins/ next to the binary first, then fall back
+             * to the build directory.  In practice, the Makefile places
+             * them in build/plugins/.  Use /proc/self/exe to find our
+             * own directory. */
+            char exe_path[4096], plugin_dir[4096];
+            ssize_t exe_len = readlink("/proc/self/exe", exe_path,
+                                        sizeof(exe_path) - 1);
+            if (exe_len > 0) {
+                exe_path[exe_len] = '\0';
+                char *slash = strrchr(exe_path, '/');
+                if (slash) *slash = '\0';
+                snprintf(plugin_dir, sizeof(plugin_dir),
+                         "%s/plugins", exe_path);
+            } else {
+                snprintf(plugin_dir, sizeof(plugin_dir), "build/plugins");
+            }
+
+            int nloaded = plugin_loader_scan(preg, plugin_dir);
+            fprintf(stdout, "allmon: %d plugin(s) loaded from %s\n",
+                    nloaded, plugin_dir);
+
+            /* Create a GtkNotebook for plugin tabs (detail panel) */
+            GtkWidget *notebook = gtk_notebook_new();
+            gtk_notebook_set_tab_pos(GTK_NOTEBOOK(notebook), GTK_POS_TOP);
+            gtk_notebook_set_scrollable(GTK_NOTEBOOK(notebook), TRUE);
+
+            /* Add each plugin instance as a tab.
+             * Preferred order: PipeWire Audio first, then Network,
+             * then everything else in load order. */
+            {
+                static const char *tab_order[] = {
+                    "org.allmon.pipewire",
+                    "org.allmon.net",
+                    NULL
+                };
+
+                /* Tab label overrides keyed by plugin id */
+                static const struct { const char *id; const char *label; }
+                tab_label_overrides[] = {
+                    { "org.allmon.net", "Network" },
+                    { NULL, NULL }
+                };
+
+                gboolean *added = g_new0(gboolean, preg->count);
+
+                /* Pass 1: add plugins in the preferred order */
+                for (int o = 0; tab_order[o]; o++) {
+                    for (size_t i = 0; i < preg->count; i++) {
+                        plugin_instance_t *inst = &preg->instances[i];
+                        if (!inst->widget || !inst->plugin ||
+                            !inst->plugin->id)
+                            continue;
+                        if (strcmp(inst->plugin->id, tab_order[o]) != 0)
+                            continue;
+                        const char *lbl = inst->plugin->name
+                                        ? inst->plugin->name : "Plugin";
+                        for (int k = 0; tab_label_overrides[k].id; k++) {
+                            if (strcmp(inst->plugin->id,
+                                       tab_label_overrides[k].id) == 0) {
+                                lbl = tab_label_overrides[k].label;
+                                break;
+                            }
+                        }
+                        GtkWidget *label = gtk_label_new(lbl);
+                        gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+                                                 inst->widget, label);
+                        added[i] = TRUE;
+                    }
+                }
+
+                /* Pass 2: remaining plugins in load order */
+                for (size_t i = 0; i < preg->count; i++) {
+                    if (added[i]) continue;
+                    plugin_instance_t *inst = &preg->instances[i];
+                    if (!inst->widget) continue;
+                    const char *lbl = (inst->plugin && inst->plugin->name)
+                                    ? inst->plugin->name : "Plugin";
+                    if (inst->plugin && inst->plugin->id) {
+                        for (int k = 0; tab_label_overrides[k].id; k++) {
+                            if (strcmp(inst->plugin->id,
+                                       tab_label_overrides[k].id) == 0) {
+                                lbl = tab_label_overrides[k].label;
+                                break;
+                            }
+                        }
+                    }
+                    GtkWidget *label = gtk_label_new(lbl);
+                    gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+                                             inst->widget, label);
+                }
+
+                g_free(added);
+            }
+
+            /* The plugin notebook lives in the detail panel (separate
+             * from the sidebar).  It is NOT packed into sidebar_vbox. */
+
+            ctx.plugin_registry = preg;
+            ctx.plugin_notebook = notebook;
+        } else {
+            ctx.plugin_registry = NULL;
+            ctx.plugin_notebook = NULL;
+        }
+        ctx.plugin_broker = NULL;  /* broker is stateless (module-level) */
+    }
+
+    /* ── Finish detail panel setup: put notebook into the hpaned ── */
+    ctx.detail_panel          = detail_panel;
+    ctx.detail_panel_pos      = PANEL_POS_BOTTOM;
+    ctx.detail_panel_menu_item = GTK_CHECK_MENU_ITEM(detail_panel_toggle);
+    ctx.detail_paned          = outer_paned;
+    ctx.content_box           = vbox;
+    ctx.hpaned                = hpaned;
+    ctx.panel_pos_group       = pos_group;
+
+    if (ctx.plugin_notebook) {
+        gtk_paned_pack2(GTK_PANED(detail_hpaned), ctx.plugin_notebook,
+                        TRUE, FALSE);
+    }
 
     /* Set up the Name column cell data function so pinned processes
      * get the ➡ prefix.  We need ctx to be initialised first. */
@@ -4429,68 +4512,24 @@ void *ui_thread(void *arg)
     g_signal_connect(font_auto, "toggled",  G_CALLBACK(on_font_auto_toggle), &ctx);
     g_signal_connect(sidebar_toggle, "toggled",
                      G_CALLBACK(on_toggle_sidebar), &ctx);
-    g_signal_connect(fd_desc_toggle, "toggled",
-                     G_CALLBACK(on_fd_desc_toggled), &ctx);
-    g_signal_connect(fd_group_dup_toggle, "toggled",
-                     G_CALLBACK(on_fd_group_dup_toggled), &ctx);
-    g_signal_connect(net_desc_toggle, "toggled",
-                     G_CALLBACK(on_net_desc_toggled), &ctx);
+    g_signal_connect(detail_panel_toggle, "toggled",
+                     G_CALLBACK(on_toggle_detail_panel), &ctx);
 
-    /* Collapsible section header double-click signals.
-     * Each section_toggle_t is heap-allocated and lives for the entire
-     * program lifetime (never freed – intentional). */
-    #define CONNECT_SECTION(eb, content_w, rev_w, arrow_w, sec_w,        \
-                            vbox_w, flag_ptr, expand, scroll_w)           \
-    do {                                                                  \
-        section_toggle_t *_st = g_new(section_toggle_t, 1);              \
-        _st->content        = (content_w);                                \
-        _st->revealer       = (rev_w);                                    \
-        _st->arrow          = (arrow_w);                                  \
-        _st->section        = (sec_w);                                    \
-        _st->sidebar_vbox   = (vbox_w);                                   \
-        _st->scroll_widget  = (scroll_w);                                 \
-        _st->collapsed_flag = (flag_ptr);                                 \
-        _st->is_expandable  = (expand);                                   \
-        _st->dragging       = FALSE;                                      \
-        g_signal_connect((eb), "button-press-event",                      \
-                         G_CALLBACK(on_section_header_button_press), _st); \
-        g_signal_connect((eb), "button-press-event",                      \
-                         G_CALLBACK(on_section_header_dblclick), _st);    \
-        g_signal_connect((eb), "button-release-event",                    \
-                         G_CALLBACK(on_section_header_button_release), _st); \
-        g_signal_connect((eb), "motion-notify-event",                     \
-                         G_CALLBACK(on_section_header_motion), _st);      \
-        /* Set resize cursor on header to hint it's draggable */          \
-        if ((scroll_w))                                                   \
-            g_signal_connect((eb), "realize",                             \
-                             G_CALLBACK(on_section_header_realize), NULL); \
-    } while (0)
-
-    /* info section is not collapsible – no CONNECT_SECTION for it */
-    CONNECT_SECTION(fd_header_eb, fd_content, fd_revealer,
-                    fd_arrow, fd_section, sidebar_vbox,
-                    &ctx.sb_fd_collapsed, TRUE, fd_scroll);
-    CONNECT_SECTION(env_header_eb, env_scroll, env_revealer,
-                    env_arrow, env_section, sidebar_vbox,
-                    &ctx.sb_env_collapsed, TRUE, env_scroll);
-    CONNECT_SECTION(mmap_header_eb, mmap_scroll, mmap_revealer,
-                    mmap_arrow, mmap_section, sidebar_vbox,
-                    &ctx.sb_mmap_collapsed, TRUE, mmap_scroll);
-    CONNECT_SECTION(lib_header_eb, lib_scroll, lib_revealer,
-                    lib_arrow, lib_section, sidebar_vbox,
-                    &ctx.sb_lib_collapsed, TRUE, lib_scroll);
-    CONNECT_SECTION(net_header_eb, net_content, net_revealer,
-                    net_arrow, net_section, sidebar_vbox,
-                    &ctx.sb_net_collapsed, TRUE, net_scroll);
-#ifdef HAVE_PIPEWIRE
-    CONNECT_SECTION(pw_header_eb, pw_scroll, pw_revealer,
-                    pw_arrow, pw_section, sidebar_vbox,
-                    &ctx.sb_pw_collapsed, TRUE, pw_scroll);
-    CONNECT_SECTION(spectro_header_eb, spectro_content, spectro_revealer,
-                    spectro_arrow, spectro_section, sidebar_vbox,
-                    &ctx.sb_spectro_collapsed, FALSE, NULL);
-#endif
-    #undef CONNECT_SECTION
+    /* Detail panel position radio items */
+    pos_data_bottom = (panel_pos_data_t){ &ctx, PANEL_POS_BOTTOM };
+    pos_data_top    = (panel_pos_data_t){ &ctx, PANEL_POS_TOP };
+    pos_data_left   = (panel_pos_data_t){ &ctx, PANEL_POS_LEFT };
+    pos_data_right  = (panel_pos_data_t){ &ctx, PANEL_POS_RIGHT };
+    g_signal_connect(pos_bottom, "toggled",
+                     G_CALLBACK(on_panel_position_changed), &pos_data_bottom);
+    g_signal_connect(pos_top, "toggled",
+                     G_CALLBACK(on_panel_position_changed), &pos_data_top);
+    g_signal_connect(pos_left, "toggled",
+                     G_CALLBACK(on_panel_position_changed), &pos_data_left);
+    g_signal_connect(pos_right, "toggled",
+                     G_CALLBACK(on_panel_position_changed), &pos_data_right);
+    /* Old FD/env/mmap/lib/net toggle + section header signals removed —
+     * those sidebar sections are handled by plugin tabs now. */
 
     g_signal_connect(name_filter_entry, "key-release-event",
                      G_CALLBACK(on_filter_entry_key_release), &ctx);
@@ -4500,50 +4539,7 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_pid_entry_insert_text), NULL);
     g_signal_connect(tree_overlay, "get-child-position",
                      G_CALLBACK(on_overlay_get_child_position), &ctx);
-    g_signal_connect(fd_tree, "row-collapsed",
-                     G_CALLBACK(on_fd_row_collapsed), &ctx);
-    g_signal_connect(fd_tree, "row-expanded",
-                     G_CALLBACK(on_fd_row_expanded), &ctx);
-    g_signal_connect(fd_tree, "key-press-event",
-                     G_CALLBACK(on_fd_key_press), &ctx);
-    g_signal_connect(env_tree, "row-collapsed",
-                     G_CALLBACK(on_env_row_collapsed), &ctx);
-    g_signal_connect(env_tree, "row-expanded",
-                     G_CALLBACK(on_env_row_expanded), &ctx);
-    g_signal_connect(env_tree, "key-press-event",
-                     G_CALLBACK(on_env_key_press), &ctx);
-    g_signal_connect(mmap_tree, "row-collapsed",
-                     G_CALLBACK(on_mmap_row_collapsed), &ctx);
-    g_signal_connect(mmap_tree, "row-expanded",
-                     G_CALLBACK(on_mmap_row_expanded), &ctx);
-    g_signal_connect(mmap_tree, "key-press-event",
-                     G_CALLBACK(on_mmap_key_press), &ctx);
-    g_signal_connect(lib_tree, "row-collapsed",
-                     G_CALLBACK(on_lib_row_collapsed), &ctx);
-    g_signal_connect(lib_tree, "row-expanded",
-                     G_CALLBACK(on_lib_row_expanded), &ctx);
-    g_signal_connect(lib_tree, "key-press-event",
-                     G_CALLBACK(on_lib_key_press), &ctx);
-    g_signal_connect(lib_tree, "query-tooltip",
-                     G_CALLBACK(on_lib_query_tooltip), &ctx);
-    g_signal_connect(net_tree, "row-collapsed",
-                     G_CALLBACK(on_net_row_collapsed), &ctx);
-    g_signal_connect(net_tree, "row-expanded",
-                     G_CALLBACK(on_net_row_expanded), &ctx);
-    g_signal_connect(net_tree, "key-press-event",
-                     G_CALLBACK(on_net_key_press), &ctx);
-#ifdef HAVE_PIPEWIRE
-    g_signal_connect(pw_tree, "row-collapsed",
-                     G_CALLBACK(on_pw_row_collapsed), &ctx);
-    g_signal_connect(pw_tree, "row-expanded",
-                     G_CALLBACK(on_pw_row_expanded), &ctx);
-    g_signal_connect(pw_tree, "key-press-event",
-                     G_CALLBACK(on_pw_key_press), &ctx);
-    g_signal_connect(pw_tree, "row-activated",
-                     G_CALLBACK(on_pw_row_activated), &ctx);
-    g_signal_connect(spectro_draw, "draw",
-                     G_CALLBACK(spectrogram_on_draw), &ctx);
-#endif
+    /* Old PipeWire sidebar signal connections removed — handled by plugin */
     g_signal_connect(window,    "configure-event",
                      G_CALLBACK(on_window_configure), &ctx);
     g_signal_connect(window,    "size-allocate",
@@ -4597,7 +4593,9 @@ void *ui_thread(void *arg)
     /* ── show & run ──────────────────────────────────────────── */
     gtk_widget_show_all(window);
     gtk_widget_hide(menubar);        /* hidden by default; toggle via status-bar right-click */
-    gtk_widget_hide(sidebar_frame);  /* hidden by default; toggle via View → Sidebar */
+    /* sidebar_frame is now embedded inside detail_panel, so it becomes
+     * visible/hidden together with the detail panel. */
+    gtk_widget_hide(detail_panel);   /* hidden by default; toggle via View → Detail Panel */
     gtk_main();
 
     ui_ctx_destroy(&ctx);
@@ -4661,16 +4659,9 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     }
 
 #ifdef HAVE_PIPEWIRE
-    /* Cancel any in-flight async PipeWire scan */
-    if (ctx->pw_cancel) {
-        g_cancellable_cancel(ctx->pw_cancel);
-        g_object_unref(ctx->pw_cancel);
-        ctx->pw_cancel = NULL;
-    }
-
-    /* Stop the spectrogram capture */
+    /* Stop the spectrogram capture and peak meters
+     * (may have been started by the PipeWire plugin via host services) */
     spectrogram_stop(ctx);
-    /* Stop the peak meters */
     pw_meter_stop(ctx);
 #endif
 
@@ -4701,4 +4692,13 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     ctx->pinned_pids     = NULL;
     ctx->pinned_count    = 0;
     ctx->pinned_capacity = 0;
+
+    /* Clean up plugin system */
+    broker_destroy();
+    if (ctx->plugin_registry) {
+        plugin_registry_destroy(ctx->plugin_registry);
+        free(ctx->plugin_registry);
+        ctx->plugin_registry = NULL;
+    }
+    ctx->plugin_notebook = NULL;
 }
