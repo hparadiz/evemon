@@ -123,16 +123,75 @@ static void format_size(size_t kb, char *buf, size_t bufsz)
 
 /* ── markup ──────────────────────────────────────────────────── */
 
+/*
+ * Render a /proc/<pid>/maps line with highlighted fields:
+ *   addr range in grey, perms in bold, size in blue, pathname plain.
+ *
+ * Raw format: "addr_start-addr_end perms offset dev inode  pathname"
+ * Display:    "<grey>addr-addr</grey>  <b>perms</b>  <blue>size</blue>  pathname"
+ */
 static char *mmap_to_markup(const char *line, size_t size_kb)
 {
     char sz[32];
     format_size(size_kb, sz, sizeof(sz));
 
-    char *esc = g_markup_escape_text(line, -1);
-    char *markup = g_strdup_printf(
-        "%s  <span foreground=\"#6699cc\">%s</span>",
-        esc, sz);
-    g_free(esc);
+    /* Parse: addr_start-addr_end perms offset dev inode [pathname] */
+    unsigned long addr_start = 0, addr_end = 0;
+    char perms[8] = "----";
+    unsigned long offset = 0;
+    char dev[16] = "";
+    unsigned long inode = 0;
+
+    int n = sscanf(line, "%lx-%lx %4s %lx %15s %lu",
+                   &addr_start, &addr_end, perms, &offset, dev, &inode);
+    if (n < 5) {
+        /* Can't parse — fall back to raw display */
+        char *esc = g_markup_escape_text(line, -1);
+        char *markup = g_strdup_printf(
+            "%s  <span foreground=\"#6699cc\">%s</span>", esc, sz);
+        g_free(esc);
+        return markup;
+    }
+
+    /* Extract pathname: skip past the 5th field (inode) */
+    const char *pathname = "";
+    {
+        const char *p = line;
+        int fields = 0;
+        while (fields < 5 && *p) {
+            while (*p && *p != ' ' && *p != '\t') p++;
+            while (*p == ' ' || *p == '\t') p++;
+            fields++;
+        }
+        if (*p)
+            pathname = p;
+    }
+
+    char addr_buf[48];
+    snprintf(addr_buf, sizeof(addr_buf), "%lx-%lx", addr_start, addr_end);
+
+    char *addr_esc = g_markup_escape_text(addr_buf, -1);
+    char *perms_esc = g_markup_escape_text(perms, -1);
+    char *path_esc = g_markup_escape_text(pathname, -1);
+
+    char *markup;
+    if (pathname[0])
+        markup = g_strdup_printf(
+            "<span foreground=\"#888888\">%s</span>  "
+            "<b>%s</b>  "
+            "<span foreground=\"#6699cc\">%s</span>  "
+            "%s",
+            addr_esc, perms_esc, sz, path_esc);
+    else
+        markup = g_strdup_printf(
+            "<span foreground=\"#888888\">%s</span>  "
+            "<b>%s</b>  "
+            "<span foreground=\"#6699cc\">%s</span>",
+            addr_esc, perms_esc, sz);
+
+    g_free(addr_esc);
+    g_free(perms_esc);
+    g_free(path_esc);
     return markup;
 }
 
