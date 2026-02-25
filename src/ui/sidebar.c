@@ -235,9 +235,11 @@ void sidebar_update(ui_ctx_t *ctx)
         }
     }
 
-    /* Scanning of FDs, environment, memory maps, libraries, network
-     * sockets, and cgroups is now handled entirely by the plugin
-     * system via the detail panel tabs. */
+    /* Scanning of FDs, environment, memory maps, libraries, and network
+     * sockets is handled by the plugin system via the detail panel tabs.
+     * cgroup limits are still displayed inline in the sidebar. */
+    if (pid > 0)
+        cgroup_scan_start(ctx, (pid_t)pid);
 
     g_free(user); g_free(name); g_free(cpu_text);
     g_free(rss_text); g_free(grp_rss_text); g_free(grp_cpu_text);

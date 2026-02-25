@@ -53,6 +53,7 @@ typedef enum {
 typedef struct {
     int       fd;
     char      path[512];
+    char      desc[256];         /* resolved label (e.g. device name) */
     int       category;          /* fd_category_t value               */
     uint64_t  net_sort_key;      /* total send+recv bytes for sort    */
 } allmon_fd_t;

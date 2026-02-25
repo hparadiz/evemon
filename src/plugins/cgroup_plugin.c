@@ -110,23 +110,14 @@ static void cgroup_update(void *opaque, const allmon_proc_data_t *data)
     const allmon_cgroup_t *cg = data->cgroup;
 
     if (!cg || cg->path[0] == '\0') {
-        /* No cgroup data → show "no limits" message */
+        /* No cgroup data at all (not on cgroup v2?) */
         gtk_widget_hide(ctx->grid);
         gtk_widget_show(ctx->no_limits);
         return;
     }
 
-    /* Check if any limits are set */
-    int has_limit = (cg->mem_max > 0 || cg->mem_high > 0 ||
-                     cg->swap_max > 0 || cg->cpu_quota > 0 ||
-                     cg->pids_max > 0 || cg->io_max[0] != '\0');
-
-    if (!has_limit) {
-        gtk_widget_hide(ctx->grid);
-        gtk_widget_show(ctx->no_limits);
-        return;
-    }
-
+    /* Always show cgroup info when a path exists — current usage
+     * values (memory, PIDs) are useful even without explicit limits. */
     gtk_widget_show(ctx->grid);
     gtk_widget_hide(ctx->no_limits);
 
@@ -141,6 +132,12 @@ static void cgroup_update(void *opaque, const allmon_proc_data_t *data)
         double pct = (double)cg->mem_current / (double)cg->mem_max * 100.0;
         char combined[128];
         snprintf(combined, sizeof(combined), "%s / %s (%.0f%%)", cur, max, pct);
+        gtk_label_set_text(ctx->mem_val, combined);
+    } else if (cg->mem_current >= 0) {
+        char cur[32];
+        format_bytes(cg->mem_current, cur, sizeof(cur));
+        char combined[128];
+        snprintf(combined, sizeof(combined), "%s / unlimited", cur);
         gtk_label_set_text(ctx->mem_val, combined);
     } else {
         gtk_label_set_text(ctx->mem_val, "unlimited");
@@ -187,6 +184,11 @@ static void cgroup_update(void *opaque, const allmon_proc_data_t *data)
         char combined[64];
         snprintf(combined, sizeof(combined), "%" PRId64 " / %" PRId64,
                  cg->pids_current, cg->pids_max);
+        gtk_label_set_text(ctx->pids_val, combined);
+    } else if (cg->pids_current >= 0) {
+        char combined[64];
+        snprintf(combined, sizeof(combined), "%" PRId64 " / unlimited",
+                 cg->pids_current);
         gtk_label_set_text(ctx->pids_val, combined);
     } else {
         gtk_label_set_text(ctx->pids_val, "unlimited");

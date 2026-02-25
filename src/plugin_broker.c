@@ -26,6 +26,9 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 
+/* Defined in ui/devices.c — resolves /dev/ paths to hardware names */
+extern void label_device(const char *path, char *desc, size_t descsz);
+
 /* ── Per-PID gathered data ───────────────────────────────────── */
 
 typedef struct {
@@ -914,6 +917,9 @@ static void gather_fds(pid_t pid, broker_pid_data_t *d)
 
         fds[count].fd = fd_num;
         snprintf(fds[count].path, sizeof(fds[count].path), "%s", target);
+        fds[count].desc[0] = '\0';
+        if (strncmp(target, "/dev/", 5) == 0)
+            label_device(target, fds[count].desc, sizeof(fds[count].desc));
         fds[count].category = 0;
         fds[count].net_sort_key = 0;
         count++;

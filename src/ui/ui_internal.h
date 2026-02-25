@@ -162,6 +162,8 @@ typedef struct {
     GtkLabel           *sb_cgroup_io;
     GtkWidget          *sb_cgroup_io_key;
     GtkWidget          *sb_cgroup_frame;     /* container to show/hide */
+    guint               cgroup_generation;
+    GCancellable       *cgroup_cancel;
 
 #ifdef HAVE_PIPEWIRE
     /* PipeWire sidebar scan state (used by pipewire_scan.c) */
@@ -283,6 +285,10 @@ static inline uint32_t spectrogram_get_target_node(void *ctx)
 { (void)ctx; return 0; }
 
 #endif /* HAVE_PIPEWIRE */
+
+/* ── cgroup sidebar scan ─────────────────────────────────────── */
+
+void cgroup_scan_start(ui_ctx_t *ctx, pid_t pid);
 
 /* ── device labelling ────────────────────────────────────────── */
 

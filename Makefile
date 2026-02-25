@@ -50,8 +50,7 @@ SRCS := $(filter-out $(SRC_DIR)/fdmon_ebpf_kern.c, $(wildcard $(SRC_DIR)/*.c))
 # They still live in src/ui/ for reference but are no longer compiled.
 # Note: pipewire_scan.c is kept — it provides pw_snapshot()/pw_graph_free()
 # used by the plugin broker.
-RETIRED_SCANS := fd_scan.c env_scan.c mmap_scan.c lib_scan.c net_scan.c \
-                 cgroup_scan.c
+RETIRED_SCANS := fd_scan.c env_scan.c mmap_scan.c lib_scan.c net_scan.c
 SRCS += $(filter-out $(addprefix $(SRC_DIR)/ui/,$(RETIRED_SCANS)), \
                      $(wildcard $(SRC_DIR)/ui/*.c))
 OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
