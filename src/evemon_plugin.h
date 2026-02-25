@@ -89,6 +89,7 @@ typedef struct {
     uint64_t  send_delta;        /* bytes sent since last snapshot    */
     uint64_t  recv_delta;        /* bytes received                    */
     uint64_t  total;             /* send + recv (sort key)            */
+    pid_t     source_pid;        /* PID that owns this socket         */
 } evemon_socket_t;
 
 /* A PipeWire graph node */

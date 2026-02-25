@@ -62,12 +62,14 @@ enum {
 typedef struct {
     GtkWidget      *main_box;
     GtkWidget      *header_label;  /* aggregate throughput summary */
+    GtkWidget      *chk_desc;     /* "Include Descendants" checkbox */
     GtkWidget      *scroll;
     GtkTreeStore   *store;
     GtkTreeView    *view;
     GtkCssProvider *css;
     unsigned        collapsed;     /* bitmask: 1 << cat */
     pid_t           last_pid;
+    gboolean        include_desc; /* current toggle state           */
 } net_ctx_t;
 
 /* ── classification from description string ──────────────────── */
@@ -313,6 +315,20 @@ static GtkWidget *net_create_widget(void *opaque)
                        gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
                        FALSE, FALSE, 0);
 
+    /* ── Checkbox bar ─────────────────────────────────────────── */
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(hbox, 6);
+    gtk_widget_set_margin_end(hbox, 6);
+    gtk_widget_set_margin_top(hbox, 2);
+    gtk_widget_set_margin_bottom(hbox, 2);
+
+    ctx->chk_desc = gtk_check_button_new_with_label("Include Descendants");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->chk_desc),
+                                  ctx->include_desc);
+    gtk_box_pack_start(GTK_BOX(hbox), ctx->chk_desc, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(ctx->main_box), hbox, FALSE, FALSE, 0);
+
     /* ── Connection tree ──────────────────────────────────────── */
     ctx->store = gtk_tree_store_new(NUM_COLS,
                                     G_TYPE_STRING,   /* text      */
@@ -380,6 +396,10 @@ static void net_update(void *opaque, const evemon_proc_data_t *data)
         ctx->last_pid = data->pid;
     }
 
+    /* Read checkbox state */
+    ctx->include_desc = gtk_toggle_button_get_active(
+        GTK_TOGGLE_BUTTON(ctx->chk_desc));
+
     size_t total = data->socket_count;
 
     if (total == 0) {
@@ -401,16 +421,31 @@ static void net_update(void *opaque, const evemon_proc_data_t *data)
     uint64_t cat_recv[NET_CAT_COUNT] = {0};
     uint64_t agg_send = 0, agg_recv = 0;
     size_t active_count = 0;
+    size_t visible = 0;
 
     for (size_t i = 0; i < total; i++) {
-        ents[i].sock = &data->sockets[i];
-        ents[i].cat  = classify_socket(data->sockets[i].desc);
-        cat_count[ents[i].cat]++;
-        cat_send[ents[i].cat] += data->sockets[i].send_delta;
-        cat_recv[ents[i].cat] += data->sockets[i].recv_delta;
+        /* Filter out descendant sockets when checkbox is unchecked */
+        if (!ctx->include_desc &&
+            data->sockets[i].source_pid != data->pid)
+            continue;
+
+        ents[visible].sock = &data->sockets[i];
+        ents[visible].cat  = classify_socket(data->sockets[i].desc);
+        cat_count[ents[visible].cat]++;
+        cat_send[ents[visible].cat] += data->sockets[i].send_delta;
+        cat_recv[ents[visible].cat] += data->sockets[i].recv_delta;
         agg_send += data->sockets[i].send_delta;
         agg_recv += data->sockets[i].recv_delta;
         if (data->sockets[i].total > 0) active_count++;
+        visible++;
+    }
+
+    if (visible == 0) {
+        gtk_tree_store_clear(ctx->store);
+        gtk_label_set_markup(GTK_LABEL(ctx->header_label),
+            "<small>No network sockets</small>");
+        g_free(ents);
+        return;
     }
 
     /* ── Update aggregate header ──────────────────────────────── */
@@ -425,12 +460,12 @@ static void net_update(void *opaque, const evemon_proc_data_t *data)
                 "  \xc2\xb7  <b>%zu</b> active"
                 "  \xc2\xb7  <span foreground=\"#88cc88\">\xe2\x86\x91 %s</span>"
                 "  <span foreground=\"#6699cc\">\xe2\x86\x93 %s</span></small>",
-                total, total == 1 ? "" : "s",
+                visible, visible == 1 ? "" : "s",
                 active_count, sbuf, rbuf);
         } else {
             hdr = g_strdup_printf(
                 "<small><b>%zu</b> connection%s</small>",
-                total, total == 1 ? "" : "s");
+                visible, visible == 1 ? "" : "s");
         }
         gtk_label_set_markup(GTK_LABEL(ctx->header_label), hdr);
         g_free(hdr);
@@ -504,7 +539,7 @@ static void net_update(void *opaque, const evemon_proc_data_t *data)
         gboolean child_valid = gtk_tree_model_iter_children(
             model, &child, &parent);
 
-        for (size_t i = 0; i < total; i++) {
+        for (size_t i = 0; i < visible; i++) {
             if (ents[i].cat != c) continue;
 
             const evemon_socket_t *s = ents[i].sock;
@@ -573,6 +608,7 @@ evemon_plugin_t *evemon_plugin_init(void)
 {
     net_ctx_t *ctx = calloc(1, sizeof(net_ctx_t));
     if (!ctx) return NULL;
+    ctx->include_desc = TRUE;
 
     net_plugin = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,

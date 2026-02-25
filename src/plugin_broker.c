@@ -891,10 +891,10 @@ static const bsock_entry_t *bsock_find(const bsock_table_t *tbl,
     return NULL;
 }
 
-/* Collect socket inodes from /proc/<pid>/fd */
+/* Collect socket inodes from /proc/<pid>/fd, tracking the source PID */
 static void collect_sock_inodes(pid_t pid,
-                                unsigned long **out, size_t *cnt,
-                                size_t *cap)
+                                unsigned long **out, pid_t **out_pids,
+                                size_t *cnt, size_t *cap)
 {
     char dirpath[64];
     snprintf(dirpath, sizeof(dirpath), "/proc/%d/fd", (int)pid);
@@ -916,8 +916,13 @@ static void collect_sock_inodes(pid_t pid,
             unsigned long *tmp = realloc(*out, *cap * sizeof(**out));
             if (!tmp) continue;
             *out = tmp;
+            pid_t *tmp2 = realloc(*out_pids, *cap * sizeof(pid_t));
+            if (!tmp2) continue;
+            *out_pids = tmp2;
         }
-        (*out)[(*cnt)++] = ino;
+        (*out)[*cnt] = ino;
+        (*out_pids)[*cnt] = pid;
+        (*cnt)++;
     }
     closedir(dp);
 }
@@ -927,17 +932,19 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
 {
     /* 1. Collect socket inodes from this PID and descendants */
     unsigned long *inodes = NULL;
+    pid_t *inode_pids = NULL;
     size_t inode_count = 0, inode_cap = 0;
 
-    collect_sock_inodes(pid, &inodes, &inode_count, &inode_cap);
+    collect_sock_inodes(pid, &inodes, &inode_pids, &inode_count, &inode_cap);
 
     /* Also collect from descendant PIDs */
     for (size_t i = 0; i < d->desc_count; i++)
         collect_sock_inodes(d->data.descendant_pids[i],
-                            &inodes, &inode_count, &inode_cap);
+                            &inodes, &inode_pids, &inode_count, &inode_cap);
 
     if (inode_count == 0) {
         free(inodes);
+        free(inode_pids);
         return;
     }
 
@@ -990,6 +997,7 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
 
         evemon_socket_t *s = &socks[count];
         memset(s, 0, sizeof(*s));
+        s->source_pid = inode_pids[i];
 
         /* Build description string */
         static const unsigned char v4mapped[12] =
@@ -1083,6 +1091,7 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
     }
 
     free(inodes);
+    free(inode_pids);
     bsock_table_free(&socktbl);
 
     /* Sort by total throughput descending, then alphabetically */
