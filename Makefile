@@ -126,6 +126,10 @@ else
 PLUGIN_SOS := $(filter-out $(PLUGIN_DIR)/evemon_pipewire_plugin.so,$(PLUGIN_SOS))
 endif
 
+# MilkDrop plugin needs -lm for math and -lepoxy for OpenGL via GtkGLArea
+$(PLUGIN_DIR)/evemon_milkdrop_plugin.so: $(SRC_DIR)/plugins/milkdrop_plugin.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
+	$(CC) $(PLUGIN_CFLAGS) -o $@ $< $(PLUGIN_LDFLAGS) -lm -lepoxy
+
 plugins: $(PLUGIN_SOS)
 
 clean:
