@@ -458,15 +458,16 @@ static void thr_destroy(void *opaque)
 
 /* ── plugin descriptor ───────────────────────────────────────── */
 
-static evemon_plugin_t thr_plugin;
-
 __attribute__((visibility("default")))
 evemon_plugin_t *evemon_plugin_init(void)
 {
     thr_ctx_t *ctx = calloc(1, sizeof(thr_ctx_t));
     if (!ctx) return NULL;
 
-    thr_plugin = (evemon_plugin_t){
+    evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
+    if (!p) { free(ctx); return NULL; }
+
+    *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Threads",
         .id            = "org.evemon.threads",
@@ -479,5 +480,5 @@ evemon_plugin_t *evemon_plugin_init(void)
         .destroy       = thr_destroy,
     };
 
-    return &thr_plugin;
+    return p;
 }

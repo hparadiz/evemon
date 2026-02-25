@@ -121,16 +121,15 @@ static char *env_to_markup(const char *text)
     char *key_esc = g_markup_escape_text(text, (gssize)(eq - text));
     char *val_esc = g_markup_escape_text(eq + 1, -1);
 
-    /* Truncate very long values for display */
+    /* Truncate very long values for display (M1: UTF-8 safe) */
     char *markup;
-    if (strlen(val_esc) > 200) {
-        char trunc[204];
-        memcpy(trunc, val_esc, 200);
-        trunc[200] = '\0';
-        strcat(trunc, "…");
+    size_t val_len = g_utf8_strlen(val_esc, -1);
+    if (val_len > 120) {
+        gchar *trunc = g_utf8_substring(val_esc, 0, 120);
         markup = g_strdup_printf(
-            "<b>%s</b>=<span foreground=\"#88aa88\">%s</span>",
+            "<b>%s</b>=<span foreground=\"#88aa88\">%s…</span>",
             key_esc, trunc);
+        g_free(trunc);
     } else {
         markup = g_strdup_printf(
             "<b>%s</b>=<span foreground=\"#88aa88\">%s</span>",
@@ -336,15 +335,16 @@ static void env_destroy(void *opaque)
 
 /* ── plugin descriptor ───────────────────────────────────────── */
 
-static evemon_plugin_t env_plugin;
-
 __attribute__((visibility("default")))
 evemon_plugin_t *evemon_plugin_init(void)
 {
     env_ctx_t *ctx = calloc(1, sizeof(env_ctx_t));
     if (!ctx) return NULL;
 
-    env_plugin = (evemon_plugin_t){
+    evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
+    if (!p) { free(ctx); return NULL; }
+
+    *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Environment Variables",
         .id            = "org.evemon.env",
@@ -357,5 +357,5 @@ evemon_plugin_t *evemon_plugin_init(void)
         .destroy       = env_destroy,
     };
 
-    return &env_plugin;
+    return p;
 }

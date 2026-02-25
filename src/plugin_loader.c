@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ── Host-provided utility functions ─────────────────────────── */
 
@@ -69,13 +71,33 @@ void plugin_registry_set_host_services(plugin_registry_t *reg,
 
 void plugin_registry_destroy(plugin_registry_t *reg)
 {
+    /* Build a set of unique dlopen handles to avoid double-close (M4) */
+    void **closed_handles = calloc(reg->count, sizeof(void *));
+    size_t nclosed = 0;
+
     for (size_t i = 0; i < reg->count; i++) {
         plugin_instance_t *inst = &reg->instances[i];
         if (inst->plugin && inst->plugin->destroy)
             inst->plugin->destroy(inst->plugin->plugin_ctx);
-        if (inst->handle)
-            dlclose(inst->handle);
+        /* Free the heap-allocated plugin descriptor (C1) */
+        free(inst->plugin);
+        inst->plugin = NULL;
+
+        if (inst->handle) {
+            int already = 0;
+            if (closed_handles) {
+                for (size_t j = 0; j < nclosed; j++)
+                    if (closed_handles[j] == inst->handle)
+                        { already = 1; break; }
+            }
+            if (!already) {
+                dlclose(inst->handle);
+                if (closed_handles)
+                    closed_handles[nclosed++] = inst->handle;
+            }
+        }
     }
+    free(closed_handles);
     free(reg->instances);
     memset(reg, 0, sizeof(*reg));
 }
@@ -182,6 +204,29 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
 
 int plugin_loader_scan(plugin_registry_t *reg, const char *dir)
 {
+    /* H1: Verify plugin directory permissions before loading.
+     * Reject directories that are world-writable or not owned by
+     * root or the current user. */
+    struct stat dirstat;
+    if (stat(dir, &dirstat) != 0)
+        return 0;  /* dir doesn't exist — not an error */
+
+    uid_t me = getuid();
+    if (dirstat.st_uid != 0 && dirstat.st_uid != me) {
+        fprintf(stderr,
+                "evemon: refusing to load plugins from %s "
+                "(owned by uid %u, expected root or %u)\n",
+                dir, (unsigned)dirstat.st_uid, (unsigned)me);
+        return 0;
+    }
+    if (dirstat.st_mode & S_IWOTH) {
+        fprintf(stderr,
+                "evemon: refusing to load plugins from %s "
+                "(directory is world-writable, mode %04o)\n",
+                dir, (unsigned)(dirstat.st_mode & 07777));
+        return 0;
+    }
+
     DIR *dp = opendir(dir);
     if (!dp) {
         /* Not an error — plugins dir may not exist yet */
@@ -253,17 +298,30 @@ int plugin_instance_create(plugin_registry_t *reg, const char *plugin_id)
 
     reg->combined_needs |= new_plugin->data_needs;
 
-    return (int)(reg->count - 1);
+    return inst->instance_id;
 }
 
-void plugin_instance_destroy(plugin_registry_t *reg, int instance_idx)
+int plugin_registry_find_by_id(const plugin_registry_t *reg, int instance_id)
 {
-    if (instance_idx < 0 || (size_t)instance_idx >= reg->count)
-        return;
+    for (size_t i = 0; i < reg->count; i++) {
+        if (reg->instances[i].instance_id == instance_id)
+            return (int)i;
+    }
+    return -1;
+}
+
+int plugin_instance_destroy(plugin_registry_t *reg, int instance_id)
+{
+    int instance_idx = plugin_registry_find_by_id(reg, instance_id);
+    if (instance_idx < 0)
+        return -1;
 
     plugin_instance_t *inst = &reg->instances[instance_idx];
     if (inst->plugin && inst->plugin->destroy)
         inst->plugin->destroy(inst->plugin->plugin_ctx);
+
+    /* Free the heap-allocated plugin descriptor (C1) */
+    free(inst->plugin);
 
     /* Don't dlclose here — other instances may share the handle.
      * The handle is closed in plugin_registry_destroy(). */
@@ -277,6 +335,7 @@ void plugin_instance_destroy(plugin_registry_t *reg, int instance_idx)
     reg->count--;
 
     plugin_registry_recalc_needs(reg);
+    return 0;
 }
 
 void plugin_registry_recalc_needs(plugin_registry_t *reg)
@@ -302,10 +361,9 @@ void plugin_dispatch_update(plugin_registry_t *reg, pid_t pid,
 {
     for (size_t i = 0; i < reg->count; i++) {
         plugin_instance_t *inst = &reg->instances[i];
-        if (!inst->plugin) continue;
+        if (!inst->plugin || !inst->plugin->update) continue;
         if (inst->tracked_pid != pid) continue;
-        if (inst->plugin->update)
-            inst->plugin->update(inst->plugin->plugin_ctx, data);
+        inst->plugin->update(inst->plugin->plugin_ctx, data);
     }
 }
 
@@ -313,10 +371,9 @@ void plugin_dispatch_clear(plugin_registry_t *reg, pid_t pid)
 {
     for (size_t i = 0; i < reg->count; i++) {
         plugin_instance_t *inst = &reg->instances[i];
-        if (!inst->plugin) continue;
+        if (!inst->plugin || !inst->plugin->clear) continue;
         if (inst->tracked_pid != pid) continue;
-        if (inst->plugin->clear)
-            inst->plugin->clear(inst->plugin->plugin_ctx);
+        inst->plugin->clear(inst->plugin->plugin_ctx);
     }
 }
 
@@ -324,9 +381,8 @@ void plugin_dispatch_clear_all(plugin_registry_t *reg)
 {
     for (size_t i = 0; i < reg->count; i++) {
         plugin_instance_t *inst = &reg->instances[i];
-        if (!inst->plugin) continue;
-        if (inst->plugin->clear)
-            inst->plugin->clear(inst->plugin->plugin_ctx);
+        if (!inst->plugin || !inst->plugin->clear) continue;
+        inst->plugin->clear(inst->plugin->plugin_ctx);
     }
 }
 

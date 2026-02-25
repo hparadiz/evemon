@@ -601,8 +601,6 @@ static void net_destroy(void *opaque)
 
 /* ── descriptor ──────────────────────────────────────────────── */
 
-static evemon_plugin_t net_plugin;
-
 __attribute__((visibility("default")))
 evemon_plugin_t *evemon_plugin_init(void)
 {
@@ -610,7 +608,10 @@ evemon_plugin_t *evemon_plugin_init(void)
     if (!ctx) return NULL;
     ctx->include_desc = TRUE;
 
-    net_plugin = (evemon_plugin_t){
+    evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
+    if (!p) { free(ctx); return NULL; }
+
+    *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Network Sockets",
         .id            = "org.evemon.net",
@@ -623,5 +624,5 @@ evemon_plugin_t *evemon_plugin_init(void)
         .destroy       = net_destroy,
     };
 
-    return &net_plugin;
+    return p;
 }

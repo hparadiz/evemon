@@ -220,15 +220,16 @@ static void cgroup_destroy(void *opaque) { free(opaque); }
 
 /* ── descriptor ──────────────────────────────────────────────── */
 
-static evemon_plugin_t cgroup_plugin;
-
 __attribute__((visibility("default")))
 evemon_plugin_t *evemon_plugin_init(void)
 {
     cgroup_ctx_t *ctx = calloc(1, sizeof(cgroup_ctx_t));
     if (!ctx) return NULL;
 
-    cgroup_plugin = (evemon_plugin_t){
+    evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
+    if (!p) { free(ctx); return NULL; }
+
+    *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "cgroup Limits",
         .id            = "org.evemon.cgroup",
@@ -241,5 +242,5 @@ evemon_plugin_t *evemon_plugin_init(void)
         .destroy       = cgroup_destroy,
     };
 
-    return &cgroup_plugin;
+    return p;
 }

@@ -167,7 +167,10 @@ static float md_var_read(md_var_ctx_t *vc, const char *name)
 typedef struct {
     md_token_t tokens[EXPR_MAX_TOKENS];
     int        count, cur;
+    int        depth;  /* H3: recursion depth limit for expression evaluator */
 } md_lexer_t;
+
+#define MD_EVAL_MAX_DEPTH 128
 
 static const char *g_func_names[] = {
     "sin","cos","tan","asin","acos","atan","atan2",
@@ -276,14 +279,18 @@ static float md_eval_mul(md_lexer_t *l, md_var_ctx_t *vc)
 
 static float md_eval_primary(md_lexer_t *l, md_var_ctx_t *vc)
 {
+    /* H3: guard against unbounded recursion from malicious presets */
+    if (l->depth >= MD_EVAL_MAX_DEPTH) return 0.0f;
+    l->depth++;
+
     md_token_t *t = md_peek(l);
-    if (t->type==TOK_NUM) { md_adv(l); return t->num_val; }
-    if (t->type==TOK_LPAREN) {
-        md_adv(l); float v=md_eval_assign(l,vc);
+    float result = 0.0f;
+    if (t->type==TOK_NUM) { md_adv(l); result = t->num_val; }
+    else if (t->type==TOK_LPAREN) {
+        md_adv(l); result=md_eval_assign(l,vc);
         if (md_peek(l)->type==TOK_RPAREN) md_adv(l);
-        return v;
     }
-    if (t->type==TOK_FUNC) {
+    else if (t->type==TOK_FUNC) {
         md_adv(l); char fn[64]; strncpy(fn,t->str_val,63); fn[63]=0;
         if (md_peek(l)->type==TOK_LPAREN) md_adv(l);
         float a[8]; int na=0;
@@ -293,42 +300,43 @@ static float md_eval_primary(md_lexer_t *l, md_var_ctx_t *vc)
         }
         if (md_peek(l)->type==TOK_RPAREN) md_adv(l);
         float x=na>0?a[0]:0, y=na>1?a[1]:0, z=na>2?a[2]:0;
-        if (!strcmp(fn,"sin"))   return sinf(x);
-        if (!strcmp(fn,"cos"))   return cosf(x);
-        if (!strcmp(fn,"tan"))   return tanf(x);
-        if (!strcmp(fn,"asin"))  return asinf(fminf(fmaxf(x,-1),1));
-        if (!strcmp(fn,"acos"))  return acosf(fminf(fmaxf(x,-1),1));
-        if (!strcmp(fn,"atan"))  return atanf(x);
-        if (!strcmp(fn,"atan2")) return atan2f(x,y);
-        if (!strcmp(fn,"pow"))   return powf(fabsf(x)+1e-30f,y);
-        if (!strcmp(fn,"exp"))   return expf(fminf(x,80.0f));
-        if (!strcmp(fn,"log"))   return logf(fabsf(x)+1e-30f);
-        if (!strcmp(fn,"log10")) return log10f(fabsf(x)+1e-30f);
-        if (!strcmp(fn,"sqrt"))  return sqrtf(fabsf(x));
-        if (!strcmp(fn,"abs"))   return fabsf(x);
-        if (!strcmp(fn,"min"))   return fminf(x,y);
-        if (!strcmp(fn,"max"))   return fmaxf(x,y);
-        if (!strcmp(fn,"sign"))  return (x>0)?1:(x<0)?-1:0;
-        if (!strcmp(fn,"sqr"))   return x*x;
-        if (!strcmp(fn,"floor")) return floorf(x);
-        if (!strcmp(fn,"ceil"))  return ceilf(x);
-        if (!strcmp(fn,"int"))   return (float)(int)x;
-        if (!strcmp(fn,"fmod"))  return y!=0?fmodf(x,y):0;
-        if (!strcmp(fn,"rand"))  return (float)(rand()%10000)/10000.0f*(x>0?x:1);
-        if (!strcmp(fn,"sigmoid")) return 1.0f/(1.0f+expf(-x*y));
-        if (!strcmp(fn,"avg"))   return (x+y)*0.5f;
-        if (!strcmp(fn,"if"))    return (fabsf(x)>0.00001f)?y:z;
-        if (!strcmp(fn,"above")) return (x>y)?1:0;
-        if (!strcmp(fn,"below")) return (x<y)?1:0;
-        if (!strcmp(fn,"equal")) return (fabsf(x-y)<0.00001f)?1:0;
-        if (!strcmp(fn,"bnot"))  return (fabsf(x)<0.00001f)?1:0;
-        if (!strcmp(fn,"band"))  return (fabsf(x)>1e-5f&&fabsf(y)>1e-5f)?1:0;
-        if (!strcmp(fn,"bor"))   return (fabsf(x)>1e-5f||fabsf(y)>1e-5f)?1:0;
-        return 0;
+        if (!strcmp(fn,"sin"))        result = sinf(x);
+        else if (!strcmp(fn,"cos"))   result = cosf(x);
+        else if (!strcmp(fn,"tan"))   result = tanf(x);
+        else if (!strcmp(fn,"asin"))  result = asinf(fminf(fmaxf(x,-1),1));
+        else if (!strcmp(fn,"acos"))  result = acosf(fminf(fmaxf(x,-1),1));
+        else if (!strcmp(fn,"atan"))  result = atanf(x);
+        else if (!strcmp(fn,"atan2")) result = atan2f(x,y);
+        else if (!strcmp(fn,"pow"))   result = powf(fabsf(x)+1e-30f,y);
+        else if (!strcmp(fn,"exp"))   result = expf(fminf(x,80.0f));
+        else if (!strcmp(fn,"log"))   result = logf(fabsf(x)+1e-30f);
+        else if (!strcmp(fn,"log10")) result = log10f(fabsf(x)+1e-30f);
+        else if (!strcmp(fn,"sqrt"))  result = sqrtf(fabsf(x));
+        else if (!strcmp(fn,"abs"))   result = fabsf(x);
+        else if (!strcmp(fn,"min"))   result = fminf(x,y);
+        else if (!strcmp(fn,"max"))   result = fmaxf(x,y);
+        else if (!strcmp(fn,"sign"))  result = (x>0)?1:(x<0)?-1:0;
+        else if (!strcmp(fn,"sqr"))   result = x*x;
+        else if (!strcmp(fn,"floor")) result = floorf(x);
+        else if (!strcmp(fn,"ceil"))  result = ceilf(x);
+        else if (!strcmp(fn,"int"))   result = (float)(int)x;
+        else if (!strcmp(fn,"fmod"))  result = y!=0?fmodf(x,y):0;
+        else if (!strcmp(fn,"rand"))  result = (float)(g_random_int_range(0,10000))/10000.0f*(x>0?x:1);
+        else if (!strcmp(fn,"sigmoid")) result = 1.0f/(1.0f+expf(-x*y));
+        else if (!strcmp(fn,"avg"))   result = (x+y)*0.5f;
+        else if (!strcmp(fn,"if"))    result = (fabsf(x)>0.00001f)?y:z;
+        else if (!strcmp(fn,"above")) result = (x>y)?1:0;
+        else if (!strcmp(fn,"below")) result = (x<y)?1:0;
+        else if (!strcmp(fn,"equal")) result = (fabsf(x-y)<0.00001f)?1:0;
+        else if (!strcmp(fn,"bnot"))  result = (fabsf(x)<0.00001f)?1:0;
+        else if (!strcmp(fn,"band"))  result = (fabsf(x)>1e-5f&&fabsf(y)>1e-5f)?1:0;
+        else if (!strcmp(fn,"bor"))   result = (fabsf(x)>1e-5f||fabsf(y)>1e-5f)?1:0;
     }
-    if (t->type==TOK_VAR) { md_adv(l); return md_var_read(vc,t->str_val); }
-    if (t->type!=TOK_EOF) md_adv(l);
-    return 0;
+    else if (t->type==TOK_VAR) { md_adv(l); result = md_var_read(vc,t->str_val); }
+    else if (t->type!=TOK_EOF) { md_adv(l); }
+
+    l->depth--;
+    return result;
 }
 
 static float md_eval_assign(md_lexer_t *l, md_var_ctx_t *vc)
@@ -671,7 +679,7 @@ static void md_lib_free(md_preset_lib_t *lib)
 static void md_lib_shuffle(md_preset_lib_t *lib)
 {
     for (int i=lib->count-1;i>0;i--) {
-        int j=rand()%(i+1);
+        int j=g_random_int_range(0,i+1);
         char *tp=lib->paths[i]; lib->paths[i]=lib->paths[j]; lib->paths[j]=tp;
         char *tn=lib->names[i]; lib->names[i]=lib->names[j]; lib->names[j]=tn;
     }
@@ -2003,7 +2011,7 @@ static void md_mini_mashup(md_ctx_t *ctx, int save)
         ctx->saved_preset = ctx->preset;
         ctx->has_saved_preset = 1;
     }
-    int donor = rand() % ctx->lib.count;
+    int donor = g_random_int_range(0, ctx->lib.count);
     md_preset_t tmp; memset(&tmp, 0, sizeof(tmp));
     if (md_load_preset(&tmp, ctx->lib.paths[donor])) return;
     /* mix in wave colors, motion, and a few interesting params */
@@ -2022,7 +2030,7 @@ static void md_deep_mashup(md_ctx_t *ctx, int save)
         ctx->saved_preset = ctx->preset;
         ctx->has_saved_preset = 1;
     }
-    int donor = rand() % ctx->lib.count;
+    int donor = g_random_int_range(0, ctx->lib.count);
     md_preset_t tmp; memset(&tmp, 0, sizeof(tmp));
     if (md_load_preset(&tmp, ctx->lib.paths[donor])) return;
     /* deep: take warp, decay, echo, post-process, shapes */
@@ -2058,7 +2066,7 @@ static gboolean on_button_press(GtkWidget *w, GdkEventButton *ev, gpointer data)
 {
     md_ctx_t *ctx = data;
     if (ev->type==GDK_2BUTTON_PRESS && ev->button==1) {
-        int idx=rand()%(ctx->lib.count?ctx->lib.count:1);
+        int idx=g_random_int_range(0,ctx->lib.count?ctx->lib.count:1);
         md_load_preset_idx(ctx, idx, 1);
         show_info(ctx,"[%d/%d] %s",ctx->preset_idx+1,ctx->lib.count,
                   ctx->lib.names[ctx->preset_idx]);
@@ -2202,7 +2210,7 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
     /* ── H: hard cut to random preset ────────────────────────── */
     case GDK_KEY_h: case GDK_KEY_H: {
         ctx->prev_preset_idx = ctx->preset_idx;
-        int idx = rand() % (ctx->lib.count ? ctx->lib.count : 1);
+        int idx = g_random_int_range(0, ctx->lib.count ? ctx->lib.count : 1);
         md_load_preset_idx(ctx, idx, 0);
         show_info(ctx, "[HARD] [%d/%d] %s", ctx->preset_idx+1,
                   ctx->lib.count, ctx->lib.names[ctx->preset_idx]);
@@ -2247,7 +2255,7 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
     case GDK_KEY_r: case GDK_KEY_R:
         if (shift) {
             /* Shift+R: random jump */
-            int idx = rand() % (ctx->lib.count ? ctx->lib.count : 1);
+            int idx = g_random_int_range(0, ctx->lib.count ? ctx->lib.count : 1);
             ctx->prev_preset_idx = ctx->preset_idx;
             md_load_preset_idx(ctx, idx, 1);
             show_info(ctx, "[RANDOM] [%d/%d] %s", ctx->preset_idx+1,
@@ -2290,9 +2298,9 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
             ctx->saved_preset = ctx->preset;
             ctx->has_saved_preset = 1;
         }
-        ctx->preset.wave_r = (float)(rand()%1000)/999.0f;
-        ctx->preset.wave_g = (float)(rand()%1000)/999.0f;
-        ctx->preset.wave_b = (float)(rand()%1000)/999.0f;
+        ctx->preset.wave_r = (float)(g_random_int_range(0,1000))/999.0f;
+        ctx->preset.wave_g = (float)(g_random_int_range(0,1000))/999.0f;
+        ctx->preset.wave_b = (float)(g_random_int_range(0,1000))/999.0f;
         show_info(ctx, "Wave color randomized (%.2f, %.2f, %.2f)",
                   ctx->preset.wave_r, ctx->preset.wave_g, ctx->preset.wave_b);
         return TRUE;
@@ -2483,7 +2491,7 @@ static void md_start_capture(md_ctx_t *ctx)
                                    ctx->audio_node_ids, ctx->audio_node_count);
     ctx->capture_started=1; ctx->running=1;
     if (!ctx->preset_loaded && ctx->lib.count>0) {
-        md_load_preset_idx(ctx, rand()%ctx->lib.count, 0);
+        md_load_preset_idx(ctx, g_random_int_range(0,ctx->lib.count), 0);
         show_info(ctx,"[%d/%d] %s",ctx->preset_idx+1,ctx->lib.count,
                   ctx->lib.names[ctx->preset_idx]);
     }
@@ -2580,7 +2588,7 @@ static gboolean audio_tick(gpointer data)
     for (int i = 0; i < samples_per_tick; i++) {
         float t = (float)i / samples_per_tick;
         float p = ctx->synth_phase + phase_inc * t;
-        float noise = ((float)(rand() % 1000) / 1000.f - 0.5f) * 0.25f;
+        float noise = ((float)(g_random_int_range(0, 1000)) / 1000.f - 0.5f) * 0.25f;
         float wl = pl * (sinf(p * 4.0f) * 0.45f +
                          sinf(p * 9.13f) * 0.25f +
                          sinf(p * 17.7f) * 0.12f +
@@ -2824,7 +2832,7 @@ static GtkWidget *md_create_widget(void *opaque)
     md_ctx_t *ctx = opaque;
 
     if (!ctx->lib_loaded) {
-        srand((unsigned)time(NULL));
+        /* GLib RNG self-seeds; no srand() needed */
         md_scan_dir(&ctx->lib, PRESET_DIR, 0);
         if (ctx->lib.count) md_lib_shuffle(&ctx->lib);
         ctx->lib_loaded = 1;
@@ -3002,8 +3010,6 @@ static void md_destroy(void *opaque)
 
 /* ── plugin descriptor ───────────────────────────────────────── */
 
-static evemon_plugin_t md_plugin;
-
 __attribute__((visibility("default")))
 evemon_plugin_t *evemon_plugin_init(void)
 {
@@ -3013,7 +3019,11 @@ evemon_plugin_t *evemon_plugin_init(void)
     ctx->blend_time_user = 2.5f;
     ctx->preset_duration = 30.0f;  /* auto-advance every 30s by default */
     ctx->prev_preset_idx = -1;
-    md_plugin = (evemon_plugin_t){
+
+    evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
+    if (!p) { free(ctx); return NULL; }
+
+    *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "MilkDrop",
         .id            = "org.evemon.milkdrop",
@@ -3026,5 +3036,5 @@ evemon_plugin_t *evemon_plugin_init(void)
         .destroy       = md_destroy,
         .activate      = md_activate,
     };
-    return &md_plugin;
+    return p;
 }

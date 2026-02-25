@@ -452,8 +452,6 @@ static void devices_destroy(void *opaque)
 
 /* ── plugin descriptor ───────────────────────────────────────── */
 
-static evemon_plugin_t devices_plugin;
-
 __attribute__((visibility("default")))
 evemon_plugin_t *evemon_plugin_init(void)
 {
@@ -463,7 +461,10 @@ evemon_plugin_t *evemon_plugin_init(void)
     ctx->include_desc = TRUE;
     ctx->merge_dup    = TRUE;
 
-    devices_plugin = (evemon_plugin_t){
+    evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
+    if (!p) { free(ctx); return NULL; }
+
+    *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Devices",
         .id            = "org.evemon.devices",
@@ -476,5 +477,5 @@ evemon_plugin_t *evemon_plugin_init(void)
         .destroy       = devices_destroy,
     };
 
-    return &devices_plugin;
+    return p;
 }

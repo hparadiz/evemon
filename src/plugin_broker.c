@@ -592,6 +592,13 @@ static void gather_cgroup(pid_t pid, broker_pid_data_t *d)
     if (nl) *nl = '\0';
     snprintf(cg->path, sizeof(cg->path), "%s", cg_path);
 
+    /* H2: Reject cgroup paths containing ".." to prevent path traversal */
+    if (strstr(cg_path, "..")) {
+        fprintf(stderr, "evemon: rejecting cgroup path with '..': %s\n",
+                cg_path);
+        return;
+    }
+
     /* Build /sys/fs/cgroup/<path> */
     char cg_dir[1024];
     snprintf(cg_dir, sizeof(cg_dir), "/sys/fs/cgroup%s", cg_path);
@@ -952,31 +959,40 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
     bsock_table_t socktbl;
     bsock_table_build(&socktbl);
 
-    /* 3. Get per-socket throughput from eBPF */
-    fdmon_sock_io_t sock_io[1024];
-    size_t sock_io_count = 1024;
+    /* 3. Get per-socket throughput from eBPF (H5: heap-allocated) */
+    size_t sock_io_cap = 1024;
+    fdmon_sock_io_t *sock_io = calloc(sock_io_cap, sizeof(fdmon_sock_io_t));
+    if (!sock_io) {
+        free(inodes); free(inode_pids);
+        bsock_table_free(&socktbl);
+        return;
+    }
+    size_t sock_io_count = sock_io_cap;
     if (fdmon)
         fdmon_sock_io_list((fdmon_ctx_t *)fdmon, pid, sock_io, &sock_io_count);
     else
         sock_io_count = 0;
 
     /* Also from descendants */
-    for (size_t i = 0; i < d->desc_count && sock_io_count < 1024; i++) {
-        fdmon_sock_io_t desc_io[256];
-        size_t dc = 256;
+    for (size_t i = 0; i < d->desc_count && sock_io_count < sock_io_cap; i++) {
+        size_t remaining = sock_io_cap - sock_io_count;
+        size_t dc = remaining < 256 ? remaining : 256;
+        fdmon_sock_io_t *desc_io = calloc(dc, sizeof(fdmon_sock_io_t));
+        if (!desc_io) break;
         if (fdmon)
             fdmon_sock_io_list((fdmon_ctx_t *)fdmon,
                                d->data.descendant_pids[i], desc_io, &dc);
         else
             dc = 0;
-        for (size_t j = 0; j < dc && sock_io_count < 1024; j++)
+        for (size_t j = 0; j < dc && sock_io_count < sock_io_cap; j++)
             sock_io[sock_io_count++] = desc_io[j];
+        free(desc_io);
     }
 
     /* 4. Resolve each inode and build the socket list */
     size_t cap = 32, count = 0;
     evemon_socket_t *socks = calloc(cap, sizeof(evemon_socket_t));
-    if (!socks) { free(inodes); bsock_table_free(&socktbl); return; }
+    if (!socks) { free(inodes); free(inode_pids); free(sock_io); bsock_table_free(&socktbl); return; }
 
     /* Deduplicate inodes (multiple fds can point to same socket) */
     for (size_t i = 0; i < inode_count; i++) {
@@ -1092,6 +1108,7 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
 
     free(inodes);
     free(inode_pids);
+    free(sock_io);
     bsock_table_free(&socktbl);
 
     /* Sort by total throughput descending, then alphabetically */
@@ -1364,24 +1381,29 @@ void broker_start(plugin_registry_t *reg, void *fdmon)
     broker_cancel();
     g_broker_cancel = g_cancellable_new();
 
-    /* Collect unique tracked PIDs */
-    pid_t pids[256];
-    size_t npids = plugin_collect_tracked_pids(reg, pids, 256);
-    if (npids == 0)
+    /* Collect unique tracked PIDs — dynamically sized (H4) */
+    size_t pid_cap = reg->count > 0 ? reg->count : 16;
+    pid_t *pids = calloc(pid_cap, sizeof(pid_t));
+    if (!pids) return;
+    size_t npids = plugin_collect_tracked_pids(reg, pids, pid_cap);
+    if (npids == 0) {
+        free(pids);
         return;
+    }
 
     /* Allocate cycle */
     broker_cycle_t *cycle = calloc(1, sizeof(broker_cycle_t));
-    if (!cycle) return;
+    if (!cycle) { free(pids); return; }
 
     cycle->reg   = reg;
     cycle->fdmon = fdmon;
     cycle->needs = reg->combined_needs;
 
     cycle->pids = calloc(npids, sizeof(pid_t));
-    if (!cycle->pids) { free(cycle); return; }
+    if (!cycle->pids) { free(cycle); free(pids); return; }
     memcpy(cycle->pids, pids, npids * sizeof(pid_t));
     cycle->pid_count = npids;
+    free(pids);  /* local copy no longer needed */
 
     cycle->results = calloc(npids, sizeof(broker_pid_data_t));
     if (!cycle->results) { free(cycle->pids); free(cycle); return; }

@@ -402,15 +402,16 @@ static void lib_destroy(void *opaque) { free(opaque); }
 
 /* ── descriptor ──────────────────────────────────────────────── */
 
-static evemon_plugin_t lib_plugin;
-
 __attribute__((visibility("default")))
 evemon_plugin_t *evemon_plugin_init(void)
 {
     lib_ctx_t *ctx = calloc(1, sizeof(lib_ctx_t));
     if (!ctx) return NULL;
 
-    lib_plugin = (evemon_plugin_t){
+    evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
+    if (!p) { free(ctx); return NULL; }
+
+    *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Shared Libraries",
         .id            = "org.evemon.libs",
@@ -423,5 +424,5 @@ evemon_plugin_t *evemon_plugin_init(void)
         .destroy       = lib_destroy,
     };
 
-    return &lib_plugin;
+    return p;
 }

@@ -295,8 +295,10 @@ typedef struct {
  * Each .so exports a single function:
  *   evemon_plugin_t *evemon_plugin_init(void);
  *
- * The returned struct must be statically allocated (or heap-allocated
- * and never freed before the host calls destroy()).
+ * The returned struct must be heap-allocated with calloc/malloc.
+ * The host takes ownership and will free() it after calling destroy().
+ * Do NOT return a pointer to a static variable — multiple instances
+ * of the same plugin type require independent descriptors.
  */
 typedef struct {
     /* ABI version — MUST equal evemon_PLUGIN_ABI_VERSION */

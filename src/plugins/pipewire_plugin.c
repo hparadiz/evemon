@@ -911,15 +911,16 @@ static void pw_destroy(void *opaque)
 
 /* ── descriptor ──────────────────────────────────────────────── */
 
-static evemon_plugin_t pw_plugin;
-
 __attribute__((visibility("default")))
 evemon_plugin_t *evemon_plugin_init(void)
 {
     pw_ctx_t *ctx = calloc(1, sizeof(pw_ctx_t));
     if (!ctx) return NULL;
 
-    pw_plugin = (evemon_plugin_t){
+    evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
+    if (!p) { free(ctx); return NULL; }
+
+    *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "PipeWire Audio",
         .id            = "org.evemon.pipewire",
@@ -933,5 +934,5 @@ evemon_plugin_t *evemon_plugin_init(void)
         .activate      = pw_activate,
     };
 
-    return &pw_plugin;
+    return p;
 }

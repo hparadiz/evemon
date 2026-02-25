@@ -378,15 +378,16 @@ static void mmap_destroy(void *opaque) { free(opaque); }
 
 /* ── descriptor ──────────────────────────────────────────────── */
 
-static evemon_plugin_t mmap_plugin;
-
 __attribute__((visibility("default")))
 evemon_plugin_t *evemon_plugin_init(void)
 {
     mmap_ctx_t *ctx = calloc(1, sizeof(mmap_ctx_t));
     if (!ctx) return NULL;
 
-    mmap_plugin = (evemon_plugin_t){
+    evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
+    if (!p) { free(ctx); return NULL; }
+
+    *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Memory Maps",
         .id            = "org.evemon.mmap",
@@ -399,5 +400,5 @@ evemon_plugin_t *evemon_plugin_init(void)
         .destroy       = mmap_destroy,
     };
 
-    return &mmap_plugin;
+    return p;
 }

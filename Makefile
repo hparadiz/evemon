@@ -105,6 +105,8 @@ $(BUILD_DIR)/ui:
 # ── Plugin shared objects ────────────────────────────────────────
 PLUGIN_DIR     := $(BUILD_DIR)/plugins
 PLUGIN_CFLAGS  := -Wall -Wextra -std=c11 -O2 -D_GNU_SOURCE -fPIC -shared \
+                  -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+                  -Wformat -Wformat-security \
                   $(GTK_CFLAGS) $(FC_CFLAGS)
 PLUGIN_LDFLAGS := $(GTK_LDFLAGS) $(FC_LDFLAGS)
 

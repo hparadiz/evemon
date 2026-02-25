@@ -74,14 +74,21 @@ int plugin_loader_scan(plugin_registry_t *reg, const char *dir);
 
 /*
  * Create a new instance of an already-loaded plugin type (by id).
- * Returns the instance index, or -1 on failure.
+ * Returns the new instance's unique instance_id, or -1 on failure.
  */
 int plugin_instance_create(plugin_registry_t *reg, const char *plugin_id);
 
 /*
- * Destroy a specific plugin instance by index.
+ * Find an instance by its unique instance_id.
+ * Returns the array index, or -1 if not found.
  */
-void plugin_instance_destroy(plugin_registry_t *reg, int instance_idx);
+int plugin_registry_find_by_id(const plugin_registry_t *reg, int instance_id);
+
+/*
+ * Destroy a specific plugin instance by its unique instance_id.
+ * Returns 0 on success, -1 if the instance was not found.
+ */
+int plugin_instance_destroy(plugin_registry_t *reg, int instance_id);
 
 /*
  * Recalculate the combined_needs bitmask from all active instances.
