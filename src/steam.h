@@ -12,8 +12,8 @@
  *   - Steam Runtime layer (e.g. "sniper", "soldier", "scout")
  */
 
-#ifndef ALLMON_STEAM_H
-#define ALLMON_STEAM_H
+#ifndef evemon_STEAM_H
+#define evemon_STEAM_H
 
 #include <sys/types.h>
 
@@ -47,4 +47,4 @@ typedef struct {
 steam_info_t *steam_detect(pid_t pid, const char *comm, const char *cmdline,
                            const steam_info_t *parent_steam);
 
-#endif /* ALLMON_STEAM_H */
+#endif /* evemon_STEAM_H */

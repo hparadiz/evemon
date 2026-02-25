@@ -1,24 +1,24 @@
 /*
- * allmon_plugin.h – Public plugin ABI header.
+ * evemon_plugin.h – Public plugin ABI header.
  *
  * This is the ONLY header third-party plugin authors need.  It defines
- * the stable contract between allmon and dynamically-loaded .so plugins.
+ * the stable contract between evemon and dynamically-loaded .so plugins.
  *
  * Plugins compile to standalone shared objects:
- *   gcc -shared -fPIC -o allmon_myplugin.so myplugin.c \
+ *   gcc -shared -fPIC -o evemon_myplugin.so myplugin.c \
  *       $(pkg-config --cflags --libs gtk+-3.0)
  *
- * Drop the .so into the plugins/ directory and restart allmon.
+ * Drop the .so into the plugins/ directory and restart evemon.
  *
  * ABI rules:
- *   - New fields may be APPENDED to allmon_proc_data_t (minor change).
- *   - New bits may be added to allmon_data_needs_t (minor change).
- *   - Removing or reordering fields bumps ALLMON_PLUGIN_ABI_VERSION.
+ *   - New fields may be APPENDED to evemon_proc_data_t (minor change).
+ *   - New bits may be added to evemon_data_needs_t (minor change).
+ *   - Removing or reordering fields bumps evemon_PLUGIN_ABI_VERSION.
  *   - Old plugins that don't know about new fields keep working.
  */
 
-#ifndef ALLMON_PLUGIN_H
-#define ALLMON_PLUGIN_H
+#ifndef evemon_PLUGIN_H
+#define evemon_PLUGIN_H
 
 #include <gtk/gtk.h>
 #include <stdint.h>
@@ -31,21 +31,21 @@ extern "C" {
 
 /* ── ABI version ─────────────────────────────────────────────── */
 
-#define ALLMON_PLUGIN_ABI_VERSION  1
+#define evemon_PLUGIN_ABI_VERSION  1
 
 /* ── Data needs bitmask ──────────────────────────────────────── */
 
 typedef enum {
-    ALLMON_NEED_FDS         = (1 << 0),  /* fd list + socket resolution       */
-    ALLMON_NEED_ENV         = (1 << 1),  /* /proc/<pid>/environ               */
-    ALLMON_NEED_MMAP        = (1 << 2),  /* /proc/<pid>/maps (all regions)    */
-    ALLMON_NEED_SOCKETS     = (1 << 3),  /* net sockets with eBPF throughput  */
-    ALLMON_NEED_CGROUP      = (1 << 4),  /* cgroup controller files           */
-    ALLMON_NEED_STATUS      = (1 << 5),  /* raw /proc/<pid>/status            */
-    ALLMON_NEED_LIBS        = (1 << 6),  /* shared library list (from maps)   */
-    ALLMON_NEED_PIPEWIRE    = (1 << 7),  /* PipeWire graph snapshot           */
-    ALLMON_NEED_DESCENDANTS = (1 << 8),  /* include descendant PIDs           */
-} allmon_data_needs_t;
+    evemon_NEED_FDS         = (1 << 0),  /* fd list + socket resolution       */
+    evemon_NEED_ENV         = (1 << 1),  /* /proc/<pid>/environ               */
+    evemon_NEED_MMAP        = (1 << 2),  /* /proc/<pid>/maps (all regions)    */
+    evemon_NEED_SOCKETS     = (1 << 3),  /* net sockets with eBPF throughput  */
+    evemon_NEED_CGROUP      = (1 << 4),  /* cgroup controller files           */
+    evemon_NEED_STATUS      = (1 << 5),  /* raw /proc/<pid>/status            */
+    evemon_NEED_LIBS        = (1 << 6),  /* shared library list (from maps)   */
+    evemon_NEED_PIPEWIRE    = (1 << 7),  /* PipeWire graph snapshot           */
+    evemon_NEED_DESCENDANTS = (1 << 8),  /* include descendant PIDs           */
+} evemon_data_needs_t;
 
 /* ── Gathered data types ─────────────────────────────────────── */
 
@@ -56,20 +56,20 @@ typedef struct {
     char      desc[256];         /* resolved label (e.g. device name) */
     int       category;          /* fd_category_t value               */
     uint64_t  net_sort_key;      /* total send+recv bytes for sort    */
-} allmon_fd_t;
+} evemon_fd_t;
 
 /* A single environment variable */
 typedef struct {
     const char *text;            /* "KEY=value"                       */
     int         category;        /* env_category_t value              */
-} allmon_env_t;
+} evemon_env_t;
 
 /* A single memory mapping region */
 typedef struct {
     const char *text;            /* display line                      */
     int         category;        /* mmap_category_t value             */
     size_t      size_kb;         /* region size in KiB                */
-} allmon_mmap_t;
+} evemon_mmap_t;
 
 /* A single shared library */
 typedef struct {
@@ -79,7 +79,7 @@ typedef struct {
     char      origin[128];       /* short origin label (may be empty) */
     int       category;          /* lib_category_t value              */
     size_t    size_kb;           /* total code mapping size in KiB    */
-} allmon_lib_t;
+} evemon_lib_t;
 
 /* A single network socket with throughput */
 typedef struct {
@@ -87,7 +87,7 @@ typedef struct {
     uint64_t  send_delta;        /* bytes sent since last snapshot    */
     uint64_t  recv_delta;        /* bytes received                    */
     uint64_t  total;             /* send + recv (sort key)            */
-} allmon_socket_t;
+} evemon_socket_t;
 
 /* A PipeWire graph node */
 typedef struct {
@@ -99,7 +99,7 @@ typedef struct {
     char        node_desc[256];  /* node.description                  */
     char        media_class[64]; /* media.class (Stream/Output/Audio) */
     char        media_name[256]; /* media.name (tab title, song)      */
-} allmon_pw_node_t;
+} evemon_pw_node_t;
 
 /* A PipeWire graph link */
 typedef struct {
@@ -107,7 +107,7 @@ typedef struct {
     uint32_t  output_port;       /* source port ID                    */
     uint32_t  input_node;        /* sink node ID                      */
     uint32_t  input_port;        /* sink port ID                      */
-} allmon_pw_link_t;
+} evemon_pw_link_t;
 
 /* A PipeWire graph port */
 typedef struct {
@@ -116,7 +116,7 @@ typedef struct {
     char      port_name[128];    /* port.name                         */
     char      direction[8];      /* "in" or "out"                     */
     char      format_dsp[64];    /* format.dsp                        */
-} allmon_pw_port_t;
+} evemon_pw_port_t;
 
 /* cgroup resource limits */
 typedef struct {
@@ -130,7 +130,7 @@ typedef struct {
     int64_t   pids_current;      /* pids.current (-1=N/A)             */
     int64_t   pids_max;          /* pids.max (-1=N/A)                 */
     char      io_max[256];       /* io.max line (empty=none)          */
-} allmon_cgroup_t;
+} evemon_cgroup_t;
 
 /*
  * The gathered data bundle — passed to plugin update() callbacks.
@@ -150,39 +150,39 @@ typedef struct {
     double            cpu_percent;
     long              rss_kb;
 
-    /* Descendant PIDs (if ALLMON_NEED_DESCENDANTS) */
+    /* Descendant PIDs (if evemon_NEED_DESCENDANTS) */
     const pid_t      *descendant_pids;
     size_t            descendant_count;
 
-    /* File descriptors (if ALLMON_NEED_FDS) */
-    const allmon_fd_t     *fds;
+    /* File descriptors (if evemon_NEED_FDS) */
+    const evemon_fd_t     *fds;
     size_t                 fd_count;
 
-    /* Environment variables (if ALLMON_NEED_ENV) */
-    const allmon_env_t    *envs;
+    /* Environment variables (if evemon_NEED_ENV) */
+    const evemon_env_t    *envs;
     size_t                 env_count;
 
-    /* Memory mappings (if ALLMON_NEED_MMAP) */
-    const allmon_mmap_t   *mmaps;
+    /* Memory mappings (if evemon_NEED_MMAP) */
+    const evemon_mmap_t   *mmaps;
     size_t                 mmap_count;
 
-    /* Shared libraries (if ALLMON_NEED_LIBS) */
-    const allmon_lib_t    *libs;
+    /* Shared libraries (if evemon_NEED_LIBS) */
+    const evemon_lib_t    *libs;
     size_t                 lib_count;
 
-    /* Network sockets with throughput (if ALLMON_NEED_SOCKETS) */
-    const allmon_socket_t *sockets;
+    /* Network sockets with throughput (if evemon_NEED_SOCKETS) */
+    const evemon_socket_t *sockets;
     size_t                 socket_count;
 
-    /* cgroup limits (if ALLMON_NEED_CGROUP) */
-    const allmon_cgroup_t *cgroup;
+    /* cgroup limits (if evemon_NEED_CGROUP) */
+    const evemon_cgroup_t *cgroup;
 
-    /* PipeWire graph (if ALLMON_NEED_PIPEWIRE) */
-    const allmon_pw_node_t   *pw_nodes;
+    /* PipeWire graph (if evemon_NEED_PIPEWIRE) */
+    const evemon_pw_node_t   *pw_nodes;
     size_t                    pw_node_count;
-    const allmon_pw_link_t   *pw_links;
+    const evemon_pw_link_t   *pw_links;
     size_t                    pw_link_count;
-    const allmon_pw_port_t   *pw_ports;
+    const evemon_pw_port_t   *pw_ports;
     size_t                    pw_port_count;
 
     /* Raw file contents (if corresponding NEED flag set) */
@@ -191,8 +191,8 @@ typedef struct {
     const char       *raw_maps;      /* /proc/<pid>/maps content       */
 
     /* eBPF network counters — host-provided, no plugin syscalls */
-    const void       *fdmon;         /* opaque, use allmon_net_io_get() */
-} allmon_proc_data_t;
+    const void       *fdmon;         /* opaque, use evemon_net_io_get() */
+} evemon_proc_data_t;
 
 /* ── Host services ────────────────────────────────────────────── */
 
@@ -264,32 +264,32 @@ typedef struct {
      */
     uint32_t (*spectro_get_target)(void *host_ctx);
 
-} allmon_host_services_t;
+} evemon_host_services_t;
 
 /* ── Plugin descriptor ───────────────────────────────────────── */
 
 /*
  * Each .so exports a single function:
- *   allmon_plugin_t *allmon_plugin_init(void);
+ *   evemon_plugin_t *evemon_plugin_init(void);
  *
  * The returned struct must be statically allocated (or heap-allocated
  * and never freed before the host calls destroy()).
  */
 typedef struct {
-    /* ABI version — MUST equal ALLMON_PLUGIN_ABI_VERSION */
+    /* ABI version — MUST equal evemon_PLUGIN_ABI_VERSION */
     int                 abi_version;
 
     /* Human-readable plugin name (e.g. "Environment Variables") */
     const char         *name;
 
-    /* Reverse-DNS identifier (e.g. "org.allmon.env") */
+    /* Reverse-DNS identifier (e.g. "org.evemon.env") */
     const char         *id;
 
     /* Plugin version string (informational, e.g. "1.0") */
     const char         *version;
 
     /* Bitmask of data the plugin needs from the broker */
-    allmon_data_needs_t data_needs;
+    evemon_data_needs_t data_needs;
 
     /* Per-instance opaque context (set by the plugin in init) */
     void               *plugin_ctx;
@@ -308,7 +308,7 @@ typedef struct {
      * Called on the GTK main thread.  `data` is valid only for the
      * duration of this call.
      */
-    void (*update)(void *ctx, const allmon_proc_data_t *data);
+    void (*update)(void *ctx, const evemon_proc_data_t *data);
 
     /*
      * The tracked PID has exited, or nothing is selected.
@@ -330,34 +330,34 @@ typedef struct {
      *
      * May be NULL if the plugin doesn't need host services.
      */
-    void (*activate)(void *ctx, const allmon_host_services_t *services);
+    void (*activate)(void *ctx, const evemon_host_services_t *services);
 
-} allmon_plugin_t;
+} evemon_plugin_t;
 
 /* ── Plugin init function signature ──────────────────────────── */
 
-typedef allmon_plugin_t *(*allmon_plugin_init_fn)(void);
+typedef evemon_plugin_t *(*evemon_plugin_init_fn)(void);
 
 /* ── Host-provided utility functions ─────────────────────────── */
 
 /*
- * These are real symbols exported by the allmon binary (linked with
+ * These are real symbols exported by the evemon binary (linked with
  * -rdynamic).  Plugins can call them directly — they are resolved
  * automatically by dlopen with RTLD_GLOBAL.
  */
 
 /* Query eBPF per-PID network throughput (reads from host's fdmon) */
-int  allmon_net_io_get(const allmon_proc_data_t *data, pid_t tgid,
+int  evemon_net_io_get(const evemon_proc_data_t *data, pid_t tgid,
                        uint64_t *send_bytes, uint64_t *recv_bytes);
 
 /* Format a KiB value to human-readable string (shared helper) */
-void allmon_format_memory(long kb, char *buf, size_t bufsz);
+void evemon_format_memory(long kb, char *buf, size_t bufsz);
 
 /* Format an epoch timestamp to fuzzy "2h 15m ago" string */
-void allmon_format_fuzzy_time(time_t epoch, char *buf, size_t bufsz);
+void evemon_format_fuzzy_time(time_t epoch, char *buf, size_t bufsz);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* ALLMON_PLUGIN_H */
+#endif /* evemon_PLUGIN_H */

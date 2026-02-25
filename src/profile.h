@@ -1,5 +1,5 @@
-#ifndef ALLMON_PROFILE_H
-#define ALLMON_PROFILE_H
+#ifndef evemon_PROFILE_H
+#define evemon_PROFILE_H
 
 /*
  * profile.h – lightweight profiler for timing code sections.
@@ -156,4 +156,4 @@ static inline double profile__diff_ms(struct timespec *a, struct timespec *b)
         profile__record(#label, _prof_##label##_ms);             \
     } while (0)
 
-#endif /* ALLMON_PROFILE_H */
+#endif /* evemon_PROFILE_H */

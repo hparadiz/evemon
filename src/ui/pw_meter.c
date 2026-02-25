@@ -223,7 +223,7 @@ void pw_meter_start(ui_ctx_t *ctx, const uint32_t *node_ids, size_t count)
 
     pw_init(NULL, NULL);
 
-    ms->loop = pw_thread_loop_new("allmon-meter", NULL);
+    ms->loop = pw_thread_loop_new("evemon-meter", NULL);
     if (!ms->loop) { free(ms); return; }
 
     ms->context = pw_context_new(pw_thread_loop_get_loop(ms->loop), NULL, 0);
@@ -251,7 +251,7 @@ void pw_meter_start(ui_ctx_t *ctx, const uint32_t *node_ids, size_t count)
         atomic_store(&mn->peak_r, 0);
 
         char stream_name[64];
-        snprintf(stream_name, sizeof(stream_name), "allmon-meter-%u", node_ids[i]);
+        snprintf(stream_name, sizeof(stream_name), "evemon-meter-%u", node_ids[i]);
 
         mn->stream = pw_stream_new(
             ms->core, stream_name,

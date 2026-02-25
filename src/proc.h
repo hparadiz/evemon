@@ -1,5 +1,5 @@
-#ifndef ALLMON_PROC_H
-#define ALLMON_PROC_H
+#ifndef evemon_PROC_H
+#define evemon_PROC_H
 
 #include <sys/types.h>
 #include <pthread.h>
@@ -76,4 +76,4 @@ void *monitor_thread(void *arg);   /* arg = monitor_state_t* */
 /* Placeholder thread entry point for the future GTK3 UI */
 void *ui_thread(void *arg);        /* arg = monitor_state_t* */
 
-#endif /* ALLMON_PROC_H */
+#endif /* evemon_PROC_H */

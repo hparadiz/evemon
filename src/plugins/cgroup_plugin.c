@@ -1,15 +1,15 @@
 /*
- * cgroup_plugin.c – cgroup Resource Limits plugin for allmon.
+ * cgroup_plugin.c – cgroup Resource Limits plugin for evemon.
  *
  * Displays cgroup v2 resource limits for a process:
  *   memory.max/current, cpu.max, pids.max/current, io.max
  *
  * Build:
- *   gcc -shared -fPIC -o allmon_cgroup.so cgroup_plugin.c \
+ *   gcc -shared -fPIC -o evemon_cgroup.so cgroup_plugin.c \
  *       $(pkg-config --cflags --libs gtk+-3.0)
  */
 
-#include "../allmon_plugin.h"
+#include "../evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
@@ -104,10 +104,10 @@ static GtkWidget *cgroup_create_widget(void *opaque)
     return ctx->box;
 }
 
-static void cgroup_update(void *opaque, const allmon_proc_data_t *data)
+static void cgroup_update(void *opaque, const evemon_proc_data_t *data)
 {
     cgroup_ctx_t *ctx = opaque;
-    const allmon_cgroup_t *cg = data->cgroup;
+    const evemon_cgroup_t *cg = data->cgroup;
 
     if (!cg || cg->path[0] == '\0') {
         /* No cgroup data at all (not on cgroup v2?) */
@@ -220,20 +220,20 @@ static void cgroup_destroy(void *opaque) { free(opaque); }
 
 /* ── descriptor ──────────────────────────────────────────────── */
 
-static allmon_plugin_t cgroup_plugin;
+static evemon_plugin_t cgroup_plugin;
 
 __attribute__((visibility("default")))
-allmon_plugin_t *allmon_plugin_init(void)
+evemon_plugin_t *evemon_plugin_init(void)
 {
     cgroup_ctx_t *ctx = calloc(1, sizeof(cgroup_ctx_t));
     if (!ctx) return NULL;
 
-    cgroup_plugin = (allmon_plugin_t){
-        .abi_version   = ALLMON_PLUGIN_ABI_VERSION,
+    cgroup_plugin = (evemon_plugin_t){
+        .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "cgroup Limits",
-        .id            = "org.allmon.cgroup",
+        .id            = "org.evemon.cgroup",
         .version       = "1.0",
-        .data_needs    = ALLMON_NEED_CGROUP,
+        .data_needs    = evemon_NEED_CGROUP,
         .plugin_ctx    = ctx,
         .create_widget = cgroup_create_widget,
         .update        = cgroup_update,

@@ -17,7 +17,7 @@
 
 /*
  * These are the implementations of the utility functions declared in
- * allmon_plugin.h.  They are resolved by plugins via dlopen(RTLD_GLOBAL)
+ * evemon_plugin.h.  They are resolved by plugins via dlopen(RTLD_GLOBAL)
  * because the host binary is linked with -rdynamic.
  */
 
@@ -25,17 +25,17 @@
 extern void format_memory(long kb, char *buf, size_t bufsz);
 extern void format_fuzzy_time(time_t epoch, char *buf, size_t bufsz);
 
-void allmon_format_memory(long kb, char *buf, size_t bufsz)
+void evemon_format_memory(long kb, char *buf, size_t bufsz)
 {
     format_memory(kb, buf, bufsz);
 }
 
-void allmon_format_fuzzy_time(time_t epoch, char *buf, size_t bufsz)
+void evemon_format_fuzzy_time(time_t epoch, char *buf, size_t bufsz)
 {
     format_fuzzy_time(epoch, buf, bufsz);
 }
 
-int allmon_net_io_get(const allmon_proc_data_t *data, pid_t tgid,
+int evemon_net_io_get(const evemon_proc_data_t *data, pid_t tgid,
                       uint64_t *send_bytes, uint64_t *recv_bytes)
 {
     if (!data || !data->fdmon) {
@@ -62,7 +62,7 @@ void plugin_registry_init(plugin_registry_t *reg)
 }
 
 void plugin_registry_set_host_services(plugin_registry_t *reg,
-                                       const allmon_host_services_t *svc)
+                                       const evemon_host_services_t *svc)
 {
     reg->host_services = svc;
 }
@@ -110,35 +110,35 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
      * and RTLD_LOCAL so plugin symbols don't pollute the global namespace */
     void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
-        fprintf(stderr, "allmon: plugin %s: %s\n", path, dlerror());
+        fprintf(stderr, "evemon: plugin %s: %s\n", path, dlerror());
         return -1;
     }
 
-    allmon_plugin_init_fn init_fn =
-        (allmon_plugin_init_fn)dlsym(handle, "allmon_plugin_init");
+    evemon_plugin_init_fn init_fn =
+        (evemon_plugin_init_fn)dlsym(handle, "evemon_plugin_init");
     if (!init_fn) {
-        fprintf(stderr, "allmon: plugin %s: no allmon_plugin_init symbol\n",
+        fprintf(stderr, "evemon: plugin %s: no evemon_plugin_init symbol\n",
                 path);
         dlclose(handle);
         return -1;
     }
 
-    allmon_plugin_t *plugin = init_fn();
+    evemon_plugin_t *plugin = init_fn();
     if (!plugin) {
-        fprintf(stderr, "allmon: plugin %s: init returned NULL\n", path);
+        fprintf(stderr, "evemon: plugin %s: init returned NULL\n", path);
         dlclose(handle);
         return -1;
     }
 
-    if (plugin->abi_version != ALLMON_PLUGIN_ABI_VERSION) {
-        fprintf(stderr, "allmon: plugin %s: ABI version %d (expected %d)\n",
-                path, plugin->abi_version, ALLMON_PLUGIN_ABI_VERSION);
+    if (plugin->abi_version != evemon_PLUGIN_ABI_VERSION) {
+        fprintf(stderr, "evemon: plugin %s: ABI version %d (expected %d)\n",
+                path, plugin->abi_version, evemon_PLUGIN_ABI_VERSION);
         dlclose(handle);
         return -1;
     }
 
     if (!plugin->create_widget || !plugin->update) {
-        fprintf(stderr, "allmon: plugin %s: missing required callbacks\n",
+        fprintf(stderr, "evemon: plugin %s: missing required callbacks\n",
                 path);
         dlclose(handle);
         return -1;
@@ -157,7 +157,7 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
     /* Call create_widget on the GTK main thread (we are on it) */
     inst->widget = plugin->create_widget(plugin->plugin_ctx);
     if (!inst->widget) {
-        fprintf(stderr, "allmon: plugin %s: create_widget returned NULL\n",
+        fprintf(stderr, "evemon: plugin %s: create_widget returned NULL\n",
                 path);
         reg->count--;  /* undo the alloc */
         dlclose(handle);
@@ -171,7 +171,7 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
     /* Update combined needs */
     reg->combined_needs |= plugin->data_needs;
 
-    fprintf(stdout, "allmon: loaded plugin \"%s\" (%s) v%s from %s\n",
+    fprintf(stdout, "evemon: loaded plugin \"%s\" (%s) v%s from %s\n",
             plugin->name ? plugin->name : "?",
             plugin->id   ? plugin->id   : "?",
             plugin->version ? plugin->version : "?",
@@ -212,7 +212,7 @@ int plugin_loader_scan(plugin_registry_t *reg, const char *dir)
 int plugin_instance_create(plugin_registry_t *reg, const char *plugin_id)
 {
     /* Find an existing instance with this plugin id to get the handle */
-    allmon_plugin_t *plugin = NULL;
+    evemon_plugin_t *plugin = NULL;
     void *handle = NULL;
 
     for (size_t i = 0; i < reg->count; i++) {
@@ -228,11 +228,11 @@ int plugin_instance_create(plugin_registry_t *reg, const char *plugin_id)
     if (!plugin) return -1;
 
     /* Re-call init to get a fresh plugin descriptor for the new instance */
-    allmon_plugin_init_fn init_fn =
-        (allmon_plugin_init_fn)dlsym(handle, "allmon_plugin_init");
+    evemon_plugin_init_fn init_fn =
+        (evemon_plugin_init_fn)dlsym(handle, "evemon_plugin_init");
     if (!init_fn) return -1;
 
-    allmon_plugin_t *new_plugin = init_fn();
+    evemon_plugin_t *new_plugin = init_fn();
     if (!new_plugin) return -1;
 
     plugin_instance_t *inst = registry_alloc(reg);
@@ -298,7 +298,7 @@ void plugin_instance_set_pid(plugin_instance_t *inst, pid_t pid,
 /* ── Dispatch callbacks ──────────────────────────────────────── */
 
 void plugin_dispatch_update(plugin_registry_t *reg, pid_t pid,
-                            const allmon_proc_data_t *data)
+                            const evemon_proc_data_t *data)
 {
     for (size_t i = 0; i < reg->count; i++) {
         plugin_instance_t *inst = &reg->instances[i];

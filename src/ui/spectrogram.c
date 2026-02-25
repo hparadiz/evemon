@@ -599,7 +599,7 @@ void spectrogram_start_for_node(ui_ctx_t *ctx, uint32_t node_id)
      * Use pw_thread_loop so the PW processing runs on its own
      * real-time thread, separate from both GTK and the GTask pool.
      */
-    st->loop = pw_thread_loop_new("allmon-spectro", NULL);
+    st->loop = pw_thread_loop_new("evemon-spectro", NULL);
     if (!st->loop) goto fail;
 
     st->context = pw_context_new(pw_thread_loop_get_loop(st->loop), NULL, 0);
@@ -647,7 +647,7 @@ void spectrogram_start_for_node(ui_ctx_t *ctx, uint32_t node_id)
      * sink monitor.
      */
     st->stream = pw_stream_new(
-        st->core, "allmon-spectrogram",
+        st->core, "evemon-spectrogram",
         pw_properties_new(
             PW_KEY_MEDIA_TYPE,        "Audio",
             PW_KEY_MEDIA_CATEGORY,    "Capture",

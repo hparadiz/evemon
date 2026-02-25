@@ -1,15 +1,15 @@
 /*
- * mmap_plugin.c – Memory Maps plugin for allmon.
+ * mmap_plugin.c – Memory Maps plugin for evemon.
  *
  * Displays /proc/<pid>/maps regions categorised into Code, Data,
  * Read-Only, Heap, Stack, vDSO, Anonymous, and Other.
  *
  * Build:
- *   gcc -shared -fPIC -o allmon_mmap.so mmap_plugin.c \
+ *   gcc -shared -fPIC -o evemon_mmap.so mmap_plugin.c \
  *       $(pkg-config --cflags --libs gtk+-3.0)
  */
 
-#include "../allmon_plugin.h"
+#include "../evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -253,7 +253,7 @@ static GtkWidget *mmap_create_widget(void *opaque)
     return ctx->scroll;
 }
 
-static void mmap_update(void *opaque, const allmon_proc_data_t *data)
+static void mmap_update(void *opaque, const evemon_proc_data_t *data)
 {
     mmap_ctx_t *ctx = opaque;
 
@@ -378,20 +378,20 @@ static void mmap_destroy(void *opaque) { free(opaque); }
 
 /* ── descriptor ──────────────────────────────────────────────── */
 
-static allmon_plugin_t mmap_plugin;
+static evemon_plugin_t mmap_plugin;
 
 __attribute__((visibility("default")))
-allmon_plugin_t *allmon_plugin_init(void)
+evemon_plugin_t *evemon_plugin_init(void)
 {
     mmap_ctx_t *ctx = calloc(1, sizeof(mmap_ctx_t));
     if (!ctx) return NULL;
 
-    mmap_plugin = (allmon_plugin_t){
-        .abi_version   = ALLMON_PLUGIN_ABI_VERSION,
+    mmap_plugin = (evemon_plugin_t){
+        .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Memory Maps",
-        .id            = "org.allmon.mmap",
+        .id            = "org.evemon.mmap",
         .version       = "1.0",
-        .data_needs    = ALLMON_NEED_MMAP,
+        .data_needs    = evemon_NEED_MMAP,
         .plugin_ctx    = ctx,
         .create_widget = mmap_create_widget,
         .update        = mmap_update,

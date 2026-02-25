@@ -5,8 +5,8 @@
  * submit_event so the eBPF backend can push events into the ring.
  */
 
-#ifndef ALLMON_FDMON_INTERNAL_H
-#define ALLMON_FDMON_INTERNAL_H
+#ifndef evemon_FDMON_INTERNAL_H
+#define evemon_FDMON_INTERNAL_H
 
 #include "fdmon.h"
 #include <pthread.h>
@@ -124,4 +124,4 @@ void submit_sock_event(fdmon_ctx_t *ctx, pid_t tgid,
                        uint32_t raddr, uint16_t rport,
                        uint32_t bytes, int is_send);
 
-#endif /* ALLMON_FDMON_INTERNAL_H */
+#endif /* evemon_FDMON_INTERNAL_H */

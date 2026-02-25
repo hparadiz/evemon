@@ -146,7 +146,7 @@ static int silent_print(enum libbpf_print_level level,
 
 /*
  * We look for the compiled BPF object next to the executable.
- * The Makefile places it in the build/ directory alongside allmon.
+ * The Makefile places it in the build/ directory alongside evemon.
  */
 static int find_bpf_object(char *buf, size_t bufsz)
 {

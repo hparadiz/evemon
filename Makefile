@@ -39,9 +39,9 @@ SRC_DIR := src
 BUILD_DIR := build
 
 # GResource (embeds icon.png into the binary)
-GRES_XML := $(SRC_DIR)/allmon.gresource.xml
-GRES_C   := $(BUILD_DIR)/allmon_resources.c
-GRES_O   := $(BUILD_DIR)/allmon_resources.o
+GRES_XML := $(SRC_DIR)/evemon.gresource.xml
+GRES_C   := $(BUILD_DIR)/evemon_resources.c
+GRES_O   := $(BUILD_DIR)/evemon_resources.o
 
 # Exclude the BPF kernel program from gcc compilation
 SRCS := $(filter-out $(SRC_DIR)/fdmon_ebpf_kern.c, $(wildcard $(SRC_DIR)/*.c))
@@ -60,7 +60,7 @@ OBJS += $(GRES_O)
 BPF_SRC := $(SRC_DIR)/fdmon_ebpf_kern.c
 BPF_OBJ := $(BUILD_DIR)/fdmon_ebpf_kern.o
 
-TARGET := $(BUILD_DIR)/allmon
+TARGET := $(BUILD_DIR)/evemon
 
 .PHONY: all clean run
 
@@ -99,21 +99,21 @@ PLUGIN_CFLAGS  := -Wall -Wextra -std=c11 -O2 -D_GNU_SOURCE -fPIC -shared \
 PLUGIN_LDFLAGS := $(GTK_LDFLAGS) $(FC_LDFLAGS)
 
 PLUGIN_SRCS := $(wildcard $(SRC_DIR)/plugins/*.c)
-PLUGIN_SOS  := $(patsubst $(SRC_DIR)/plugins/%.c,$(PLUGIN_DIR)/allmon_%.so,$(PLUGIN_SRCS))
+PLUGIN_SOS  := $(patsubst $(SRC_DIR)/plugins/%.c,$(PLUGIN_DIR)/evemon_%.so,$(PLUGIN_SRCS))
 
 $(PLUGIN_DIR):
 	mkdir -p $(PLUGIN_DIR)
 
-$(PLUGIN_DIR)/allmon_%.so: $(SRC_DIR)/plugins/%.c $(SRC_DIR)/allmon_plugin.h | $(PLUGIN_DIR)
+$(PLUGIN_DIR)/evemon_%.so: $(SRC_DIR)/plugins/%.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
 	$(CC) $(PLUGIN_CFLAGS) -o $@ $< $(PLUGIN_LDFLAGS)
 
 # PipeWire plugin needs PW flags (only built when PW is available)
 ifneq ($(PW_LDFLAGS),)
-$(PLUGIN_DIR)/allmon_pipewire_plugin.so: $(SRC_DIR)/plugins/pipewire_plugin.c $(SRC_DIR)/allmon_plugin.h | $(PLUGIN_DIR)
+$(PLUGIN_DIR)/evemon_pipewire_plugin.so: $(SRC_DIR)/plugins/pipewire_plugin.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
 	$(CC) $(PLUGIN_CFLAGS) $(PW_CFLAGS) -DHAVE_PIPEWIRE -o $@ $< $(PLUGIN_LDFLAGS) $(PW_LDFLAGS)
 else
 # If PipeWire is not available, skip the PipeWire plugin
-PLUGIN_SOS := $(filter-out $(PLUGIN_DIR)/allmon_pipewire_plugin.so,$(PLUGIN_SOS))
+PLUGIN_SOS := $(filter-out $(PLUGIN_DIR)/evemon_pipewire_plugin.so,$(PLUGIN_SOS))
 endif
 
 plugins: $(PLUGIN_SOS)

@@ -33,8 +33,8 @@
  *     fdmon_destroy(ctx);
  */
 
-#ifndef ALLMON_FDMON_H
-#define ALLMON_FDMON_H
+#ifndef evemon_FDMON_H
+#define evemon_FDMON_H
 
 #include <sys/types.h>
 #include <stdint.h>
@@ -216,4 +216,4 @@ int fdmon_sock_io_list(const fdmon_ctx_t *ctx, pid_t tgid,
 }
 #endif
 
-#endif /* ALLMON_FDMON_H */
+#endif /* evemon_FDMON_H */

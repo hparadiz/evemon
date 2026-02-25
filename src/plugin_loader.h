@@ -6,10 +6,10 @@
  * public plugin ABI — only used internally by the host.
  */
 
-#ifndef ALLMON_PLUGIN_LOADER_H
-#define ALLMON_PLUGIN_LOADER_H
+#ifndef evemon_PLUGIN_LOADER_H
+#define evemon_PLUGIN_LOADER_H
 
-#include "allmon_plugin.h"
+#include "evemon_plugin.h"
 
 #include <stddef.h>
 
@@ -24,7 +24,7 @@ extern "C" {
  * multiple instances (e.g. two "Network" tabs watching different PIDs).
  */
 typedef struct {
-    allmon_plugin_t  *plugin;        /* plugin descriptor (from .so)    */
+    evemon_plugin_t  *plugin;        /* plugin descriptor (from .so)    */
     void             *handle;        /* dlopen handle                   */
     GtkWidget        *widget;        /* root widget returned by create  */
     pid_t             tracked_pid;   /* PID this instance is watching   */
@@ -40,10 +40,10 @@ typedef struct {
     size_t             capacity;
 
     /* Combined data needs of all loaded instances (OR'd together) */
-    allmon_data_needs_t combined_needs;
+    evemon_data_needs_t combined_needs;
 
     /* Host services table — injected by the host, passed to plugins */
-    const allmon_host_services_t *host_services;
+    const evemon_host_services_t *host_services;
 } plugin_registry_t;
 
 /*
@@ -57,7 +57,7 @@ void plugin_registry_init(plugin_registry_t *reg);
  * receive services via their activate() callback.
  */
 void plugin_registry_set_host_services(plugin_registry_t *reg,
-                                       const allmon_host_services_t *svc);
+                                       const evemon_host_services_t *svc);
 
 /*
  * Free all resources in the registry (calls destroy on each instance).
@@ -66,7 +66,7 @@ void plugin_registry_destroy(plugin_registry_t *reg);
 
 /*
  * Scan a directory for .so files and load each as a plugin.
- * Calls allmon_plugin_init() and create_widget() for each.
+ * Calls evemon_plugin_init() and create_widget() for each.
  *
  * Returns the number of plugins successfully loaded.
  */
@@ -100,7 +100,7 @@ void plugin_instance_set_pid(plugin_instance_t *inst, pid_t pid,
  * Called from the main thread after the broker gathers data.
  */
 void plugin_dispatch_update(plugin_registry_t *reg, pid_t pid,
-                            const allmon_proc_data_t *data);
+                            const evemon_proc_data_t *data);
 
 /*
  * Dispatch clear() to all instances tracking a given PID.
@@ -123,4 +123,4 @@ size_t plugin_collect_tracked_pids(const plugin_registry_t *reg,
 }
 #endif
 
-#endif /* ALLMON_PLUGIN_LOADER_H */
+#endif /* evemon_PLUGIN_LOADER_H */

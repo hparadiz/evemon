@@ -4,7 +4,7 @@
  * Resolves /dev/ paths to human-readable hardware names by querying
  * sysfs attributes and the PCI IDs database.  Results are cached in
  * a simple linear table so each sysfs path is read at most once per
- * allmon session.
+ * evemon session.
  */
 
 #include "ui_internal.h"

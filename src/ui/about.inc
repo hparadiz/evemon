@@ -299,9 +299,9 @@ static gboolean ensure_font_logos_loaded(void)
     if (failed) return FALSE;
 
     GBytes *bytes = g_resources_lookup_data(
-        "/org/allmon/font-logos.ttf", G_RESOURCE_LOOKUP_FLAGS_NONE, NULL);
+        "/org/evemon/font-logos.ttf", G_RESOURCE_LOOKUP_FLAGS_NONE, NULL);
     if (!bytes) {
-        fprintf(stderr, "allmon: font-logos.ttf not found in GResource\n");
+        fprintf(stderr, "evemon: font-logos.ttf not found in GResource\n");
         failed = TRUE;
         return FALSE;
     }
@@ -309,10 +309,10 @@ static gboolean ensure_font_logos_loaded(void)
     /* Write to a temp file (fontconfig needs a filesystem path).
      * Use .ttf suffix so fontconfig recognises the format. */
     snprintf(g_font_logos_tmp, sizeof(g_font_logos_tmp),
-             "/tmp/allmon-font-logos-XXXXXX.ttf");
+             "/tmp/evemon-font-logos-XXXXXX.ttf");
     int fd = mkstemps(g_font_logos_tmp, 4);
     if (fd < 0) {
-        fprintf(stderr, "allmon: mkstemp failed for font-logos\n");
+        fprintf(stderr, "evemon: mkstemp failed for font-logos\n");
         g_bytes_unref(bytes);
         failed = TRUE;
         return FALSE;
@@ -326,7 +326,7 @@ static gboolean ensure_font_logos_loaded(void)
     g_bytes_unref(bytes);
 
     if (written != (ssize_t)sz) {
-        fprintf(stderr, "allmon: failed to write font-logos temp file\n");
+        fprintf(stderr, "evemon: failed to write font-logos temp file\n");
         failed = TRUE;
         return FALSE;
     }
@@ -340,7 +340,7 @@ static gboolean ensure_font_logos_loaded(void)
     FcBool ok = FcConfigAppFontAddFile(
         fc_cfg, (const FcChar8 *)g_font_logos_tmp);
     if (!ok) {
-        fprintf(stderr, "allmon: FcConfigAppFontAddFile failed\n");
+        fprintf(stderr, "evemon: FcConfigAppFontAddFile failed\n");
         failed = TRUE;
         return FALSE;
     }
@@ -878,14 +878,14 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
         g_free(sh_esc); g_free(de_esc); g_free(cpu_esc);
         g_free(disp_esc); g_free(hdr_esc); g_free(gpu_esc);
 
-        /* Blank line + allmon branding */
+        /* Blank line + evemon branding */
         g_string_append(info,
             "\n<span font_family='Monospace' size='10000'"
-            " weight='bold'>allmon</span>"
+            " weight='bold'>evemon</span>"
             "<span font_family='Monospace' size='10000'>"
             " 0.1.0</span>\n"
             "<span font_family='Monospace' size='9000'"
-            " style='italic'>A lightweight Linux process monitor"
+            " style='italic'>A lightweight Linux everything monitor"
             "</span>\n");
 
         GtkWidget *info_label = gtk_label_new(NULL);

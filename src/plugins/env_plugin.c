@@ -1,15 +1,15 @@
 /*
- * env_plugin.c – Environment Variables plugin for allmon.
+ * env_plugin.c – Environment Variables plugin for evemon.
  *
  * Displays the environment variables of a process, categorised into
  * PATH, Display, Locale, XDG, Steam, and Other.
  *
  * Build:
- *   gcc -shared -fPIC -o allmon_env.so env_plugin.c \
+ *   gcc -shared -fPIC -o evemon_env.so env_plugin.c \
  *       $(pkg-config --cflags --libs gtk+-3.0)
  */
 
-#include "../allmon_plugin.h"
+#include "../evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -206,7 +206,7 @@ static GtkWidget *env_create_widget(void *opaque)
     return ctx->scroll;
 }
 
-static void env_update(void *opaque, const allmon_proc_data_t *data)
+static void env_update(void *opaque, const evemon_proc_data_t *data)
 {
     env_ctx_t *ctx = opaque;
 
@@ -336,20 +336,20 @@ static void env_destroy(void *opaque)
 
 /* ── plugin descriptor ───────────────────────────────────────── */
 
-static allmon_plugin_t env_plugin;
+static evemon_plugin_t env_plugin;
 
 __attribute__((visibility("default")))
-allmon_plugin_t *allmon_plugin_init(void)
+evemon_plugin_t *evemon_plugin_init(void)
 {
     env_ctx_t *ctx = calloc(1, sizeof(env_ctx_t));
     if (!ctx) return NULL;
 
-    env_plugin = (allmon_plugin_t){
-        .abi_version   = ALLMON_PLUGIN_ABI_VERSION,
+    env_plugin = (evemon_plugin_t){
+        .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Environment Variables",
-        .id            = "org.allmon.env",
+        .id            = "org.evemon.env",
         .version       = "1.0",
-        .data_needs    = ALLMON_NEED_ENV,
+        .data_needs    = evemon_NEED_ENV,
         .plugin_ctx    = ctx,
         .create_widget = env_create_widget,
         .update        = env_update,

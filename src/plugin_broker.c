@@ -33,27 +33,27 @@ extern void label_device(const char *path, char *desc, size_t descsz);
 
 typedef struct {
     pid_t                pid;
-    allmon_proc_data_t   data;
+    evemon_proc_data_t   data;
 
     /* Owned storage (freed after dispatch) */
-    allmon_fd_t         *fd_buf;
+    evemon_fd_t         *fd_buf;
     size_t               fd_cap;
 
-    allmon_env_t        *env_buf;
+    evemon_env_t        *env_buf;
     char                *env_raw;       /* raw /proc/<pid>/environ */
     size_t               env_cap;
 
-    allmon_mmap_t       *mmap_buf;
+    evemon_mmap_t       *mmap_buf;
     char                *mmap_raw;      /* raw /proc/<pid>/maps    */
     size_t               mmap_cap;
 
-    allmon_lib_t        *lib_buf;
+    evemon_lib_t        *lib_buf;
     size_t               lib_cap;
 
-    allmon_socket_t     *sock_buf;
+    evemon_socket_t     *sock_buf;
     size_t               sock_cap;
 
-    allmon_cgroup_t      cgroup_data;
+    evemon_cgroup_t      cgroup_data;
 
     pid_t               *desc_pids;
     size_t               desc_count;
@@ -63,12 +63,12 @@ typedef struct {
     char                *raw_maps;
     char                *raw_cgroup;
 
-    /* PipeWire graph (if ALLMON_NEED_PIPEWIRE) */
-    allmon_pw_node_t    *pw_nodes;
+    /* PipeWire graph (if evemon_NEED_PIPEWIRE) */
+    evemon_pw_node_t    *pw_nodes;
     size_t               pw_node_cap;
-    allmon_pw_link_t    *pw_links;
+    evemon_pw_link_t    *pw_links;
     size_t               pw_link_cap;
-    allmon_pw_port_t    *pw_ports;
+    evemon_pw_port_t    *pw_ports;
     size_t               pw_port_cap;
 } broker_pid_data_t;
 
@@ -99,7 +99,7 @@ struct broker_cycle {
     /* Input: PIDs to gather for + what data is needed */
     pid_t              *pids;
     size_t              pid_count;
-    allmon_data_needs_t needs;
+    evemon_data_needs_t needs;
 
     /* Output: per-PID gathered data */
     broker_pid_data_t  *results;
@@ -141,7 +141,7 @@ static ssize_t read_file_alloc(const char *path, char **out)
     return (ssize_t)len;
 }
 
-/* Read /proc/<pid>/environ into an array of allmon_env_t */
+/* Read /proc/<pid>/environ into an array of evemon_env_t */
 static void gather_environ(pid_t pid, broker_pid_data_t *d)
 {
     char path[64];
@@ -155,7 +155,7 @@ static void gather_environ(pid_t pid, broker_pid_data_t *d)
     for (ssize_t i = 0; i < len; i++)
         if (d->env_raw[i] == '\0') count++;
 
-    d->env_buf = calloc(count, sizeof(allmon_env_t));
+    d->env_buf = calloc(count, sizeof(evemon_env_t));
     if (!d->env_buf) return;
     d->env_cap = count;
 
@@ -190,7 +190,7 @@ static void gather_maps(pid_t pid, broker_pid_data_t *d)
         if (d->mmap_raw[i] == '\n') lines++;
     if (lines == 0) return;
 
-    d->mmap_buf = calloc(lines, sizeof(allmon_mmap_t));
+    d->mmap_buf = calloc(lines, sizeof(evemon_mmap_t));
     if (!d->mmap_buf) return;
     d->mmap_cap = lines;
 
@@ -287,7 +287,7 @@ static void gather_libs(pid_t pid, broker_pid_data_t *d)
     if (!f) return;
 
     size_t cap = 64, count = 0;
-    allmon_lib_t *buf = calloc(cap, sizeof(allmon_lib_t));
+    evemon_lib_t *buf = calloc(cap, sizeof(evemon_lib_t));
     if (!buf) { fclose(f); return; }
 
     char line[1024];
@@ -344,12 +344,12 @@ static void gather_libs(pid_t pid, broker_pid_data_t *d)
 
         if (count >= cap) {
             cap *= 2;
-            allmon_lib_t *nb = realloc(buf, cap * sizeof(allmon_lib_t));
+            evemon_lib_t *nb = realloc(buf, cap * sizeof(evemon_lib_t));
             if (!nb) break;
             buf = nb;
         }
 
-        allmon_lib_t *e = &buf[count];
+        evemon_lib_t *e = &buf[count];
         memset(e, 0, sizeof(*e));
         snprintf(e->path, sizeof(e->path), "%s", p);
         snprintf(e->name, sizeof(e->name), "%s", bname);
@@ -395,7 +395,7 @@ static void gather_cgroup(pid_t pid, broker_pid_data_t *d)
     d->data.raw_cgroup = d->raw_cgroup;
 
     /* Parse cgroup v2 path */
-    allmon_cgroup_t *cg = &d->cgroup_data;
+    evemon_cgroup_t *cg = &d->cgroup_data;
     memset(cg, 0, sizeof(*cg));
     cg->mem_current = -1;
     cg->mem_max     = -1;
@@ -742,7 +742,7 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
 
     /* 4. Resolve each inode and build the socket list */
     size_t cap = 32, count = 0;
-    allmon_socket_t *socks = calloc(cap, sizeof(allmon_socket_t));
+    evemon_socket_t *socks = calloc(cap, sizeof(evemon_socket_t));
     if (!socks) { free(inodes); bsock_table_free(&socktbl); return; }
 
     /* Deduplicate inodes (multiple fds can point to same socket) */
@@ -757,12 +757,12 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
 
         if (count >= cap) {
             cap *= 2;
-            allmon_socket_t *tmp = realloc(socks, cap * sizeof(*tmp));
+            evemon_socket_t *tmp = realloc(socks, cap * sizeof(*tmp));
             if (!tmp) break;
             socks = tmp;
         }
 
-        allmon_socket_t *s = &socks[count];
+        evemon_socket_t *s = &socks[count];
         memset(s, 0, sizeof(*s));
 
         /* Build description string */
@@ -870,7 +870,7 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
                          strcmp(socks[i].desc, socks[j].desc) > 0)
                     swap = 1;
                 if (swap) {
-                    allmon_socket_t tmp = socks[i];
+                    evemon_socket_t tmp = socks[i];
                     socks[i] = socks[j];
                     socks[j] = tmp;
                 }
@@ -894,7 +894,7 @@ static void gather_fds(pid_t pid, broker_pid_data_t *d)
     if (!dp) return;
 
     size_t cap = 64, count = 0;
-    allmon_fd_t *fds = calloc(cap, sizeof(allmon_fd_t));
+    evemon_fd_t *fds = calloc(cap, sizeof(evemon_fd_t));
     if (!fds) { closedir(dp); return; }
 
     struct dirent *de;
@@ -910,7 +910,7 @@ static void gather_fds(pid_t pid, broker_pid_data_t *d)
 
         if (count >= cap) {
             cap *= 2;
-            allmon_fd_t *tmp = realloc(fds, cap * sizeof(allmon_fd_t));
+            evemon_fd_t *tmp = realloc(fds, cap * sizeof(evemon_fd_t));
             if (!tmp) break;
             fds = tmp;
         }
@@ -932,7 +932,7 @@ static void gather_fds(pid_t pid, broker_pid_data_t *d)
     d->data.fd_count = count;
 }
 
-/* ── PipeWire graph snapshot → allmon_pw_* conversion ────────── */
+/* ── PipeWire graph snapshot → evemon_pw_* conversion ────────── */
 
 #ifdef HAVE_PIPEWIRE
 static void gather_pipewire(broker_pid_data_t *d)
@@ -941,14 +941,14 @@ static void gather_pipewire(broker_pid_data_t *d)
     if (pw_snapshot(&graph) != 0)
         return;
 
-    /* Convert pw_snap_node_t[] → allmon_pw_node_t[] */
+    /* Convert pw_snap_node_t[] → evemon_pw_node_t[] */
     if (graph.node_count > 0) {
-        d->pw_nodes = calloc(graph.node_count, sizeof(allmon_pw_node_t));
+        d->pw_nodes = calloc(graph.node_count, sizeof(evemon_pw_node_t));
         if (d->pw_nodes) {
             d->pw_node_cap = graph.node_count;
             for (size_t i = 0; i < graph.node_count; i++) {
                 const pw_snap_node_t *s = &graph.nodes[i];
-                allmon_pw_node_t *n = &d->pw_nodes[i];
+                evemon_pw_node_t *n = &d->pw_nodes[i];
                 n->id        = s->id;
                 n->client_id = s->client_id;
                 n->pid       = s->pid;
@@ -963,14 +963,14 @@ static void gather_pipewire(broker_pid_data_t *d)
         }
     }
 
-    /* Convert pw_snap_link_t[] → allmon_pw_link_t[] */
+    /* Convert pw_snap_link_t[] → evemon_pw_link_t[] */
     if (graph.link_count > 0) {
-        d->pw_links = calloc(graph.link_count, sizeof(allmon_pw_link_t));
+        d->pw_links = calloc(graph.link_count, sizeof(evemon_pw_link_t));
         if (d->pw_links) {
             d->pw_link_cap = graph.link_count;
             for (size_t i = 0; i < graph.link_count; i++) {
                 const pw_snap_link_t *s = &graph.links[i];
-                allmon_pw_link_t *l = &d->pw_links[i];
+                evemon_pw_link_t *l = &d->pw_links[i];
                 l->output_node = s->output_node_id;
                 l->output_port = s->output_port_id;
                 l->input_node  = s->input_node_id;
@@ -981,14 +981,14 @@ static void gather_pipewire(broker_pid_data_t *d)
         }
     }
 
-    /* Convert pw_snap_port_t[] → allmon_pw_port_t[] */
+    /* Convert pw_snap_port_t[] → evemon_pw_port_t[] */
     if (graph.port_count > 0) {
-        d->pw_ports = calloc(graph.port_count, sizeof(allmon_pw_port_t));
+        d->pw_ports = calloc(graph.port_count, sizeof(evemon_pw_port_t));
         if (d->pw_ports) {
             d->pw_port_cap = graph.port_count;
             for (size_t i = 0; i < graph.port_count; i++) {
                 const pw_snap_port_t *s = &graph.ports[i];
-                allmon_pw_port_t *p = &d->pw_ports[i];
+                evemon_pw_port_t *p = &d->pw_ports[i];
                 p->id      = s->id;
                 p->node_id = s->node_id;
                 memcpy(p->port_name,   s->port_name,   sizeof(p->port_name));
@@ -1023,38 +1023,38 @@ static void broker_thread_func(GTask        *task,
         memset(&d->data, 0, sizeof(d->data));
         d->data.pid = cycle->pids[i];
 
-        allmon_data_needs_t needs = cycle->needs;
+        evemon_data_needs_t needs = cycle->needs;
 
-        if (needs & ALLMON_NEED_DESCENDANTS)
+        if (needs & evemon_NEED_DESCENDANTS)
             gather_descendants(d->pid, d);
 
-        if (needs & ALLMON_NEED_FDS)
+        if (needs & evemon_NEED_FDS)
             gather_fds(d->pid, d);
 
-        if (needs & ALLMON_NEED_ENV)
+        if (needs & evemon_NEED_ENV)
             gather_environ(d->pid, d);
 
-        if (needs & ALLMON_NEED_MMAP)
+        if (needs & evemon_NEED_MMAP)
             gather_maps(d->pid, d);
 
-        if (needs & ALLMON_NEED_LIBS)
+        if (needs & evemon_NEED_LIBS)
             gather_libs(d->pid, d);
 
-        if (needs & ALLMON_NEED_SOCKETS)
+        if (needs & evemon_NEED_SOCKETS)
             gather_sockets(d->pid, cycle->fdmon, d);
 
-        if (needs & ALLMON_NEED_CGROUP)
+        if (needs & evemon_NEED_CGROUP)
             gather_cgroup(d->pid, d);
 
-        if (needs & ALLMON_NEED_STATUS)
+        if (needs & evemon_NEED_STATUS)
             gather_status(d->pid, d);
 
 #ifdef HAVE_PIPEWIRE
-        if (needs & ALLMON_NEED_PIPEWIRE)
+        if (needs & evemon_NEED_PIPEWIRE)
             gather_pipewire(d);
 #endif
 
-        /* Store fdmon context for allmon_net_io_get() */
+        /* Store fdmon context for evemon_net_io_get() */
         d->data.fdmon = cycle->fdmon;
     }
 

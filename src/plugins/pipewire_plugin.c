@@ -1,5 +1,5 @@
 /*
- * pipewire_plugin.c – PipeWire Audio Connections plugin for allmon.
+ * pipewire_plugin.c – PipeWire Audio Connections plugin for evemon.
  *
  * Displays PipeWire audio nodes and connections for a process:
  * categorised into Audio Output, Audio Input, Video, MIDI, and Other.
@@ -11,17 +11,17 @@
  *   - Double-click a stream to switch spectrogram target
  *   - Proper node labelling: media_name → node_desc → app_name → node_name
  *
- * NOTE: This plugin requests ALLMON_NEED_PIPEWIRE.  The broker
+ * NOTE: This plugin requests evemon_NEED_PIPEWIRE.  The broker
  * will populate pw_nodes/pw_links from a PipeWire graph snapshot.
  * Real-time audio features (meters, spectrogram) are provided by
- * the host via allmon_host_services_t callbacks.
+ * the host via evemon_host_services_t callbacks.
  *
  * Build:
- *   gcc -shared -fPIC -o allmon_pipewire_plugin.so pipewire_plugin.c \
+ *   gcc -shared -fPIC -o evemon_pipewire_plugin.so pipewire_plugin.c \
  *       $(pkg-config --cflags --libs gtk+-3.0)
  */
 
-#include "../allmon_plugin.h"
+#include "../evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -255,7 +255,7 @@ typedef struct {
     gboolean        spectro_shown;
 
     /* Host services (injected by activate()) */
-    const allmon_host_services_t *host;
+    const evemon_host_services_t *host;
 
     /* Meter update timer */
     guint           meter_timer;
@@ -290,7 +290,7 @@ static int classify_node(const char *media_class)
  * For streams: prefer media_name (song title, tab name),
  * then node_desc, then app_name, then node_name.
  */
-static const char *node_label(const allmon_pw_node_t *n)
+static const char *node_label(const evemon_pw_node_t *n)
 {
     if (n->media_name[0])  return n->media_name;
     if (n->node_desc[0])   return n->node_desc;
@@ -299,7 +299,7 @@ static const char *node_label(const allmon_pw_node_t *n)
     return "(unknown)";
 }
 
-static const allmon_pw_node_t *find_node(const allmon_proc_data_t *data,
+static const evemon_pw_node_t *find_node(const evemon_proc_data_t *data,
                                           uint32_t id)
 {
     for (size_t i = 0; i < data->pw_node_count; i++)
@@ -592,7 +592,7 @@ static GtkWidget *pw_create_widget(void *opaque)
 }
 
 static void pw_activate(void *opaque,
-                        const allmon_host_services_t *services)
+                        const evemon_host_services_t *services)
 {
     pw_ctx_t *ctx = opaque;
     ctx->host = services;
@@ -600,7 +600,7 @@ static void pw_activate(void *opaque,
      * to avoid running before the tree store is fully ready. */
 }
 
-static void pw_update(void *opaque, const allmon_proc_data_t *data)
+static void pw_update(void *opaque, const evemon_proc_data_t *data)
 {
     pw_ctx_t *ctx = opaque;
 
@@ -643,7 +643,7 @@ static void pw_update(void *opaque, const allmon_proc_data_t *data)
     ctx->audio_node_count = 0;
 
     for (size_t ni = 0; ni < data->pw_node_count; ni++) {
-        const allmon_pw_node_t *node = &data->pw_nodes[ni];
+        const evemon_pw_node_t *node = &data->pw_nodes[ni];
         if (node->pid != data->pid) continue;
 
         int cat = classify_node(node->media_class);
@@ -660,7 +660,7 @@ static void pw_update(void *opaque, const allmon_proc_data_t *data)
         /* Find linked peers */
         uint32_t peers[32]; size_t np = 0;
         for (size_t li = 0; li < data->pw_link_count; li++) {
-            const allmon_pw_link_t *lk = &data->pw_links[li];
+            const evemon_pw_link_t *lk = &data->pw_links[li];
             uint32_t peer_id = 0;
             if (lk->output_node == node->id)
                 peer_id = lk->input_node;
@@ -695,7 +695,7 @@ static void pw_update(void *opaque, const allmon_proc_data_t *data)
                     if (!tmp) break;
                     ents = tmp;
                 }
-                const allmon_pw_node_t *peer =
+                const evemon_pw_node_t *peer =
                     find_node(data, peers[pi]);
                 const char *peer_lbl =
                     peer ? node_label(peer) : "(unknown)";
@@ -909,20 +909,20 @@ static void pw_destroy(void *opaque)
 
 /* ── descriptor ──────────────────────────────────────────────── */
 
-static allmon_plugin_t pw_plugin;
+static evemon_plugin_t pw_plugin;
 
 __attribute__((visibility("default")))
-allmon_plugin_t *allmon_plugin_init(void)
+evemon_plugin_t *evemon_plugin_init(void)
 {
     pw_ctx_t *ctx = calloc(1, sizeof(pw_ctx_t));
     if (!ctx) return NULL;
 
-    pw_plugin = (allmon_plugin_t){
-        .abi_version   = ALLMON_PLUGIN_ABI_VERSION,
+    pw_plugin = (evemon_plugin_t){
+        .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "PipeWire Audio",
-        .id            = "org.allmon.pipewire",
+        .id            = "org.evemon.pipewire",
         .version       = "1.0",
-        .data_needs    = ALLMON_NEED_PIPEWIRE,
+        .data_needs    = evemon_NEED_PIPEWIRE,
         .plugin_ctx    = ctx,
         .create_widget = pw_create_widget,
         .update        = pw_update,

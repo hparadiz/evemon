@@ -1,16 +1,16 @@
 /*
- * libs_plugin.c – Shared Libraries / DLLs plugin for allmon.
+ * libs_plugin.c – Shared Libraries / DLLs plugin for evemon.
  *
  * Displays loaded shared libraries from /proc/<pid>/maps (r-x segments),
  * categorised into Runtime, System, Application, Wine Built-in,
  * Windows DLLs, and Other.
  *
  * Build:
- *   gcc -shared -fPIC -o allmon_libs.so libs_plugin.c \
+ *   gcc -shared -fPIC -o evemon_libs.so libs_plugin.c \
  *       $(pkg-config --cflags --libs gtk+-3.0)
  */
 
-#include "../allmon_plugin.h"
+#include "../evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
 #include <strings.h>
@@ -134,7 +134,7 @@ static void format_lib_size(size_t kb, char *buf, size_t bufsz)
         buf[0] = '\0';
 }
 
-static char *lib_to_markup(const allmon_lib_t *lib)
+static char *lib_to_markup(const evemon_lib_t *lib)
 {
     char *safe_name = utf8_sanitize(lib->name);
     char *n_esc = g_markup_escape_text(safe_name, -1);
@@ -270,7 +270,7 @@ static GtkWidget *lib_create_widget(void *opaque)
     return ctx->scroll;
 }
 
-static void lib_update(void *opaque, const allmon_proc_data_t *data)
+static void lib_update(void *opaque, const evemon_proc_data_t *data)
 {
     lib_ctx_t *ctx = opaque;
 
@@ -353,7 +353,7 @@ static void lib_update(void *opaque, const allmon_proc_data_t *data)
         for (size_t i = 0; i < total; i++) {
             if (cats[i] != c) continue;
 
-            const allmon_lib_t *lib = &data->libs[i];
+            const evemon_lib_t *lib = &data->libs[i];
 
             char *markup = lib_to_markup(lib);
             char *safe_path = utf8_sanitize(lib->path);
@@ -402,20 +402,20 @@ static void lib_destroy(void *opaque) { free(opaque); }
 
 /* ── descriptor ──────────────────────────────────────────────── */
 
-static allmon_plugin_t lib_plugin;
+static evemon_plugin_t lib_plugin;
 
 __attribute__((visibility("default")))
-allmon_plugin_t *allmon_plugin_init(void)
+evemon_plugin_t *evemon_plugin_init(void)
 {
     lib_ctx_t *ctx = calloc(1, sizeof(lib_ctx_t));
     if (!ctx) return NULL;
 
-    lib_plugin = (allmon_plugin_t){
-        .abi_version   = ALLMON_PLUGIN_ABI_VERSION,
+    lib_plugin = (evemon_plugin_t){
+        .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Shared Libraries",
-        .id            = "org.allmon.libs",
+        .id            = "org.evemon.libs",
         .version       = "1.0",
-        .data_needs    = ALLMON_NEED_LIBS,
+        .data_needs    = evemon_NEED_LIBS,
         .plugin_ctx    = ctx,
         .create_widget = lib_create_widget,
         .update        = lib_update,

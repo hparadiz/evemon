@@ -1,5 +1,5 @@
 /*
- * net_plugin.c – Network Sockets plugin for allmon.
+ * net_plugin.c – Network Sockets plugin for evemon.
  *
  * Displays network sockets open by a process with eBPF per-socket
  * throughput data.  Sockets are categorised by protocol and state
@@ -8,11 +8,11 @@
  * highlighted with colored send/recv rate indicators.
  *
  * Build:
- *   gcc -shared -fPIC -o allmon_net.so net_plugin.c \
+ *   gcc -shared -fPIC -o evemon_net.so net_plugin.c \
  *       $(pkg-config --cflags --libs gtk+-3.0)
  */
 
-#include "../allmon_plugin.h"
+#include "../evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -116,7 +116,7 @@ static void format_rate(uint64_t bytes, char *buf, size_t bufsz)
  * The protocol prefix is dimmed, listening sockets are styled
  * distinctively, and addresses are the primary visual element.
  */
-static char *sock_to_markup(const allmon_socket_t *s)
+static char *sock_to_markup(const evemon_socket_t *s)
 {
     char *desc_esc = g_markup_escape_text(s->desc, -1);
 
@@ -371,7 +371,7 @@ static GtkWidget *net_create_widget(void *opaque)
     return ctx->main_box;
 }
 
-static void net_update(void *opaque, const allmon_proc_data_t *data)
+static void net_update(void *opaque, const evemon_proc_data_t *data)
 {
     net_ctx_t *ctx = opaque;
 
@@ -391,7 +391,7 @@ static void net_update(void *opaque, const allmon_proc_data_t *data)
 
     /* ── Bucket sockets into categories ───────────────────────── */
     typedef struct {
-        const allmon_socket_t *sock;
+        const evemon_socket_t *sock;
         int cat;
     } sock_ent_t;
 
@@ -507,7 +507,7 @@ static void net_update(void *opaque, const allmon_proc_data_t *data)
         for (size_t i = 0; i < total; i++) {
             if (ents[i].cat != c) continue;
 
-            const allmon_socket_t *s = ents[i].sock;
+            const evemon_socket_t *s = ents[i].sock;
             char *markup = sock_to_markup(s);
             gint64 sort_key = (gint64)s->total;
 
@@ -566,20 +566,20 @@ static void net_destroy(void *opaque)
 
 /* ── descriptor ──────────────────────────────────────────────── */
 
-static allmon_plugin_t net_plugin;
+static evemon_plugin_t net_plugin;
 
 __attribute__((visibility("default")))
-allmon_plugin_t *allmon_plugin_init(void)
+evemon_plugin_t *evemon_plugin_init(void)
 {
     net_ctx_t *ctx = calloc(1, sizeof(net_ctx_t));
     if (!ctx) return NULL;
 
-    net_plugin = (allmon_plugin_t){
-        .abi_version   = ALLMON_PLUGIN_ABI_VERSION,
+    net_plugin = (evemon_plugin_t){
+        .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Network Sockets",
-        .id            = "org.allmon.net",
+        .id            = "org.evemon.net",
         .version       = "2.0",
-        .data_needs    = ALLMON_NEED_SOCKETS | ALLMON_NEED_DESCENDANTS,
+        .data_needs    = evemon_NEED_SOCKETS | evemon_NEED_DESCENDANTS,
         .plugin_ctx    = ctx,
         .create_widget = net_create_widget,
         .update        = net_update,

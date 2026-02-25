@@ -1,15 +1,15 @@
 /*
- * fd_plugin.c – File Descriptors plugin for allmon.
+ * fd_plugin.c – File Descriptors plugin for evemon.
  *
  * Displays the file descriptors open by a process, categorised into
  * Files, Devices, Net Sockets, Unix Sockets, Pipes, Events, Other.
  *
  * Build:
- *   gcc -shared -fPIC -o allmon_fd.so fd_plugin.c \
+ *   gcc -shared -fPIC -o evemon_fd.so fd_plugin.c \
  *       $(pkg-config --cflags --libs gtk+-3.0)
  */
 
-#include "../allmon_plugin.h"
+#include "../evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
 #include <strings.h>
@@ -148,7 +148,7 @@ static GtkWidget *fd_create_widget(void *opaque)
     return ctx->scroll;
 }
 
-static void fd_update(void *opaque, const allmon_proc_data_t *data)
+static void fd_update(void *opaque, const evemon_proc_data_t *data)
 {
     fd_ctx_t *ctx = opaque;
 
@@ -293,20 +293,20 @@ static void fd_destroy(void *opaque)
 
 /* ── plugin descriptor ───────────────────────────────────────── */
 
-static allmon_plugin_t fd_plugin;
+static evemon_plugin_t fd_plugin;
 
 __attribute__((visibility("default")))
-allmon_plugin_t *allmon_plugin_init(void)
+evemon_plugin_t *evemon_plugin_init(void)
 {
     fd_ctx_t *ctx = calloc(1, sizeof(fd_ctx_t));
     if (!ctx) return NULL;
 
-    fd_plugin = (allmon_plugin_t){
-        .abi_version   = ALLMON_PLUGIN_ABI_VERSION,
+    fd_plugin = (evemon_plugin_t){
+        .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "File Descriptors",
-        .id            = "org.allmon.fd",
+        .id            = "org.evemon.fd",
         .version       = "1.0",
-        .data_needs    = ALLMON_NEED_FDS | ALLMON_NEED_DESCENDANTS,
+        .data_needs    = evemon_NEED_FDS | evemon_NEED_DESCENDANTS,
         .plugin_ctx    = ctx,
         .create_widget = fd_create_widget,
         .update        = fd_update,

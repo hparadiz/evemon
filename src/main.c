@@ -1,5 +1,5 @@
 /*
- * main.c – allmon entry point.
+ * main.c – evemon entry point.
  *
  * The monitor thread runs in the background scanning /proc.
  * The GTK3 UI runs on the main thread (required by GTK).
@@ -59,9 +59,9 @@ int main(int argc, char *argv[])
     FcInit();
     gtk_init(&argc, &argv);
 
-    //fprintf(stdout, "allmon: starting up...\n");
+    //fprintf(stdout, "evemon: starting up...\n");
     if (monitor_state_init(&g_state) != 0) {
-        fprintf(stderr, "allmon: failed to initialise state\n");
+        fprintf(stderr, "evemon: failed to initialise state\n");
         return EXIT_FAILURE;
     }
 
@@ -77,7 +77,7 @@ int main(int argc, char *argv[])
     /* Start monitor in a background thread */
     pthread_t mon_tid;
     if (pthread_create(&mon_tid, NULL, monitor_thread, &g_state) != 0) {
-        fprintf(stderr, "allmon: failed to start monitor thread\n");
+        fprintf(stderr, "evemon: failed to start monitor thread\n");
         monitor_state_destroy(&g_state);
         return EXIT_FAILURE;
     }

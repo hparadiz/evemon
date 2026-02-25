@@ -1,5 +1,5 @@
 /*
- * devices_plugin.c – Devices tab for allmon.
+ * devices_plugin.c – Devices tab for evemon.
  *
  * Shows device files (/dev/) open by the process with resolved
  * hardware names (GPU model, sound card, input device, etc.).
@@ -11,11 +11,11 @@
  *   Terminals & PTYs, Other Devices
  *
  * Build:
- *   gcc -shared -fPIC -o allmon_devices.so devices_plugin.c \
+ *   gcc -shared -fPIC -o evemon_devices.so devices_plugin.c \
  *       $(pkg-config --cflags --libs gtk+-3.0)
  */
 
-#include "../allmon_plugin.h"
+#include "../evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -187,7 +187,7 @@ static GtkWidget *devices_create_widget(void *opaque)
     return ctx->stack;
 }
 
-static void devices_update(void *opaque, const allmon_proc_data_t *data)
+static void devices_update(void *opaque, const evemon_proc_data_t *data)
 {
     devices_ctx_t *ctx = opaque;
 
@@ -360,20 +360,20 @@ static void devices_destroy(void *opaque)
 
 /* ── plugin descriptor ───────────────────────────────────────── */
 
-static allmon_plugin_t devices_plugin;
+static evemon_plugin_t devices_plugin;
 
 __attribute__((visibility("default")))
-allmon_plugin_t *allmon_plugin_init(void)
+evemon_plugin_t *evemon_plugin_init(void)
 {
     devices_ctx_t *ctx = calloc(1, sizeof(devices_ctx_t));
     if (!ctx) return NULL;
 
-    devices_plugin = (allmon_plugin_t){
-        .abi_version   = ALLMON_PLUGIN_ABI_VERSION,
+    devices_plugin = (evemon_plugin_t){
+        .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Devices",
-        .id            = "org.allmon.devices",
+        .id            = "org.evemon.devices",
         .version       = "1.0",
-        .data_needs    = ALLMON_NEED_FDS,
+        .data_needs    = evemon_NEED_FDS,
         .plugin_ctx    = ctx,
         .create_widget = devices_create_widget,
         .update        = devices_update,

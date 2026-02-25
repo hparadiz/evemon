@@ -749,7 +749,7 @@ static void on_row_collapsed(GtkTreeView *view,
     set_process_tree_node(&ctx->ptree_nodes, pinned_root, (pid_t)pid,
                           PTREE_COLLAPSED);
 
-    //fprintf(stdout, "allmon: collapsed PID %d\n", pid);
+    //fprintf(stdout, "evemon: collapsed PID %d\n", pid);
 }
 
 static void on_row_expanded(GtkTreeView *view,
@@ -771,7 +771,7 @@ static void on_row_expanded(GtkTreeView *view,
     set_process_tree_node(&ctx->ptree_nodes, pinned_root, (pid_t)pid,
                           PTREE_EXPANDED);
 
-    //fprintf(stdout, "allmon: expanded PID %d\n", pid);
+    //fprintf(stdout, "evemon: expanded PID %d\n", pid);
 
     /*
      * When GTK expands a row it reveals immediate children in their
@@ -3135,7 +3135,7 @@ void *ui_thread(void *arg)
 
     /* ── window ──────────────────────────────────────────────── */
     GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "allmon – Process Monitor");
+    gtk_window_set_title(GTK_WINDOW(window), "Everything Monitor");
     gtk_window_set_default_size(GTK_WINDOW(window), 1100, 700);
 
     /* Set the window icon from the embedded GResource PNG.
@@ -3146,7 +3146,7 @@ void *ui_thread(void *arg)
      * This avoids blurry stretching and preserves transparency.      */
     {
         GdkPixbuf *raw = gdk_pixbuf_new_from_resource(
-            "/org/allmon/icon.png", NULL);
+            "/org/evemon/icon.png", NULL);
         if (raw) {
             static const int sizes[] = { 16, 32, 48, 64, 128 };
             GList *icon_list = NULL;
@@ -4053,7 +4053,7 @@ void *ui_thread(void *arg)
 
 #ifdef HAVE_PIPEWIRE
             /* Build host services table on the heap so it outlives this block */
-            allmon_host_services_t *hsvc = calloc(1, sizeof(allmon_host_services_t));
+            evemon_host_services_t *hsvc = calloc(1, sizeof(evemon_host_services_t));
             if (hsvc) {
                 hsvc->host_ctx          = &ctx;
                 hsvc->pw_meter_start    = host_pw_meter_start;
@@ -4085,7 +4085,7 @@ void *ui_thread(void *arg)
             }
 
             int nloaded = plugin_loader_scan(preg, plugin_dir);
-            fprintf(stdout, "allmon: %d plugin(s) loaded from %s\n",
+            fprintf(stdout, "evemon: %d plugin(s) loaded from %s\n",
                     nloaded, plugin_dir);
 
             /* Create a GtkNotebook for plugin tabs (detail panel) */
@@ -4098,15 +4098,15 @@ void *ui_thread(void *arg)
              * then everything else in load order. */
             {
                 static const char *tab_order[] = {
-                    "org.allmon.pipewire",
-                    "org.allmon.net",
+                    "org.evemon.pipewire",
+                    "org.evemon.net",
                     NULL
                 };
 
                 /* Tab label overrides keyed by plugin id */
                 static const struct { const char *id; const char *label; }
                 tab_label_overrides[] = {
-                    { "org.allmon.net", "Network" },
+                    { "org.evemon.net", "Network" },
                     { NULL, NULL }
                 };
 
