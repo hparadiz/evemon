@@ -212,7 +212,30 @@ int plugin_loader_scan(plugin_registry_t *reg, const char *dir)
         return 0;  /* dir doesn't exist — not an error */
 
     uid_t me = getuid();
-    if (dirstat.st_uid != 0 && dirstat.st_uid != me) {
+
+    /*
+     * When running as root via sudo/pkexec, also trust the original
+     * invoking user's UID.  This allows plugins installed in the
+     * real user's home directory (e.g. ~/.local/share/evemon/plugins/)
+     * to load when evemon is launched with `sudo ./evemon`.
+     *
+     * SUDO_UID is set by sudo(8), PKEXEC_UID by polkit's pkexec(1).
+     */
+    uid_t sudo_uid = (uid_t)-1;
+    if (me == 0) {
+        const char *uid_str = getenv("SUDO_UID");
+        if (!uid_str)
+            uid_str = getenv("PKEXEC_UID");
+        if (uid_str) {
+            char *end = NULL;
+            unsigned long val = strtoul(uid_str, &end, 10);
+            if (end && end != uid_str && *end == '\0' && val > 0)
+                sudo_uid = (uid_t)val;
+        }
+    }
+
+    if (dirstat.st_uid != 0 && dirstat.st_uid != me &&
+        dirstat.st_uid != sudo_uid) {
         fprintf(stderr,
                 "evemon: refusing to load plugins from %s "
                 "(owned by uid %u, expected root or %u)\n",
