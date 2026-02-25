@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Evemon
+Comment=A lightweight Linux everything monitor
+Exec=evemon
+Icon=evemon
+Terminal=false
+Type=Application
+Categories=System;Monitor;GTK;
+StartupNotify=true
+StartupWMClass=evemon

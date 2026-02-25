@@ -57,6 +57,7 @@ int main(int argc, char *argv[])
 {
     profile_init();
     FcInit();
+    g_set_prgname("evemon");
     gtk_init(&argc, &argv);
 
     //fprintf(stdout, "evemon: starting up...\n");

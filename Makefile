@@ -1,7 +1,13 @@
+PREFIX ?= /usr/local
+BINDIR = $(PREFIX)/bin
+LIBDIR = $(PREFIX)/lib/evemon
+DATADIR = $(PREFIX)/share
+
 CC      := gcc
 CFLAGS  := -Wall -Wextra -std=c11 -O2 -pthread -D_GNU_SOURCE \
            -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
-           -Wformat -Wformat-security -fPIE
+           -Wformat -Wformat-security -fPIE \
+           -DEVEMON_LIBDIR='"$(LIBDIR)"'
 LDFLAGS := -pthread -lm -pie -Wl,-z,relro,-z,now \
            -rdynamic -ldl
 
@@ -9,12 +15,15 @@ LDFLAGS := -pthread -lm -pie -Wl,-z,relro,-z,now \
 GTK_CFLAGS  := $(shell pkg-config --cflags gtk+-3.0)
 GTK_LDFLAGS := $(shell pkg-config --libs gtk+-3.0)
 
+# X11 (needed for _MOTIF_WM_HINTS in the About splash)
+X11_LDFLAGS := $(shell pkg-config --libs x11 2>/dev/null)
+
 # Fontconfig (explicit init to suppress startup warning)
 FC_CFLAGS   := $(shell pkg-config --cflags fontconfig)
 FC_LDFLAGS  := $(shell pkg-config --libs fontconfig)
 
 CFLAGS  += $(GTK_CFLAGS) $(FC_CFLAGS)
-LDFLAGS += $(GTK_LDFLAGS) $(FC_LDFLAGS)
+LDFLAGS += $(GTK_LDFLAGS) $(FC_LDFLAGS) $(X11_LDFLAGS)
 
 # PipeWire (optional — audio connection info in sidebar)
 # Auto-detect: if libpipewire-0.3 is installed, enable the feature.
@@ -63,6 +72,7 @@ BPF_OBJ := $(BUILD_DIR)/fdmon_ebpf_kern.o
 TARGET := $(BUILD_DIR)/evemon
 
 .PHONY: all clean run
+.PHONY: all clean run install uninstall
 
 all: $(TARGET) $(BPF_OBJ) plugins
 
@@ -123,3 +133,28 @@ clean:
 
 run: $(TARGET) $(BPF_OBJ) plugins
 	./$(TARGET)
+
+# ── Install ──────────────────────────────────────────────────────
+
+install: all
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/evemon
+	install -d $(DESTDIR)$(DATADIR)/applications
+	install -m 644 evemon.desktop $(DESTDIR)$(DATADIR)/applications/evemon.desktop
+	install -d $(DESTDIR)$(DATADIR)/icons/hicolor/256x256/apps
+	install -m 644 icon.png $(DESTDIR)$(DATADIR)/icons/hicolor/256x256/apps/evemon.png
+	install -d $(DESTDIR)$(DATADIR)/pixmaps
+	install -m 644 icon.png $(DESTDIR)$(DATADIR)/pixmaps/evemon.png
+	install -d $(DESTDIR)$(LIBDIR)/plugins
+	install -m 644 $(BPF_OBJ) $(DESTDIR)$(LIBDIR)/
+	install -m 755 $(PLUGIN_SOS) $(DESTDIR)$(LIBDIR)/plugins/
+	update-desktop-database $(DESTDIR)$(DATADIR)/applications
+	-gtk-update-icon-cache -f -t $(DESTDIR)$(DATADIR)/icons/hicolor 2>/dev/null || true
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/evemon
+	rm -f $(DESTDIR)$(DATADIR)/applications/evemon.desktop
+	rm -f $(DESTDIR)$(DATADIR)/icons/hicolor/256x256/apps/evemon.png
+	rm -f $(DESTDIR)$(DATADIR)/pixmaps/evemon.png
+	rm -rf $(DESTDIR)$(LIBDIR)
+	-gtk-update-icon-cache -f -t $(DESTDIR)$(DATADIR)/icons/hicolor 2>/dev/null || true

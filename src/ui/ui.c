@@ -17,6 +17,9 @@
 
 #include <fontconfig/fontconfig.h>
 #include <pango/pangocairo.h>
+#ifdef GDK_WINDOWING_X11
+#include <gdk/gdkx.h>
+#endif
 #include <math.h>
 #include <signal.h>
 #include <unistd.h>
@@ -4066,12 +4069,12 @@ void *ui_thread(void *arg)
             }
 #endif
 
-            /* Resolve plugins directory relative to the executable.
-             * Look for ./plugins/ next to the binary first, then fall back
-             * to the build directory.  In practice, the Makefile places
-             * them in build/plugins/.  Use /proc/self/exe to find our
-             * own directory. */
+            /* Resolve plugins directory.  Search order:
+             *  1. <exe_dir>/plugins/    — for development (build/plugins/)
+             *  2. EVEMON_LIBDIR/plugins — installed system path
+             *  3. build/plugins          — last-ditch fallback              */
             char exe_path[4096], plugin_dir[4096];
+            plugin_dir[0] = '\0';
             ssize_t exe_len = readlink("/proc/self/exe", exe_path,
                                         sizeof(exe_path) - 1);
             if (exe_len > 0) {
@@ -4080,8 +4083,18 @@ void *ui_thread(void *arg)
                 if (slash) *slash = '\0';
                 snprintf(plugin_dir, sizeof(plugin_dir),
                          "%s/plugins", exe_path);
-            } else {
+            }
+
+            /* If the exe-relative dir doesn't exist (installed layout),
+             * fall back to the compiled-in LIBDIR.                        */
+            if (plugin_dir[0] == '\0' ||
+                access(plugin_dir, F_OK) != 0) {
+#ifdef EVEMON_LIBDIR
+                snprintf(plugin_dir, sizeof(plugin_dir),
+                         "%s/plugins", EVEMON_LIBDIR);
+#else
                 snprintf(plugin_dir, sizeof(plugin_dir), "build/plugins");
+#endif
             }
 
             int nloaded = plugin_loader_scan(preg, plugin_dir);

@@ -354,6 +354,37 @@ static gboolean ensure_font_logos_loaded(void)
     return TRUE;
 }
 
+/*
+ * After the splash window is realized, set _MOTIF_WM_HINTS on the
+ * underlying X11 window to forcibly disable server-side decorations.
+ * KDE/KWin respects this even when it ignores gtk_window_set_decorated().
+ */
+static void splash_force_no_decorations(GtkWidget *widget,
+                                        gpointer   user_data)
+{
+    (void)user_data;
+#ifdef GDK_WINDOWING_X11
+    GdkWindow *gdkwin = gtk_widget_get_window(widget);
+    if (!gdkwin) return;
+    GdkDisplay *display = gdk_window_get_display(gdkwin);
+    if (!GDK_IS_X11_DISPLAY(display)) return;
+
+    Display *xdpy = GDK_DISPLAY_XDISPLAY(display);
+    Window   xwin = GDK_WINDOW_XID(gdkwin);
+
+    /* Motif WM hints: flags=2 (MWM_HINTS_DECORATIONS), decorations=0 */
+    typedef struct { unsigned long flags, functions, decorations, input_mode;
+                     unsigned long status; } MwmHints;
+    MwmHints hints = { 2, 0, 0, 0, 0 };   /* flags=MWM_HINTS_DECORATIONS */
+
+    Atom motif_atom = XInternAtom(xdpy, "_MOTIF_WM_HINTS", False);
+    XChangeProperty(xdpy, xwin, motif_atom, motif_atom, 32,
+                    PropModeReplace, (unsigned char *)&hints, 5);
+#else
+    (void)widget;
+#endif
+}
+
 static void on_menu_about(GtkMenuItem *item, gpointer data)
 {
     (void)item;
@@ -780,6 +811,31 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
     gtk_window_set_position(GTK_WINDOW(dlg), GTK_WIN_POS_CENTER_ON_PARENT);
     gtk_window_set_resizable(GTK_WINDOW(dlg), FALSE);
     gtk_window_set_type_hint(GTK_WINDOW(dlg), GDK_WINDOW_TYPE_HINT_SPLASHSCREEN);
+
+    /* Force CSD mode with an invisible header bar.  On KDE Wayland,
+     * set_decorated(FALSE) alone doesn't prevent KWin from adding
+     * its own server-side title bar.  Setting an empty GtkHeaderBar
+     * as the titlebar tells GTK to use client-side decorations,
+     * which in turn tells KWin "this window draws its own chrome."
+     * We hide the header bar so it takes zero vertical space.       */
+    {
+        GtkWidget *fake_hdr = gtk_header_bar_new();
+        gtk_widget_set_no_show_all(fake_hdr, TRUE);
+        gtk_widget_hide(fake_hdr);
+        gtk_window_set_titlebar(GTK_WINDOW(dlg), fake_hdr);
+    }
+
+    /* Override WM_CLASS so compositors that apply title-bar rules
+     * based on class name treat this as a true splash, not a
+     * regular "evemon" window that should get decorations.         */
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    gtk_window_set_wmclass(GTK_WINDOW(dlg), "evemon_splash", "evemon_splash");
+    G_GNUC_END_IGNORE_DEPRECATIONS
+
+    /* Force-strip SSD on X11: set _MOTIF_WM_HINTS with decorations=0.
+     * KDE/KWin on X11 sometimes ignores gtk_window_set_decorated(FALSE)
+     * and the SPLASHSCREEN type hint, but respects _MOTIF_WM_HINTS.  */
+    g_signal_connect(dlg, "realize", G_CALLBACK(splash_force_no_decorations), NULL);
 
     /* Rounded-corner frame + border via CSS */
     {

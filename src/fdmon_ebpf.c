@@ -145,31 +145,36 @@ static int silent_print(enum libbpf_print_level level,
 /* ── path to the BPF object file ─────────────────────────────── */
 
 /*
- * We look for the compiled BPF object next to the executable.
- * The Makefile places it in the build/ directory alongside evemon.
+ * We look for the compiled BPF object in several locations:
+ *  1. Next to the executable (build/ during development)
+ *  2. EVEMON_LIBDIR (installed system path)
  */
 static int find_bpf_object(char *buf, size_t bufsz)
 {
-    /* Try next to the executable */
+    /* 1. Try next to the executable */
     ssize_t n = readlink("/proc/self/exe", buf, bufsz - 1);
-    if (n <= 0) return -1;
-    buf[n] = '\0';
+    if (n > 0) {
+        buf[n] = '\0';
+        char *slash = strrchr(buf, '/');
+        if (slash) {
+            slash[1] = '\0';
+            size_t remaining = bufsz - (size_t)(slash + 1 - buf);
+            if (remaining >= sizeof("fdmon_ebpf_kern.o")) {
+                strcat(buf, "fdmon_ebpf_kern.o");
+                if (access(buf, R_OK) == 0)
+                    return 0;
+            }
+        }
+    }
 
-    /* Strip the executable name, append our object name. */
-    char *slash = strrchr(buf, '/');
-    if (!slash) return -1;
-    slash[1] = '\0';
+    /* 2. Try the compiled-in install path */
+#ifdef EVEMON_LIBDIR
+    snprintf(buf, bufsz, "%s/fdmon_ebpf_kern.o", EVEMON_LIBDIR);
+    if (access(buf, R_OK) == 0)
+        return 0;
+#endif
 
-    size_t remaining = bufsz - (size_t)(slash + 1 - buf);
-    if (remaining < sizeof("fdmon_ebpf_kern.o"))
-        return -1;
-    strcat(buf, "fdmon_ebpf_kern.o");
-
-    /* Check it exists. */
-    if (access(buf, R_OK) != 0)
-        return -1;
-
-    return 0;
+    return -1;
 }
 
 /* ── public init / destroy ───────────────────────────────────── */

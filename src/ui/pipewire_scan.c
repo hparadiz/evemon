@@ -23,6 +23,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static void pw_graph_init(pw_graph_t *g)
 {
@@ -376,17 +377,51 @@ int pw_snapshot(pw_graph_t *out)
     pw_graph_init(&e.graph);
 
     /*
-     * When running under sudo, XDG_RUNTIME_DIR points at root's
-     * runtime dir (or is unset), so pw_context_connect() can't
-     * find the real user's PipeWire socket.  Detect this and set
-     * PIPEWIRE_REMOTE to the correct path.
+     * When running as root via sudo, pkexec, kdesu, or similar,
+     * XDG_RUNTIME_DIR points at root's runtime dir (or is unset),
+     * so pw_context_connect() can't find the real user's PipeWire
+     * socket.  Detect this and set PIPEWIRE_REMOTE to the correct
+     * path.
+     *
+     * Priority:
+     *   1. PIPEWIRE_REMOTE already set → respect it.
+     *   2. SUDO_UID     (set by sudo)
+     *   3. PKEXEC_UID   (set by polkit/pkexec)
+     *   4. Scan /run/user/<uid>/pipewire-0 for active sessions
      */
     char pw_remote_buf[256] = {0};
-    const char *sudo_uid = getenv("SUDO_UID");
-    if (sudo_uid && !getenv("PIPEWIRE_REMOTE")) {
-        snprintf(pw_remote_buf, sizeof(pw_remote_buf),
-                 "/run/user/%s/pipewire-0", sudo_uid);
-        setenv("PIPEWIRE_REMOTE", pw_remote_buf, 1);
+    if (getuid() == 0 && !getenv("PIPEWIRE_REMOTE")) {
+        const char *uid_str = getenv("SUDO_UID");
+        if (!uid_str) uid_str = getenv("PKEXEC_UID");
+
+        if (uid_str) {
+            snprintf(pw_remote_buf, sizeof(pw_remote_buf),
+                     "/run/user/%s/pipewire-0", uid_str);
+        } else {
+            /* No hint — scan /run/user/ for the first pipewire socket.
+             * This handles kdesu, gksu, and other su wrappers that
+             * don't set a UID variable.                                */
+            DIR *run_dir = opendir("/run/user");
+            if (run_dir) {
+                struct dirent *de;
+                while ((de = readdir(run_dir)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+                    /* Skip UID 0 (root's own session) */
+                    if (strcmp(de->d_name, "0") == 0) continue;
+                    char probe[256];
+                    snprintf(probe, sizeof(probe),
+                             "/run/user/%s/pipewire-0", de->d_name);
+                    if (access(probe, F_OK) == 0) {
+                        snprintf(pw_remote_buf, sizeof(pw_remote_buf),
+                                 "%s", probe);
+                        break;
+                    }
+                }
+                closedir(run_dir);
+            }
+        }
+        if (pw_remote_buf[0])
+            setenv("PIPEWIRE_REMOTE", pw_remote_buf, 1);
     }
 
     pw_init(NULL, NULL);
