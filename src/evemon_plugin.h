@@ -45,6 +45,7 @@ typedef enum {
     evemon_NEED_LIBS        = (1 << 6),  /* shared library list (from maps)   */
     evemon_NEED_PIPEWIRE    = (1 << 7),  /* PipeWire graph snapshot           */
     evemon_NEED_DESCENDANTS = (1 << 8),  /* include descendant PIDs           */
+    evemon_NEED_THREADS     = (1 << 9),  /* per-thread info from /proc/task   */
 } evemon_data_needs_t;
 
 /* ── Gathered data types ─────────────────────────────────────── */
@@ -56,6 +57,7 @@ typedef struct {
     char      desc[256];         /* resolved label (e.g. device name) */
     int       category;          /* fd_category_t value               */
     uint64_t  net_sort_key;      /* total send+recv bytes for sort    */
+    pid_t     source_pid;        /* PID that owns this fd (for desc)  */
 } evemon_fd_t;
 
 /* A single environment variable */
@@ -117,6 +119,22 @@ typedef struct {
     char      direction[8];      /* "in" or "out"                     */
     char      format_dsp[64];    /* format.dsp                        */
 } evemon_pw_port_t;
+
+/* A single thread (task) within a process */
+typedef struct {
+    pid_t       tid;              /* thread ID (= /proc/<pid>/task/<tid>)  */
+    char        name[64];         /* thread name from /proc/.../comm       */
+    char        state;            /* 'R','S','D','Z','T','t','X','I' etc   */
+    int         priority;         /* scheduling priority (field 18 of stat)*/
+    int         nice;             /* nice value (field 19 of stat)         */
+    int         processor;        /* last CPU core (field 39 of stat)      */
+    unsigned long long utime;     /* user ticks (field 14)                 */
+    unsigned long long stime;     /* system ticks (field 15)               */
+    unsigned long long starttime; /* start time in jiffies (field 22)      */
+    double      cpu_percent;      /* CPU% since last snapshot              */
+    unsigned long long voluntary_ctxt_switches;   /* from status           */
+    unsigned long long nonvoluntary_ctxt_switches; /* from status          */
+} evemon_thread_t;
 
 /* cgroup resource limits */
 typedef struct {
@@ -184,6 +202,10 @@ typedef struct {
     size_t                    pw_link_count;
     const evemon_pw_port_t   *pw_ports;
     size_t                    pw_port_count;
+
+    /* Threads (if evemon_NEED_THREADS) */
+    const evemon_thread_t *threads;
+    size_t                 thread_count;
 
     /* Raw file contents (if corresponding NEED flag set) */
     const char       *raw_cgroup;    /* /proc/<pid>/cgroup content     */

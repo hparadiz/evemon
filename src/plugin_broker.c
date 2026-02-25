@@ -59,6 +59,9 @@ typedef struct {
     size_t               desc_count;
     size_t               desc_cap;
 
+    evemon_thread_t     *thread_buf;
+    size_t               thread_cap;
+
     char                *raw_status;
     char                *raw_maps;
     char                *raw_cgroup;
@@ -82,6 +85,7 @@ static void broker_pid_data_free(broker_pid_data_t *d)
     free(d->lib_buf);
     free(d->sock_buf);
     free(d->desc_pids);
+    free(d->thread_buf);
     free(d->raw_status);
     free(d->raw_maps);
     free(d->raw_cgroup);
@@ -375,6 +379,166 @@ static void gather_libs(pid_t pid, broker_pid_data_t *d)
     d->data.lib_count = count;
 }
 
+/* ── Thread gathering ─────────────────────────────────────────── */
+
+/*
+ * Read per-thread data from /proc/<pid>/task/<tid>/stat and
+ * /proc/<pid>/task/<tid>/status for all threads of a process.
+ *
+ * Fields gathered per thread:
+ *   - TID, name, state, priority, nice, last CPU, utime, stime,
+ *     starttime, voluntary/nonvoluntary context switches.
+ *
+ * CPU% is left at 0.0 — it requires cross-snapshot delta computation.
+ * The plugin itself can show raw utime/stime for now; future work
+ * can add per-thread delta tracking similar to per-process CPU%.
+ */
+static void gather_threads(pid_t pid, broker_pid_data_t *d)
+{
+    char task_dir[64];
+    snprintf(task_dir, sizeof(task_dir), "/proc/%d/task", pid);
+
+    DIR *dp = opendir(task_dir);
+    if (!dp) return;
+
+    size_t cap = 32, count = 0;
+    evemon_thread_t *buf = calloc(cap, sizeof(evemon_thread_t));
+    if (!buf) { closedir(dp); return; }
+
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+
+        pid_t tid = (pid_t)atoi(de->d_name);
+        if (tid <= 0) continue;
+
+        if (count >= cap) {
+            cap *= 2;
+            evemon_thread_t *tmp = realloc(buf, cap * sizeof(evemon_thread_t));
+            if (!tmp) break;
+            buf = tmp;
+        }
+
+        evemon_thread_t *t = &buf[count];
+        memset(t, 0, sizeof(*t));
+        t->tid = tid;
+
+        /* Read thread name from comm */
+        {
+            char path[128];
+            snprintf(path, sizeof(path), "/proc/%d/task/%d/comm", pid, tid);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fgets(t->name, sizeof(t->name), f)) {
+                    size_t len = strlen(t->name);
+                    if (len > 0 && t->name[len - 1] == '\n')
+                        t->name[len - 1] = '\0';
+                }
+                fclose(f);
+            }
+        }
+
+        /* Parse /proc/<pid>/task/<tid>/stat for:
+         *   state(3), priority(18), nice(19), utime(14), stime(15),
+         *   starttime(22), processor(39)                              */
+        {
+            char path[128], statbuf[1024];
+            snprintf(path, sizeof(path), "/proc/%d/task/%d/stat", pid, tid);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fgets(statbuf, sizeof(statbuf), f)) {
+                    /* Skip past comm field (in parens, may contain spaces) */
+                    const char *p = strrchr(statbuf, ')');
+                    if (p) {
+                        p++;  /* skip ')' */
+                        char state_c;
+                        long priority, nice;
+                        unsigned long utime, stime;
+                        unsigned long long starttime;
+
+                        /* Fields 3..22 and 39 */
+                        int n = sscanf(p,
+                            " %c"           /* 3: state */
+                            " %*d %*d %*d"  /* 4-6: ppid, pgrp, session */
+                            " %*d %*d"      /* 7-8: tty_nr, tpgid */
+                            " %*u"          /* 9: flags */
+                            " %*u %*u"      /* 10-11: minflt, cminflt */
+                            " %*u %*u"      /* 12-13: majflt, cmajflt */
+                            " %lu %lu"      /* 14-15: utime, stime */
+                            " %*d %*d"      /* 16-17: cutime, cstime */
+                            " %ld %ld"      /* 18-19: priority, nice */
+                            " %*d"          /* 20: num_threads */
+                            " %*d"          /* 21: itrealvalue */
+                            " %llu",        /* 22: starttime */
+                            &state_c,
+                            &utime, &stime,
+                            &priority, &nice,
+                            &starttime);
+                        if (n >= 6) {
+                            t->state = state_c;
+                            t->utime = (unsigned long long)utime;
+                            t->stime = (unsigned long long)stime;
+                            t->priority = (int)priority;
+                            t->nice = (int)nice;
+                            t->starttime = starttime;
+                        }
+
+                        /* Field 39 (processor) — skip fields 23..38 */
+                        const char *q = p;
+                        /* We already consumed up to field 22.
+                         * Scan forward to field 39 by skipping spaces. */
+                        int fields_to_skip = 39 - 22 - 1; /* 16 more fields */
+                        /* Re-parse from after starttime position.
+                         * Easier: just scan the whole line for field 39. */
+                        const char *r = p;
+                        /* Count fields from position after ')': field 3 starts */
+                        int fld = 3;
+                        while (*r == ' ') r++;
+                        while (*r && fld < 39) {
+                            while (*r && *r != ' ') r++;
+                            while (*r == ' ') r++;
+                            fld++;
+                        }
+                        if (fld == 39 && *r) {
+                            t->processor = atoi(r);
+                        }
+                        (void)q;
+                        (void)fields_to_skip;
+                    }
+                }
+                fclose(f);
+            }
+        }
+
+        /* Read context switch counts from /proc/<pid>/task/<tid>/status */
+        {
+            char path[128], line[256];
+            snprintf(path, sizeof(path), "/proc/%d/task/%d/status", pid, tid);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                while (fgets(line, sizeof(line), f)) {
+                    if (strncmp(line, "voluntary_ctxt_switches:", 24) == 0) {
+                        t->voluntary_ctxt_switches = strtoull(line + 24, NULL, 10);
+                    } else if (strncmp(line, "nonvoluntary_ctxt_switches:", 27) == 0) {
+                        t->nonvoluntary_ctxt_switches = strtoull(line + 27, NULL, 10);
+                    }
+                }
+                fclose(f);
+            }
+        }
+
+        count++;
+    }
+    closedir(dp);
+
+    if (count == 0) { free(buf); return; }
+
+    d->thread_buf = buf;
+    d->thread_cap = cap;
+    d->data.threads = buf;
+    d->data.thread_count = count;
+}
+
 /* Read /proc/<pid>/status */
 static void gather_status(pid_t pid, broker_pid_data_t *d)
 {
@@ -494,40 +658,102 @@ static void gather_cgroup(pid_t pid, broker_pid_data_t *d)
     d->data.cgroup = &d->cgroup_data;
 }
 
-/* Collect descendant PIDs by walking /proc/<pid>/task/<tid>/children */
+/*
+ * Collect descendant PIDs by scanning /proc and walking the ppid chain.
+ * This is the portable approach — /proc/<pid>/task/<tid>/children
+ * requires CONFIG_PROC_CHILDREN which many kernels don't enable.
+ */
 static void gather_descendants(pid_t pid, broker_pid_data_t *d)
 {
-    /* Simple approach: read /proc/<pid>/task/<pid>/children recursively */
+    /*
+     * Strategy: scan every numeric entry in /proc, read its ppid from
+     * /proc/<candidate>/stat, and check if the ppid is either `pid`
+     * or any PID we've already accepted as a descendant.  Iterate
+     * until no new descendants are found (handles arbitrary depth).
+     */
     size_t cap = 64, count = 0;
     pid_t *pids = calloc(cap, sizeof(pid_t));
     if (!pids) return;
 
-    /* Seed with the root PID's children */
-    pid_t queue[4096];
-    int qhead = 0, qtail = 0;
-    queue[qtail++] = pid;
+    /* Build a list of candidate (pid, ppid) pairs from /proc */
+    typedef struct { pid_t p; pid_t pp; } pp_entry_t;
+    size_t pc_cap = 256, pc_count = 0;
+    pp_entry_t *pc = malloc(pc_cap * sizeof(pp_entry_t));
+    if (!pc) { free(pids); return; }
 
-    while (qhead < qtail && qhead < 4096) {
-        pid_t cur = queue[qhead++];
-        char path[128];
-        snprintf(path, sizeof(path), "/proc/%d/task/%d/children", cur, cur);
-        FILE *f = fopen(path, "r");
+    DIR *proc = opendir("/proc");
+    if (!proc) { free(pids); free(pc); return; }
+
+    struct dirent *de;
+    while ((de = readdir(proc)) != NULL) {
+        if (de->d_name[0] < '1' || de->d_name[0] > '9') continue;
+        pid_t candidate = (pid_t)atoi(de->d_name);
+        if (candidate <= 0 || candidate == pid) continue;
+
+        char stat_path[64];
+        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", candidate);
+        FILE *f = fopen(stat_path, "r");
         if (!f) continue;
 
-        pid_t child;
-        while (fscanf(f, "%d", &child) == 1) {
+        char buf[512];
+        pid_t ppid = 0;
+        if (fgets(buf, sizeof(buf), f)) {
+            /* ppid is field 4; skip past "(comm)" which may contain spaces */
+            const char *cp = strrchr(buf, ')');
+            if (cp) {
+                /* fields after ')': state(3) ppid(4) */
+                char st;
+                if (sscanf(cp + 1, " %c %d", &st, &ppid) < 2)
+                    ppid = 0;
+            }
+        }
+        fclose(f);
+        if (ppid <= 0) continue;
+
+        if (pc_count >= pc_cap) {
+            pc_cap *= 2;
+            pp_entry_t *tmp = realloc(pc, pc_cap * sizeof(pp_entry_t));
+            if (!tmp) break;
+            pc = tmp;
+        }
+        pc[pc_count].p  = candidate;
+        pc[pc_count].pp = ppid;
+        pc_count++;
+    }
+    closedir(proc);
+
+    /*
+     * Iteratively find descendants: on each pass, any candidate whose
+     * ppid matches `pid` or an already-accepted descendant is added.
+     * Repeat until a pass finds nothing new.
+     */
+    for (;;) {
+        int found = 0;
+        for (size_t i = 0; i < pc_count; i++) {
+            if (pc[i].p == 0) continue;  /* already consumed */
+
+            int is_desc = (pc[i].pp == pid);
+            if (!is_desc) {
+                for (size_t j = 0; j < count; j++) {
+                    if (pids[j] == pc[i].pp) { is_desc = 1; break; }
+                }
+            }
+            if (!is_desc) continue;
+
             if (count >= cap) {
                 cap *= 2;
                 pid_t *tmp = realloc(pids, cap * sizeof(pid_t));
                 if (!tmp) break;
                 pids = tmp;
             }
-            pids[count++] = child;
-            if (qtail < 4096)
-                queue[qtail++] = child;
+            pids[count++] = pc[i].p;
+            pc[i].p = 0;  /* mark consumed */
+            found = 1;
         }
-        fclose(f);
+        if (!found) break;
     }
+
+    free(pc);
 
     d->desc_pids = pids;
     d->desc_count = count;
@@ -885,7 +1111,10 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
 }
 
 /* Gather file descriptors */
-static void gather_fds(pid_t pid, broker_pid_data_t *d)
+/* Read FDs from a single PID into the growing fds array */
+static void gather_fds_for_pid(pid_t pid, pid_t source,
+                               evemon_fd_t **fds, size_t *count,
+                               size_t *cap)
 {
     char fd_dir[64];
     snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", pid);
@@ -893,38 +1122,53 @@ static void gather_fds(pid_t pid, broker_pid_data_t *d)
     DIR *dp = opendir(fd_dir);
     if (!dp) return;
 
-    size_t cap = 64, count = 0;
-    evemon_fd_t *fds = calloc(cap, sizeof(evemon_fd_t));
-    if (!fds) { closedir(dp); return; }
-
     struct dirent *de;
     while ((de = readdir(dp)) != NULL) {
         if (de->d_name[0] == '.') continue;
 
         int fd_num = atoi(de->d_name);
         char link_path[128], target[512];
-        snprintf(link_path, sizeof(link_path), "%s/%s", fd_dir, de->d_name);
+        snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%s",
+                 pid, de->d_name);
         ssize_t len = readlink(link_path, target, sizeof(target) - 1);
         if (len <= 0) continue;
         target[len] = '\0';
 
-        if (count >= cap) {
-            cap *= 2;
-            evemon_fd_t *tmp = realloc(fds, cap * sizeof(evemon_fd_t));
+        if (*count >= *cap) {
+            *cap *= 2;
+            evemon_fd_t *tmp = realloc(*fds, *cap * sizeof(evemon_fd_t));
             if (!tmp) break;
-            fds = tmp;
+            *fds = tmp;
         }
 
-        fds[count].fd = fd_num;
-        snprintf(fds[count].path, sizeof(fds[count].path), "%s", target);
-        fds[count].desc[0] = '\0';
+        evemon_fd_t *e = &(*fds)[*count];
+        e->fd = fd_num;
+        snprintf(e->path, sizeof(e->path), "%s", target);
+        e->desc[0] = '\0';
         if (strncmp(target, "/dev/", 5) == 0)
-            label_device(target, fds[count].desc, sizeof(fds[count].desc));
-        fds[count].category = 0;
-        fds[count].net_sort_key = 0;
-        count++;
+            label_device(target, e->desc, sizeof(e->desc));
+        e->category = 0;
+        e->net_sort_key = 0;
+        e->source_pid = source;
+        (*count)++;
     }
     closedir(dp);
+}
+
+static void gather_fds(pid_t pid, broker_pid_data_t *d)
+{
+    size_t cap = 64, count = 0;
+    evemon_fd_t *fds = calloc(cap, sizeof(evemon_fd_t));
+    if (!fds) return;
+
+    /* Root PID's FDs */
+    gather_fds_for_pid(pid, pid, &fds, &count, &cap);
+
+    /* Descendant FDs (if descendants were gathered) */
+    for (size_t i = 0; i < d->desc_count; i++)
+        gather_fds_for_pid(d->data.descendant_pids[i],
+                           d->data.descendant_pids[i],
+                           &fds, &count, &cap);
 
     d->fd_buf = fds;
     d->fd_cap = cap;
@@ -1048,6 +1292,9 @@ static void broker_thread_func(GTask        *task,
 
         if (needs & evemon_NEED_STATUS)
             gather_status(d->pid, d);
+
+        if (needs & evemon_NEED_THREADS)
+            gather_threads(d->pid, d);
 
 #ifdef HAVE_PIPEWIRE
         if (needs & evemon_NEED_PIPEWIRE)

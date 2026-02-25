@@ -164,8 +164,10 @@ static void meter_render(GtkCellRenderer *cell, cairo_t *cr,
 
     float fl = self->level_l / 1000.0f;
     float fr = self->level_r / 1000.0f;
-    if (fl < 0.0f) fl = 0.0f; if (fl > 1.0f) fl = 1.0f;
-    if (fr < 0.0f) fr = 0.0f; if (fr > 1.0f) fr = 1.0f;
+    if (fl < 0.0f) fl = 0.0f;
+    if (fl > 1.0f) fl = 1.0f;
+    if (fr < 0.0f) fr = 0.0f;
+    if (fr > 1.0f) fr = 1.0f;
     if (fl < 0.001f && fr < 0.001f) return;
 
     int x = cell_area->x + 2;

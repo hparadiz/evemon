@@ -6,6 +6,10 @@
  * Device name resolution is performed centrally by the broker via
  * label_device(), so the desc field arrives pre-populated.
  *
+ * Options:
+ *   • Include Descendants – also show device FDs from child processes.
+ *   • Merge Duplicates    – group identical device paths with a count.
+ *
  * Categories:
  *   GPU / DRI, Sound / Audio, Input, Block Storage,
  *   Terminals & PTYs, Other Devices
@@ -62,13 +66,18 @@ enum {
 /* ── per-instance state ──────────────────────────────────────── */
 
 typedef struct {
+    GtkWidget      *vbox;         /* top-level container            */
     GtkWidget      *scroll;
     GtkTreeStore   *store;
     GtkTreeView    *view;
     GtkWidget      *empty_label;
     GtkWidget      *stack;        /* switches between tree and empty label */
-    unsigned        collapsed;    /* bitmask: 1 << cat */
+    GtkWidget      *chk_desc;     /* "Include Descendants" checkbox */
+    GtkWidget      *chk_dedup;    /* "Merge Duplicates" checkbox    */
+    unsigned        collapsed;    /* bitmask: 1 << cat              */
     pid_t           last_pid;
+    gboolean        include_desc; /* current toggle state           */
+    gboolean        merge_dup;    /* current toggle state           */
 } devices_ctx_t;
 
 /* ── classification ──────────────────────────────────────────── */
@@ -142,6 +151,28 @@ static GtkWidget *devices_create_widget(void *opaque)
 {
     devices_ctx_t *ctx = opaque;
 
+    /* Top-level vbox: checkboxes + stack */
+    ctx->vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+
+    /* Checkbox bar */
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(hbox, 4);
+    gtk_widget_set_margin_top(hbox, 2);
+    gtk_widget_set_margin_bottom(hbox, 2);
+
+    ctx->chk_desc = gtk_check_button_new_with_label("Include Descendants");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->chk_desc),
+                                  ctx->include_desc);
+    gtk_box_pack_start(GTK_BOX(hbox), ctx->chk_desc, FALSE, FALSE, 0);
+
+    ctx->chk_dedup = gtk_check_button_new_with_label("Merge Duplicates");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->chk_dedup),
+                                  ctx->merge_dup);
+    gtk_box_pack_start(GTK_BOX(hbox), ctx->chk_dedup, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(ctx->vbox), hbox, FALSE, FALSE, 0);
+
+    /* Tree store + view */
     ctx->store = gtk_tree_store_new(NUM_COLS,
                                     G_TYPE_STRING,   /* text   */
                                     G_TYPE_STRING,   /* markup */
@@ -155,6 +186,7 @@ static GtkWidget *devices_create_widget(void *opaque)
     gtk_tree_view_set_enable_search(ctx->view, FALSE);
 
     GtkCellRenderer *cell = gtk_cell_renderer_text_new();
+    g_object_set(cell, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
     GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(
         "Device", cell, "markup", COL_MARKUP, NULL);
     gtk_tree_view_append_column(ctx->view, col);
@@ -182,9 +214,27 @@ static GtkWidget *devices_create_widget(void *opaque)
     gtk_stack_add_named(GTK_STACK(ctx->stack), ctx->empty_label, "empty");
     gtk_stack_set_visible_child_name(GTK_STACK(ctx->stack), "empty");
 
-    gtk_widget_show_all(ctx->stack);
+    gtk_box_pack_start(GTK_BOX(ctx->vbox), ctx->stack, TRUE, TRUE, 0);
 
-    return ctx->stack;
+    gtk_widget_show_all(ctx->vbox);
+
+    return ctx->vbox;
+}
+
+/* ── display entry (for filtering + dedup) ──────────────────── */
+
+typedef struct {
+    int         fd;
+    const char *path;
+    const char *desc;
+    int         cat;
+    size_t      dup_count;   /* 1 = unique, >1 = merged group */
+} dev_display_t;
+
+static int dev_path_cmp(const void *a, const void *b)
+{
+    const dev_display_t *ea = a, *eb = b;
+    return strcmp(ea->path, eb->path);
 }
 
 static void devices_update(void *opaque, const evemon_proc_data_t *data)
@@ -196,36 +246,69 @@ static void devices_update(void *opaque, const evemon_proc_data_t *data)
         ctx->last_pid = data->pid;
     }
 
-    /* Bucket device FDs by category */
-    typedef struct {
-        int         fd;
-        const char *path;
-        const char *desc;
-        int         cat;
-    } dev_ent_t;
+    /* Read current checkbox state */
+    ctx->include_desc = gtk_toggle_button_get_active(
+        GTK_TOGGLE_BUTTON(ctx->chk_desc));
+    ctx->merge_dup = gtk_toggle_button_get_active(
+        GTK_TOGGLE_BUTTON(ctx->chk_dedup));
 
+    /* Phase 1: classify device FDs, optionally filter by source_pid */
     size_t total = data->fd_count;
-    size_t dev_total = 0;
-    size_t cat_count[DEV_CAT_COUNT] = {0};
-
-    dev_ent_t *ents = g_new0(dev_ent_t, total > 0 ? total : 1);
+    dev_display_t *raw = g_new0(dev_display_t, total > 0 ? total : 1);
+    size_t raw_count = 0;
 
     for (size_t i = 0; i < total; i++) {
         int cat = classify_device(data->fds[i].path);
         if (cat < 0) continue;  /* not a /dev/ path */
 
-        ents[dev_total].fd   = data->fds[i].fd;
-        ents[dev_total].path = data->fds[i].path;
-        ents[dev_total].desc = data->fds[i].desc;
-        ents[dev_total].cat  = cat;
-        cat_count[cat]++;
-        dev_total++;
+        if (!ctx->include_desc && data->fds[i].source_pid != data->pid)
+            continue;
+
+        raw[raw_count].fd        = data->fds[i].fd;
+        raw[raw_count].path      = data->fds[i].path;
+        raw[raw_count].desc      = data->fds[i].desc;
+        raw[raw_count].cat       = cat;
+        raw[raw_count].dup_count = 1;
+        raw_count++;
     }
 
-    if (dev_total == 0) {
+    /* Phase 2: optionally merge duplicates */
+    dev_display_t *display = raw;
+    size_t display_count = raw_count;
+
+    if (ctx->merge_dup && raw_count > 1) {
+        qsort(raw, raw_count, sizeof(dev_display_t), dev_path_cmp);
+
+        dev_display_t *merged = g_new0(dev_display_t, raw_count);
+        size_t mi = 0;
+        size_t i = 0;
+        while (i < raw_count) {
+            merged[mi] = raw[i];
+            merged[mi].dup_count = 1;
+            size_t j = i + 1;
+            while (j < raw_count &&
+                   merged[mi].cat == raw[j].cat &&
+                   strcmp(raw[i].path, raw[j].path) == 0) {
+                merged[mi].dup_count++;
+                j++;
+            }
+            mi++;
+            i = j;
+        }
+        g_free(raw);
+        display = merged;
+        display_count = mi;
+    }
+
+    /* Count per category */
+    size_t cat_count[DEV_CAT_COUNT] = {0};
+    for (size_t i = 0; i < display_count; i++)
+        cat_count[display[i].cat]++;
+
+    if (display_count == 0) {
         gtk_tree_store_clear(ctx->store);
         gtk_stack_set_visible_child_name(GTK_STACK(ctx->stack), "empty");
-        g_free(ents);
+        g_free(display);
         return;
     }
 
@@ -298,22 +381,31 @@ static void devices_update(void *opaque, const evemon_proc_data_t *data)
         gboolean child_valid = gtk_tree_model_iter_children(
             model, &child, &parent);
 
-        for (size_t i = 0; i < dev_total; i++) {
-            if (ents[i].cat != c) continue;
+        for (size_t i = 0; i < display_count; i++) {
+            if (display[i].cat != c) continue;
 
-            /* Build a rich markup line:
-             *   fd N  /dev/path  (resolved description) */
-            const char *display = (ents[i].desc && ents[i].desc[0])
-                                  ? ents[i].desc : ents[i].path;
-            char *esc = g_markup_escape_text(display, -1);
-            char *markup = g_strdup_printf(
-                "<span foreground=\"#6699cc\">%d</span>  %s",
-                ents[i].fd, esc);
-            g_free(esc);
+            char *markup;
+            if (display[i].dup_count > 1) {
+                const char *d = (display[i].desc && display[i].desc[0])
+                                ? display[i].desc : display[i].path;
+                char *esc = g_markup_escape_text(d, -1);
+                markup = g_strdup_printf(
+                    "%s  <span foreground=\"#888888\">(%zu duplicates)</span>",
+                    esc, display[i].dup_count);
+                g_free(esc);
+            } else {
+                const char *d = (display[i].desc && display[i].desc[0])
+                                ? display[i].desc : display[i].path;
+                char *esc = g_markup_escape_text(d, -1);
+                markup = g_strdup_printf(
+                    "<span foreground=\"#6699cc\">%d</span>  %s",
+                    display[i].fd, esc);
+                g_free(esc);
+            }
 
             if (child_valid) {
                 gtk_tree_store_set(ctx->store, &child,
-                                   COL_TEXT, ents[i].path,
+                                   COL_TEXT, display[i].path,
                                    COL_MARKUP, markup,
                                    COL_CAT, (gint)-1, -1);
                 child_valid = gtk_tree_model_iter_next(model, &child);
@@ -321,7 +413,7 @@ static void devices_update(void *opaque, const evemon_proc_data_t *data)
                 GtkTreeIter new_child;
                 gtk_tree_store_append(ctx->store, &new_child, &parent);
                 gtk_tree_store_set(ctx->store, &new_child,
-                                   COL_TEXT, ents[i].path,
+                                   COL_TEXT, display[i].path,
                                    COL_MARKUP, markup,
                                    COL_CAT, (gint)-1, -1);
             }
@@ -342,7 +434,7 @@ static void devices_update(void *opaque, const evemon_proc_data_t *data)
     }
 
     gtk_adjustment_set_value(vadj, scroll_pos);
-    g_free(ents);
+    g_free(display);
 }
 
 static void devices_clear(void *opaque)
@@ -368,12 +460,15 @@ evemon_plugin_t *evemon_plugin_init(void)
     devices_ctx_t *ctx = calloc(1, sizeof(devices_ctx_t));
     if (!ctx) return NULL;
 
+    ctx->include_desc = TRUE;
+    ctx->merge_dup    = TRUE;
+
     devices_plugin = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "Devices",
         .id            = "org.evemon.devices",
         .version       = "1.0",
-        .data_needs    = evemon_NEED_FDS,
+        .data_needs    = evemon_NEED_FDS | evemon_NEED_DESCENDANTS,
         .plugin_ctx    = ctx,
         .create_widget = devices_create_widget,
         .update        = devices_update,

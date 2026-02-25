@@ -519,15 +519,18 @@ static int md_load_preset(md_preset_t *p, const char *filepath)
         { int n;
           if (sscanf(key,"per_frame_init_%d",&n)==1 && n>=1 && n-1<MAX_EXPR_LINES) {
               strncpy(p->per_frame_init[n-1],val,MAX_LINE_LEN-1);
-              if (n>p->per_frame_init_count) p->per_frame_init_count=n; continue;
+              if (n>p->per_frame_init_count) p->per_frame_init_count=n;
+              continue;
           }
           if (sscanf(key,"per_frame_%d",&n)==1 && n>=1 && n-1<MAX_EXPR_LINES) {
               strncpy(p->per_frame[n-1],val,MAX_LINE_LEN-1);
-              if (n>p->per_frame_count) p->per_frame_count=n; continue;
+              if (n>p->per_frame_count) p->per_frame_count=n;
+              continue;
           }
           if (sscanf(key,"per_pixel_%d",&n)==1 && n>=1 && n-1<MAX_EXPR_LINES) {
               strncpy(p->per_pixel[n-1],val,MAX_LINE_LEN-1);
-              if (n>p->per_pixel_count) p->per_pixel_count=n; continue;
+              if (n>p->per_pixel_count) p->per_pixel_count=n;
+              continue;
           }
         }
 
@@ -555,17 +558,20 @@ static int md_load_preset(md_preset_t *p, const char *filepath)
               if (sscanf(key,"wave_%d_per_point%d",&wn,&nn)==2 && wn==wi
                   && nn>=1 && nn-1<MAX_EXPR_LINES) {
                   strncpy(w->per_point[nn-1],val,MAX_LINE_LEN-1);
-                  if (nn>w->per_point_count) w->per_point_count=nn; goto next;
+                  if (nn>w->per_point_count) w->per_point_count=nn;
+                  goto next;
               }
               if (sscanf(key,"wave_%d_per_frame%d",&wn,&nn)==2 && wn==wi
                   && nn>=1 && nn-1<MAX_EXPR_LINES) {
                   strncpy(w->per_frame[nn-1],val,MAX_LINE_LEN-1);
-                  if (nn>w->per_frame_count) w->per_frame_count=nn; goto next;
+                  if (nn>w->per_frame_count) w->per_frame_count=nn;
+                  goto next;
               }
               if (sscanf(key,"wave_%d_init%d",&wn,&nn)==2 && wn==wi
                   && nn>=1 && nn-1<MAX_EXPR_LINES) {
                   strncpy(w->init_code[nn-1],val,MAX_LINE_LEN-1);
-                  if (nn>w->init_count) w->init_count=nn; goto next;
+                  if (nn>w->init_count) w->init_count=nn;
+                  goto next;
               }
             }
         }
@@ -604,12 +610,14 @@ static int md_load_preset(md_preset_t *p, const char *filepath)
               if (sscanf(key,"shape_%d_per_frame%d",&sn,&nn)==2 && sn==si
                   && nn>=1 && nn-1<MAX_EXPR_LINES) {
                   strncpy(s->per_frame[nn-1],val,MAX_LINE_LEN-1);
-                  if (nn>s->per_frame_count) s->per_frame_count=nn; goto next;
+                  if (nn>s->per_frame_count) s->per_frame_count=nn;
+                  goto next;
               }
               if (sscanf(key,"shape_%d_init%d",&sn,&nn)==2 && sn==si
                   && nn>=1 && nn-1<MAX_EXPR_LINES) {
                   strncpy(s->init_code[nn-1],val,MAX_LINE_LEN-1);
-                  if (nn>s->init_count) s->init_count=nn; goto next;
+                  if (nn>s->init_count) s->init_count=nn;
+                  goto next;
               }
             }
         }

@@ -49,11 +49,16 @@ enum {
 /* ── per-instance state ──────────────────────────────────────── */
 
 typedef struct {
+    GtkWidget      *vbox;         /* top-level container            */
     GtkWidget      *scroll;
     GtkTreeStore   *store;
     GtkTreeView    *view;
-    unsigned        collapsed;    /* bitmask: 1 << cat */
+    GtkWidget      *chk_desc;     /* "Include Descendants" checkbox */
+    GtkWidget      *chk_dedup;    /* "Merge Duplicates" checkbox    */
+    unsigned        collapsed;    /* bitmask: 1 << cat              */
     pid_t           last_pid;
+    gboolean        include_desc; /* current toggle state           */
+    gboolean        merge_dup;    /* current toggle state           */
 } fd_ctx_t;
 
 /* ── classification ──────────────────────────────────────────── */
@@ -81,6 +86,18 @@ static char *fd_to_markup(int fd_num, const char *path, const char *desc)
     char *esc = g_markup_escape_text(display, -1);
     char *markup = g_strdup_printf(
         "<span foreground=\"#6699cc\">%d</span>  %s", fd_num, esc);
+    g_free(esc);
+    return markup;
+}
+
+static char *fd_to_markup_grouped(const char *path, const char *desc,
+                                  size_t count)
+{
+    const char *display = (desc && desc[0]) ? desc : path;
+    char *esc = g_markup_escape_text(display, -1);
+    char *markup = g_strdup_printf(
+        "%s  <span foreground=\"#888888\">(%zu duplicates)</span>",
+        esc, count);
     g_free(esc);
     return markup;
 }
@@ -115,6 +132,28 @@ static GtkWidget *fd_create_widget(void *opaque)
 {
     fd_ctx_t *ctx = opaque;
 
+    /* Top-level vbox: checkboxes + scrolled tree */
+    ctx->vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+
+    /* Checkbox bar */
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(hbox, 4);
+    gtk_widget_set_margin_top(hbox, 2);
+    gtk_widget_set_margin_bottom(hbox, 2);
+
+    ctx->chk_desc = gtk_check_button_new_with_label("Include Descendants");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->chk_desc),
+                                  ctx->include_desc);
+    gtk_box_pack_start(GTK_BOX(hbox), ctx->chk_desc, FALSE, FALSE, 0);
+
+    ctx->chk_dedup = gtk_check_button_new_with_label("Merge Duplicates");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->chk_dedup),
+                                  ctx->merge_dup);
+    gtk_box_pack_start(GTK_BOX(hbox), ctx->chk_dedup, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(ctx->vbox), hbox, FALSE, FALSE, 0);
+
+    /* Tree store + view */
     ctx->store = gtk_tree_store_new(NUM_COLS,
                                     G_TYPE_STRING,   /* text   */
                                     G_TYPE_STRING,   /* markup */
@@ -128,6 +167,7 @@ static GtkWidget *fd_create_widget(void *opaque)
     gtk_tree_view_set_enable_search(ctx->view, FALSE);
 
     GtkCellRenderer *cell = gtk_cell_renderer_text_new();
+    g_object_set(cell, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
     GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(
         "FD", cell, "markup", COL_MARKUP, NULL);
     gtk_tree_view_append_column(ctx->view, col);
@@ -143,9 +183,28 @@ static GtkWidget *fd_create_widget(void *opaque)
                                    GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(ctx->scroll), GTK_WIDGET(ctx->view));
     gtk_widget_set_vexpand(ctx->scroll, TRUE);
-    gtk_widget_show_all(ctx->scroll);
 
-    return ctx->scroll;
+    gtk_box_pack_start(GTK_BOX(ctx->vbox), ctx->scroll, TRUE, TRUE, 0);
+
+    gtk_widget_show_all(ctx->vbox);
+
+    return ctx->vbox;
+}
+
+/* ── display entry (for filtering + dedup) ──────────────────── */
+
+typedef struct {
+    int         fd;
+    const char *path;
+    const char *desc;
+    int         cat;
+    size_t      dup_count;   /* 1 = unique, >1 = merged group */
+} fd_display_t;
+
+static int path_cmp(const void *a, const void *b)
+{
+    const fd_display_t *ea = a, *eb = b;
+    return strcmp(ea->path, eb->path);
 }
 
 static void fd_update(void *opaque, const evemon_proc_data_t *data)
@@ -157,20 +216,60 @@ static void fd_update(void *opaque, const evemon_proc_data_t *data)
         ctx->last_pid = data->pid;
     }
 
-    /* Bucket fds by category */
-    size_t cat_count[FD_CAT_COUNT] = {0};
-    typedef struct { int fd; const char *path; const char *desc; int cat; } fd_ent_t;
+    /* Read current checkbox state */
+    ctx->include_desc = gtk_toggle_button_get_active(
+        GTK_TOGGLE_BUTTON(ctx->chk_desc));
+    ctx->merge_dup = gtk_toggle_button_get_active(
+        GTK_TOGGLE_BUTTON(ctx->chk_dedup));
 
-    size_t total = data->fd_count;
-    fd_ent_t *ents = g_new0(fd_ent_t, total > 0 ? total : 1);
+    /* Phase 1: classify and optionally filter by source_pid */
+    size_t raw_total = data->fd_count;
+    fd_display_t *raw = g_new0(fd_display_t, raw_total > 0 ? raw_total : 1);
+    size_t raw_count = 0;
 
-    for (size_t i = 0; i < total; i++) {
-        ents[i].fd   = data->fds[i].fd;
-        ents[i].path = data->fds[i].path;
-        ents[i].desc = data->fds[i].desc;
-        ents[i].cat  = classify_fd(data->fds[i].path);
-        cat_count[ents[i].cat]++;
+    for (size_t i = 0; i < raw_total; i++) {
+        if (!ctx->include_desc && data->fds[i].source_pid != data->pid)
+            continue;
+        raw[raw_count].fd        = data->fds[i].fd;
+        raw[raw_count].path      = data->fds[i].path;
+        raw[raw_count].desc      = data->fds[i].desc;
+        raw[raw_count].cat       = classify_fd(data->fds[i].path);
+        raw[raw_count].dup_count = 1;
+        raw_count++;
     }
+
+    /* Phase 2: optionally merge duplicates */
+    fd_display_t *display = raw;
+    size_t display_count = raw_count;
+
+    if (ctx->merge_dup && raw_count > 1) {
+        qsort(raw, raw_count, sizeof(fd_display_t), path_cmp);
+
+        fd_display_t *merged = g_new0(fd_display_t, raw_count);
+        size_t mi = 0;
+        size_t i = 0;
+        while (i < raw_count) {
+            merged[mi] = raw[i];
+            merged[mi].dup_count = 1;
+            size_t j = i + 1;
+            while (j < raw_count &&
+                   merged[mi].cat == (int)raw[j].cat &&
+                   strcmp(raw[i].path, raw[j].path) == 0) {
+                merged[mi].dup_count++;
+                j++;
+            }
+            mi++;
+            i = j;
+        }
+        g_free(raw);
+        display = merged;
+        display_count = mi;
+    }
+
+    /* Count per category */
+    size_t cat_count[FD_CAT_COUNT] = {0};
+    for (size_t i = 0; i < display_count; i++)
+        cat_count[display[i].cat]++;
 
     GtkTreeModel *model = GTK_TREE_MODEL(ctx->store);
 
@@ -235,17 +334,22 @@ static void fd_update(void *opaque, const evemon_proc_data_t *data)
         GtkTreeIter child;
         gboolean child_valid = gtk_tree_model_iter_children(
             model, &child, &parent);
-        size_t bi = 0;
 
-        for (size_t i = 0; i < total; i++) {
-            if (ents[i].cat != c) continue;
+        for (size_t i = 0; i < display_count; i++) {
+            if (display[i].cat != c) continue;
 
-            char *markup = fd_to_markup(ents[i].fd, ents[i].path,
-                                        ents[i].desc);
+            char *markup;
+            if (display[i].dup_count > 1)
+                markup = fd_to_markup_grouped(display[i].path,
+                                              display[i].desc,
+                                              display[i].dup_count);
+            else
+                markup = fd_to_markup(display[i].fd, display[i].path,
+                                      display[i].desc);
 
             if (child_valid) {
                 gtk_tree_store_set(ctx->store, &child,
-                                   COL_TEXT, ents[i].path,
+                                   COL_TEXT, display[i].path,
                                    COL_MARKUP, markup,
                                    COL_CAT, (gint)-1, -1);
                 child_valid = gtk_tree_model_iter_next(model, &child);
@@ -253,12 +357,11 @@ static void fd_update(void *opaque, const evemon_proc_data_t *data)
                 GtkTreeIter new_child;
                 gtk_tree_store_append(ctx->store, &new_child, &parent);
                 gtk_tree_store_set(ctx->store, &new_child,
-                                   COL_TEXT, ents[i].path,
+                                   COL_TEXT, display[i].path,
                                    COL_MARKUP, markup,
                                    COL_CAT, (gint)-1, -1);
             }
             g_free(markup);
-            bi++;
         }
 
         /* Remove excess children */
@@ -275,7 +378,7 @@ static void fd_update(void *opaque, const evemon_proc_data_t *data)
     }
 
     gtk_adjustment_set_value(vadj, scroll_pos);
-    g_free(ents);
+    g_free(display);
 }
 
 static void fd_clear(void *opaque)
@@ -300,6 +403,9 @@ evemon_plugin_t *evemon_plugin_init(void)
 {
     fd_ctx_t *ctx = calloc(1, sizeof(fd_ctx_t));
     if (!ctx) return NULL;
+
+    ctx->include_desc = TRUE;
+    ctx->merge_dup    = FALSE;
 
     fd_plugin = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
