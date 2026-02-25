@@ -2882,7 +2882,18 @@ static void md_update(void *opaque, const evemon_proc_data_t *data)
         snprintf(ctx->process_name, sizeof(ctx->process_name), "%s", data->name);
     if (!data->pw_nodes || !data->pw_node_count) {
         if (ctx->capture_started) md_stop_capture(ctx);
-        ctx->audio_node_count=0; return;
+        ctx->audio_node_count=0;
+        /* Hide the notebook tab when there are no audio streams */
+        if (ctx->main_box) {
+            GtkWidget *nb = gtk_widget_get_parent(ctx->main_box);
+            if (nb && GTK_IS_NOTEBOOK(nb)) {
+                gtk_widget_hide(ctx->main_box);
+                GtkWidget *tab = gtk_notebook_get_tab_label(
+                    GTK_NOTEBOOK(nb), ctx->main_box);
+                if (tab) gtk_widget_hide(tab);
+            }
+        }
+        return;
     }
     size_t old=ctx->audio_node_count; ctx->audio_node_count=0;
     for (size_t i=0; i<data->pw_node_count; i++) {
@@ -2902,6 +2913,16 @@ static void md_update(void *opaque, const evemon_proc_data_t *data)
         }
     }
     if (ctx->audio_node_count) {
+        /* Show the notebook tab now that we have audio streams */
+        if (ctx->main_box) {
+            GtkWidget *nb = gtk_widget_get_parent(ctx->main_box);
+            if (nb && GTK_IS_NOTEBOOK(nb)) {
+                gtk_widget_show(ctx->main_box);
+                GtkWidget *tab = gtk_notebook_get_tab_label(
+                    GTK_NOTEBOOK(nb), ctx->main_box);
+                if (tab) gtk_widget_show(tab);
+            }
+        }
         /* Detect whether the set of audio node IDs actually changed,
          * not just the count.  When a user switches audio output
          * (e.g. headphones → speakers) the PW node ID changes but
@@ -2939,6 +2960,16 @@ static void md_clear(void *opaque)
     if (ctx->audio_timer) { g_source_remove(ctx->audio_timer); ctx->audio_timer=0; }
     ctx->audio_node_count=0; ctx->last_pid=0;
     if (ctx->gl_area) gtk_widget_queue_draw(ctx->gl_area);
+    /* Hide the notebook tab */
+    if (ctx->main_box) {
+        GtkWidget *nb = gtk_widget_get_parent(ctx->main_box);
+        if (nb && GTK_IS_NOTEBOOK(nb)) {
+            gtk_widget_hide(ctx->main_box);
+            GtkWidget *tab = gtk_notebook_get_tab_label(
+                GTK_NOTEBOOK(nb), ctx->main_box);
+            if (tab) gtk_widget_hide(tab);
+        }
+    }
 }
 
 static void md_destroy(void *opaque)

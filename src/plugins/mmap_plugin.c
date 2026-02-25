@@ -168,7 +168,7 @@ static char *mmap_to_markup(const char *line, size_t size_kb)
     }
 
     char addr_buf[48];
-    snprintf(addr_buf, sizeof(addr_buf), "%lx-%lx", addr_start, addr_end);
+    snprintf(addr_buf, sizeof(addr_buf), "0x%lx-0x%lx", addr_start, addr_end);
 
     char *addr_esc = g_markup_escape_text(addr_buf, -1);
     char *perms_esc = g_markup_escape_text(perms, -1);

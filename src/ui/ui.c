@@ -3132,6 +3132,18 @@ static uint32_t host_spectro_get_target(void *host_ctx)
 }
 #endif /* HAVE_PIPEWIRE */
 
+/* Helper: check if a plugin is in a load-last list */
+static int inst_is_last_order(const evemon_plugin_t *p,
+                               const char *list[])
+{
+    if (!p || !p->id) return 0;
+    for (int i = 0; list[i]; i++)
+        if (strcmp(p->id, list[i]) == 0) return 1;
+    return 0;
+}
+
+/* ── UI thread ───────────────────────────────────────────────── */
+
 void *ui_thread(void *arg)
 {
     monitor_state_t *mon = (monitor_state_t *)arg;
@@ -4116,6 +4128,14 @@ void *ui_thread(void *arg)
                     NULL
                 };
 
+                /* Plugins listed here are appended at the very end,
+                 * after the pass-2 "remaining" plugins, and are hidden
+                 * by default (the plugin itself shows them on demand). */
+                static const char *tab_order_last[] = {
+                    "org.evemon.milkdrop",
+                    NULL
+                };
+
                 /* Tab label overrides keyed by plugin id */
                 static const struct { const char *id; const char *label; }
                 tab_label_overrides[] = {
@@ -4150,9 +4170,13 @@ void *ui_thread(void *arg)
                     }
                 }
 
-                /* Pass 2: remaining plugins in load order */
+                /* Pass 2: remaining plugins in load order (skip last-order) */
                 for (size_t i = 0; i < preg->count; i++) {
                     if (added[i]) continue;
+                    /* Skip plugins reserved for pass 3 (last) */
+                    if (inst_is_last_order(preg->instances[i].plugin,
+                                           tab_order_last))
+                        continue;
                     plugin_instance_t *inst = &preg->instances[i];
                     if (!inst->widget) continue;
                     const char *lbl = (inst->plugin && inst->plugin->name)
@@ -4169,6 +4193,44 @@ void *ui_thread(void *arg)
                     GtkWidget *label = gtk_label_new(lbl);
                     gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
                                              inst->widget, label);
+                    added[i] = TRUE;
+                }
+
+                /* Pass 3: "load last" plugins, hidden by default */
+                for (int o = 0; tab_order_last[o]; o++) {
+                    for (size_t i = 0; i < preg->count; i++) {
+                        if (added[i]) continue;
+                        plugin_instance_t *inst = &preg->instances[i];
+                        if (!inst->widget || !inst->plugin ||
+                            !inst->plugin->id)
+                            continue;
+                        if (strcmp(inst->plugin->id,
+                                   tab_order_last[o]) != 0)
+                            continue;
+                        const char *lbl = inst->plugin->name
+                                        ? inst->plugin->name : "Plugin";
+                        for (int k = 0; tab_label_overrides[k].id; k++) {
+                            if (strcmp(inst->plugin->id,
+                                       tab_label_overrides[k].id) == 0) {
+                                lbl = tab_label_overrides[k].label;
+                                break;
+                            }
+                        }
+                        GtkWidget *label = gtk_label_new(lbl);
+                        gtk_notebook_append_page(
+                            GTK_NOTEBOOK(notebook),
+                            inst->widget, label);
+                        /* Hide the tab until the plugin activates it */
+                        gtk_widget_set_no_show_all(inst->widget, TRUE);
+                        gtk_widget_hide(inst->widget);
+                        GtkWidget *tab_lbl = gtk_notebook_get_tab_label(
+                            GTK_NOTEBOOK(notebook), inst->widget);
+                        if (tab_lbl) {
+                            gtk_widget_set_no_show_all(tab_lbl, TRUE);
+                            gtk_widget_hide(tab_lbl);
+                        }
+                        added[i] = TRUE;
+                    }
                 }
 
                 g_free(added);

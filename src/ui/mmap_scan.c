@@ -186,10 +186,10 @@ static void read_maps(pid_t pid, mmap_list_t *out)
 
         char display[768];
         if (pathname[0])
-            snprintf(display, sizeof(display), "%lx-%lx  %s  %s  %s",
+            snprintf(display, sizeof(display), "0x%lx-0x%lx  %s  %s  %s",
                      addr_start, addr_end, perms, sz_buf, pathname);
         else
-            snprintf(display, sizeof(display), "%lx-%lx  %s  %s",
+            snprintf(display, sizeof(display), "0x%lx-0x%lx  %s  %s",
                      addr_start, addr_end, perms, sz_buf);
 
         mmap_list_push(out, display, cat, size_kb);
