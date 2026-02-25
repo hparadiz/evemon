@@ -24,6 +24,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <utmpx.h>
+#include <pwd.h>
 
 /* Forward declarations for filter helpers */
 static void rebuild_filter_store(ui_ctx_t *ctx);
@@ -1673,6 +1674,40 @@ static void reload_font_css(ui_ctx_t *ctx)
                  "frame, label, checkbutton { font-size: %dpt; }",
                  ctx->font_size);
         gtk_css_provider_load_from_data(ctx->sidebar_css, buf, -1, NULL);
+    }
+
+    /* Plugin notebook: tab labels + all plugin widget contents */
+    if (ctx->plugin_css) {
+        snprintf(buf, sizeof(buf),
+                 ".evemon-plugins tab,"
+                 ".evemon-plugins tab label,"
+                 ".evemon-plugins treeview,"
+                 ".evemon-plugins label,"
+                 ".evemon-plugins checkbutton { font-size: %dpt; }",
+                 ctx->font_size);
+        gtk_css_provider_load_from_data(ctx->plugin_css, buf, -1, NULL);
+    }
+
+    /* Name-filter and PID search entries */
+    if (ctx->filter_css) {
+        snprintf(buf, sizeof(buf),
+                 "entry {"
+                 "  font-size: %dpt;"
+                 "  min-height: 0;"
+                 "  padding: 1px 4px;"
+                 "  border-radius: 3px;"
+                 "}", ctx->font_size);
+        gtk_css_provider_load_from_data(ctx->filter_css, buf, -1, NULL);
+    }
+    if (ctx->pid_css) {
+        snprintf(buf, sizeof(buf),
+                 "entry {"
+                 "  font-size: %dpt;"
+                 "  min-height: 0;"
+                 "  padding: 1px 4px;"
+                 "  border-radius: 3px;"
+                 "}", ctx->font_size);
+        gtk_css_provider_load_from_data(ctx->pid_css, buf, -1, NULL);
     }
 }
 
@@ -3455,22 +3490,24 @@ void *ui_thread(void *arg)
     gtk_widget_set_valign(name_filter_entry, GTK_ALIGN_START);
     gtk_widget_set_halign(name_filter_entry, GTK_ALIGN_START);
 
-    /* Compact CSS: small font, minimal padding so it fits the header row */
+    /* Compact CSS: small font, minimal padding so it fits the header row.
+     * NOTE: don't unref – kept alive for dynamic font changes. */
+    GtkCssProvider *filt_css = gtk_css_provider_new();
     {
-        GtkCssProvider *filt_css = gtk_css_provider_new();
-        gtk_css_provider_load_from_data(filt_css,
-            "entry {"
-            "  font-size: 8pt;"
-            "  min-height: 0;"
-            "  padding: 1px 4px;"
-            "  border-radius: 3px;"
-            "}", -1, NULL);
-        gtk_style_context_add_provider(
-            gtk_widget_get_style_context(name_filter_entry),
-            GTK_STYLE_PROVIDER(filt_css),
-            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-        g_object_unref(filt_css);
+        char fbuf[128];
+        snprintf(fbuf, sizeof(fbuf),
+                 "entry {"
+                 "  font-size: %dpt;"
+                 "  min-height: 0;"
+                 "  padding: 1px 4px;"
+                 "  border-radius: 3px;"
+                 "}", FONT_SIZE_DEFAULT);
+        gtk_css_provider_load_from_data(filt_css, fbuf, -1, NULL);
     }
+    gtk_style_context_add_provider(
+        gtk_widget_get_style_context(name_filter_entry),
+        GTK_STYLE_PROVIDER(filt_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     GtkWidget *tree_overlay = gtk_overlay_new();
     gtk_container_add(GTK_CONTAINER(tree_overlay), scroll);
@@ -3485,21 +3522,23 @@ void *ui_thread(void *arg)
     gtk_widget_set_valign(pid_entry, GTK_ALIGN_START);
     gtk_widget_set_halign(pid_entry, GTK_ALIGN_START);
 
+    /* NOTE: don't unref – kept alive for dynamic font changes. */
+    GtkCssProvider *pid_entry_css = gtk_css_provider_new();
     {
-        GtkCssProvider *pid_css = gtk_css_provider_new();
-        gtk_css_provider_load_from_data(pid_css,
-            "entry {"
-            "  font-size: 8pt;"
-            "  min-height: 0;"
-            "  padding: 1px 4px;"
-            "  border-radius: 3px;"
-            "}", -1, NULL);
-        gtk_style_context_add_provider(
-            gtk_widget_get_style_context(pid_entry),
-            GTK_STYLE_PROVIDER(pid_css),
-            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-        g_object_unref(pid_css);
+        char pbuf[128];
+        snprintf(pbuf, sizeof(pbuf),
+                 "entry {"
+                 "  font-size: %dpt;"
+                 "  min-height: 0;"
+                 "  padding: 1px 4px;"
+                 "  border-radius: 3px;"
+                 "}", FONT_SIZE_DEFAULT);
+        gtk_css_provider_load_from_data(pid_entry_css, pbuf, -1, NULL);
     }
+    gtk_style_context_add_provider(
+        gtk_widget_get_style_context(pid_entry),
+        GTK_STYLE_PROVIDER(pid_entry_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     gtk_overlay_add_overlay(GTK_OVERLAY(tree_overlay), pid_entry);
 
@@ -3990,11 +4029,13 @@ void *ui_thread(void *arg)
     ctx.filter_store = NULL;
     ctx.sort_model   = GTK_TREE_MODEL_SORT(sort_model);
     ctx.filter_entry = name_filter_entry;
+    ctx.filter_css   = filt_css;
     ctx.name_col     = name_col;
     ctx.filter_text[0] = '\0';
 
     /* Go-to-PID */
     ctx.pid_entry = pid_entry;
+    ctx.pid_css   = pid_entry_css;
     ctx.pid_col   = pid_col;
 
     /* Sidebar detail panel */
@@ -4241,6 +4282,26 @@ void *ui_thread(void *arg)
 
             ctx.plugin_registry = preg;
             ctx.plugin_notebook = notebook;
+
+            /* Live CSS provider for plugin notebook font size */
+            gtk_style_context_add_class(
+                gtk_widget_get_style_context(notebook), "evemon-plugins");
+            ctx.plugin_css = gtk_css_provider_new();
+            {
+                char pbuf[256];
+                snprintf(pbuf, sizeof(pbuf),
+                         ".evemon-plugins tab,"
+                         ".evemon-plugins tab label,"
+                         ".evemon-plugins treeview,"
+                         ".evemon-plugins label,"
+                         ".evemon-plugins checkbutton { font-size: %dpt; }",
+                         FONT_SIZE_DEFAULT);
+                gtk_css_provider_load_from_data(ctx.plugin_css, pbuf, -1, NULL);
+            }
+            gtk_style_context_add_provider_for_screen(
+                gdk_screen_get_default(),
+                GTK_STYLE_PROVIDER(ctx.plugin_css),
+                GTK_STYLE_PROVIDER_PRIORITY_USER);
         } else {
             ctx.plugin_registry = NULL;
             ctx.plugin_notebook = NULL;

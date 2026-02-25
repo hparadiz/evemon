@@ -385,6 +385,183 @@ static void splash_force_no_decorations(GtkWidget *widget,
 #endif
 }
 
+/*
+ * Expand a zsh PS1 prompt string into plain text.
+ * Strips all %{...%} literal escape wrappers and expands common
+ * prompt escapes (%n, %m, %M, %~, %d, %/, %%, %#, %D, %T, %t, %w,
+ * %W, %l, %?, %j, %i).  Color/attribute sequences (%F, %f, %K, %k,
+ * %B, %b, %U, %u, %S, %s) are silently consumed.
+ * Returns a g_malloc'd string (caller frees with g_free).
+ */
+static char *expand_zsh_ps1(const char *ps1,
+                            const char *user,
+                            const char *hostname)
+{
+    if (!ps1 || !ps1[0])
+        return NULL;
+
+    /* Short hostname (up to first dot) */
+    char short_host[256];
+    snprintf(short_host, sizeof(short_host), "%s", hostname);
+    { char *dot = strchr(short_host, '.'); if (dot) *dot = '\0'; }
+
+    GString *out = g_string_new(NULL);
+    const char *p = ps1;
+
+    while (*p) {
+        if (*p == '%' && *(p + 1) == '{') {
+            /* %{...%} — literal escape wrapper, skip everything inside */
+            p += 2;
+            while (*p) {
+                if (*p == '%' && *(p + 1) == '}') { p += 2; break; }
+                p++;
+            }
+            continue;
+        }
+
+        if (*p != '%') {
+            g_string_append_c(out, *p);
+            p++;
+            continue;
+        }
+
+        /* We have a % escape */
+        p++;  /* skip the '%' */
+        if (!*p) break;
+
+        switch (*p) {
+        /* ── Text sequences that produce visible output ─────── */
+        case 'n':   /* username */
+            g_string_append(out, user);
+            p++;
+            break;
+        case 'm':   /* short hostname */
+            g_string_append(out, short_host);
+            p++;
+            break;
+        case 'M':   /* full hostname */
+            g_string_append(out, hostname);
+            p++;
+            break;
+        case '~':   /* cwd with ~ abbreviation */
+        case 'd':   /* cwd */
+        case '/':   /* cwd */
+            {
+                const char *home = g_get_home_dir();
+                char cwd[PATH_MAX] = "";
+                if (getcwd(cwd, sizeof(cwd)) == NULL)
+                    snprintf(cwd, sizeof(cwd), "~");
+                if (*p == '~' && home && strncmp(cwd, home, strlen(home)) == 0) {
+                    g_string_append_c(out, '~');
+                    g_string_append(out, cwd + strlen(home));
+                } else {
+                    g_string_append(out, cwd);
+                }
+            }
+            p++;
+            break;
+        case '%':   /* literal % */
+            g_string_append_c(out, '%');
+            p++;
+            break;
+        case '#':   /* # if root, %% if not */
+            g_string_append_c(out, (getuid() == 0) ? '#' : '%');
+            p++;
+            break;
+        case 'l':   /* tty basename */
+            {
+                const char *tty = ttyname(STDIN_FILENO);
+                if (tty) {
+                    const char *base = strrchr(tty, '/');
+                    g_string_append(out, base ? base + 1 : tty);
+                }
+            }
+            p++;
+            break;
+
+        /* ── Color / attribute sequences — consume silently ──── */
+        case 'F':   /* foreground: %F{color} or %F alone */
+        case 'K':   /* background: %K{color} or %K alone */
+            p++;
+            if (*p == '{') {
+                p++;
+                while (*p && *p != '}') p++;
+                if (*p == '}') p++;
+            }
+            break;
+        case 'f':   /* reset foreground */
+        case 'k':   /* reset background */
+        case 'B':   /* bold on */
+        case 'b':   /* bold off */
+        case 'U':   /* underline on */
+        case 'u':   /* underline off */
+        case 'S':   /* standout on */
+        case 's':   /* standout off */
+            p++;
+            break;
+
+        /* ── Conditional expressions %( — skip to matching %) ── */
+        case '(':
+            {
+                int depth = 1;
+                p++;
+                while (*p && depth > 0) {
+                    if (*p == '%' && *(p + 1) == '(') { depth++; p += 2; }
+                    else if (*p == '%' && *(p + 1) == ')') { depth--; p += 2; }
+                    else p++;
+                }
+            }
+            break;
+
+        /* ── Numeric argument prefix (e.g. %2~) — skip digits ─ */
+        case '0': case '1': case '2': case '3': case '4':
+        case '5': case '6': case '7': case '8': case '9':
+            /* Skip digits then re-process the following escape char */
+            while (*p >= '0' && *p <= '9') p++;
+            /* The next char is the actual escape (e.g. ~ in %2~);
+             * don't advance p, let the loop re-process it as %<char>.
+             * We need to prepend a fake '%' — simplest: just handle
+             * the common case of %N~ directly. */
+            if (*p == '~' || *p == 'd' || *p == '/') {
+                const char *home = g_get_home_dir();
+                char cwd[PATH_MAX] = "";
+                if (getcwd(cwd, sizeof(cwd)) == NULL)
+                    snprintf(cwd, sizeof(cwd), "~");
+                if (*p == '~' && home && strncmp(cwd, home, strlen(home)) == 0) {
+                    g_string_append_c(out, '~');
+                    g_string_append(out, cwd + strlen(home));
+                } else {
+                    g_string_append(out, cwd);
+                }
+                p++;
+            } else {
+                /* Unknown numeric-prefixed escape, skip the char */
+                if (*p) p++;
+            }
+            break;
+
+        default:
+            /* Unknown escape — skip it silently */
+            p++;
+            break;
+        }
+    }
+
+    /* Trim trailing whitespace / newlines */
+    while (out->len > 0 && (out->str[out->len - 1] == ' ' ||
+                            out->str[out->len - 1] == '\n' ||
+                            out->str[out->len - 1] == '\r'))
+        g_string_truncate(out, out->len - 1);
+
+    /* If the expansion is empty, return NULL to fall back to default */
+    if (out->len == 0) {
+        g_string_free(out, TRUE);
+        return NULL;
+    }
+
+    return g_string_free(out, FALSE);
+}
+
 static void on_menu_about(GtkMenuItem *item, gpointer data)
 {
     (void)item;
@@ -408,9 +585,29 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
     gethostname(hostname, sizeof(hostname));
     hostname[sizeof(hostname) - 1] = '\0';
 
-    /* Username */
-    const char *user = g_get_user_name();
+    /* Username – prefer the original (pre-sudo) user */
+    const char *user = g_getenv("SUDO_USER");
+    if (!user || !user[0])
+        user = g_get_user_name();
     if (!user) user = "unknown";
+
+    /* Resolve the original user's home directory.
+     * Under sudo, g_get_home_dir() returns /root, but we want the
+     * invoking user's home so we can read their shell config.      */
+    char real_home[PATH_MAX] = "";
+    {
+        const char *sudo_user = g_getenv("SUDO_USER");
+        if (sudo_user && sudo_user[0]) {
+            /* Look up the user's home from /etc/passwd */
+            struct passwd *pw = getpwnam(sudo_user);
+            if (pw && pw->pw_dir)
+                snprintf(real_home, sizeof(real_home), "%s", pw->pw_dir);
+        }
+        if (!real_home[0]) {
+            const char *h = g_get_home_dir();
+            if (h) snprintf(real_home, sizeof(real_home), "%s", h);
+        }
+    }
 
     /* Kernel */
     char kernel[128] = "unknown";
@@ -500,9 +697,23 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
     format_memory(mem_used_kb, mem_used_buf, sizeof(mem_used_buf));
     format_memory(mem_total_kb, mem_total_buf, sizeof(mem_total_buf));
 
-    /* Shell */
-    const char *shell = g_getenv("SHELL");
-    if (!shell) shell = "/bin/sh";
+    /* Shell – resolve the original user's login shell, not root's */
+    const char *shell = NULL;
+    char shell_buf[PATH_MAX] = "";
+    {
+        const char *sudo_user = g_getenv("SUDO_USER");
+        if (sudo_user && sudo_user[0]) {
+            struct passwd *pw = getpwnam(sudo_user);
+            if (pw && pw->pw_shell && pw->pw_shell[0]) {
+                snprintf(shell_buf, sizeof(shell_buf), "%s", pw->pw_shell);
+                shell = shell_buf;
+            }
+        }
+        if (!shell) {
+            shell = g_getenv("SHELL");
+            if (!shell) shell = "/bin/sh";
+        }
+    }
     const char *shell_base = strrchr(shell, '/');
     shell_base = shell_base ? shell_base + 1 : shell;
 
@@ -880,24 +1091,195 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
     {
         GString *info = g_string_new(NULL);
 
-        /* user@host header (bold + colored) */
-        char *user_esc = g_markup_escape_text(user, -1);
-        char *host_esc = g_markup_escape_text(hostname, -1);
-        g_string_append_printf(info,
-            "<span font_family='Monospace' size='12000'"
-            " foreground='%s' weight='bold'>%s</span>"
-            "<span font_family='Monospace' size='12000'>@</span>"
-            "<span font_family='Monospace' size='12000'"
-            " foreground='%s' weight='bold'>%s</span>\n",
-            glyph.color, user_esc, glyph.color, host_esc);
+        /*
+         * If the user's shell is zsh, try to expand their PS1 prompt
+         * (stripping color/formatting codes) for the header line.
+         * Otherwise fall back to the plain user@hostname.
+         */
+        char *prompt_header = NULL;
+        if (strcmp(shell_base, "zsh") == 0) {
+            /*
+             * The user's prompt may be set by a framework like
+             * oh-my-zsh (theme functions, powerline segments, etc.),
+             * so a simple file parse won't work.  Instead, spawn
+             * zsh as the original user in interactive mode, let it
+             * source all configs/themes, then print the expanded
+             * prompt.  Strip ANSI escape sequences and Powerline
+             * separator glyphs from the output.
+             *
+             * Under sudo we use "sudo -u <user>" to run as the
+             * original invoker; without sudo we run zsh directly.
+             */
+            char cmd[512];
+            const char *sudo_user = g_getenv("SUDO_USER");
+            if (sudo_user && sudo_user[0])
+                snprintf(cmd, sizeof(cmd),
+                         "sudo -u %s zsh -ic 'print -Pn \"$PROMPT\"'"
+                         " 2>/dev/null", sudo_user);
+            else
+                snprintf(cmd, sizeof(cmd),
+                         "zsh -ic 'print -Pn \"$PROMPT\"'"
+                         " 2>/dev/null");
 
-        /* separator */
-        int sep_len = (int)(strlen(user) + 1 + strlen(hostname));
-        g_string_append(info,
-            "<span font_family='Monospace' size='10000'>");
-        for (int i = 0; i < sep_len; i++)
-            g_string_append_c(info, '-');
-        g_string_append(info, "</span>\n");
+            FILE *pp = popen(cmd, "r");
+            if (pp) {
+                char raw[2048] = "";
+                size_t total = 0;
+                size_t n;
+                while ((n = fread(raw + total, 1,
+                                  sizeof(raw) - 1 - total, pp)) > 0)
+                    total += n;
+                raw[total] = '\0';
+                pclose(pp);
+
+                if (total > 0) {
+                    /* Strip ANSI escape sequences (\e[...m etc.) and
+                     * Powerline separator glyphs (U+E0B0–U+E0B3).
+                     * Keep only printable UTF-8 text.                */
+                    GString *clean = g_string_new(NULL);
+                    const char *r = raw;
+                    while (*r) {
+                        /* Skip ANSI CSI sequences: ESC [ ... final_byte */
+                        if (r[0] == '\033' && r[1] == '[') {
+                            r += 2;
+                            while (*r && !(*r >= 0x40 && *r <= 0x7E)) r++;
+                            if (*r) r++;
+                            continue;
+                        }
+                        /* Skip other ESC sequences (OSC, etc.) */
+                        if (r[0] == '\033') {
+                            r++;
+                            if (*r) r++;
+                            continue;
+                        }
+                        /* Decode a UTF-8 character and check for
+                         * Powerline glyphs (U+E0A0–U+E0D4) */
+                        gunichar uc = g_utf8_get_char_validated(r, -1);
+                        if (uc == (gunichar)-1 || uc == (gunichar)-2) {
+                            r++;
+                            continue;
+                        }
+                        const char *next = g_utf8_next_char(r);
+                        /* Skip Powerline Private Use Area glyphs */
+                        if (uc >= 0xE0A0 && uc <= 0xE0D4) {
+                            r = next;
+                            continue;
+                        }
+                        /* Skip control characters */
+                        if (g_unichar_iscntrl(uc) && uc != ' ') {
+                            r = next;
+                            continue;
+                        }
+                        /* Keep this character */
+                        g_string_append_len(clean, r, (gssize)(next - r));
+                        r = next;
+                    }
+
+                    /* Collapse runs of spaces, trim edges */
+                    {
+                        GString *trimmed = g_string_new(NULL);
+                        const char *s = clean->str;
+                        gboolean prev_space = TRUE;
+                        while (*s) {
+                            if (*s == ' ') {
+                                if (!prev_space)
+                                    g_string_append_c(trimmed, ' ');
+                                prev_space = TRUE;
+                            } else {
+                                g_string_append_c(trimmed, *s);
+                                prev_space = FALSE;
+                            }
+                            s++;
+                        }
+                        /* Trim trailing space */
+                        while (trimmed->len > 0 &&
+                               trimmed->str[trimmed->len - 1] == ' ')
+                            g_string_truncate(trimmed, trimmed->len - 1);
+                        /* Trim leading space */
+                        if (trimmed->len > 0 && trimmed->str[0] == ' ')
+                            g_string_erase(trimmed, 0, 1);
+                        g_string_free(clean, TRUE);
+                        clean = trimmed;
+                    }
+
+                    if (clean->len > 0) {
+                        /* The cleaned prompt may contain multiple
+                         * segments (user@host, cwd, git branch, etc.).
+                         * Extract only the part containing '@' — that
+                         * is the user@host context segment.           */
+                        char *at = strstr(clean->str, "@");
+                        if (at) {
+                            /* Walk backwards from '@' to find the start
+                             * of this segment (after a space or at the
+                             * beginning of the string). */
+                            const char *seg_start = clean->str;
+                            for (const char *p = at - 1; p >= clean->str; ) {
+                                gunichar uc = g_utf8_get_char(p);
+                                if (uc == ' ') {
+                                    seg_start = g_utf8_next_char(p);
+                                    break;
+                                }
+                                if (p == clean->str) break;
+                                p = g_utf8_prev_char(p);
+                            }
+                            /* Walk forwards from '@' to find the end
+                             * (next space or end of string). */
+                            const char *seg_end = at + 1;
+                            while (*seg_end && *seg_end != ' ')
+                                seg_end = g_utf8_next_char(seg_end);
+                            prompt_header = g_strndup(seg_start,
+                                (gsize)(seg_end - seg_start));
+                            g_string_free(clean, TRUE);
+                        } else {
+                            prompt_header = g_string_free(clean, FALSE);
+                        }
+                    } else {
+                        g_string_free(clean, TRUE);
+                    }
+                }
+            }
+        }
+
+        if (prompt_header) {
+            /* Use the expanded PS1 as the header (all in brand color) */
+            char *hdr_esc = g_markup_escape_text(prompt_header, -1);
+            g_string_append_printf(info,
+                "<span font_family='Monospace' size='12000'"
+                " foreground='%s' weight='bold'>%s</span>\n",
+                glyph.color, hdr_esc);
+
+            /* separator */
+            int sep_len = (int)g_utf8_strlen(prompt_header, -1);
+            g_string_append(info,
+                "<span font_family='Monospace' size='10000'>");
+            for (int i = 0; i < sep_len; i++)
+                g_string_append_c(info, '-');
+            g_string_append(info, "</span>\n");
+
+            g_free(hdr_esc);
+            g_free(prompt_header);
+        } else {
+            /* Fallback: user@host header (bold + colored) */
+            char *user_esc = g_markup_escape_text(user, -1);
+            char *host_esc = g_markup_escape_text(hostname, -1);
+            g_string_append_printf(info,
+                "<span font_family='Monospace' size='12000'"
+                " foreground='%s' weight='bold'>%s</span>"
+                "<span font_family='Monospace' size='12000'>@</span>"
+                "<span font_family='Monospace' size='12000'"
+                " foreground='%s' weight='bold'>%s</span>\n",
+                glyph.color, user_esc, glyph.color, host_esc);
+
+            /* separator */
+            int sep_len = (int)(strlen(user) + 1 + strlen(hostname));
+            g_string_append(info,
+                "<span font_family='Monospace' size='10000'>");
+            for (int i = 0; i < sep_len; i++)
+                g_string_append_c(info, '-');
+            g_string_append(info, "</span>\n");
+
+            g_free(user_esc); g_free(host_esc);
+        }
 
         /* Key-value info lines — escape values for Pango markup */
         char *dn_esc   = g_markup_escape_text(distro_name, -1);
@@ -929,7 +1311,6 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
         INFO_LINE("Memory:",     "%s / %s", mem_used_buf, mem_total_buf);
         #undef INFO_LINE
 
-        g_free(user_esc); g_free(host_esc);
         g_free(dn_esc); g_free(kern_esc); g_free(up_esc);
         g_free(sh_esc); g_free(de_esc); g_free(cpu_esc);
         g_free(disp_esc); g_free(hdr_esc); g_free(gpu_esc);

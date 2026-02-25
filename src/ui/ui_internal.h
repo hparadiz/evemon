@@ -109,6 +109,9 @@ typedef struct {
     gboolean            alt_pressed;     /* bare Alt-tap detection */
     GtkCssProvider     *css;
     GtkCssProvider     *sidebar_css;
+    GtkCssProvider     *plugin_css;
+    GtkCssProvider     *filter_css;
+    GtkCssProvider     *pid_css;
     int                 font_size;
     gboolean            auto_font;
 
