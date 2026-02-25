@@ -183,45 +183,9 @@ static gboolean meter_tick(gpointer data)
             ms->display_r[i] = ms->display_r[i] * METER_DECAY;
     }
 
-    /* Update tree store levels for all audio output leaf rows.
-     * pw_store may be NULL when PipeWire is handled entirely by the
-     * plugin — in that case the plugin's own meter_tick updates its
-     * private store; we just skip the legacy tree-store update here. */
-    if (!ctx->pw_store)
-        return G_SOURCE_CONTINUE;
-
-    GtkTreeModel *model = GTK_TREE_MODEL(ctx->pw_store);
-    GtkTreeIter parent;
-    gboolean pvalid = gtk_tree_model_iter_children(model, &parent, NULL);
-    int any_changed = 0;
-
-    while (pvalid) {
-        GtkTreeIter child;
-        gboolean cvalid = gtk_tree_model_iter_children(model, &child, &parent);
-        while (cvalid) {
-            guint nid = 0;
-            gtk_tree_model_get(model, &child, PW_COL_NODE_ID, &nid, -1);
-            if (nid != 0) {
-                /* Find this node in our meter array */
-                for (size_t i = 0; i < ms->node_count; i++) {
-                    if (ms->nodes[i].node_id == nid) {
-                        int ll = (int)(ms->display_l[i] * 1000.0f + 0.5f);
-                        int lr = (int)(ms->display_r[i] * 1000.0f + 0.5f);
-                        gtk_tree_store_set(ctx->pw_store, &child,
-                                           PW_COL_LEVEL_L, ll,
-                                           PW_COL_LEVEL_R, lr, -1);
-                        any_changed = 1;
-                        break;
-                    }
-                }
-            }
-            cvalid = gtk_tree_model_iter_next(model, &child);
-        }
-        pvalid = gtk_tree_model_iter_next(model, &parent);
-    }
-
-    if (any_changed)
-        gtk_widget_queue_draw(GTK_WIDGET(ctx->pw_view));
+    /* The PipeWire plugin's own timer uses pw_meter_read() to fetch
+     * levels and update its private tree store.  No legacy tree-store
+     * update is needed here. */
 
     return G_SOURCE_CONTINUE;
 }

@@ -109,7 +109,6 @@ typedef struct {
     gboolean            alt_pressed;     /* bare Alt-tap detection */
     GtkCssProvider     *css;
     GtkCssProvider     *sidebar_css;
-    GtkCssProvider     *fd_css;
     int                 font_size;
     gboolean            auto_font;
 
@@ -117,7 +116,6 @@ typedef struct {
 
     /* sidebar */
     GtkWidget          *sidebar;
-    GtkCheckMenuItem   *sidebar_menu_item;
     GtkWidget          *sidebar_grid;
 
     /* sidebar section collapse state & containers */
@@ -125,29 +123,6 @@ typedef struct {
     GtkWidget          *sb_info_content;     /* process info grid          */
     GtkWidget          *sb_info_header_arrow; /* ▼/▶ indicator             */
 
-    gboolean            sb_fd_collapsed;
-    GtkWidget          *sb_fd_content;       /* fd scroll + toggles box    */
-    GtkWidget          *sb_fd_header_arrow;
-
-    gboolean            sb_env_collapsed;
-    GtkWidget          *sb_env_content;      /* env scroll                 */
-    GtkWidget          *sb_env_header_arrow;
-
-    gboolean            sb_mmap_collapsed;
-    GtkWidget          *sb_mmap_content;     /* mmap scroll                */
-    GtkWidget          *sb_mmap_header_arrow;
-
-#ifdef HAVE_PIPEWIRE
-    gboolean            sb_pw_collapsed;
-    GtkWidget          *sb_pw_content;       /* pw scroll                  */
-    GtkWidget          *sb_pw_header_arrow;
-
-    gboolean            sb_spectro_collapsed;
-    GtkWidget          *sb_spectro_content;
-    GtkWidget          *sb_spectro_section;   /* entire section (show/hide) */
-    GtkWidget          *sb_spectro_header_arrow;
-    gboolean            sb_spectro_user_shown; /* user explicitly opened    */
-#endif
     GtkLabel           *sb_pid;
     GtkLabel           *sb_ppid;
     GtkLabel           *sb_user;
@@ -187,83 +162,25 @@ typedef struct {
     GtkLabel           *sb_cgroup_io;
     GtkWidget          *sb_cgroup_io_key;
     GtkWidget          *sb_cgroup_frame;     /* container to show/hide */
-    guint               cgroup_generation;
-    GCancellable       *cgroup_cancel;
-
-    /* file descriptor list in sidebar */
-    GtkTreeStore       *fd_store;
-    GtkTreeView        *fd_view;
-    GtkWidget          *fd_desc_toggle;
-    gboolean            fd_include_desc;
-    GtkWidget          *fd_group_dup_toggle;
-    gboolean            fd_group_dup_active;
-    unsigned            fd_collapsed;      /* bitmask: 1 << cat */
-    pid_t               fd_last_pid;
-
-    /* environment variable list in sidebar */
-    GtkTreeStore       *env_store;
-    GtkTreeView        *env_view;
-    GtkCssProvider     *env_css;
-    unsigned            env_collapsed;     /* bitmask: 1 << env_cat */
-    pid_t               env_last_pid;
-    guint               env_generation;
-    GCancellable       *env_cancel;
-
-    /* memory map list in sidebar */
-    GtkTreeStore       *mmap_store;
-    GtkTreeView        *mmap_view;
-    GtkCssProvider     *mmap_css;
-    unsigned            mmap_collapsed;    /* bitmask: 1 << mmap_cat */
-    pid_t               mmap_last_pid;
-    guint               mmap_generation;
-    GCancellable       *mmap_cancel;
-
-    /* shared library / DLL list in sidebar */
-    GtkTreeStore       *lib_store;
-    GtkTreeView        *lib_view;
-    GtkCssProvider     *lib_css;
-    unsigned            lib_collapsed;     /* bitmask: 1 << lib_cat */
-    pid_t               lib_last_pid;
-    guint               lib_generation;
-    GCancellable       *lib_cancel;
-
-    /* lib section collapse/expand */
-    gboolean            sb_lib_collapsed;
-    GtkWidget          *sb_lib_content;
-    GtkWidget          *sb_lib_header_arrow;
-    GtkWidget          *sb_lib_scroll;
-
-    /* network sockets in sidebar (dedicated section) */
-    GtkTreeStore       *net_store;
-    GtkTreeView        *net_view;
-    GtkCssProvider     *net_css;
-    pid_t               net_last_pid;
-    guint               net_generation;
-    GCancellable       *net_cancel;
-    GtkWidget          *net_desc_toggle;
-    gboolean            net_include_desc;
-
-    /* net section collapse/expand */
-    gboolean            sb_net_collapsed;
-    GtkWidget          *sb_net_content;
-    GtkWidget          *sb_net_header_arrow;
-    GtkWidget          *sb_net_scroll;
 
 #ifdef HAVE_PIPEWIRE
-    /* PipeWire audio connections in sidebar */
+    /* PipeWire sidebar scan state (used by pipewire_scan.c) */
     GtkTreeStore       *pw_store;
     GtkTreeView        *pw_view;
     GtkCssProvider     *pw_css;
-    unsigned            pw_collapsed;      /* bitmask: 1 << cat */
+    unsigned            pw_collapsed;      /* bitmask: 1 << pw_cat */
     pid_t               pw_last_pid;
     guint               pw_generation;
     GCancellable       *pw_cancel;
+
+    /* PipeWire host services (meter + spectrogram) */
     void               *pw_meter;          /* opaque pw_meter_state_t */
     guint               pw_meter_timer;    /* GTK timer for meter updates */
 
     /* Spectrogram (real-time FFT visualisation of audio stream) */
     GtkWidget          *spectro_draw;      /* GtkDrawingArea         */
     void               *spectro;           /* opaque spectro_state_t */
+    gboolean            sb_spectro_user_shown; /* user explicitly showed spectrogram */
 #endif
 
     /* middle-click autoscroll */
@@ -273,10 +190,6 @@ typedef struct {
     double              velocity_x;
     double              velocity_y;
     guint               scroll_timer;
-
-    /* async fd scan state */
-    guint               fd_generation;
-    GCancellable       *fd_cancel;
 
     /* startup: fast-poll until first snapshot arrives */
     gboolean            initial_refresh;
@@ -299,14 +212,6 @@ typedef struct {
     GtkWidget          *pid_entry;
     GtkTreeViewColumn  *pid_col;
 
-    /* scroll widgets for drag-to-resize (stored for window-resize clamping) */
-    GtkWidget          *sb_fd_scroll;
-    GtkWidget          *sb_env_scroll;
-    GtkWidget          *sb_mmap_scroll;
-#ifdef HAVE_PIPEWIRE
-    GtkWidget          *sb_pw_scroll;
-#endif
-
     /* pinned processes */
     pid_t              *pinned_pids;     /* dynamic array of pinned PIDs  */
     size_t              pinned_count;
@@ -328,208 +233,7 @@ typedef struct {
     GSList             *panel_pos_group;        /* radio group for position items   */
 } ui_ctx_t;
 
-/* ── fd types ────────────────────────────────────────────────── */
-
-typedef struct {
-    int   fd;
-    char  path[512];
-    uint64_t net_sort_key;   /* total send+recv bytes for network sort (0 = unsorted) */
-} fd_entry_t;
-
-typedef struct {
-    fd_entry_t *entries;
-    size_t      count;
-    size_t      capacity;
-} fd_list_t;
-
-void fd_list_init(fd_list_t *l);
-void fd_list_free(fd_list_t *l);
-void fd_list_push(fd_list_t *l, int fd, const char *path);
-
-/* ── fd classification ───────────────────────────────────────── */
-
-typedef enum {
-    FD_CAT_FILES,
-    FD_CAT_DEVICES,
-    FD_CAT_NET_SOCKETS,
-    FD_CAT_UNIX_SOCKETS,
-    FD_CAT_OTHER_SOCKETS,
-    FD_CAT_PIPES,
-    FD_CAT_EVENTS,
-    FD_CAT_OTHER,
-    FD_CAT_COUNT
-} fd_category_t;
-
-enum {
-    FD_COL_TEXT,
-    FD_COL_MARKUP,
-    FD_COL_CAT,
-    FD_NUM_COLS
-};
-
-extern const char *fd_cat_label[FD_CAT_COUNT];
-
-/* ── socket table ────────────────────────────────────────────── */
-
-typedef enum {
-    SOCK_KIND_UNKNOWN,
-    SOCK_KIND_TCP,
-    SOCK_KIND_TCP6,
-    SOCK_KIND_UDP,
-    SOCK_KIND_UDP6,
-    SOCK_KIND_UNIX,
-} sock_kind_t;
-
-typedef struct {
-    unsigned long inode;
-    sock_kind_t   kind;
-    uint32_t      local_addr;
-    uint16_t      local_port;
-    uint32_t      remote_addr;
-    uint16_t      remote_port;
-    unsigned char local_addr6[16];
-    unsigned char remote_addr6[16];
-    uint16_t      local_port6;
-    uint16_t      remote_port6;
-    char          unix_path[256];
-    int           unix_type;
-} sock_info_t;
-
-typedef struct {
-    sock_info_t *entries;
-    size_t       count;
-    size_t       capacity;
-} sock_table_t;
-
-void              sock_table_build(sock_table_t *out);
-void              sock_table_free(sock_table_t *t);
-fd_category_t     resolve_socket(unsigned long inode, const sock_table_t *tbl,
-                                 char *desc, size_t descsz);
-fd_category_t     classify_fd(const char *path);
-
-/* ── /proc fd reading & sorting ──────────────────────────────── */
-
-void read_pid_fds(pid_t pid, fd_list_t *out);
-int  fd_entry_path_cmp(const void *a, const void *b);
-int  strcmp_trimmed(const char *a, const char *b);
-char *fd_path_to_markup(const char *path);
-
-/* ── async fd scan ───────────────────────────────────────────── */
-
-void fd_scan_start(ui_ctx_t *ctx, pid_t pid);
-
-/* ── async network socket scan ───────────────────────────────── */
-
-enum {
-    NET_COL_TEXT,        /* plain text (display line)            */
-    NET_COL_MARKUP,      /* Pango markup for display             */
-    NET_COL_SORT_KEY,    /* sort key: total bytes (gint64)       */
-    NET_NUM_COLS
-};
-
-void net_scan_start(ui_ctx_t *ctx, pid_t pid);
-void on_net_desc_toggled(GtkToggleButton *btn, gpointer data);
-
-/* sidebar signal callbacks for network tree */
-void on_net_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
-                          GtkTreePath *path, gpointer data);
-void on_net_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
-                         GtkTreePath *path, gpointer data);
-gboolean on_net_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
-
-/* ── environment variable scanning ───────────────────────────── */
-
-typedef enum {
-    ENV_CAT_PATH,        /* PATH, LD_LIBRARY_PATH, etc.         */
-    ENV_CAT_DISPLAY,     /* DISPLAY, WAYLAND_DISPLAY, DBUS, etc */
-    ENV_CAT_LOCALE,      /* LANG, LC_*, LANGUAGE                */
-    ENV_CAT_XDG,         /* XDG_*                               */
-    ENV_CAT_STEAM,       /* STEAM_*, PROTON_*, WINE*, SteamApp* */
-    ENV_CAT_OTHER,       /* everything else                     */
-    ENV_CAT_COUNT
-} env_category_t;
-
-enum {
-    ENV_COL_TEXT,         /* plain text (KEY=value)              */
-    ENV_COL_MARKUP,       /* Pango markup for display            */
-    ENV_COL_CAT,          /* env_category_t (-1 for leaf rows)   */
-    ENV_NUM_COLS
-};
-
-extern const char *env_cat_label[ENV_CAT_COUNT];
-
-void env_scan_start(ui_ctx_t *ctx, pid_t pid);
-
-/* sidebar signal callbacks for env tree (connected in ui.c) */
-void on_env_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
-                          GtkTreePath *path, gpointer data);
-void on_env_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
-                         GtkTreePath *path, gpointer data);
-gboolean on_env_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
-
-/* ── memory map scanning ─────────────────────────────────────── */
-
-typedef enum {
-    MMAP_CAT_CODE,       /* executable mappings (r-x)           */
-    MMAP_CAT_DATA,       /* read-write file-backed              */
-    MMAP_CAT_RODATA,     /* read-only file-backed               */
-    MMAP_CAT_HEAP,       /* [heap]                              */
-    MMAP_CAT_STACK,      /* [stack]                             */
-    MMAP_CAT_VDSO,       /* [vdso], [vvar], [vsyscall]          */
-    MMAP_CAT_ANON,       /* anonymous (no pathname)             */
-    MMAP_CAT_OTHER,      /* everything else                     */
-    MMAP_CAT_COUNT
-} mmap_category_t;
-
-enum {
-    MMAP_COL_TEXT,        /* plain text (display line)           */
-    MMAP_COL_MARKUP,      /* Pango markup for display            */
-    MMAP_COL_CAT,         /* mmap_category_t (-1 for leaf rows)  */
-    MMAP_NUM_COLS
-};
-
-extern const char *mmap_cat_label[MMAP_CAT_COUNT];
-
-void mmap_scan_start(ui_ctx_t *ctx, pid_t pid);
-
-/* ── shared library / DLL scanning ────────────────────────────── */
-
-typedef enum {
-    LIB_CAT_RUNTIME,       /* ld-linux, libc, libm, libgcc_s, etc.  */
-    LIB_CAT_SYSTEM,        /* system-installed .so files             */
-    LIB_CAT_APPLICATION,   /* app-shipped .so files                  */
-    LIB_CAT_WINE_BUILTIN,  /* Wine/Proton built-in DLLs (.so + .dll)*/
-    LIB_CAT_WINDOWS_DLL,   /* real Windows .dll under Wine/Proton    */
-    LIB_CAT_OTHER,         /* anything else                          */
-    LIB_CAT_COUNT
-} lib_category_t;
-
-enum {
-    LIB_COL_TEXT,          /* plain text (full path for leaves, header for cats) */
-    LIB_COL_MARKUP,        /* Pango markup for display              */
-    LIB_COL_CAT,           /* lib_category_t (-1 for leaf rows)     */
-    LIB_NUM_COLS
-};
-
-extern const char *lib_cat_label[LIB_CAT_COUNT];
-
-void lib_scan_start(ui_ctx_t *ctx, pid_t pid);
-
-/* ── cgroup resource limits scanning ──────────────────────────── */
-
-void cgroup_scan_start(ui_ctx_t *ctx, pid_t pid);
-
-/* sidebar signal callbacks for library tree */
-void on_lib_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
-                          GtkTreePath *path, gpointer data);
-void on_lib_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
-                         GtkTreePath *path, gpointer data);
-gboolean on_lib_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
-gboolean on_lib_query_tooltip(GtkWidget *widget, gint x, gint y,
-                              gboolean keyboard_mode, GtkTooltip *tooltip,
-                              gpointer data);
-
-/* ── PipeWire audio connection scanning ───────────────────────── */
+/* ── PipeWire audio connection scanning & host services ───────── */
 
 #ifdef HAVE_PIPEWIRE
 
@@ -557,7 +261,7 @@ void spectrogram_stop(ui_ctx_t *ctx);
 uint32_t spectrogram_get_target_node(ui_ctx_t *ctx);
 gboolean spectrogram_on_draw(GtkWidget *widget, cairo_t *cr, gpointer data);
 
-/* sidebar signal callbacks for PipeWire tree (connected in ui.c) */
+/* sidebar signal callbacks for PipeWire tree */
 void on_pw_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
                          GtkTreePath *path, gpointer data);
 void on_pw_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
@@ -579,13 +283,6 @@ static inline uint32_t spectrogram_get_target_node(void *ctx)
 { (void)ctx; return 0; }
 
 #endif /* HAVE_PIPEWIRE */
-
-/* sidebar signal callbacks for mmap tree (connected in ui.c) */
-void on_mmap_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
-                           GtkTreePath *path, gpointer data);
-void on_mmap_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
-                          GtkTreePath *path, gpointer data);
-gboolean on_mmap_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
 
 /* ── device labelling ────────────────────────────────────────── */
 
@@ -620,15 +317,6 @@ void     collect_descendant_pids(GtkTreeModel *model, GtkTreeIter *parent,
 /* ── sidebar ─────────────────────────────────────────────────── */
 
 void sidebar_update(ui_ctx_t *ctx);
-
-/* sidebar signal callbacks (connected by ui.c, defined in sidebar.c) */
-void on_fd_desc_toggled(GtkToggleButton *btn, gpointer data);
-void on_fd_group_dup_toggled(GtkToggleButton *btn, gpointer data);
-void on_fd_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
-                         GtkTreePath *path, gpointer data);
-void on_fd_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
-                        GtkTreePath *path, gpointer data);
-gboolean on_fd_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data);
 
 /* ── cleanup (fix 6) ─────────────────────────────────────────── */
 

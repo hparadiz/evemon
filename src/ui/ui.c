@@ -813,43 +813,11 @@ static void on_selection_changed(GtkTreeSelection *sel, gpointer data)
     sidebar_update((ui_ctx_t *)data);
 }
 
-/* ── Collapsible section types / constants ───────────────────── */
+/* ── Collapsible section constants ────────────────────────────── */
 #define SECTION_ARROW_EXPANDED  "▼"
-#define SECTION_ARROW_COLLAPSED "▶"
 
 /* Animation duration for section reveal transitions (ms) */
 #define SECTION_TRANSITION_MS  200
-
-typedef struct {
-    GtkWidget *content;          /* widget inside the revealer          */
-    GtkWidget *revealer;         /* GtkRevealer wrapping the content    */
-    GtkWidget *arrow;            /* ▼/▶ label                          */
-    GtkWidget *section;          /* outermost section box               */
-    GtkWidget *sidebar_vbox;     /* parent container (for reordering)   */
-    GtkWidget *scroll_widget;    /* scrolled window to resize (or NULL) */
-    gboolean  *collapsed_flag;
-    gboolean   is_expandable;    /* TRUE for fd/env/mmap/pw sections    */
-    gboolean   dragging;         /* drag-to-resize in progress          */
-    double     drag_start_y;     /* root-Y at drag start                */
-    int        drag_start_height;/* scroll_widget height at drag start  */
-} section_toggle_t;
-
-/* Minimum / maximum height bounds for drag-to-resize */
-#define SECTION_MIN_HEIGHT       60
-#define SECTION_MAX_HEIGHT_FRAC  0.50   /* max = 50% of sidebar height   */
-#define SECTION_DEFAULT_HEIGHT   200    /* default scroll area min-height */
-#define SECTION_DRAG_MIN_WIN_H   900    /* window must be >= this tall    */
-
-static void on_toggle_sidebar(GtkCheckMenuItem *item, gpointer data)
-{
-    ui_ctx_t *ctx = data;
-    if (gtk_check_menu_item_get_active(item)) {
-        gtk_widget_show_all(ctx->sidebar);
-        sidebar_update(ctx);
-    } else {
-        gtk_widget_hide(ctx->sidebar);
-    }
-}
 
 /* ── detail panel: toggle visibility ─────────────────────────── */
 
@@ -991,195 +959,6 @@ static void detail_panel_relayout(ui_ctx_t *ctx)
         gtk_widget_hide(ctx->detail_panel);
 }
 
-
-/* ── callback when revealer collapse animation finishes ─────────── */
-static void on_revealer_collapse_done(GObject *obj, GParamSpec *pspec,
-                                      gpointer data)
-{
-    (void)pspec;
-    GtkRevealer *rv = GTK_REVEALER(obj);
-    section_toggle_t *t = data;
-
-    /* Only act when the animation is fully finished (child-revealed
-     * becomes FALSE) and the section is still logically collapsed. */
-    if (gtk_revealer_get_child_revealed(rv))
-        return;
-    if (!(*t->collapsed_flag))
-        return;
-
-    /* Disconnect ourselves so we don't fire on future transitions */
-    g_signal_handlers_disconnect_by_func(rv, on_revealer_collapse_done, t);
-}
-
-/* ── drag-to-resize section height ────────────────────────────── */
-
-/* Set resize cursor on section header after it's realized */
-static void on_section_header_realize(GtkWidget *eb, gpointer data)
-{
-    (void)data;
-    GdkDisplay *display = gdk_display_get_default();
-    GdkCursor *cursor = gdk_cursor_new_from_name(display, "ns-resize");
-    if (!cursor)
-        cursor = gdk_cursor_new_from_name(display, "sb_v_double_arrow");
-    if (cursor) {
-        gdk_window_set_cursor(gtk_widget_get_window(eb), cursor);
-        g_object_unref(cursor);
-    }
-}
-
-static gboolean on_section_header_button_press(GtkWidget *eb,
-                                               GdkEventButton *ev,
-                                               gpointer data)
-{
-    section_toggle_t *t = data;
-
-    /* Double-click → collapse / expand (handled below) */
-    if (ev->type == GDK_2BUTTON_PRESS && ev->button == 1) {
-        /* Cancel any drag that the first click of the double-click started */
-        t->dragging = FALSE;
-        GdkDisplay *d = gdk_display_get_default();
-        gdk_seat_ungrab(gdk_display_get_default_seat(d));
-        return FALSE;   /* fall through to the dblclick handler */
-    }
-
-    /* Single press with left button → begin drag-to-resize.
-     * Only allow when the window is tall enough that extra space exists. */
-    if (ev->type == GDK_BUTTON_PRESS && ev->button == 1 &&
-        t->scroll_widget && !(*t->collapsed_flag)) {
-        GtkWidget *toplevel = gtk_widget_get_toplevel(eb);
-        if (!GTK_IS_WINDOW(toplevel) ||
-            gtk_widget_get_allocated_height(toplevel) < SECTION_DRAG_MIN_WIN_H)
-            return FALSE;
-        t->dragging          = TRUE;
-        t->drag_start_y      = ev->y_root;
-        t->drag_start_height = gtk_widget_get_allocated_height(t->scroll_widget);
-        /* Grab pointer so we get motion events even outside the header */
-        GdkDisplay *display = gdk_display_get_default();
-        GdkSeat    *seat    = gdk_display_get_default_seat(display);
-        GdkWindow  *win     = gtk_widget_get_window(eb);
-        GdkCursor  *cursor  = gdk_cursor_new_from_name(display, "ns-resize");
-        if (!cursor)
-            cursor = gdk_cursor_new_from_name(display, "sb_v_double_arrow");
-        gdk_seat_grab(seat, win,
-                      GDK_SEAT_CAPABILITY_POINTER,
-                      FALSE, cursor, (GdkEvent *)ev, NULL, NULL);
-        if (cursor) g_object_unref(cursor);
-        return TRUE;
-    }
-    return FALSE;
-}
-
-static gboolean on_section_header_button_release(GtkWidget *eb,
-                                                 GdkEventButton *ev,
-                                                 gpointer data)
-{
-    (void)eb; (void)ev;
-    section_toggle_t *t = data;
-    /* Always ungrab if we were dragging (or if a grab is still held
-     * from a drag that was cancelled by a double-click). */
-    gboolean was_dragging = t->dragging;
-    t->dragging = FALSE;
-    GdkDisplay *display = gdk_display_get_default();
-    GdkSeat    *seat    = gdk_display_get_default_seat(display);
-    gdk_seat_ungrab(seat);
-    return was_dragging;
-}
-
-static gboolean on_section_header_motion(GtkWidget *eb,
-                                         GdkEventMotion *ev,
-                                         gpointer data)
-{
-    (void)eb;
-    section_toggle_t *t = data;
-    if (!t->dragging || !t->scroll_widget)
-        return FALSE;
-
-    /* Safety: if the button was released but we missed the event, stop */
-    if (!(ev->state & GDK_BUTTON1_MASK)) {
-        t->dragging = FALSE;
-        GdkDisplay *d = gdk_display_get_default();
-        gdk_seat_ungrab(gdk_display_get_default_seat(d));
-        return TRUE;
-    }
-
-    double dy = ev->y_root - t->drag_start_y;
-    /* Dragging header UP (dy<0) → grow section, DOWN → shrink */
-    int new_height = t->drag_start_height - (int)dy;
-
-    /* Clamp to bounds */
-    if (new_height < SECTION_MIN_HEIGHT)
-        new_height = SECTION_MIN_HEIGHT;
-
-    /* Cap at a fraction of the sidebar's current height */
-    GtkWidget *sidebar = gtk_widget_get_toplevel(t->scroll_widget);
-    if (GTK_IS_WINDOW(sidebar)) {
-        int win_h = gtk_widget_get_allocated_height(sidebar);
-        int max_h = (int)(win_h * SECTION_MAX_HEIGHT_FRAC);
-        if (max_h < SECTION_MIN_HEIGHT) max_h = SECTION_MIN_HEIGHT;
-        if (new_height > max_h) new_height = max_h;
-    }
-
-    gtk_widget_set_size_request(t->scroll_widget, -1, new_height);
-    return TRUE;
-}
-
-/* ── clamp section heights when window shrinks ──────────────── */
-static void on_sidebar_win_size_allocate(GtkWidget *widget,
-                                        GdkRectangle *alloc,
-                                        gpointer data)
-{
-    (void)widget;
-    ui_ctx_t *ctx = data;
-    if (alloc->height >= SECTION_DRAG_MIN_WIN_H)
-        return;   /* window is large enough – keep custom heights */
-
-    /* Window is small: reset any sections whose min-height exceeds the
-     * default back to the default so they don't fight for space.  */
-    GtkWidget *scrolls[] = {
-        ctx->sb_fd_scroll, ctx->sb_env_scroll, ctx->sb_mmap_scroll,
-        ctx->sb_lib_scroll, ctx->sb_net_scroll,
-#ifdef HAVE_PIPEWIRE
-        ctx->sb_pw_scroll,
-#endif
-    };
-    for (size_t i = 0; i < sizeof(scrolls)/sizeof(scrolls[0]); i++) {
-        if (scrolls[i]) {
-            int cur_min;
-            gtk_widget_get_size_request(scrolls[i], NULL, &cur_min);
-            if (cur_min > SECTION_DEFAULT_HEIGHT)
-                gtk_widget_set_size_request(scrolls[i], -1,
-                                            SECTION_DEFAULT_HEIGHT);
-        }
-    }
-}
-
-/* ── double-click a section header to collapse / expand it ────── */
-static gboolean on_section_header_dblclick(GtkWidget *eb,
-                                           GdkEventButton *ev,
-                                           gpointer data)
-{
-    (void)eb;
-    if (ev->type != GDK_2BUTTON_PRESS || ev->button != 1)
-        return FALSE;
-
-    section_toggle_t *t = data;
-    gboolean collapsed = !(*t->collapsed_flag);
-    *t->collapsed_flag = collapsed;
-
-    if (collapsed) {
-        /* Update the arrow immediately, then animate content closed.
-         * Defer vexpand removal and reorder until the animation ends
-         * so the section smoothly shrinks instead of jumping. */
-        gtk_label_set_text(GTK_LABEL(t->arrow), SECTION_ARROW_COLLAPSED);
-        g_signal_connect(t->revealer, "notify::child-revealed",
-                         G_CALLBACK(on_revealer_collapse_done), t);
-        gtk_revealer_set_reveal_child(GTK_REVEALER(t->revealer), FALSE);
-    } else {
-        gtk_label_set_text(GTK_LABEL(t->arrow), SECTION_ARROW_EXPANDED);
-        gtk_revealer_set_reveal_child(GTK_REVEALER(t->revealer), TRUE);
-    }
-    return TRUE;   /* event consumed */
-}
 
 /* ── double-click: open sidebar for the activated row ─────────── */
 
@@ -1892,68 +1671,6 @@ static void reload_font_css(ui_ctx_t *ctx)
                  ctx->font_size);
         gtk_css_provider_load_from_data(ctx->sidebar_css, buf, -1, NULL);
     }
-
-    /* FD tree in sidebar (1pt smaller than main) */
-    if (ctx->fd_css) {
-        int fd_size = ctx->font_size > FONT_SIZE_MIN
-                    ? ctx->font_size - 1 : ctx->font_size;
-        snprintf(buf, sizeof(buf),
-                 "treeview { font-family: Monospace; font-size: %dpt; }",
-                 fd_size);
-        gtk_css_provider_load_from_data(ctx->fd_css, buf, -1, NULL);
-    }
-
-    /* Env tree in sidebar (same size as fd tree) */
-    if (ctx->env_css) {
-        int env_size = ctx->font_size > FONT_SIZE_MIN
-                     ? ctx->font_size - 1 : ctx->font_size;
-        snprintf(buf, sizeof(buf),
-                 "treeview { font-family: Monospace; font-size: %dpt; }",
-                 env_size);
-        gtk_css_provider_load_from_data(ctx->env_css, buf, -1, NULL);
-    }
-
-    /* Mmap tree in sidebar (same size as fd/env tree) */
-    if (ctx->mmap_css) {
-        int mmap_size = ctx->font_size > FONT_SIZE_MIN
-                      ? ctx->font_size - 1 : ctx->font_size;
-        snprintf(buf, sizeof(buf),
-                 "treeview { font-family: Monospace; font-size: %dpt; }",
-                 mmap_size);
-        gtk_css_provider_load_from_data(ctx->mmap_css, buf, -1, NULL);
-    }
-
-    /* Library tree in sidebar (same size as fd/env/mmap tree) */
-    if (ctx->lib_css) {
-        int lib_size = ctx->font_size > FONT_SIZE_MIN
-                     ? ctx->font_size - 1 : ctx->font_size;
-        snprintf(buf, sizeof(buf),
-                 "treeview { font-family: Monospace; font-size: %dpt; }",
-                 lib_size);
-        gtk_css_provider_load_from_data(ctx->lib_css, buf, -1, NULL);
-    }
-
-    /* Net tree in sidebar (same size as fd/env/mmap tree) */
-    if (ctx->net_css) {
-        int net_size = ctx->font_size > FONT_SIZE_MIN
-                     ? ctx->font_size - 1 : ctx->font_size;
-        snprintf(buf, sizeof(buf),
-                 "treeview { font-family: Monospace; font-size: %dpt; }",
-                 net_size);
-        gtk_css_provider_load_from_data(ctx->net_css, buf, -1, NULL);
-    }
-
-#ifdef HAVE_PIPEWIRE
-    /* PipeWire tree in sidebar (same size as fd/env/mmap tree) */
-    if (ctx->pw_css) {
-        int pw_size = ctx->font_size > FONT_SIZE_MIN
-                    ? ctx->font_size - 1 : ctx->font_size;
-        snprintf(buf, sizeof(buf),
-                 "treeview { font-family: Monospace; font-size: %dpt; }",
-                 pw_size);
-        gtk_css_provider_load_from_data(ctx->pw_css, buf, -1, NULL);
-    }
-#endif
 }
 
 /* ── desktop-environment–aware modifier detection ─────────────── */
@@ -4055,36 +3772,34 @@ void *ui_thread(void *arg)
     GtkWidget *info_section, *info_header_eb, *info_revealer, *info_arrow;
     MAKE_SECTION(info_section, info_header_eb, info_revealer,
                  info_arrow, "Process Info", info_content_box, FALSE);
-    (void)info_header_eb; (void)info_revealer;
+    (void)info_revealer;
     gtk_widget_set_name(info_section, "info-section");
     /* Info always participates in equal vertical space sharing */
     gtk_widget_set_vexpand(info_section, TRUE);
-    /* Info section is never collapsible – hide the arrow */
+    /* Info section is never collapsible – hide the arrow and header */
     gtk_widget_hide(info_arrow);
     gtk_widget_set_no_show_all(info_arrow, TRUE);
-
-    /* Old sidebar data-scanner sections (FD, Environment Variables,
-     * Memory Map, Libraries, Network Sockets) have been retired.
-     * Their functionality is now provided by plugin tabs in the
-     * detail panel.  See src/plugins/ for the new implementations. */
-
-    /* PipeWire Audio sidebar section removed — now handled by the
-     * PipeWire plugin (src/plugins/pipewire_plugin.c).  The host
-     * still provides pw_meter and spectrogram services via
-     * allmon_host_services_t for the plugin to use. */
+    /* Hide the "Process Info" header label and its separator/divider */
+    gtk_widget_hide(info_header_eb);
+    gtk_widget_set_no_show_all(info_header_eb, TRUE);
+    {
+        GList *kids = gtk_container_get_children(GTK_CONTAINER(info_section));
+        if (kids) {
+            /* First child is the separator added by MAKE_SECTION */
+            gtk_widget_hide(GTK_WIDGET(kids->data));
+            gtk_widget_set_no_show_all(GTK_WIDGET(kids->data), TRUE);
+            g_list_free(kids);
+        }
+    }
 
     #undef MAKE_SECTION
 
-    /* ── Pack Process Info into the sidebar vbox ─────────────── */
-    /* The sidebar now only contains the Process Info section (with
-     * Steam/Proton and cgroup subsections).  Old data-scanner sections
-     * (FD, env, mmap, libs, network) are retired — those are handled
-     * by plugin tabs in the detail panel. */
+    /* ── Pack sidebar content ───────────────────────────────────── */
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), info_section, TRUE, TRUE, 0);
 
     gtk_container_add(GTK_CONTAINER(sidebar_scroll), sidebar_vbox);
 
-    GtkWidget *sidebar_frame = gtk_frame_new("Process");
+    GtkWidget *sidebar_frame = gtk_frame_new(NULL);
     gtk_container_add(GTK_CONTAINER(sidebar_frame), sidebar_scroll);
 
     /* Live CSS provider for sidebar font size (cascades to all children) */
@@ -4100,11 +3815,8 @@ void *ui_thread(void *arg)
         GTK_STYLE_PROVIDER(sidebar_css),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-    /* ── layout: tree occupies the main area (no sidebar paned) ── */
-    /* The old sidebar was packed to the right of the tree in an
-     * hpaned.  Now the sidebar lives INSIDE the detail panel,
-     * so the tree overlay is the sole child of the main content. */
-    GtkWidget *hpaned = tree_overlay;  /* no sidebar pane needed */
+    /* ── layout: tree is the main content ───────────────────── */
+    GtkWidget *hpaned = tree_overlay;
 
     /* ── menu bar (hidden by default) ─────────────────────────── */
     GtkWidget *menubar = gtk_menu_bar_new();
@@ -4120,15 +3832,10 @@ void *ui_thread(void *arg)
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menubar), file_item);
 
-    /* View menu → Sidebar toggle + Appearance submenu */
+    /* View menu → Appearance submenu */
     GtkWidget *view_menu = gtk_menu_new();
     GtkWidget *view_item = gtk_menu_item_new_with_label("View");
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(view_item), view_menu);
-
-    /* Sidebar toggle removed — sidebar is now embedded in the detail panel.
-     * A dummy widget satisfies references in ctx initialization. */
-    GtkWidget *sidebar_toggle = gtk_check_menu_item_new_with_label("Sidebar");
-    (void)sidebar_toggle;  /* not added to any menu */
 
     /* Detail Panel toggle */
     GtkWidget *detail_panel_toggle = gtk_check_menu_item_new_with_label("Detail Panel");
@@ -4259,7 +3966,6 @@ void *ui_thread(void *arg)
     ctx.alt_pressed    = FALSE;
     ctx.css          = css;
     ctx.sidebar_css  = sidebar_css;
-    ctx.fd_css       = NULL;  /* old FD section removed */
     ctx.font_size    = FONT_SIZE_DEFAULT;
     ctx.auto_font    = FALSE;
     ctx.ptree_nodes  = (ptree_node_set_t){ NULL, NULL, NULL, 0, 0 };
@@ -4278,18 +3984,12 @@ void *ui_thread(void *arg)
 
     /* Sidebar detail panel */
     ctx.sidebar            = sidebar_frame;
-    ctx.sidebar_menu_item  = GTK_CHECK_MENU_ITEM(sidebar_toggle);
     ctx.sidebar_grid       = sidebar_vbox;
 
     /* Collapsible section state */
     ctx.sb_info_collapsed     = FALSE;
     ctx.sb_info_content       = info_content_box;
     ctx.sb_info_header_arrow  = info_arrow;
-
-    /* Old sidebar sections (FD, env, mmap, lib, net) removed —
-     * now handled by plugin tabs. */
-
-    /* Old PipeWire sidebar state removed — handled by plugin now */
 
     ctx.sb_pid        = sb_pid;
     ctx.sb_ppid       = sb_ppid;
@@ -4330,15 +4030,9 @@ void *ui_thread(void *arg)
     ctx.sb_cgroup_io           = sb_cgroup_io;
     ctx.sb_cgroup_io_key       = sb_cgroup_io_key;
     ctx.sb_cgroup_frame        = cgroup_box;
-    ctx.cgroup_generation      = 0;
-    ctx.cgroup_cancel          = NULL;
-
-    /* Old scanner stores/views removed — handled by plugins now.
-     * Fields zeroed by static initialisation of ctx. */
 
 #ifdef HAVE_PIPEWIRE
-    /* Old PipeWire sidebar store/view removed — now handled by plugin.
-     * Meter and spectrogram state are still used by host services. */
+    /* Meter and spectrogram state are still used by host services */
     ctx.pw_meter       = NULL;
     ctx.pw_meter_timer = 0;
     ctx.spectro_draw   = NULL;
@@ -4510,8 +4204,6 @@ void *ui_thread(void *arg)
     g_signal_connect(font_inc,  "activate", G_CALLBACK(on_font_increase),    &ctx);
     g_signal_connect(font_dec,  "activate", G_CALLBACK(on_font_decrease),    &ctx);
     g_signal_connect(font_auto, "toggled",  G_CALLBACK(on_font_auto_toggle), &ctx);
-    g_signal_connect(sidebar_toggle, "toggled",
-                     G_CALLBACK(on_toggle_sidebar), &ctx);
     g_signal_connect(detail_panel_toggle, "toggled",
                      G_CALLBACK(on_toggle_detail_panel), &ctx);
 
@@ -4528,8 +4220,6 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_panel_position_changed), &pos_data_left);
     g_signal_connect(pos_right, "toggled",
                      G_CALLBACK(on_panel_position_changed), &pos_data_right);
-    /* Old FD/env/mmap/lib/net toggle + section header signals removed —
-     * those sidebar sections are handled by plugin tabs now. */
 
     g_signal_connect(name_filter_entry, "key-release-event",
                      G_CALLBACK(on_filter_entry_key_release), &ctx);
@@ -4539,11 +4229,8 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_pid_entry_insert_text), NULL);
     g_signal_connect(tree_overlay, "get-child-position",
                      G_CALLBACK(on_overlay_get_child_position), &ctx);
-    /* Old PipeWire sidebar signal connections removed — handled by plugin */
     g_signal_connect(window,    "configure-event",
                      G_CALLBACK(on_window_configure), &ctx);
-    g_signal_connect(window,    "size-allocate",
-                     G_CALLBACK(on_sidebar_win_size_allocate), &ctx);
     g_signal_connect(window,    "notify::scale-factor",
                      G_CALLBACK(on_scale_factor_changed), &ctx);
 
@@ -4614,48 +4301,6 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     if (ctx->filter_store) {
         g_object_unref(ctx->filter_store);
         ctx->filter_store = NULL;
-    }
-
-    /* Cancel any in-flight async fd scan */
-    if (ctx->fd_cancel) {
-        g_cancellable_cancel(ctx->fd_cancel);
-        g_object_unref(ctx->fd_cancel);
-        ctx->fd_cancel = NULL;
-    }
-
-    /* Cancel any in-flight async env scan */
-    if (ctx->env_cancel) {
-        g_cancellable_cancel(ctx->env_cancel);
-        g_object_unref(ctx->env_cancel);
-        ctx->env_cancel = NULL;
-    }
-
-    /* Cancel any in-flight async mmap scan */
-    if (ctx->mmap_cancel) {
-        g_cancellable_cancel(ctx->mmap_cancel);
-        g_object_unref(ctx->mmap_cancel);
-        ctx->mmap_cancel = NULL;
-    }
-
-    /* Cancel any in-flight async lib scan */
-    if (ctx->lib_cancel) {
-        g_cancellable_cancel(ctx->lib_cancel);
-        g_object_unref(ctx->lib_cancel);
-        ctx->lib_cancel = NULL;
-    }
-
-    /* Cancel any in-flight async cgroup scan */
-    if (ctx->cgroup_cancel) {
-        g_cancellable_cancel(ctx->cgroup_cancel);
-        g_object_unref(ctx->cgroup_cancel);
-        ctx->cgroup_cancel = NULL;
-    }
-
-    /* Cancel any in-flight async net scan */
-    if (ctx->net_cancel) {
-        g_cancellable_cancel(ctx->net_cancel);
-        g_object_unref(ctx->net_cancel);
-        ctx->net_cancel = NULL;
     }
 
 #ifdef HAVE_PIPEWIRE
