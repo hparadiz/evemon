@@ -15,6 +15,7 @@
  */
 
 #include "plugin_broker.h"
+#include "mpris.h"
 #ifdef HAVE_PIPEWIRE
 #include "ui/pipewire_graph.h"
 #endif
@@ -73,6 +74,10 @@ typedef struct {
     size_t               pw_link_cap;
     evemon_pw_port_t    *pw_ports;
     size_t               pw_port_cap;
+
+    /* MPRIS media metadata */
+    evemon_mpris_player_t *mpris_players;
+    size_t                 mpris_player_count;
 } broker_pid_data_t;
 
 static void broker_pid_data_free(broker_pid_data_t *d)
@@ -92,6 +97,7 @@ static void broker_pid_data_free(broker_pid_data_t *d)
     free(d->pw_nodes);
     free(d->pw_links);
     free(d->pw_ports);
+    free(d->mpris_players);
 }
 
 /* ── Broker cycle state ──────────────────────────────────────── */
@@ -1326,6 +1332,28 @@ static void broker_thread_func(GTask        *task,
         if (needs & evemon_NEED_PIPEWIRE)
             gather_pipewire(d);
 #endif
+
+        /* MPRIS media metadata (uses GDBus, safe from worker thread) */
+        if (needs & evemon_NEED_MPRIS) {
+            evemon_mpris_data_t mpris_out;
+            int rc = mpris_scan_for_pid(d->pid,
+                                        d->data.descendant_pids,
+                                        d->data.descendant_count,
+                                        &mpris_out);
+            fprintf(stderr, "[BROKER MPRIS] pid=%d rc=%d players=%zu\n",
+                    (int)d->pid, rc, mpris_out.player_count);
+            if (rc == 0 && mpris_out.player_count > 0) {
+                d->mpris_players = calloc(mpris_out.player_count,
+                                          sizeof(evemon_mpris_player_t));
+                if (d->mpris_players) {
+                    memcpy(d->mpris_players, mpris_out.players,
+                           mpris_out.player_count * sizeof(evemon_mpris_player_t));
+                    d->mpris_player_count = mpris_out.player_count;
+                    d->data.mpris_players = d->mpris_players;
+                    d->data.mpris_player_count = mpris_out.player_count;
+                }
+            }
+        }
 
         /* Store fdmon context for evemon_net_io_get() */
         d->data.fdmon = cycle->fdmon;

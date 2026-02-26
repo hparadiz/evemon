@@ -22,6 +22,7 @@
  */
 
 #include "../evemon_plugin.h"
+#include "../art_loader.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -265,6 +266,18 @@ typedef struct {
     /* Audio output node tracking */
     uint32_t        audio_node_ids[64];
     size_t          audio_node_count;
+
+    /* MPRIS media metadata display */
+    GtkWidget      *media_section;      /* container for now-playing */
+    GtkWidget      *media_art_image;    /* GtkImage for album art    */
+    GtkWidget      *media_title_label;
+    GtkWidget      *media_artist_label;
+    GtkWidget      *media_album_label;
+    GtkWidget      *media_status_label;
+    GtkWidget      *media_position_label;
+    GdkPixbuf      *art_pixbuf;         /* cached album art pixbuf   */
+    char            art_url_cached[512]; /* URL of cached art         */
+    GCancellable   *art_cancel;          /* in-flight async art load  */
 } pw_ctx_t;
 
 /* ── classification ──────────────────────────────────────────── */
@@ -493,6 +506,207 @@ static gboolean meter_tick(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
+/* ── MPRIS media metadata display ─────────────────────────────── */
+
+/*
+ * Format microseconds to "M:SS" or "H:MM:SS".
+ */
+static void format_duration(int64_t us, char *buf, size_t bufsz)
+{
+    if (us < 0) { buf[0] = '\0'; return; }
+    int64_t total_s = us / 1000000;
+    int h = (int)(total_s / 3600);
+    int m = (int)((total_s % 3600) / 60);
+    int s = (int)(total_s % 60);
+    if (h > 0)
+        snprintf(buf, bufsz, "%d:%02d:%02d", h, m, s);
+    else
+        snprintf(buf, bufsz, "%d:%02d", m, s);
+}
+
+/* ── async art load callback (pipewire) ─────────────────────── */
+
+/* Scale a pixbuf to fit within max_size, preserving aspect ratio. */
+static GdkPixbuf *scale_art_pixbuf(GdkPixbuf *src, int max_size)
+{
+    if (!src) return NULL;
+    int w = gdk_pixbuf_get_width(src);
+    int h = gdk_pixbuf_get_height(src);
+    if (w <= max_size && h <= max_size) return g_object_ref(src);
+    double scale = (double)max_size / (w > h ? w : h);
+    int nw = (int)(w * scale);
+    int nh = (int)(h * scale);
+    if (nw < 1) nw = 1;
+    if (nh < 1) nh = 1;
+    return gdk_pixbuf_scale_simple(src, nw, nh, GDK_INTERP_BILINEAR);
+}
+
+static void pw_on_art_loaded(GdkPixbuf *pixbuf, void *user_data)
+{
+    pw_ctx_t *ctx = user_data;
+    if (ctx->art_pixbuf)
+        g_object_unref(ctx->art_pixbuf);
+    ctx->art_pixbuf = pixbuf;  /* takes ownership (may be NULL) */
+    if (ctx->art_cancel) {
+        g_object_unref(ctx->art_cancel);
+        ctx->art_cancel = NULL;
+    }
+    /* Scale and update the GtkImage widget */
+    if (ctx->art_pixbuf && ctx->media_art_image) {
+        GdkPixbuf *scaled = scale_art_pixbuf(ctx->art_pixbuf, 64);
+        gtk_image_set_from_pixbuf(GTK_IMAGE(ctx->media_art_image), scaled);
+        if (scaled) g_object_unref(scaled);
+    } else if (ctx->media_art_image) {
+        gtk_image_clear(GTK_IMAGE(ctx->media_art_image));
+    }
+}
+
+/*
+ * Update the Now Playing section with MPRIS metadata.
+ */
+static void pw_update_mpris(pw_ctx_t *ctx, const evemon_proc_data_t *data)
+{
+    if (!data->mpris_players || data->mpris_player_count == 0) {
+        /* No MPRIS data — hide the section */
+        if (ctx->media_section)
+            gtk_widget_hide(ctx->media_section);
+        return;
+    }
+
+    /* Pick the best player using smart scoring.
+     *
+     * For multi-stream apps like Firefox (with multiple tabs
+     * producing audio, paused YouTube, etc.), simple "first Playing"
+     * picks the wrong player.  Score each candidate:
+     *
+     *   +100 : PlaybackStatus == "Playing"
+     *    +50 : PlaybackStatus == "Paused"
+     *    +30 : track_title matches a PipeWire media_name from our
+     *           monitored audio nodes (strong correlation signal)
+     *    +20 : has a non-empty track_title
+     *    +10 : has album art
+     */
+    int best_score = -1;
+    const evemon_mpris_player_t *best = NULL;
+    for (size_t i = 0; i < data->mpris_player_count; i++) {
+        const evemon_mpris_player_t *p = &data->mpris_players[i];
+        int score = 0;
+        if (strcmp(p->playback_status, "Playing") == 0) score += 100;
+        else if (strcmp(p->playback_status, "Paused") == 0) score += 50;
+        if (p->track_title[0]) score += 20;
+        if (p->art_url[0]) score += 10;
+        /* Correlate with PipeWire streams */
+        if (p->track_title[0] && data->pw_nodes) {
+            for (size_t j = 0; j < data->pw_node_count; j++) {
+                const evemon_pw_node_t *nd = &data->pw_nodes[j];
+                if (nd->pid != data->pid) continue;
+                if (!nd->media_name[0]) continue;
+                if (strstr(nd->media_name, p->track_title) ||
+                    strstr(p->track_title, nd->media_name)) {
+                    score += 30;
+                    break;
+                }
+            }
+        }
+        if (score > best_score) {
+            best_score = score;
+            best = p;
+        }
+    }
+    if (!best) best = &data->mpris_players[0];
+
+    /* Title */
+    if (best->track_title[0]) {
+        char markup[512];
+        char *esc = g_markup_escape_text(best->track_title, -1);
+        snprintf(markup, sizeof(markup), "<b>%s</b>", esc);
+        g_free(esc);
+        gtk_label_set_markup(GTK_LABEL(ctx->media_title_label), markup);
+    } else {
+        gtk_label_set_text(GTK_LABEL(ctx->media_title_label), "");
+    }
+
+    /* Artist */
+    if (best->track_artist[0]) {
+        char *esc = g_markup_escape_text(best->track_artist, -1);
+        char markup[512];
+        snprintf(markup, sizeof(markup),
+                 "<span foreground=\"#8899bb\">%s</span>", esc);
+        g_free(esc);
+        gtk_label_set_markup(GTK_LABEL(ctx->media_artist_label), markup);
+    } else {
+        gtk_label_set_text(GTK_LABEL(ctx->media_artist_label), "");
+    }
+
+    /* Album */
+    if (best->track_album[0]) {
+        char *esc = g_markup_escape_text(best->track_album, -1);
+        char markup[512];
+        snprintf(markup, sizeof(markup),
+                 "<span foreground=\"#778899\"><i>%s</i></span>", esc);
+        g_free(esc);
+        gtk_label_set_markup(GTK_LABEL(ctx->media_album_label), markup);
+    } else {
+        gtk_label_set_text(GTK_LABEL(ctx->media_album_label), "");
+    }
+
+    /* Playback status with icon */
+    {
+        const char *icon = "⏹";
+        if (strcmp(best->playback_status, "Playing") == 0) icon = "▶";
+        else if (strcmp(best->playback_status, "Paused") == 0) icon = "⏸";
+
+        char status[128];
+        if (best->identity[0])
+            snprintf(status, sizeof(status), "%s %s",
+                     icon, best->identity);
+        else
+            snprintf(status, sizeof(status), "%s %s",
+                     icon, best->playback_status);
+        gtk_label_set_text(GTK_LABEL(ctx->media_status_label), status);
+    }
+
+    /* Position / Duration */
+    {
+        char pos_buf[32] = "", len_buf[32] = "", disp[80] = "";
+        format_duration(best->position_us, pos_buf, sizeof(pos_buf));
+        format_duration(best->length_us, len_buf, sizeof(len_buf));
+        if (pos_buf[0] && len_buf[0])
+            snprintf(disp, sizeof(disp), "%s / %s", pos_buf, len_buf);
+        else if (len_buf[0])
+            snprintf(disp, sizeof(disp), "/ %s", len_buf);
+        else if (pos_buf[0])
+            snprintf(disp, sizeof(disp), "%s", pos_buf);
+        gtk_label_set_text(GTK_LABEL(ctx->media_position_label), disp);
+    }
+
+    /* Album art — async load for file://, https://, data: URIs */
+    if (best->art_url[0] &&
+        strcmp(best->art_url, ctx->art_url_cached) != 0) {
+        /* URL changed — cancel any in-flight load and start new one */
+        if (ctx->art_cancel) {
+            g_cancellable_cancel(ctx->art_cancel);
+            g_object_unref(ctx->art_cancel);
+            ctx->art_cancel = NULL;
+        }
+        snprintf(ctx->art_url_cached, sizeof(ctx->art_url_cached),
+                 "%s", best->art_url);
+        art_load_async(best->art_url, pw_on_art_loaded, ctx,
+                       &ctx->art_cancel);
+    } else if (ctx->art_pixbuf) {
+        GdkPixbuf *scaled = scale_art_pixbuf(ctx->art_pixbuf, 64);
+        gtk_image_set_from_pixbuf(GTK_IMAGE(ctx->media_art_image), scaled);
+        if (scaled) g_object_unref(scaled);
+    } else {
+        gtk_image_clear(GTK_IMAGE(ctx->media_art_image));
+    }
+
+    /* Show the section */
+    gtk_widget_set_no_show_all(ctx->media_section, FALSE);
+    gtk_widget_show_all(ctx->media_section);
+    gtk_widget_set_no_show_all(ctx->media_section, TRUE);
+}
+
 /* ── plugin callbacks ────────────────────────────────────────── */
 
 static GtkWidget *pw_create_widget(void *opaque)
@@ -561,6 +775,88 @@ static GtkWidget *pw_create_widget(void *opaque)
 
     gtk_box_pack_start(GTK_BOX(ctx->main_box), ctx->scroll, TRUE, TRUE, 0);
 
+    /* ── Now Playing section (MPRIS metadata) ─────────────────── */
+    {
+        GtkWidget *media_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+        GtkWidget *media_label = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(media_label),
+            "<small><b>Now Playing</b></small>");
+        gtk_label_set_xalign(GTK_LABEL(media_label), 0.0f);
+        gtk_box_pack_start(GTK_BOX(media_box), media_label,
+                           FALSE, FALSE, 2);
+
+        GtkWidget *info_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+
+        /* Album art — fixed 64×64, no expand */
+        ctx->media_art_image = gtk_image_new();
+        gtk_widget_set_size_request(ctx->media_art_image, 64, 64);
+        gtk_widget_set_halign(ctx->media_art_image, GTK_ALIGN_START);
+        gtk_widget_set_valign(ctx->media_art_image, GTK_ALIGN_CENTER);
+        gtk_box_pack_start(GTK_BOX(info_box), ctx->media_art_image,
+                           FALSE, FALSE, 4);
+
+        /* Text info */
+        GtkWidget *text_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
+
+        ctx->media_title_label = gtk_label_new("");
+        gtk_label_set_xalign(GTK_LABEL(ctx->media_title_label), 0.0f);
+        gtk_label_set_ellipsize(GTK_LABEL(ctx->media_title_label),
+                                PANGO_ELLIPSIZE_END);
+        gtk_box_pack_start(GTK_BOX(text_box), ctx->media_title_label,
+                           FALSE, FALSE, 0);
+
+        ctx->media_artist_label = gtk_label_new("");
+        gtk_label_set_xalign(GTK_LABEL(ctx->media_artist_label), 0.0f);
+        gtk_label_set_ellipsize(GTK_LABEL(ctx->media_artist_label),
+                                PANGO_ELLIPSIZE_END);
+        gtk_box_pack_start(GTK_BOX(text_box), ctx->media_artist_label,
+                           FALSE, FALSE, 0);
+
+        ctx->media_album_label = gtk_label_new("");
+        gtk_label_set_xalign(GTK_LABEL(ctx->media_album_label), 0.0f);
+        gtk_label_set_ellipsize(GTK_LABEL(ctx->media_album_label),
+                                PANGO_ELLIPSIZE_END);
+        gtk_box_pack_start(GTK_BOX(text_box), ctx->media_album_label,
+                           FALSE, FALSE, 0);
+
+        GtkWidget *status_pos_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        ctx->media_status_label = gtk_label_new("");
+        gtk_label_set_xalign(GTK_LABEL(ctx->media_status_label), 0.0f);
+        gtk_box_pack_start(GTK_BOX(status_pos_box), ctx->media_status_label,
+                           FALSE, FALSE, 0);
+        ctx->media_position_label = gtk_label_new("");
+        gtk_label_set_xalign(GTK_LABEL(ctx->media_position_label), 0.0f);
+        gtk_box_pack_start(GTK_BOX(status_pos_box), ctx->media_position_label,
+                           FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(text_box), status_pos_box,
+                           FALSE, FALSE, 0);
+
+        gtk_box_pack_start(GTK_BOX(info_box), text_box, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(media_box), info_box, FALSE, FALSE, 2);
+
+        /* Apply monospace style to match the tree */
+        GtkCssProvider *media_css = gtk_css_provider_new();
+        gtk_css_provider_load_from_data(media_css,
+            "label { font-family: Sans; font-size: 8pt; }", -1, NULL);
+        GtkWidget *labels[] = { ctx->media_title_label,
+                                ctx->media_artist_label,
+                                ctx->media_album_label,
+                                ctx->media_status_label,
+                                ctx->media_position_label };
+        for (int i = 0; i < 5; i++)
+            gtk_style_context_add_provider(
+                gtk_widget_get_style_context(labels[i]),
+                GTK_STYLE_PROVIDER(media_css),
+                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        g_object_unref(media_css);
+
+        ctx->media_section = media_box;
+        gtk_widget_set_no_show_all(ctx->media_section, TRUE);
+        /* Pack at the end so it stays fixed at the bottom */
+        gtk_box_pack_end(GTK_BOX(ctx->main_box), ctx->media_section,
+                         FALSE, FALSE, 4);
+    }
+
     /* ── Spectrogram section ──────────────────────────────────── */
     ctx->spectro_draw = gtk_drawing_area_new();
     gtk_widget_set_size_request(ctx->spectro_draw, -1, 180);
@@ -585,8 +881,9 @@ static GtkWidget *pw_create_widget(void *opaque)
                      G_CALLBACK(on_spectro_draw), ctx);
 
     gtk_widget_set_no_show_all(ctx->spectro_section, TRUE);
-    gtk_box_pack_start(GTK_BOX(ctx->main_box), ctx->spectro_section,
-                       FALSE, FALSE, 4);
+    /* Pack at end (above Now Playing) so the tree list gets grow space */
+    gtk_box_pack_end(GTK_BOX(ctx->main_box), ctx->spectro_section,
+                     FALSE, FALSE, 4);
 
     gtk_widget_show_all(ctx->main_box);
 
@@ -608,12 +905,10 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
 
     if (!data->pw_nodes || data->pw_node_count == 0) {
         gtk_tree_store_clear(ctx->store);
-        if (ctx->host) {
-            if (ctx->host->pw_meter_stop)
-                ctx->host->pw_meter_stop(ctx->host->host_ctx);
-            if (ctx->host->spectro_stop)
-                ctx->host->spectro_stop(ctx->host->host_ctx);
-        }
+        /* Don't call pw_meter_stop — the meter is shared across
+         * all plugin instances.  Just clear our local node list;
+         * stale meter streams for nodes that no longer exist are
+         * harmless (they produce silence / zero levels). */
         ctx->audio_node_count = 0;
         return;
     }
@@ -647,6 +942,12 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
     for (size_t ni = 0; ni < data->pw_node_count; ni++) {
         const evemon_pw_node_t *node = &data->pw_nodes[ni];
         if (node->pid != data->pid) continue;
+
+        /* Skip evemon's own capture/meter streams — they appear in
+         * the PW graph as "evemon-meter-*" or "evemon-spectrogram"
+         * and confuse stream selection for the real audio source. */
+        if (strncmp(node->node_name, "evemon-", 7) == 0) continue;
+        if (strncmp(node->app_name, "evemon", 6) == 0) continue;
 
         int cat = classify_node(node->media_class);
         const char *self = node_label(node);
@@ -866,12 +1167,17 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
                         ctx->audio_node_ids[0]);
             }
         } else {
-            if (ctx->host->pw_meter_stop)
-                ctx->host->pw_meter_stop(ctx->host->host_ctx);
+            /* No audio output nodes for this process — but don't
+             * call pw_meter_stop since the meter is shared across
+             * all plugin instances.  Just stop spectrogram since
+             * that's per-plugin (owned draw area). */
             if (ctx->host->spectro_stop)
                 ctx->host->spectro_stop(ctx->host->host_ctx);
         }
     }
+
+    /* ── Update MPRIS metadata display ────────────────────────── */
+    pw_update_mpris(ctx, data);
 }
 
 static void pw_clear(void *opaque)
@@ -880,12 +1186,7 @@ static void pw_clear(void *opaque)
     gtk_tree_store_clear(ctx->store);
     ctx->last_pid = 0;
     ctx->audio_node_count = 0;
-    if (ctx->host) {
-        if (ctx->host->pw_meter_stop)
-            ctx->host->pw_meter_stop(ctx->host->host_ctx);
-        if (ctx->host->spectro_stop)
-            ctx->host->spectro_stop(ctx->host->host_ctx);
-    }
+    /* Don't call pw_meter_stop here — the meter is shared. */
 }
 
 static void pw_destroy(void *opaque)
@@ -906,6 +1207,12 @@ static void pw_destroy(void *opaque)
         ctx->store = NULL;
     }
     if (ctx->css) g_object_unref(ctx->css);
+    if (ctx->art_cancel) {
+        g_cancellable_cancel(ctx->art_cancel);
+        g_object_unref(ctx->art_cancel);
+        ctx->art_cancel = NULL;
+    }
+    if (ctx->art_pixbuf) g_object_unref(ctx->art_pixbuf);
     free(ctx);
 }
 
@@ -925,7 +1232,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .name          = "PipeWire Audio",
         .id            = "org.evemon.pipewire",
         .version       = "1.0",
-        .data_needs    = evemon_NEED_PIPEWIRE,
+        .data_needs    = evemon_NEED_PIPEWIRE | evemon_NEED_MPRIS,
         .plugin_ctx    = ctx,
         .create_widget = pw_create_widget,
         .update        = pw_update,

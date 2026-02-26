@@ -52,8 +52,8 @@ GRES_XML := $(SRC_DIR)/evemon.gresource.xml
 GRES_C   := $(BUILD_DIR)/evemon_resources.c
 GRES_O   := $(BUILD_DIR)/evemon_resources.o
 
-# Exclude the BPF kernel program from gcc compilation
-SRCS := $(filter-out $(SRC_DIR)/fdmon_ebpf_kern.c, $(wildcard $(SRC_DIR)/*.c))
+# Exclude the BPF kernel program and plugin-only modules from gcc compilation
+SRCS := $(filter-out $(SRC_DIR)/fdmon_ebpf_kern.c $(SRC_DIR)/art_loader.c, $(wildcard $(SRC_DIR)/*.c))
 
 # Retired sidebar scan modules (replaced by the plugin system).
 # They still live in src/ui/ for reference but are no longer compiled.
@@ -104,6 +104,8 @@ $(BUILD_DIR)/ui:
 
 # ── Plugin shared objects ────────────────────────────────────────
 PLUGIN_DIR     := $(BUILD_DIR)/plugins
+SOUP_CFLAGS    := $(shell pkg-config --cflags libsoup-3.0 2>/dev/null)
+SOUP_LDFLAGS   := $(shell pkg-config --libs   libsoup-3.0 2>/dev/null)
 PLUGIN_CFLAGS  := -Wall -Wextra -std=c11 -O2 -D_GNU_SOURCE -fPIC -shared \
                   -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
                   -Wformat -Wformat-security \
@@ -121,16 +123,16 @@ $(PLUGIN_DIR)/evemon_%.so: $(SRC_DIR)/plugins/%.c $(SRC_DIR)/evemon_plugin.h | $
 
 # PipeWire plugin needs PW flags (only built when PW is available)
 ifneq ($(PW_LDFLAGS),)
-$(PLUGIN_DIR)/evemon_pipewire_plugin.so: $(SRC_DIR)/plugins/pipewire_plugin.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
-	$(CC) $(PLUGIN_CFLAGS) $(PW_CFLAGS) -DHAVE_PIPEWIRE -o $@ $< $(PLUGIN_LDFLAGS) $(PW_LDFLAGS)
+$(PLUGIN_DIR)/evemon_pipewire_plugin.so: $(SRC_DIR)/plugins/pipewire_plugin.c $(SRC_DIR)/art_loader.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
+	$(CC) $(PLUGIN_CFLAGS) $(PW_CFLAGS) $(SOUP_CFLAGS) -DHAVE_PIPEWIRE -o $@ $(SRC_DIR)/plugins/pipewire_plugin.c $(SRC_DIR)/art_loader.c $(PLUGIN_LDFLAGS) $(PW_LDFLAGS) $(SOUP_LDFLAGS)
 else
 # If PipeWire is not available, skip the PipeWire plugin
 PLUGIN_SOS := $(filter-out $(PLUGIN_DIR)/evemon_pipewire_plugin.so,$(PLUGIN_SOS))
 endif
 
 # MilkDrop plugin needs -lm for math and -lepoxy for OpenGL via GtkGLArea
-$(PLUGIN_DIR)/evemon_milkdrop_plugin.so: $(SRC_DIR)/plugins/milkdrop_plugin.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
-	$(CC) $(PLUGIN_CFLAGS) -o $@ $< $(PLUGIN_LDFLAGS) -lm -lepoxy
+$(PLUGIN_DIR)/evemon_milkdrop_plugin.so: $(SRC_DIR)/plugins/milkdrop_plugin.c $(SRC_DIR)/art_loader.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
+	$(CC) $(PLUGIN_CFLAGS) $(SOUP_CFLAGS) -o $@ $(SRC_DIR)/plugins/milkdrop_plugin.c $(SRC_DIR)/art_loader.c $(PLUGIN_LDFLAGS) $(SOUP_LDFLAGS) -lm -lepoxy
 
 plugins: $(PLUGIN_SOS)
 

@@ -15,6 +15,7 @@
  */
 
 #include "../evemon_plugin.h"
+#include "../art_loader.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -919,6 +920,10 @@ typedef struct {
     int       show_preset_name;  /* F4: persistent preset name */
     int       show_fps;          /* F5: FPS counter */
     int       show_rating;       /* F6: show preset rating */
+    int       show_nowplaying;   /* M: now-playing detail level
+                                  *   0=off, 1=title only,
+                                  *   2=title+artist+album,
+                                  *   3=full (+ art + timer) */
     int       sequential_order;  /* R: sequential vs random */
     int       effects_enabled;   /* F11: all effects on/off */
     float     preset_duration;   /* seconds before auto-advance */
@@ -947,6 +952,20 @@ typedef struct {
     char      audio_app_name[128];  /* e.g. "Firefox" */
     char      audio_media_name[256]; /* e.g. "YouTube - Song Title" */
     char      process_name[128];    /* monitored process name */
+
+    /* MPRIS metadata (richer than PipeWire media_name) */
+    char      mpris_title[256];
+    char      mpris_artist[256];
+    char      mpris_album[256];
+    char      mpris_status[32];     /* "Playing", "Paused", "Stopped" */
+    int64_t   mpris_position_us;
+    int64_t   mpris_length_us;
+    int       mpris_available;      /* 1 if we have MPRIS data */
+
+    /* Album art for overlay rendering */
+    char      mpris_art_url[512];   /* cached art URL (detect changes) */
+    GdkPixbuf *mpris_art_pixbuf;    /* loaded album art (any size)     */
+    GCancellable *art_cancel;       /* in-flight async art load        */
 } md_ctx_t;
 
 /* ── sound analysis ──────────────────────────────────────────── */
@@ -2070,9 +2089,11 @@ static gboolean on_button_press(GtkWidget *w, GdkEventButton *ev, gpointer data)
         md_load_preset_idx(ctx, idx, 1);
         show_info(ctx,"[%d/%d] %s",ctx->preset_idx+1,ctx->lib.count,
                   ctx->lib.names[ctx->preset_idx]);
-        return TRUE;
     }
-    gtk_widget_grab_focus(w); return FALSE;
+    /* Always force keyboard focus onto the GL area and stop propagation
+     * so that the notebook / parent containers don't steal it back. */
+    gtk_widget_grab_focus(w);
+    return TRUE;
 }
 
 /* ── fullscreen support ──────────────────────────────────────── */
@@ -2185,6 +2206,18 @@ static void md_toggle_fullscreen(md_ctx_t *ctx)
 static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 {
     (void)w; md_ctx_t *ctx=data;
+
+    /* If a text-input widget (GtkEntry, GtkEditable) currently has
+     * keyboard focus, let it handle the keypress instead of consuming
+     * it for milkdrop hotkeys.  This prevents typing in the filter /
+     * PID-go-to entries from triggering visualiser commands. */
+    GtkWidget *toplevel = gtk_widget_get_toplevel(w);
+    if (GTK_IS_WINDOW(toplevel)) {
+        GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(toplevel));
+        if (focus && focus != w && GTK_IS_EDITABLE(focus))
+            return FALSE;
+    }
+
     int shift = (ev->state & GDK_SHIFT_MASK) != 0;
     int ctrl  = (ev->state & GDK_CONTROL_MASK) != 0;
     (void)ctrl;
@@ -2403,6 +2436,21 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
         show_info(ctx, "Auto-advance: %.0fs", ctx->preset_duration);
         return TRUE;
 
+    /* ── M: cycle now-playing detail ──────────────────────────── */
+    case GDK_KEY_m:
+        ctx->show_nowplaying = (ctx->show_nowplaying + 1) % 4;
+        { static const char *modes[] = {
+            "OFF", "Title only", "Title + Artist + Album", "Full"
+          };
+          show_info(ctx, "Now Playing: %s", modes[ctx->show_nowplaying]);
+        }
+        return TRUE;
+    case GDK_KEY_M:
+        /* Shift+M: jump straight to full */
+        ctx->show_nowplaying = 3;
+        show_info(ctx, "Now Playing: Full");
+        return TRUE;
+
     /* ── F / Escape: fullscreen toggle ────────────────────────── */
     case GDK_KEY_f: case GDK_KEY_F:
         md_toggle_fullscreen(ctx);
@@ -2502,8 +2550,9 @@ static void md_start_capture(md_ctx_t *ctx)
 static void md_stop_capture(md_ctx_t *ctx)
 {
     ctx->running=0; ctx->capture_started=0;
-    if (ctx->host && ctx->host->pw_meter_stop)
-        ctx->host->pw_meter_stop(ctx->host->host_ctx);
+    /* Don't call pw_meter_stop — the meter is shared across all
+     * plugin instances and tearing it down would kill monitoring
+     * for other tabs.  Just stop reading; stale streams are harmless. */
 }
 
 static gboolean audio_tick(gpointer data)
@@ -2612,6 +2661,110 @@ static gboolean audio_tick(gpointer data)
 
 /* ── plugin callbacks ────────────────────────────────────────── */
 
+/* ── PangoCairo text helpers ─────────────────────────────────── */
+/*
+ * Cairo's "toy" font API (cairo_select_font_face / cairo_show_text)
+ * picks a single FreeType face and has NO Unicode fallback — CJK,
+ * Hangul, emoji, and even the Unicode play symbols (▶ ⏸ ⏹) all
+ * render as blank boxes when the primary face lacks those glyphs.
+ *
+ * PangoCairo goes through fontconfig's full fallback chain and
+ * handles every script automatically.  Pango is already linked
+ * via GTK3 so this adds zero new dependencies.
+ */
+
+/*
+ * Measure a UTF-8 string using Pango (handles all scripts).
+ * Returns width and height in pixels via *out_w, *out_h.
+ */
+static PangoLayout *md_pango_layout(cairo_t *cr,
+                                     const char *family,
+                                     double font_px,
+                                     PangoWeight weight,
+                                     PangoStyle style,
+                                     const char *text,
+                                     int *out_w, int *out_h)
+{
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+    pango_layout_set_text(layout, text, -1);
+
+    PangoFontDescription *fd = pango_font_description_new();
+    pango_font_description_set_family(fd, family);
+    /* Pango sizes are in Pango units (1/1024 of a point).
+     * We want pixel sizes, so use set_absolute_size (takes Pango units
+     * where 1px = PANGO_SCALE). */
+    pango_font_description_set_absolute_size(fd, font_px * PANGO_SCALE);
+    pango_font_description_set_weight(fd, weight);
+    pango_font_description_set_style(fd, style);
+    pango_layout_set_font_description(layout, fd);
+    pango_font_description_free(fd);
+
+    pango_layout_get_pixel_size(layout, out_w, out_h);
+    return layout;
+}
+
+/*
+ * Draw text with a drop shadow using PangoCairo.
+ * (x, y) is the top-left corner of the text bounding box.
+ */
+static void md_pango_show(cairo_t *cr, PangoLayout *layout,
+                           float x, float y,
+                           float sr, float sg, float sb, float sa,
+                           float fr, float fg, float fb, float fa)
+{
+    /* shadow */
+    cairo_set_source_rgba(cr, sr, sg, sb, sa);
+    cairo_move_to(cr, x + 1, y + 1);
+    pango_cairo_show_layout(cr, layout);
+    /* foreground */
+    cairo_set_source_rgba(cr, fr, fg, fb, fa);
+    cairo_move_to(cr, x, y);
+    pango_cairo_show_layout(cr, layout);
+}
+
+/*
+ * Convenience: create layout, draw right-aligned with shadow, free layout.
+ * Returns the layout height so callers can advance the cursor.
+ */
+static float md_pango_right(cairo_t *cr, float right_x, float baseline_y,
+                             const char *family, double font_px,
+                             PangoWeight weight, PangoStyle style,
+                             const char *text,
+                             float sr, float sg, float sb, float sa,
+                             float fr, float fg, float fb, float fa)
+{
+    int tw, th;
+    PangoLayout *layout = md_pango_layout(cr, family, font_px,
+                                           weight, style, text,
+                                           &tw, &th);
+    float tx = right_x - tw;
+    /* baseline_y is the baseline position; Pango draws from top-left,
+     * so approximate: top = baseline - ascent ≈ baseline - 0.8*font_px */
+    float top_y = baseline_y - font_px * 0.82f;
+    md_pango_show(cr, layout, tx, top_y, sr, sg, sb, sa, fr, fg, fb, fa);
+    g_object_unref(layout);
+    return (float)th;
+}
+
+/*
+ * Simple left-aligned Pango text (for preset names, status text, etc.)
+ */
+static void md_pango_left(cairo_t *cr, float x, float y,
+                           const char *family, double font_px,
+                           PangoWeight weight, PangoStyle style,
+                           const char *text,
+                           float r, float g_, float b, float a)
+{
+    int tw, th; (void)th;
+    PangoLayout *layout = md_pango_layout(cr, family, font_px,
+                                           weight, style, text,
+                                           &tw, &th);
+    cairo_set_source_rgba(cr, r, g_, b, a);
+    cairo_move_to(cr, x, y);
+    pango_cairo_show_layout(cr, layout);
+    g_object_unref(layout);
+}
+
 /* Draw info overlay using Cairo on top of GL */
 static gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data)
 {
@@ -2626,19 +2779,19 @@ static gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data)
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
     if (!ctx->running && !ctx->audio_node_count) {
-        cairo_set_source_rgba(cr,1,1,1,0.3);
-        cairo_select_font_face(cr,"Sans",CAIRO_FONT_SLANT_ITALIC,
-                               CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr,12);
-        cairo_move_to(cr,12,hh/2.0-16);
-        cairo_show_text(cr,"MilkDrop — waiting for audio stream");
-        cairo_set_font_size(cr,9);
-        cairo_move_to(cr,12,hh/2.0+4);
-        cairo_show_text(cr,"Select a process with PipeWire audio output");
-        cairo_move_to(cr,12,hh/2.0+20);
+        md_pango_left(cr, 12, hh/2.0-26, "Sans", 12,
+                      PANGO_WEIGHT_NORMAL, PANGO_STYLE_ITALIC,
+                      "MilkDrop — waiting for audio stream",
+                      1,1,1, 0.3f);
+        md_pango_left(cr, 12, hh/2.0-4, "Sans", 9,
+                      PANGO_WEIGHT_NORMAL, PANGO_STYLE_NORMAL,
+                      "Select a process with PipeWire audio output",
+                      1,1,1, 0.3f);
         char buf[80]; snprintf(buf,sizeof(buf),"%d presets loaded from disk",
                                ctx->lib.count);
-        cairo_show_text(cr, buf);
+        md_pango_left(cr, 12, hh/2.0+12, "Sans", 9,
+                      PANGO_WEIGHT_NORMAL, PANGO_STYLE_NORMAL,
+                      buf, 1,1,1, 0.3f);
     }
 
     /* ── help overlay (F1) ───────────────────────────────────── */
@@ -2648,16 +2801,10 @@ static gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         cairo_rectangle(cr, 0, 0, ww, hh);
         cairo_fill(cr);
 
-        cairo_select_font_face(cr, "Monospace", CAIRO_FONT_SLANT_NORMAL,
-                               CAIRO_FONT_WEIGHT_BOLD);
-        cairo_set_font_size(cr, 13);
-        cairo_set_source_rgba(cr, 1, 0.9, 0.4, 1);
-        cairo_move_to(cr, 16, 28);
-        cairo_show_text(cr, "MilkDrop Hotkeys (F1 to close)");
-
-        cairo_select_font_face(cr, "Monospace", CAIRO_FONT_SLANT_NORMAL,
-                               CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 10);
+        md_pango_left(cr, 16, 14, "Monospace", 13,
+                      PANGO_WEIGHT_BOLD, PANGO_STYLE_NORMAL,
+                      "MilkDrop Hotkeys (F1 to close)",
+                      1, 0.9f, 0.4f, 1);
 
         static const char *help[] = {
             "SPACE        Soft cut to next preset",
@@ -2688,6 +2835,7 @@ static gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data)
             "U            Flip motion direction",
             "Shift+U      Zero out motion",
             "O            Reload current preset from disk",
+            "M / Shift+M  Cycle now-playing (off/title/info/full)",
             "",
             "B / Shift+B  Increase/decrease blend time",
             "+/-          Increase/decrease auto-advance time",
@@ -2709,12 +2857,12 @@ static gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data)
             NULL
         };
 
-        float y = 48;
-        cairo_set_source_rgba(cr, 0.85, 0.9, 1.0, 0.95);
+        float y = 36;
         for (int i = 0; help[i]; i++) {
             if (help[i][0] == '\0') { y += 6; continue; }
-            cairo_move_to(cr, 24, y);
-            cairo_show_text(cr, help[i]);
+            md_pango_left(cr, 24, y, "Monospace", 10,
+                          PANGO_WEIGHT_NORMAL, PANGO_STYLE_NORMAL,
+                          help[i], 0.85f, 0.9f, 1.0f, 0.95f);
             y += 14;
             if (y > hh - 16) break;
         }
@@ -2724,43 +2872,39 @@ static gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data)
     if (ctx->show_fps && ctx->preset_loaded) {
         char fps_buf[32];
         snprintf(fps_buf, sizeof(fps_buf), "%.1f fps", ctx->fps_display);
-        cairo_select_font_face(cr, "Monospace", CAIRO_FONT_SLANT_NORMAL,
-                               CAIRO_FONT_WEIGHT_BOLD);
-        cairo_set_font_size(cr, 10);
-        /* shadow */
-        cairo_set_source_rgba(cr, 0, 0, 0, 0.6);
-        cairo_move_to(cr, ww - 81, 15);
-        cairo_show_text(cr, fps_buf);
-        /* text */
-        cairo_set_source_rgba(cr, 0.2, 1.0, 0.2, 0.8);
-        cairo_move_to(cr, ww - 82, 14);
-        cairo_show_text(cr, fps_buf);
+        int tw, th;
+        PangoLayout *fps_l = md_pango_layout(cr, "Monospace", 10,
+                                              PANGO_WEIGHT_BOLD,
+                                              PANGO_STYLE_NORMAL,
+                                              fps_buf, &tw, &th);
+        md_pango_show(cr, fps_l,
+                       (float)(ww - tw - 6), 4,
+                       0,0,0, 0.6f,
+                       0.2f, 1.0f, 0.2f, 0.8f);
+        g_object_unref(fps_l);
     }
 
     /* ── status indicators (lock, auto, blend) ───────────────── */
     if (ctx->preset_loaded) {
-        float sx = 6, sy = hh - 50;
-        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL,
-                               CAIRO_FONT_WEIGHT_BOLD);
-        cairo_set_font_size(cr, 9);
+        float sy = hh - 60;
         if (ctx->locked) {
-            cairo_set_source_rgba(cr, 1, 0.3, 0.3, 0.7);
-            cairo_move_to(cr, sx, sy);
-            cairo_show_text(cr, "LOCKED");
+            md_pango_left(cr, 6, sy, "Sans", 9,
+                          PANGO_WEIGHT_BOLD, PANGO_STYLE_NORMAL,
+                          "LOCKED", 1, 0.3f, 0.3f, 0.7f);
             sy -= 13;
         }
         if (ctx->auto_preset) {
-            cairo_set_source_rgba(cr, 0.3, 1, 0.3, 0.7);
-            cairo_move_to(cr, sx, sy);
-            cairo_show_text(cr, "AUTO");
+            md_pango_left(cr, 6, sy, "Sans", 9,
+                          PANGO_WEIGHT_BOLD, PANGO_STYLE_NORMAL,
+                          "AUTO", 0.3f, 1, 0.3f, 0.7f);
             sy -= 13;
         }
         if (ctx->blending) {
-            cairo_set_source_rgba(cr, 0.5, 0.7, 1, 0.6);
-            cairo_move_to(cr, sx, sy);
             char bb[32]; snprintf(bb, sizeof(bb), "BLEND %.0f%%",
                                   ctx->blend_progress * 100);
-            cairo_show_text(cr, bb);
+            md_pango_left(cr, 6, sy, "Sans", 9,
+                          PANGO_WEIGHT_BOLD, PANGO_STYLE_NORMAL,
+                          bb, 0.5f, 0.7f, 1, 0.6f);
         }
     }
 
@@ -2770,58 +2914,198 @@ static gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         float a = ctx->info_frames>60 ? 0.9f : 0.9f*ctx->info_frames/60.0f;
         cairo_set_source_rgba(cr,0,0,0,a*0.7);
         cairo_rectangle(cr,0,hh-36,ww,36); cairo_fill(cr);
-        cairo_set_source_rgba(cr,1,1,1,a);
-        cairo_select_font_face(cr,"Sans",CAIRO_FONT_SLANT_NORMAL,
-                               CAIRO_FONT_WEIGHT_BOLD);
-        cairo_set_font_size(cr,11);
-        cairo_move_to(cr,8,hh-14);
-        cairo_show_text(cr,ctx->info_text);
+        md_pango_left(cr, 8, hh-30, "Sans", 11,
+                      PANGO_WEIGHT_BOLD, PANGO_STYLE_NORMAL,
+                      ctx->info_text, 1,1,1, a);
     }
 
     /* ── preset name (top-left, always or faded) ─────────────── */
     if (ctx->preset_loaded) {
         float name_alpha = ctx->show_preset_name ? 0.6f : 0.2f;
-        cairo_set_source_rgba(cr, 1, 1, 1, name_alpha);
-        cairo_select_font_face(cr,"Sans",CAIRO_FONT_SLANT_NORMAL,
-                               CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr,9);
-        cairo_move_to(cr,6,14);
         char dn[80]; strncpy(dn,ctx->preset.name,70); dn[70]=0;
         if (strlen(ctx->preset.name)>70) strcat(dn,"...");
-        cairo_show_text(cr,dn);
+        md_pango_left(cr, 6, 4, "Sans", 9,
+                      PANGO_WEIGHT_NORMAL, PANGO_STYLE_NORMAL,
+                      dn, 1,1,1, name_alpha);
     }
 
-    /* ── audio source text (top-right) ───────────────────────── */
-    if (ctx->running && ctx->audio_node_count > 0) {
-        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL,
-                               CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 9);
+    /* ── now-playing / audio source (bottom-right) ───────────── */
+    /*
+     * show_nowplaying controls detail level:
+     *   0 = off (hidden)
+     *   1 = title only
+     *   2 = title + artist + album
+     *   3 = full (title + artist + album + status/timer + album art)
+     */
+    if (ctx->running && ctx->audio_node_count > 0 && ctx->show_nowplaying > 0) {
+        /*
+         * Scale all text proportionally to the widget's shorter
+         * dimension so it looks right at 320×240 and at 3840×2160.
+         * Reference size: 480 px → base multiplier 1.0.
+         */
+        float ref = (ww < hh ? ww : hh);
+        float scale = ref / 480.0f;
+        if (scale < 0.6f) scale = 0.6f;
+        if (scale > 3.0f) scale = 3.0f;
 
-        /* build the audio source string */
-        char src[384];
-        if (ctx->audio_media_name[0])
-            snprintf(src, sizeof(src), "%s", ctx->audio_media_name);
-        else if (ctx->audio_app_name[0])
-            snprintf(src, sizeof(src), "%s", ctx->audio_app_name);
-        else if (ctx->process_name[0])
-            snprintf(src, sizeof(src), "%s", ctx->process_name);
-        else
-            snprintf(src, sizeof(src), "PID %d", (int)ctx->last_pid);
+        int np_level = ctx->show_nowplaying; /* 1, 2, or 3 */
 
-        /* measure text width to right-align */
-        cairo_text_extents_t ext;
-        cairo_text_extents(cr, src, &ext);
-        float tx = ww - ext.width - 8;
-        float ty = hh - 44;
+        if (ctx->mpris_available && ctx->mpris_title[0]) {
+            /* ── album art thumbnail (level 3 only) ──────────── */
+            float art_sz = 0;           /* actual rendered size   */
+            float art_margin = 6 * scale;
+            if (np_level >= 3 && ctx->mpris_art_pixbuf) {
+                int aw = gdk_pixbuf_get_width(ctx->mpris_art_pixbuf);
+                int ah = gdk_pixbuf_get_height(ctx->mpris_art_pixbuf);
+                art_sz = 48 * scale;
+                if (art_sz < 24) art_sz = 24;
+                float asx = art_sz / (float)aw;
+                float asy = art_sz / (float)ah;
+                float as  = asx < asy ? asx : asy;
+                float rw = aw * as, rh = ah * as;
 
-        /* shadow */
-        cairo_set_source_rgba(cr, 0, 0, 0, 0.4);
-        cairo_move_to(cr, tx + 1, ty + 1);
-        cairo_show_text(cr, src);
-        /* text */
-        cairo_set_source_rgba(cr, 0.7, 0.8, 1.0, 0.5);
-        cairo_move_to(cr, tx, ty);
-        cairo_show_text(cr, src);
+                float ax = ww - rw - 8 * scale;
+                float ay = hh - 44 * scale - rh;
+
+                /* subtle shadow behind the art */
+                cairo_set_source_rgba(cr, 0, 0, 0, 0.45);
+                cairo_rectangle(cr, ax + 2, ay + 2, rw, rh);
+                cairo_fill(cr);
+
+                cairo_save(cr);
+                cairo_translate(cr, ax, ay);
+                cairo_scale(cr, as, as);
+                gdk_cairo_set_source_pixbuf(cr, ctx->mpris_art_pixbuf,
+                                            0, 0);
+                cairo_paint_with_alpha(cr, 0.85);
+                cairo_restore(cr);
+
+                /* thin border */
+                cairo_set_source_rgba(cr, 1, 1, 1, 0.15);
+                cairo_set_line_width(cr, 1);
+                cairo_rectangle(cr, ax, ay, rw, rh);
+                cairo_stroke(cr);
+            }
+
+            /* ── text block (right-aligned, above info bar) ─── */
+            float text_right = ww - (art_sz > 0 ? art_sz + art_margin : 0)
+                               - 8 * scale;
+            float font_title  = 14 * scale;
+            float font_artist = 12 * scale;
+            float font_album  = 10 * scale;
+            float font_status = 9  * scale;
+            float line_gap    = 4  * scale;
+            float ty = hh - 44 * scale;
+
+            /* Status icon + position/length (level 3 only) */
+            if (np_level >= 3) {
+                const char *icon = "⏹";
+                if (strcmp(ctx->mpris_status, "Playing") == 0) icon = "▶";
+                else if (strcmp(ctx->mpris_status, "Paused") == 0) icon = "⏸";
+
+                char pos_buf[32] = "", len_buf[32] = "", status[128];
+                if (ctx->mpris_position_us > 0) {
+                    int64_t ps = ctx->mpris_position_us / 1000000;
+                    int pm = (int)(ps / 60), pss = (int)(ps % 60);
+                    snprintf(pos_buf, sizeof(pos_buf), "%d:%02d", pm, pss);
+                }
+                if (ctx->mpris_length_us > 0) {
+                    int64_t ls = ctx->mpris_length_us / 1000000;
+                    int lm = (int)(ls / 60), lss = (int)(ls % 60);
+                    snprintf(len_buf, sizeof(len_buf), "%d:%02d", lm, lss);
+                }
+                if (pos_buf[0] && len_buf[0])
+                    snprintf(status, sizeof(status), "%s %s / %s",
+                             icon, pos_buf, len_buf);
+                else if (len_buf[0])
+                    snprintf(status, sizeof(status), "%s / %s",
+                             icon, len_buf);
+                else
+                    snprintf(status, sizeof(status), "%s %s",
+                             icon, ctx->mpris_status);
+
+                int tw, th;
+                PangoLayout *sl = md_pango_layout(
+                    cr, "Sans", font_status,
+                    PANGO_WEIGHT_NORMAL, PANGO_STYLE_NORMAL,
+                    status, &tw, &th);
+                md_pango_show(cr, sl,
+                              text_right - tw, ty - th,
+                              0,0,0, 0.4f,
+                              0.6f, 0.7f, 0.8f, 0.55f);
+                g_object_unref(sl);
+                ty -= th + line_gap;
+            }
+
+            /* Album (level 2+) */
+            if (np_level >= 2 && ctx->mpris_album[0]) {
+                int tw, th;
+                PangoLayout *al = md_pango_layout(
+                    cr, "Sans", font_album,
+                    PANGO_WEIGHT_NORMAL, PANGO_STYLE_ITALIC,
+                    ctx->mpris_album, &tw, &th);
+                md_pango_show(cr, al,
+                              text_right - tw, ty - th,
+                              0,0,0, 0.4f,
+                              0.6f, 0.65f, 0.8f, 0.5f);
+                g_object_unref(al);
+                ty -= th + line_gap;
+            }
+
+            /* Artist (level 2+) */
+            if (np_level >= 2 && ctx->mpris_artist[0]) {
+                int tw, th;
+                PangoLayout *al = md_pango_layout(
+                    cr, "Sans", font_artist,
+                    PANGO_WEIGHT_NORMAL, PANGO_STYLE_NORMAL,
+                    ctx->mpris_artist, &tw, &th);
+                md_pango_show(cr, al,
+                              text_right - tw, ty - th,
+                              0,0,0, 0.4f,
+                              0.7f, 0.8f, 1.0f, 0.6f);
+                g_object_unref(al);
+                ty -= th + line_gap + 1;
+            }
+
+            /* Title (largest, boldest) */
+            {
+                int tw, th;
+                PangoLayout *tl = md_pango_layout(
+                    cr, "Sans", font_title,
+                    PANGO_WEIGHT_BOLD, PANGO_STYLE_NORMAL,
+                    ctx->mpris_title, &tw, &th);
+                md_pango_show(cr, tl,
+                              text_right - tw, ty - th,
+                              0,0,0, 0.5f,
+                              0.9f, 0.93f, 1.0f, 0.7f);
+                g_object_unref(tl);
+            }
+        } else {
+            /* Fallback: single-line PipeWire media name */
+            float font_fb = 12 * scale;
+
+            char src[384];
+            if (ctx->audio_media_name[0])
+                snprintf(src, sizeof(src), "%s", ctx->audio_media_name);
+            else if (ctx->audio_app_name[0])
+                snprintf(src, sizeof(src), "%s", ctx->audio_app_name);
+            else if (ctx->process_name[0])
+                snprintf(src, sizeof(src), "%s", ctx->process_name);
+            else
+                snprintf(src, sizeof(src), "PID %d", (int)ctx->last_pid);
+
+            int tw, th;
+            PangoLayout *fl = md_pango_layout(
+                cr, "Sans", font_fb,
+                PANGO_WEIGHT_NORMAL, PANGO_STYLE_NORMAL,
+                src, &tw, &th);
+            float tx = ww - tw - 8 * scale;
+            float ty = hh - 44 * scale - th;
+            md_pango_show(cr, fl, tx, ty,
+                           0,0,0, 0.4f,
+                           0.7f, 0.8f, 1.0f, 0.5f);
+            g_object_unref(fl);
+        }
     }
 
     return FALSE; /* let GL render through */
@@ -2890,6 +3174,25 @@ static GtkWidget *md_create_widget(void *opaque)
 static void md_activate(void *opaque, const evemon_host_services_t *svc)
 { ((md_ctx_t*)opaque)->host = svc; }
 
+/* ── async art load callback ─────────────────────────────────── */
+
+static void md_on_art_loaded(GdkPixbuf *pixbuf, void *user_data)
+{
+    md_ctx_t *ctx = user_data;
+    /* Replace any existing pixbuf */
+    if (ctx->mpris_art_pixbuf)
+        g_object_unref(ctx->mpris_art_pixbuf);
+    ctx->mpris_art_pixbuf = pixbuf;  /* takes ownership (may be NULL) */
+    /* Cancel ref is consumed — clear it */
+    if (ctx->art_cancel) {
+        g_object_unref(ctx->art_cancel);
+        ctx->art_cancel = NULL;
+    }
+    /* Trigger a redraw so the new art appears */
+    if (ctx->gl_area)
+        gtk_widget_queue_draw(ctx->gl_area);
+}
+
 static void md_update(void *opaque, const evemon_proc_data_t *data)
 {
     md_ctx_t *ctx = opaque;
@@ -2915,6 +3218,11 @@ static void md_update(void *opaque, const evemon_proc_data_t *data)
     for (size_t i=0; i<data->pw_node_count; i++) {
         const evemon_pw_node_t *nd=&data->pw_nodes[i];
         if (nd->pid!=data->pid) continue;
+        /* Skip evemon's own capture/meter streams — they appear in
+         * the PW graph as "evemon-meter-*" or "evemon-spectrogram"
+         * and confuse stream selection for the real audio source. */
+        if (strncmp(nd->node_name, "evemon-", 7) == 0) continue;
+        if (strncmp(nd->app_name, "evemon", 6) == 0) continue;
         if (strstr(nd->media_class,"Stream") && strstr(nd->media_class,"Output")
             && strstr(nd->media_class,"Audio")) {
             if (ctx->audio_node_count<64)
@@ -2967,6 +3275,110 @@ static void md_update(void *opaque, const evemon_proc_data_t *data)
            ctx->audio_node_count * sizeof(uint32_t));
     ctx->old_audio_node_count = ctx->audio_node_count;
     ctx->last_pid = data->pid;
+
+    /* ── Capture MPRIS metadata ──────────────────────────────── */
+    ctx->mpris_available = 0;
+    if (data->mpris_players && data->mpris_player_count > 0) {
+        /*
+         * Smart player selection for multi-stream apps (Firefox, etc.).
+         *
+         * Scoring (highest total wins):
+         *   +100 : PlaybackStatus == "Playing"
+         *    +50 : PlaybackStatus == "Paused"  (still relevant)
+         *    +30 : MPRIS track_title matches a PipeWire media_name
+         *          from one of our monitored audio nodes — strong
+         *          signal that this player owns the active stream.
+         *    +20 : has a non-empty track_title (real metadata)
+         *    +10 : has album art
+         */
+        int best_score = -1;
+        const evemon_mpris_player_t *best = NULL;
+        for (size_t i = 0; i < data->mpris_player_count; i++) {
+            const evemon_mpris_player_t *p = &data->mpris_players[i];
+            int score = 0;
+            if (strcmp(p->playback_status, "Playing") == 0) score += 100;
+            else if (strcmp(p->playback_status, "Paused") == 0) score += 50;
+            if (p->track_title[0]) score += 20;
+            if (p->art_url[0]) score += 10;
+            /* Correlate with PipeWire streams — if any audio node's
+             * media_name contains the track title (or vice versa),
+             * this player is likely the one producing our audio. */
+            if (p->track_title[0] && data->pw_nodes) {
+                for (size_t j = 0; j < data->pw_node_count; j++) {
+                    const evemon_pw_node_t *nd = &data->pw_nodes[j];
+                    if (nd->pid != data->pid) continue;
+                    if (!nd->media_name[0]) continue;
+                    if (strstr(nd->media_name, p->track_title) ||
+                        strstr(p->track_title, nd->media_name)) {
+                        score += 30;
+                        break;
+                    }
+                }
+            }
+            if (score > best_score) {
+                best_score = score;
+                best = p;
+            }
+        }
+        if (!best) best = &data->mpris_players[0];
+        snprintf(ctx->mpris_title, sizeof(ctx->mpris_title),
+                 "%s", best->track_title);
+        snprintf(ctx->mpris_artist, sizeof(ctx->mpris_artist),
+                 "%s", best->track_artist);
+        snprintf(ctx->mpris_album, sizeof(ctx->mpris_album),
+                 "%s", best->track_album);
+        snprintf(ctx->mpris_status, sizeof(ctx->mpris_status),
+                 "%s", best->playback_status);
+        ctx->mpris_position_us = best->position_us;
+        ctx->mpris_length_us = best->length_us;
+        ctx->mpris_available = 1;
+
+        /* Album art — reload only when the URL changes */
+        if (best->art_url[0] &&
+            strcmp(best->art_url, ctx->mpris_art_url) != 0) {
+            /* Cancel any in-flight load */
+            if (ctx->art_cancel) {
+                g_cancellable_cancel(ctx->art_cancel);
+                g_object_unref(ctx->art_cancel);
+                ctx->art_cancel = NULL;
+            }
+            if (ctx->mpris_art_pixbuf) {
+                g_object_unref(ctx->mpris_art_pixbuf);
+                ctx->mpris_art_pixbuf = NULL;
+            }
+            snprintf(ctx->mpris_art_url, sizeof(ctx->mpris_art_url),
+                     "%s", best->art_url);
+            /* Async load — handles file://, https://, data: */
+            art_load_async(best->art_url, md_on_art_loaded, ctx,
+                           &ctx->art_cancel);
+        } else if (!best->art_url[0] && ctx->mpris_art_url[0]) {
+            /* Art URL cleared */
+            if (ctx->art_cancel) {
+                g_cancellable_cancel(ctx->art_cancel);
+                g_object_unref(ctx->art_cancel);
+                ctx->art_cancel = NULL;
+            }
+            if (ctx->mpris_art_pixbuf) {
+                g_object_unref(ctx->mpris_art_pixbuf);
+                ctx->mpris_art_pixbuf = NULL;
+            }
+            ctx->mpris_art_url[0] = '\0';
+        }
+
+        /* Also update the overlay audio source from MPRIS
+         * (richer than PipeWire's media_name) */
+        if (best->track_title[0]) {
+            if (best->track_artist[0])
+                snprintf(ctx->audio_media_name,
+                         sizeof(ctx->audio_media_name),
+                         "%s — %s", best->track_artist,
+                         best->track_title);
+            else
+                snprintf(ctx->audio_media_name,
+                         sizeof(ctx->audio_media_name),
+                         "%s", best->track_title);
+        }
+    }
 }
 
 static void md_clear(void *opaque)
@@ -3004,6 +3416,15 @@ static void md_destroy(void *opaque)
     }
     md_stop_capture(ctx);
     if (ctx->audio_timer) { g_source_remove(ctx->audio_timer); ctx->audio_timer=0; }
+    if (ctx->art_cancel) {
+        g_cancellable_cancel(ctx->art_cancel);
+        g_object_unref(ctx->art_cancel);
+        ctx->art_cancel = NULL;
+    }
+    if (ctx->mpris_art_pixbuf) {
+        g_object_unref(ctx->mpris_art_pixbuf);
+        ctx->mpris_art_pixbuf = NULL;
+    }
     md_lib_free(&ctx->lib);
     free(ctx);
 }
@@ -3019,6 +3440,7 @@ evemon_plugin_t *evemon_plugin_init(void)
     ctx->blend_time_user = 2.5f;
     ctx->preset_duration = 30.0f;  /* auto-advance every 30s by default */
     ctx->prev_preset_idx = -1;
+    ctx->show_nowplaying = 3;       /* full now-playing by default */
 
     evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
     if (!p) { free(ctx); return NULL; }
@@ -3028,7 +3450,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .name          = "MilkDrop",
         .id            = "org.evemon.milkdrop",
         .version       = "3.0",
-        .data_needs    = evemon_NEED_PIPEWIRE,
+        .data_needs    = evemon_NEED_PIPEWIRE | evemon_NEED_MPRIS,
         .plugin_ctx    = ctx,
         .create_widget = md_create_widget,
         .update        = md_update,

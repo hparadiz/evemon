@@ -190,30 +190,19 @@ static gboolean meter_tick(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
-void pw_meter_start(ui_ctx_t *ctx, const uint32_t *node_ids, size_t count)
+/*
+ * Helper: bootstrap the PW thread loop and core if not already running.
+ * Returns the existing or newly-created meter state, or NULL on failure.
+ */
+static pw_meter_state_t *meter_ensure_running(ui_ctx_t *ctx)
 {
-    /* If already monitoring the same set of nodes, keep going */
-    pw_meter_state_t *old = ctx->pw_meter;
-    if (old && old->node_count == count) {
-        int same = 1;
-        for (size_t i = 0; i < count; i++) {
-            int found = 0;
-            for (size_t j = 0; j < old->node_count; j++) {
-                if (old->nodes[j].node_id == node_ids[i]) { found = 1; break; }
-            }
-            if (!found) { same = 0; break; }
-        }
-        if (same) return;
-    }
-
-    pw_meter_stop(ctx);
-    if (count == 0) return;
-    if (count > METER_MAX_NODES) count = METER_MAX_NODES;
+    if (ctx->pw_meter)
+        return ctx->pw_meter;
 
     pw_meter_state_t *ms = calloc(1, sizeof(*ms));
-    if (!ms) return;
+    if (!ms) return NULL;
 
-    /* Ensure PIPEWIRE_REMOTE is set */
+    /* Ensure PIPEWIRE_REMOTE is set when running as root */
     const char *sudo_uid = getenv("SUDO_UID");
     if (sudo_uid && !getenv("PIPEWIRE_REMOTE")) {
         char buf[256];
@@ -224,7 +213,7 @@ void pw_meter_start(ui_ctx_t *ctx, const uint32_t *node_ids, size_t count)
     pw_init(NULL, NULL);
 
     ms->loop = pw_thread_loop_new("evemon-meter", NULL);
-    if (!ms->loop) { free(ms); return; }
+    if (!ms->loop) { free(ms); return NULL; }
 
     ms->context = pw_context_new(pw_thread_loop_get_loop(ms->loop), NULL, 0);
     if (!ms->context) goto fail;
@@ -237,78 +226,114 @@ void pw_meter_start(ui_ctx_t *ctx, const uint32_t *node_ids, size_t count)
         pw_thread_loop_unlock(ms->loop);
         goto fail;
     }
-
-    /* Create one stereo capture stream per node */
-    uint8_t pod_buf[1024];
-    struct spa_pod_builder b;
-    struct spa_audio_info_raw raw_info;
-    const struct spa_pod *params[1];
-
-    for (size_t i = 0; i < count; i++) {
-        meter_node_t *mn = &ms->nodes[ms->node_count];
-        mn->node_id = node_ids[i];
-        atomic_store(&mn->peak_l, 0);
-        atomic_store(&mn->peak_r, 0);
-
-        char stream_name[64];
-        snprintf(stream_name, sizeof(stream_name), "evemon-meter-%u", node_ids[i]);
-
-        mn->stream = pw_stream_new(
-            ms->core, stream_name,
-            pw_properties_new(
-                PW_KEY_MEDIA_TYPE,     "Audio",
-                PW_KEY_MEDIA_CATEGORY, "Capture",
-                PW_KEY_MEDIA_ROLE,     "DSP",
-                PW_KEY_NODE_PASSIVE,   "true",
-                PW_KEY_NODE_LATENCY,   "1024/48000",
-                NULL));
-        if (!mn->stream) continue;
-
-        pw_stream_add_listener(mn->stream, &mn->listener,
-                               &meter_stream_events, mn);
-
-        /* F32 stereo, no forced rate */
-        b = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
-        raw_info = SPA_AUDIO_INFO_RAW_INIT(
-            .format   = SPA_AUDIO_FORMAT_F32,
-            .channels = 2
-        );
-        params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &raw_info);
-
-        int ret = pw_stream_connect(mn->stream,
-                                    PW_DIRECTION_INPUT,
-                                    node_ids[i],
-                                    PW_STREAM_FLAG_AUTOCONNECT |
-                                    PW_STREAM_FLAG_MAP_BUFFERS |
-                                    PW_STREAM_FLAG_RT_PROCESS,
-                                    params, 1);
-        if (ret < 0) {
-            pw_stream_destroy(mn->stream);
-            mn->stream = NULL;
-            continue;
-        }
-
-        ms->node_count++;
-    }
-
     pw_thread_loop_unlock(ms->loop);
 
     ctx->pw_meter = ms;
 
     /* Start a ~50ms GTK timer for smooth meter updates */
-    ctx->pw_meter_timer = g_timeout_add(50, meter_tick, ctx);
-    return;
+    if (!ctx->pw_meter_timer)
+        ctx->pw_meter_timer = g_timeout_add(50, meter_tick, ctx);
+
+    return ms;
 
 fail:
-    if (ms->loop)
-        pw_thread_loop_stop(ms->loop);
-    if (ms->core)
-        pw_core_disconnect(ms->core);
-    if (ms->context)
-        pw_context_destroy(ms->context);
-    if (ms->loop)
-        pw_thread_loop_destroy(ms->loop);
+    if (ms->loop)    pw_thread_loop_stop(ms->loop);
+    if (ms->context) pw_context_destroy(ms->context);
+    if (ms->loop)    pw_thread_loop_destroy(ms->loop);
     free(ms);
+    return NULL;
+}
+
+/*
+ * Helper: create a single capture stream for a node ID.
+ * Must be called with the PW thread loop LOCKED.
+ */
+static int meter_add_stream(pw_meter_state_t *ms, uint32_t node_id)
+{
+    if (ms->node_count >= METER_MAX_NODES) return -1;
+
+    meter_node_t *mn = &ms->nodes[ms->node_count];
+    mn->node_id = node_id;
+    atomic_store(&mn->peak_l, 0);
+    atomic_store(&mn->peak_r, 0);
+
+    char stream_name[64];
+    snprintf(stream_name, sizeof(stream_name), "evemon-meter-%u", node_id);
+
+    mn->stream = pw_stream_new(
+        ms->core, stream_name,
+        pw_properties_new(
+            PW_KEY_MEDIA_TYPE,     "Audio",
+            PW_KEY_MEDIA_CATEGORY, "Capture",
+            PW_KEY_MEDIA_ROLE,     "DSP",
+            PW_KEY_NODE_PASSIVE,   "true",
+            PW_KEY_NODE_LATENCY,   "1024/48000",
+            NULL));
+    if (!mn->stream) return -1;
+
+    pw_stream_add_listener(mn->stream, &mn->listener,
+                           &meter_stream_events, mn);
+
+    uint8_t pod_buf[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
+    struct spa_audio_info_raw raw_info = SPA_AUDIO_INFO_RAW_INIT(
+        .format   = SPA_AUDIO_FORMAT_F32,
+        .channels = 2
+    );
+    const struct spa_pod *params[1];
+    params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &raw_info);
+
+    int ret = pw_stream_connect(mn->stream,
+                                PW_DIRECTION_INPUT,
+                                node_id,
+                                PW_STREAM_FLAG_AUTOCONNECT |
+                                PW_STREAM_FLAG_MAP_BUFFERS |
+                                PW_STREAM_FLAG_RT_PROCESS,
+                                params, 1);
+    if (ret < 0) {
+        pw_stream_destroy(mn->stream);
+        mn->stream = NULL;
+        return -1;
+    }
+
+    ms->node_count++;
+    return 0;
+}
+
+void pw_meter_start(ui_ctx_t *ctx, const uint32_t *node_ids, size_t count)
+{
+    if (count == 0) return;
+
+    pw_meter_state_t *ms = meter_ensure_running(ctx);
+    if (!ms) return;
+
+    /*
+     * Additive merge: for each requested node, only create a new
+     * capture stream if we're not already monitoring that node.
+     * This allows multiple plugin instances (e.g. two MilkDrop tabs
+     * + the PipeWire plugin) to coexist without stomping each
+     * other's capture streams.
+     */
+    int added = 0;
+    pw_thread_loop_lock(ms->loop);
+
+    for (size_t i = 0; i < count; i++) {
+        /* Check if already monitored */
+        int found = 0;
+        for (size_t j = 0; j < ms->node_count; j++) {
+            if (ms->nodes[j].node_id == node_ids[i]) {
+                found = 1;
+                break;
+            }
+        }
+        if (found) continue;
+
+        if (meter_add_stream(ms, node_ids[i]) == 0)
+            added++;
+    }
+
+    pw_thread_loop_unlock(ms->loop);
+    (void)added;
 }
 
 void pw_meter_read(ui_ctx_t *ctx, uint32_t node_id,

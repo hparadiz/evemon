@@ -46,6 +46,7 @@ typedef enum {
     evemon_NEED_PIPEWIRE    = (1 << 7),  /* PipeWire graph snapshot           */
     evemon_NEED_DESCENDANTS = (1 << 8),  /* include descendant PIDs           */
     evemon_NEED_THREADS     = (1 << 9),  /* per-thread info from /proc/task   */
+    evemon_NEED_MPRIS       = (1 << 10), /* MPRIS2 media player metadata      */
 } evemon_data_needs_t;
 
 /* ── Gathered data types ─────────────────────────────────────── */
@@ -137,6 +138,41 @@ typedef struct {
     unsigned long long nonvoluntary_ctxt_switches; /* from status          */
 } evemon_thread_t;
 
+/* MPRIS media player metadata (from D-Bus session bus) */
+typedef struct {
+    char      identity[128];        /* player name ("Spotify", "Firefox") */
+    char      desktop_entry[128];   /* .desktop entry name               */
+    pid_t     pid;                  /* player process ID                 */
+    char      bus_name[256];        /* D-Bus bus name                    */
+
+    char      playback_status[32];  /* "Playing", "Paused", "Stopped"    */
+    char      loop_status[32];      /* "None", "Track", "Playlist"       */
+    int       shuffle;              /* 0 or 1                            */
+    double    volume;               /* 0.0–1.0                           */
+    double    rate;                 /* playback rate (1.0 = normal)      */
+    int64_t   position_us;          /* playback position in µs           */
+
+    char      track_title[256];     /* xesam:title                       */
+    char      track_artist[256];    /* xesam:artist (comma-joined)       */
+    char      track_album[256];     /* xesam:album                       */
+    char      track_album_artist[256]; /* xesam:albumArtist              */
+    char      art_url[512];         /* mpris:artUrl (file:// or http)    */
+    char      track_id[256];        /* mpris:trackid                     */
+    char      genre[128];           /* xesam:genre (comma-joined)        */
+    int64_t   length_us;            /* mpris:length in µs (-1=unknown)   */
+    int       track_number;         /* xesam:trackNumber (-1=unknown)    */
+    int       disc_number;          /* xesam:discNumber (-1=unknown)     */
+    char      content_type[64];     /* xesam:contentCreated              */
+    char      url[512];             /* xesam:url (stream URL)            */
+
+    int       can_play;
+    int       can_pause;
+    int       can_seek;
+    int       can_go_next;
+    int       can_go_previous;
+    int       can_control;
+} evemon_mpris_player_t;
+
 /* cgroup resource limits */
 typedef struct {
     char      path[512];         /* cgroup v2 path                    */
@@ -207,6 +243,10 @@ typedef struct {
     /* Threads (if evemon_NEED_THREADS) */
     const evemon_thread_t *threads;
     size_t                 thread_count;
+
+    /* MPRIS media metadata (if evemon_NEED_MPRIS) */
+    const evemon_mpris_player_t *mpris_players;
+    size_t                       mpris_player_count;
 
     /* Raw file contents (if corresponding NEED flag set) */
     const char       *raw_cgroup;    /* /proc/<pid>/cgroup content     */
