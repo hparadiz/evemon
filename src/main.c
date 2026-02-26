@@ -13,8 +13,12 @@
 #include <fontconfig/fontconfig.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <signal.h>
 #include <unistd.h>
+
+/* Global debug flag (--debug enables verbose logging to stderr) */
+int evemon_debug = 0;
 
 /* Global so the signal handler can reach it. */
 static monitor_state_t g_state;
@@ -55,6 +59,18 @@ static gboolean check_shutdown(gpointer data)
 
 int main(int argc, char *argv[])
 {
+    /* Check for --debug before GTK consumes argv */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug") == 0) {
+            evemon_debug = 1;
+            /* Remove from argv so GTK doesn't complain */
+            for (int j = i; j < argc - 1; j++)
+                argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        }
+    }
+
     profile_init();
     FcInit();
     g_set_prgname("evemon");

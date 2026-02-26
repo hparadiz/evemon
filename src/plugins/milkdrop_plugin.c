@@ -15,7 +15,6 @@
  */
 
 #include "../evemon_plugin.h"
-#include "../art_loader.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +27,9 @@
 #include <time.h>
 #include <float.h>
 #include <epoxy/gl.h>
+
+/* from main.c – resolved at dlopen time (-rdynamic) */
+extern int evemon_debug;
 
 /* ── compile-time knobs ──────────────────────────────────────── */
 
@@ -698,7 +700,8 @@ static GLuint gl_compile_shader(GLenum type, const char *src)
     GLint ok; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) {
         char log[512]; glGetShaderInfoLog(s,512,NULL,log);
-        fprintf(stderr,"milkdrop: shader compile error: %s\n",log);
+        if (evemon_debug)
+            fprintf(stderr,"milkdrop: shader compile error: %s\n",log);
         glDeleteShader(s); return 0;
     }
     return s;
@@ -712,7 +715,8 @@ static GLuint gl_link_program(GLuint vs, GLuint fs)
     GLint ok; glGetProgramiv(p, GL_LINK_STATUS, &ok);
     if (!ok) {
         char log[512]; glGetProgramInfoLog(p,512,NULL,log);
-        fprintf(stderr,"milkdrop: program link error: %s\n",log);
+        if (evemon_debug)
+            fprintf(stderr,"milkdrop: program link error: %s\n",log);
         glDeleteProgram(p); return 0;
     }
     return p;
@@ -893,6 +897,7 @@ typedef struct {
     float     warp_time, frame_time, total_time;
     int       frame_count;
     guint     audio_timer;
+    guint     redraw_timer;
     gboolean  running;
 
     float     beat_acc;
@@ -965,7 +970,6 @@ typedef struct {
     /* Album art for overlay rendering */
     char      mpris_art_url[512];   /* cached art URL (detect changes) */
     GdkPixbuf *mpris_art_pixbuf;    /* loaded album art (any size)     */
-    GCancellable *art_cancel;       /* in-flight async art load        */
 } md_ctx_t;
 
 /* ── sound analysis ──────────────────────────────────────────── */
@@ -1904,20 +1908,24 @@ static void gl_init_resources(md_ctx_t *ctx)
 
     /* Query the FBO that GtkGLArea set up for us */
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, (GLint*)&g->gtk_fbo);
-    fprintf(stderr,"milkdrop: GtkGLArea FBO = %u\n", g->gtk_fbo);
+    if (evemon_debug)
+        fprintf(stderr,"milkdrop: GtkGLArea FBO = %u\n", g->gtk_fbo);
 
     g->gl_ready = 1;
-    fprintf(stderr,"milkdrop: GL init OK  warp=%u post=%u echo=%u darken=%u color=%u blit=%u\n",
-            g->prog_warp, g->prog_post, g->prog_echo, g->prog_darken,
-            g->prog_color, g->prog_blit);
-    GLenum fbs = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    fprintf(stderr,"milkdrop: FBO status=0x%x (want 0x%x)\n", fbs, GL_FRAMEBUFFER_COMPLETE);
+    if (evemon_debug) {
+        fprintf(stderr,"milkdrop: GL init OK  warp=%u post=%u echo=%u darken=%u color=%u blit=%u\n",
+                g->prog_warp, g->prog_post, g->prog_echo, g->prog_darken,
+                g->prog_color, g->prog_blit);
+        GLenum fbs = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        fprintf(stderr,"milkdrop: FBO status=0x%x (want 0x%x)\n", fbs, GL_FRAMEBUFFER_COMPLETE);
+    }
 }
 
 static gboolean redraw_tick(gpointer data)
 {
     md_ctx_t *ctx = data;
-    if (ctx->gl_area && gtk_widget_get_realized(ctx->gl_area))
+    if (ctx->gl_area && GTK_IS_WIDGET(ctx->gl_area) &&
+        gtk_widget_get_realized(ctx->gl_area))
         gtk_widget_queue_draw(ctx->gl_area);
     return G_SOURCE_CONTINUE;
 }
@@ -1928,12 +1936,14 @@ static void on_realize(GtkGLArea *area, gpointer data)
     md_ctx_t *ctx = data;
     gtk_gl_area_make_current(area);
     if (gtk_gl_area_get_error(area)) {
-        fprintf(stderr,"milkdrop: GtkGLArea error on realize\n");
+        if (evemon_debug)
+            fprintf(stderr,"milkdrop: GtkGLArea error on realize\n");
         return;
     }
     gl_init_resources(ctx);
     /* 60 Hz redraw timer so rendering keeps going */
-    g_timeout_add(16, redraw_tick, ctx);
+    if (!ctx->redraw_timer)
+        ctx->redraw_timer = g_timeout_add(16, redraw_tick, ctx);
 }
 
 static gboolean on_render(GtkGLArea *area, GdkGLContext *glctx, gpointer data)
@@ -1972,8 +1982,9 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *glctx, gpointer data)
 
     static int first_render = 1;
     if (first_render) {
-        fprintf(stderr,"milkdrop: first render frame, preset='%s' cur_fbo=%d\n",
-                ctx->preset.name, ctx->cur_fbo);
+        if (evemon_debug)
+            fprintf(stderr,"milkdrop: first render frame, preset='%s' cur_fbo=%d\n",
+                    ctx->preset.name, ctx->cur_fbo);
         first_render = 0;
     }
 
@@ -1991,14 +2002,15 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *glctx, gpointer data)
     gl_draw_fullscreen_quad(ctx);
 
     static int dbg_count = 0;
-    if (dbg_count++ < 5) {
+    if (evemon_debug && dbg_count++ < 5) {
         GLenum err = glGetError();
         fprintf(stderr, "milkdrop: frame %d  gtk_fbo=%u display_fbo=%d tex=%u err=0x%x\n",
                 dbg_count, gtk_fbo, display_fbo, ctx->gl.fbo_tex[display_fbo], err);
     }
 
     /* request next frame */
-    gtk_widget_queue_draw(GTK_WIDGET(area));
+    if (GTK_IS_WIDGET(area))
+        gtk_widget_queue_draw(GTK_WIDGET(area));
     return TRUE;
 }
 
@@ -2126,7 +2138,8 @@ static void md_resize_fbos(md_ctx_t *ctx, int w, int h)
         glClear(GL_COLOR_BUFFER_BIT);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    fprintf(stderr, "milkdrop: FBO resized to %dx%d\n", w, h);
+    if (evemon_debug)
+        fprintf(stderr, "milkdrop: FBO resized to %dx%d\n", w, h);
 }
 
 static void md_toggle_fullscreen(md_ctx_t *ctx)
@@ -2544,7 +2557,8 @@ static void md_start_capture(md_ctx_t *ctx)
                   ctx->lib.names[ctx->preset_idx]);
     }
     /* kick off rendering by requesting a draw */
-    if (ctx->gl_area) gtk_widget_queue_draw(ctx->gl_area);
+    if (ctx->gl_area && GTK_IS_WIDGET(ctx->gl_area))
+        gtk_widget_queue_draw(ctx->gl_area);
 }
 
 static void md_stop_capture(md_ctx_t *ctx)
@@ -3158,6 +3172,8 @@ static GtkWidget *md_create_widget(void *opaque)
         gtk_widget_set_visual(info_area, rgba_visual);
     g_signal_connect(info_area, "draw", G_CALLBACK(on_overlay_draw), ctx);
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), info_area);
+    /* Let mouse/keyboard events pass through the overlay to the GL area */
+    gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(overlay), info_area, TRUE);
 
     /* stash overlay refs so fullscreen can reparent them */
     ctx->fs_overlay = overlay;
@@ -3171,25 +3187,71 @@ static GtkWidget *md_create_widget(void *opaque)
     return ctx->main_box;
 }
 
+/* Forward declaration for event bus callback (defined below md_activate) */
+static void md_on_album_art_event(const evemon_event_t *event,
+                                  void *user_data);
+
 static void md_activate(void *opaque, const evemon_host_services_t *svc)
-{ ((md_ctx_t*)opaque)->host = svc; }
+{
+    md_ctx_t *ctx = (md_ctx_t*)opaque;
+    ctx->host = svc;
+    /* Subscribe to album art events from the audio service plugin */
+    if (svc->subscribe)
+        svc->subscribe(svc->host_ctx,
+                       EVEMON_EVENT_ALBUM_ART_UPDATED,
+                       md_on_album_art_event, ctx);
+}
 
-/* ── async art load callback ─────────────────────────────────── */
+/* ── event bus callback for album art ────────────────────────────── */
 
-static void md_on_art_loaded(GdkPixbuf *pixbuf, void *user_data)
+/*
+ * Called on the GTK main thread when the audio service publishes
+ * an album art update.  We stash the metadata and pixbuf for the
+ * GL overlay renderer.
+ */
+static void md_on_album_art_event(const evemon_event_t *event,
+                                  void *user_data)
 {
     md_ctx_t *ctx = user_data;
-    /* Replace any existing pixbuf */
+    const evemon_album_art_payload_t *art = event->payload;
+    if (!art) return;
+
+    /* Update MPRIS metadata fields */
+    snprintf(ctx->mpris_title, sizeof(ctx->mpris_title),
+             "%s", art->track_title);
+    snprintf(ctx->mpris_artist, sizeof(ctx->mpris_artist),
+             "%s", art->track_artist);
+    snprintf(ctx->mpris_album, sizeof(ctx->mpris_album),
+             "%s", art->track_album);
+    snprintf(ctx->mpris_status, sizeof(ctx->mpris_status),
+             "%s", art->playback_status);
+    ctx->mpris_position_us = art->position_us;
+    ctx->mpris_length_us   = art->length_us;
+    ctx->mpris_available   = (art->track_title[0] || art->playback_status[0]) ? 1 : 0;
+
+    /* Update album art pixbuf */
     if (ctx->mpris_art_pixbuf)
         g_object_unref(ctx->mpris_art_pixbuf);
-    ctx->mpris_art_pixbuf = pixbuf;  /* takes ownership (may be NULL) */
-    /* Cancel ref is consumed — clear it */
-    if (ctx->art_cancel) {
-        g_object_unref(ctx->art_cancel);
-        ctx->art_cancel = NULL;
+    ctx->mpris_art_pixbuf = art->pixbuf ? g_object_ref(art->pixbuf) : NULL;
+    snprintf(ctx->mpris_art_url, sizeof(ctx->mpris_art_url),
+             "%s", art->art_url);
+
+    /* Also update the overlay audio source from MPRIS
+     * (richer than PipeWire's media_name) */
+    if (art->track_title[0]) {
+        if (art->track_artist[0])
+            snprintf(ctx->audio_media_name,
+                     sizeof(ctx->audio_media_name),
+                     "%s \xe2\x80\x94 %s", art->track_artist,
+                     art->track_title);
+        else
+            snprintf(ctx->audio_media_name,
+                     sizeof(ctx->audio_media_name),
+                     "%s", art->track_title);
     }
+
     /* Trigger a redraw so the new art appears */
-    if (ctx->gl_area)
+    if (ctx->gl_area && GTK_IS_WIDGET(ctx->gl_area))
         gtk_widget_queue_draw(ctx->gl_area);
 }
 
@@ -3276,109 +3338,11 @@ static void md_update(void *opaque, const evemon_proc_data_t *data)
     ctx->old_audio_node_count = ctx->audio_node_count;
     ctx->last_pid = data->pid;
 
-    /* ── Capture MPRIS metadata ──────────────────────────────── */
-    ctx->mpris_available = 0;
-    if (data->mpris_players && data->mpris_player_count > 0) {
-        /*
-         * Smart player selection for multi-stream apps (Firefox, etc.).
-         *
-         * Scoring (highest total wins):
-         *   +100 : PlaybackStatus == "Playing"
-         *    +50 : PlaybackStatus == "Paused"  (still relevant)
-         *    +30 : MPRIS track_title matches a PipeWire media_name
-         *          from one of our monitored audio nodes — strong
-         *          signal that this player owns the active stream.
-         *    +20 : has a non-empty track_title (real metadata)
-         *    +10 : has album art
-         */
-        int best_score = -1;
-        const evemon_mpris_player_t *best = NULL;
-        for (size_t i = 0; i < data->mpris_player_count; i++) {
-            const evemon_mpris_player_t *p = &data->mpris_players[i];
-            int score = 0;
-            if (strcmp(p->playback_status, "Playing") == 0) score += 100;
-            else if (strcmp(p->playback_status, "Paused") == 0) score += 50;
-            if (p->track_title[0]) score += 20;
-            if (p->art_url[0]) score += 10;
-            /* Correlate with PipeWire streams — if any audio node's
-             * media_name contains the track title (or vice versa),
-             * this player is likely the one producing our audio. */
-            if (p->track_title[0] && data->pw_nodes) {
-                for (size_t j = 0; j < data->pw_node_count; j++) {
-                    const evemon_pw_node_t *nd = &data->pw_nodes[j];
-                    if (nd->pid != data->pid) continue;
-                    if (!nd->media_name[0]) continue;
-                    if (strstr(nd->media_name, p->track_title) ||
-                        strstr(p->track_title, nd->media_name)) {
-                        score += 30;
-                        break;
-                    }
-                }
-            }
-            if (score > best_score) {
-                best_score = score;
-                best = p;
-            }
-        }
-        if (!best) best = &data->mpris_players[0];
-        snprintf(ctx->mpris_title, sizeof(ctx->mpris_title),
-                 "%s", best->track_title);
-        snprintf(ctx->mpris_artist, sizeof(ctx->mpris_artist),
-                 "%s", best->track_artist);
-        snprintf(ctx->mpris_album, sizeof(ctx->mpris_album),
-                 "%s", best->track_album);
-        snprintf(ctx->mpris_status, sizeof(ctx->mpris_status),
-                 "%s", best->playback_status);
-        ctx->mpris_position_us = best->position_us;
-        ctx->mpris_length_us = best->length_us;
-        ctx->mpris_available = 1;
-
-        /* Album art — reload only when the URL changes */
-        if (best->art_url[0] &&
-            strcmp(best->art_url, ctx->mpris_art_url) != 0) {
-            /* Cancel any in-flight load */
-            if (ctx->art_cancel) {
-                g_cancellable_cancel(ctx->art_cancel);
-                g_object_unref(ctx->art_cancel);
-                ctx->art_cancel = NULL;
-            }
-            if (ctx->mpris_art_pixbuf) {
-                g_object_unref(ctx->mpris_art_pixbuf);
-                ctx->mpris_art_pixbuf = NULL;
-            }
-            snprintf(ctx->mpris_art_url, sizeof(ctx->mpris_art_url),
-                     "%s", best->art_url);
-            /* Async load — handles file://, https://, data: */
-            art_load_async(best->art_url, md_on_art_loaded, ctx,
-                           &ctx->art_cancel);
-        } else if (!best->art_url[0] && ctx->mpris_art_url[0]) {
-            /* Art URL cleared */
-            if (ctx->art_cancel) {
-                g_cancellable_cancel(ctx->art_cancel);
-                g_object_unref(ctx->art_cancel);
-                ctx->art_cancel = NULL;
-            }
-            if (ctx->mpris_art_pixbuf) {
-                g_object_unref(ctx->mpris_art_pixbuf);
-                ctx->mpris_art_pixbuf = NULL;
-            }
-            ctx->mpris_art_url[0] = '\0';
-        }
-
-        /* Also update the overlay audio source from MPRIS
-         * (richer than PipeWire's media_name) */
-        if (best->track_title[0]) {
-            if (best->track_artist[0])
-                snprintf(ctx->audio_media_name,
-                         sizeof(ctx->audio_media_name),
-                         "%s — %s", best->track_artist,
-                         best->track_title);
-            else
-                snprintf(ctx->audio_media_name,
-                         sizeof(ctx->audio_media_name),
-                         "%s", best->track_title);
-        }
-    }
+    /* ── MPRIS metadata now arrives via the event bus ────────── */
+    /* Just clear the flag when no MPRIS data is present;
+     * md_on_album_art_event() handles all metadata updates. */
+    if (!data->mpris_players || data->mpris_player_count == 0)
+        ctx->mpris_available = 0;
 }
 
 static void md_clear(void *opaque)
@@ -3387,7 +3351,8 @@ static void md_clear(void *opaque)
     md_stop_capture(ctx);
     if (ctx->audio_timer) { g_source_remove(ctx->audio_timer); ctx->audio_timer=0; }
     ctx->audio_node_count=0; ctx->last_pid=0;
-    if (ctx->gl_area) gtk_widget_queue_draw(ctx->gl_area);
+    if (ctx->gl_area && GTK_IS_WIDGET(ctx->gl_area))
+        gtk_widget_queue_draw(ctx->gl_area);
     /* Hide the notebook tab */
     if (ctx->main_box) {
         GtkWidget *nb = gtk_widget_get_parent(ctx->main_box);
@@ -3415,12 +3380,8 @@ static void md_destroy(void *opaque)
         ctx->fullscreen = 0;
     }
     md_stop_capture(ctx);
+    if (ctx->redraw_timer) { g_source_remove(ctx->redraw_timer); ctx->redraw_timer=0; }
     if (ctx->audio_timer) { g_source_remove(ctx->audio_timer); ctx->audio_timer=0; }
-    if (ctx->art_cancel) {
-        g_cancellable_cancel(ctx->art_cancel);
-        g_object_unref(ctx->art_cancel);
-        ctx->art_cancel = NULL;
-    }
     if (ctx->mpris_art_pixbuf) {
         g_object_unref(ctx->mpris_art_pixbuf);
         ctx->mpris_art_pixbuf = NULL;

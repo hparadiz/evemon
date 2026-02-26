@@ -16,6 +16,9 @@
 
 #include "plugin_broker.h"
 #include "mpris.h"
+
+/* from main.c */
+extern int evemon_debug;
 #ifdef HAVE_PIPEWIRE
 #include "ui/pipewire_graph.h"
 #endif
@@ -1340,8 +1343,9 @@ static void broker_thread_func(GTask        *task,
                                         d->data.descendant_pids,
                                         d->data.descendant_count,
                                         &mpris_out);
-            fprintf(stderr, "[BROKER MPRIS] pid=%d rc=%d players=%zu\n",
-                    (int)d->pid, rc, mpris_out.player_count);
+            if (evemon_debug)
+                fprintf(stderr, "[BROKER MPRIS] pid=%d rc=%d players=%zu\n",
+                        (int)d->pid, rc, mpris_out.player_count);
             if (rc == 0 && mpris_out.player_count > 0) {
                 d->mpris_players = calloc(mpris_out.player_count,
                                           sizeof(evemon_mpris_player_t));

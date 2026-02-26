@@ -15,6 +15,9 @@
 
 #include "art_loader.h"
 
+/* from main.c */
+extern int evemon_debug;
+
 #include <gio/gio.h>
 #include <libsoup/soup.h>
 #include <string.h>
@@ -61,12 +64,14 @@ static void on_pixbuf_ready(GObject *source, GAsyncResult *res,
     GError *err = NULL;
     GdkPixbuf *pb = gdk_pixbuf_new_from_stream_finish(res, &err);
     if (!pb) {
-        fprintf(stderr, "[ART LOADER] pixbuf decode FAILED: %s\n",
-                err ? err->message : "(unknown)");
+        if (evemon_debug)
+            fprintf(stderr, "[ART LOADER] pixbuf decode FAILED: %s\n",
+                    err ? err->message : "(unknown)");
         g_clear_error(&err);
     } else {
-        fprintf(stderr, "[ART LOADER] pixbuf OK  %dx%d\n",
-                gdk_pixbuf_get_width(pb), gdk_pixbuf_get_height(pb));
+        if (evemon_debug)
+            fprintf(stderr, "[ART LOADER] pixbuf OK  %dx%d\n",
+                    gdk_pixbuf_get_width(pb), gdk_pixbuf_get_height(pb));
     }
 
     ac->cb(pb, ac->user_data);
@@ -85,7 +90,8 @@ static void on_soup_send_ready(GObject *source, GAsyncResult *res,
     GInputStream *stream = soup_session_send_finish(session, res, &err);
 
     if (!stream) {
-        fprintf(stderr, "[ART LOADER] HTTP fetch FAILED: %s\n",
+        if (evemon_debug)
+            fprintf(stderr, "[ART LOADER] HTTP fetch FAILED: %s\n",
                 err ? err->message : "(unknown)");
         g_clear_error(&err);
         ac->cb(NULL, ac->user_data);
@@ -111,8 +117,9 @@ static void on_file_read_ready(GObject *source, GAsyncResult *res,
     GFileInputStream *fis = g_file_read_finish(file, res, &err);
 
     if (!fis) {
-        fprintf(stderr, "[ART LOADER] file read FAILED: %s\n",
-                err ? err->message : "(unknown)");
+        if (evemon_debug)
+            fprintf(stderr, "[ART LOADER] file read FAILED: %s\n",
+                    err ? err->message : "(unknown)");
         g_clear_error(&err);
         ac->cb(NULL, ac->user_data);
         art_ctx_free(ac);
@@ -175,7 +182,8 @@ void art_load_async(const char *url, art_loaded_cb cb, void *user_data,
         return;
     }
 
-    fprintf(stderr, "[ART LOADER] url='%.120s'\n", url);
+    if (evemon_debug)
+        fprintf(stderr, "[ART LOADER] url='%.120s'\n", url);
 
     /* ── data: URI → decode inline (fast, no I/O) ─────────── */
     if (strncmp(url, "data:", 5) == 0) {
@@ -203,7 +211,8 @@ void art_load_async(const char *url, art_loaded_cb cb, void *user_data,
         SoupSession *session = get_soup_session();
         SoupMessage *msg = soup_message_new("GET", url);
         if (!msg) {
-            fprintf(stderr, "[ART LOADER] bad HTTP URL\n");
+            if (evemon_debug)
+                fprintf(stderr, "[ART LOADER] bad HTTP URL\n");
             ac->cb(NULL, ac->user_data);
             art_ctx_free(ac);
             return;

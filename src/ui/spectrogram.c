@@ -524,7 +524,8 @@ static void spectro_stop_internal(spectro_state_t *st)
 
     /* Disconnect our draw handler from the plugin's drawing area
      * BEFORE freeing the state, so no dangling-pointer callbacks. */
-    if (st->draw_handler_id && st->draw_area) {
+    if (st->draw_handler_id && st->draw_area &&
+        GTK_IS_WIDGET(st->draw_area)) {
         g_signal_handler_disconnect(st->draw_area, st->draw_handler_id);
         st->draw_handler_id = 0;
     }

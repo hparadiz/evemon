@@ -123,16 +123,21 @@ $(PLUGIN_DIR)/evemon_%.so: $(SRC_DIR)/plugins/%.c $(SRC_DIR)/evemon_plugin.h | $
 
 # PipeWire plugin needs PW flags (only built when PW is available)
 ifneq ($(PW_LDFLAGS),)
-$(PLUGIN_DIR)/evemon_pipewire_plugin.so: $(SRC_DIR)/plugins/pipewire_plugin.c $(SRC_DIR)/art_loader.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
-	$(CC) $(PLUGIN_CFLAGS) $(PW_CFLAGS) $(SOUP_CFLAGS) -DHAVE_PIPEWIRE -o $@ $(SRC_DIR)/plugins/pipewire_plugin.c $(SRC_DIR)/art_loader.c $(PLUGIN_LDFLAGS) $(PW_LDFLAGS) $(SOUP_LDFLAGS)
+$(PLUGIN_DIR)/evemon_pipewire_plugin.so: $(SRC_DIR)/plugins/pipewire_plugin.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
+	$(CC) $(PLUGIN_CFLAGS) $(PW_CFLAGS) -DHAVE_PIPEWIRE -o $@ $(SRC_DIR)/plugins/pipewire_plugin.c $(PLUGIN_LDFLAGS) $(PW_LDFLAGS)
 else
 # If PipeWire is not available, skip the PipeWire plugin
 PLUGIN_SOS := $(filter-out $(PLUGIN_DIR)/evemon_pipewire_plugin.so,$(PLUGIN_SOS))
 endif
 
 # MilkDrop plugin needs -lm for math and -lepoxy for OpenGL via GtkGLArea
-$(PLUGIN_DIR)/evemon_milkdrop_plugin.so: $(SRC_DIR)/plugins/milkdrop_plugin.c $(SRC_DIR)/art_loader.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
-	$(CC) $(PLUGIN_CFLAGS) $(SOUP_CFLAGS) -o $@ $(SRC_DIR)/plugins/milkdrop_plugin.c $(SRC_DIR)/art_loader.c $(PLUGIN_LDFLAGS) $(SOUP_LDFLAGS) -lm -lepoxy
+$(PLUGIN_DIR)/evemon_milkdrop_plugin.so: $(SRC_DIR)/plugins/milkdrop_plugin.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
+	$(CC) $(PLUGIN_CFLAGS) -o $@ $(SRC_DIR)/plugins/milkdrop_plugin.c $(PLUGIN_LDFLAGS) -lm -lepoxy
+	$(CC) $(PLUGIN_CFLAGS) -o $@ $(SRC_DIR)/plugins/milkdrop_plugin.c $(PLUGIN_LDFLAGS) -lm -lepoxy
+
+# Audio service headless plugin — owns album art loading (art_loader.c + libsoup)
+$(PLUGIN_DIR)/evemon_audio_service_plugin.so: $(SRC_DIR)/plugins/audio_service_plugin.c $(SRC_DIR)/art_loader.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
+	$(CC) $(PLUGIN_CFLAGS) $(SOUP_CFLAGS) -o $@ $(SRC_DIR)/plugins/audio_service_plugin.c $(SRC_DIR)/art_loader.c $(PLUGIN_LDFLAGS) $(SOUP_LDFLAGS)
 
 plugins: $(PLUGIN_SOS)
 

@@ -33,6 +33,65 @@ extern "C" {
 
 #define evemon_PLUGIN_ABI_VERSION  1
 
+/* ── Event bus types ──────────────────────────────────────────── */
+
+/*
+ * Event types for the publish/subscribe event bus.
+ * New event types may be appended (minor ABI change).
+ */
+typedef enum {
+    EVEMON_EVENT_PROCESS_SELECTED,     /* payload: pid_t*                */
+    EVEMON_EVENT_ALBUM_ART_UPDATED,    /* payload: evemon_album_art_payload_t* */
+    EVEMON_EVENT_AUDIO_STATE_CHANGED,  /* payload: reserved (NULL)       */
+    EVEMON_EVENT_PID_EXITED,           /* payload: pid_t*                */
+    EVEMON_EVENT_CUSTOM                /* payload: user-defined          */
+} evemon_event_type_t;
+
+/* Event structure passed to subscribers */
+typedef struct {
+    evemon_event_type_t  type;
+    void                *payload;     /* type-specific, see enum above   */
+} evemon_event_t;
+
+/* Subscriber callback signature */
+typedef void (*evemon_event_cb)(const evemon_event_t *event,
+                                void *user_data);
+
+/* ── Plugin kind ─────────────────────────────────────────────── */
+
+/*
+ * Distinguishes UI plugins (provide a GtkWidget tab) from headless
+ * service plugins (no UI, auto-activated, provide reusable subsystems).
+ *
+ * EVEMON_PLUGIN_UI = 0 so that existing plugins compiled before this
+ * enum was added (their `kind` field will be zero-initialized)
+ * continue to work as UI plugins without recompilation.
+ */
+typedef enum {
+    EVEMON_PLUGIN_UI       = 0,       /* provides create_widget()       */
+    EVEMON_PLUGIN_HEADLESS = 1        /* no UI, auto-activated service   */
+} evemon_plugin_kind_t;
+
+/* ── Event payloads ──────────────────────────────────────────── */
+
+/*
+ * Payload for EVEMON_EVENT_ALBUM_ART_UPDATED.
+ * Published by the audio service plugin when album art changes.
+ * The pixbuf is ref'd by the publisher; subscribers must ref it
+ * if they want to keep it beyond the callback.
+ */
+typedef struct {
+    GdkPixbuf  *pixbuf;               /* loaded art (may be NULL)        */
+    char        art_url[512];         /* source URL                      */
+    char        track_title[256];     /* current track title             */
+    char        track_artist[256];    /* current track artist            */
+    char        track_album[256];     /* current track album             */
+    char        playback_status[32];  /* "Playing", "Paused", "Stopped"  */
+    int64_t     position_us;          /* playback position in µs         */
+    int64_t     length_us;            /* track length in µs              */
+    char        identity[128];        /* player identity                 */
+} evemon_album_art_payload_t;
+
 /* ── Data needs bitmask ──────────────────────────────────────── */
 
 typedef enum {
@@ -327,6 +386,30 @@ typedef struct {
      */
     uint32_t (*spectro_get_target)(void *host_ctx);
 
+    /* ── Event bus ─────────────────────────────────────────── */
+
+    /*
+     * Subscribe to events of a given type.  The callback is
+     * always invoked on the GTK main thread.
+     */
+    void (*subscribe)(void *host_ctx,
+                      evemon_event_type_t type,
+                      evemon_event_cb cb,
+                      void *user_data);
+
+    /*
+     * Publish an event.  Thread-safe: if called off the main
+     * thread, dispatch is marshalled via g_idle_add.
+     * The payload is deep-copied for known event types.
+     */
+    void (*publish)(void *host_ctx, const evemon_event_t *event);
+
+    /*
+     * Remove a subscription by its ID.  Pass the ID returned
+     * by subscribe().
+     */
+    void (*unsubscribe)(void *host_ctx, int subscription_id);
+
 } evemon_host_services_t;
 
 /* ── Plugin descriptor ───────────────────────────────────────── */
@@ -396,6 +479,19 @@ typedef struct {
      * May be NULL if the plugin doesn't need host services.
      */
     void (*activate)(void *ctx, const evemon_host_services_t *services);
+
+    /*
+     * Plugin kind — UI (default, = 0) or headless service.
+     *
+     * Headless plugins do not provide create_widget() and are
+     * auto-activated at load time.  They participate in the event
+     * bus as publishers and/or subscribers.
+     *
+     * Appended at end of struct — existing plugins compiled before
+     * this field was added will have it zero-initialized, which
+     * maps to EVEMON_PLUGIN_UI.
+     */
+    evemon_plugin_kind_t kind;
 
 } evemon_plugin_t;
 

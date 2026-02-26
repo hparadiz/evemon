@@ -167,7 +167,7 @@ typedef struct pw_bound_node pw_bound_node_t;
 struct pw_bound_node {
     struct pw_proxy    *proxy;
     struct spa_hook     listener;
-    pw_snap_node_t     *snap;       /* points into graph.nodes[] */
+    size_t              node_index;  /* index into graph.nodes[] (resolved after enum) */
     struct pw_enum     *owner;      /* back-pointer               */
 };
 
@@ -182,7 +182,7 @@ typedef struct pw_enum {
     int                  sync_seq;
     int                  phase;     /* 0 = collecting globals, 1 = collecting info */
 
-    pw_bound_node_t    *bound;      /* array of bound nodes */
+    pw_bound_node_t   **bound;      /* array of pointers to heap-allocated bound nodes */
     size_t              bound_count;
     size_t              bound_cap;
 } pw_enum_t;
@@ -192,7 +192,9 @@ typedef struct pw_enum {
 static void on_node_info(void *data, const struct pw_node_info *info)
 {
     pw_bound_node_t *bn = data;
-    pw_snap_node_t  *n  = bn->snap;
+    if (!bn->owner || bn->node_index >= bn->owner->graph.node_count)
+        return;
+    pw_snap_node_t  *n  = &bn->owner->graph.nodes[bn->node_index];
 
     if (!info || !info->props)
         return;
@@ -251,19 +253,22 @@ static void on_global(void *data, uint32_t id,
             dict_copy(props, PW_KEY_MEDIA_NAME,        n->media_name,  sizeof(n->media_name));
         }
 
-        /* Record that we need to bind this node later */
+        /* Record that we need to bind this node later.
+         * Each bound node is individually heap-allocated so that
+         * realloc of the pointer array never invalidates the
+         * embedded spa_hook that PipeWire's listener list references. */
         if (e->bound_count >= e->bound_cap) {
             size_t nc = e->bound_cap ? e->bound_cap * 2 : 64;
-            pw_bound_node_t *tmp = realloc(e->bound, nc * sizeof(*tmp));
+            pw_bound_node_t **tmp = realloc(e->bound, nc * sizeof(*tmp));
             if (!tmp) return;
             e->bound     = tmp;
             e->bound_cap = nc;
         }
-        pw_bound_node_t *bn = &e->bound[e->bound_count++];
-        memset(bn, 0, sizeof(*bn));
-        bn->snap  = n;
+        pw_bound_node_t *bn = calloc(1, sizeof(*bn));
+        if (!bn) return;
+        e->bound[e->bound_count++] = bn;
+        bn->node_index = e->graph.node_count - 1;  /* index of the node we just pushed */
         bn->owner = e;
-        /* proxy will be created in phase 2 */
         bn->proxy = pw_registry_bind(e->registry, id,
                                      type, version, 0);
         if (bn->proxy) {
@@ -470,8 +475,9 @@ int pw_snapshot(pw_graph_t *out)
 
     /* Tear down bound node proxies */
     for (size_t i = 0; i < e.bound_count; i++) {
-        if (e.bound[i].proxy)
-            pw_proxy_destroy(e.bound[i].proxy);
+        if (e.bound[i] && e.bound[i]->proxy)
+            pw_proxy_destroy(e.bound[i]->proxy);
+        free(e.bound[i]);
     }
     free(e.bound);
 

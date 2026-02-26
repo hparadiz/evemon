@@ -159,11 +159,25 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
         return -1;
     }
 
-    if (!plugin->create_widget || !plugin->update) {
-        fprintf(stderr, "evemon: plugin %s: missing required callbacks\n",
-                path);
-        dlclose(handle);
-        return -1;
+    /* UI plugins must provide create_widget and update.
+     * Headless plugins (services) may omit create_widget. */
+    if (plugin->kind == EVEMON_PLUGIN_HEADLESS) {
+        /* Headless plugins need at minimum an activate callback
+         * to receive host services (including the event bus). */
+        if (!plugin->activate) {
+            fprintf(stderr,
+                    "evemon: plugin %s: headless plugin missing activate()\n",
+                    path);
+            dlclose(handle);
+            return -1;
+        }
+    } else {
+        if (!plugin->create_widget || !plugin->update) {
+            fprintf(stderr, "evemon: plugin %s: missing required callbacks\n",
+                    path);
+            dlclose(handle);
+            return -1;
+        }
     }
 
     /* Create the first instance */
@@ -176,14 +190,20 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
     inst->plugin = plugin;
     inst->handle = handle;
 
-    /* Call create_widget on the GTK main thread (we are on it) */
-    inst->widget = plugin->create_widget(plugin->plugin_ctx);
-    if (!inst->widget) {
-        fprintf(stderr, "evemon: plugin %s: create_widget returned NULL\n",
-                path);
-        reg->count--;  /* undo the alloc */
-        dlclose(handle);
-        return -1;
+    if (plugin->kind == EVEMON_PLUGIN_HEADLESS) {
+        /* Headless plugins have no widget */
+        inst->widget = NULL;
+    } else {
+        /* Call create_widget on the GTK main thread (we are on it) */
+        inst->widget = plugin->create_widget(plugin->plugin_ctx);
+        if (!inst->widget) {
+            fprintf(stderr,
+                    "evemon: plugin %s: create_widget returned NULL\n",
+                    path);
+            reg->count--;  /* undo the alloc */
+            dlclose(handle);
+            return -1;
+        }
     }
 
     /* Inject host services if the plugin wants them */
@@ -193,7 +213,8 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
     /* Update combined needs */
     reg->combined_needs |= plugin->data_needs;
 
-    fprintf(stdout, "evemon: loaded plugin \"%s\" (%s) v%s from %s\n",
+    fprintf(stdout, "evemon: loaded %s plugin \"%s\" (%s) v%s from %s\n",
+            plugin->kind == EVEMON_PLUGIN_HEADLESS ? "headless" : "UI",
             plugin->name ? plugin->name : "?",
             plugin->id   ? plugin->id   : "?",
             plugin->version ? plugin->version : "?",
@@ -309,10 +330,14 @@ int plugin_instance_create(plugin_registry_t *reg, const char *plugin_id)
     inst->plugin = new_plugin;
     inst->handle = handle;  /* shared handle — don't dlclose twice */
 
-    inst->widget = new_plugin->create_widget(new_plugin->plugin_ctx);
-    if (!inst->widget) {
-        reg->count--;
-        return -1;
+    if (new_plugin->kind == EVEMON_PLUGIN_HEADLESS) {
+        inst->widget = NULL;
+    } else {
+        inst->widget = new_plugin->create_widget(new_plugin->plugin_ctx);
+        if (!inst->widget) {
+            reg->count--;
+            return -1;
+        }
     }
 
     /* Inject host services if the plugin wants them */

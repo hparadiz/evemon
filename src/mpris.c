@@ -19,6 +19,9 @@
 
 #include "mpris.h"
 
+/* from main.c */
+extern int evemon_debug;
+
 #include <gio/gio.h>
 #include <string.h>
 #include <stdio.h>
@@ -88,7 +91,8 @@ static GDBusConnection *mpris_connect_session_bus(void)
     if (!is_root) {
         conn = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &err);
         if (conn) {
-            fprintf(stderr, "[MPRIS DEBUG] using default session bus\n");
+            if (evemon_debug)
+                fprintf(stderr, "[MPRIS DEBUG] using default session bus\n");
             return conn;
         }
         g_clear_error(&err);
@@ -202,8 +206,9 @@ static GDBusConnection *mpris_connect_session_bus(void)
     if (!bus_addr[0])
         return NULL;
 
-    fprintf(stderr, "[MPRIS DEBUG] connecting to bus: %s (as uid %u)\n",
-            bus_addr, (unsigned)target_uid);
+    if (evemon_debug)
+        fprintf(stderr, "[MPRIS DEBUG] connecting to bus: %s (as uid %u)\n",
+                bus_addr, (unsigned)target_uid);
 
     /*
      * D-Bus EXTERNAL auth checks the Unix socket peer credentials.
@@ -226,13 +231,15 @@ static GDBusConnection *mpris_connect_session_bus(void)
         seteuid(saved_euid);
 
     if (!conn) {
-        fprintf(stderr, "[MPRIS DEBUG] bus connect FAILED: %s\n",
-                err ? err->message : "(unknown)");
+        if (evemon_debug)
+            fprintf(stderr, "[MPRIS DEBUG] bus connect FAILED: %s\n",
+                    err ? err->message : "(unknown)");
         g_clear_error(&err);
         return NULL;
     }
 
-    fprintf(stderr, "[MPRIS DEBUG] bus connect OK\n");
+    if (evemon_debug)
+        fprintf(stderr, "[MPRIS DEBUG] bus connect OK\n");
     return conn;
 }
 
@@ -588,8 +595,9 @@ int mpris_scan_for_pid(pid_t pid,
     g_variant_get(result, "(as)", &iter);
 
     const gchar *name;
-    fprintf(stderr, "[MPRIS DEBUG] scan for pid=%d, desc_count=%zu\n",
-            (int)pid, desc_count);
+    if (evemon_debug)
+        fprintf(stderr, "[MPRIS DEBUG] scan for pid=%d, desc_count=%zu\n",
+                (int)pid, desc_count);
     while (g_variant_iter_next(iter, "&s", &name)) {
         /* Filter for org.mpris.MediaPlayer2.* */
         if (!g_str_has_prefix(name, "org.mpris.MediaPlayer2."))
@@ -600,8 +608,9 @@ int mpris_scan_for_pid(pid_t pid,
 
         /* Get the PID of this bus name owner */
         pid_t bus_pid = mpris_get_bus_pid(conn, name);
-        fprintf(stderr, "[MPRIS DEBUG]   bus=%s  bus_pid=%d\n",
-                name, (int)bus_pid);
+        if (evemon_debug)
+            fprintf(stderr, "[MPRIS DEBUG]   bus=%s  bus_pid=%d\n",
+                    name, (int)bus_pid);
         if (bus_pid <= 0)
             continue;
 
@@ -615,17 +624,19 @@ int mpris_scan_for_pid(pid_t pid,
                 }
             }
         }
-        fprintf(stderr, "[MPRIS DEBUG]   match=%d\n", match);
+        if (evemon_debug)
+            fprintf(stderr, "[MPRIS DEBUG]   match=%d\n", match);
         if (!match)
             continue;
 
         /* Read the player's metadata */
         evemon_mpris_player_t *p = &out->players[out->player_count];
         if (mpris_read_player(conn, name, bus_pid, p) == 0) {
-            fprintf(stderr, "[MPRIS DEBUG]   -> identity='%s' title='%s' "
-                    "artist='%s' album='%s' status='%s' art='%.80s'\n",
-                    p->identity, p->track_title, p->track_artist,
-                    p->track_album, p->playback_status, p->art_url);
+            if (evemon_debug)
+                fprintf(stderr, "[MPRIS DEBUG]   -> identity='%s' title='%s' "
+                        "artist='%s' album='%s' status='%s' art='%.80s'\n",
+                        p->identity, p->track_title, p->track_artist,
+                        p->track_album, p->playback_status, p->art_url);
             out->player_count++;
         }
     }

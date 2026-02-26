@@ -22,7 +22,6 @@
  */
 
 #include "../evemon_plugin.h"
-#include "../art_loader.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -277,7 +276,6 @@ typedef struct {
     GtkWidget      *media_position_label;
     GdkPixbuf      *art_pixbuf;         /* cached album art pixbuf   */
     char            art_url_cached[512]; /* URL of cached art         */
-    GCancellable   *art_cancel;          /* in-flight async art load  */
 } pw_ctx_t;
 
 /* ── classification ──────────────────────────────────────────── */
@@ -546,11 +544,7 @@ static void pw_on_art_loaded(GdkPixbuf *pixbuf, void *user_data)
     pw_ctx_t *ctx = user_data;
     if (ctx->art_pixbuf)
         g_object_unref(ctx->art_pixbuf);
-    ctx->art_pixbuf = pixbuf;  /* takes ownership (may be NULL) */
-    if (ctx->art_cancel) {
-        g_object_unref(ctx->art_cancel);
-        ctx->art_cancel = NULL;
-    }
+    ctx->art_pixbuf = pixbuf ? g_object_ref(pixbuf) : NULL;
     /* Scale and update the GtkImage widget */
     if (ctx->art_pixbuf && ctx->media_art_image) {
         GdkPixbuf *scaled = scale_art_pixbuf(ctx->art_pixbuf, 64);
@@ -562,63 +556,25 @@ static void pw_on_art_loaded(GdkPixbuf *pixbuf, void *user_data)
 }
 
 /*
- * Update the Now Playing section with MPRIS metadata.
+ * Event bus callback: receives album art + metadata from the
+ * audio_service headless plugin.
  */
-static void pw_update_mpris(pw_ctx_t *ctx, const evemon_proc_data_t *data)
+static void pw_on_album_art_event(const evemon_event_t *event,
+                                  void *user_data)
 {
-    if (!data->mpris_players || data->mpris_player_count == 0) {
-        /* No MPRIS data — hide the section */
-        if (ctx->media_section)
-            gtk_widget_hide(ctx->media_section);
-        return;
-    }
+    pw_ctx_t *ctx = user_data;
+    const evemon_album_art_payload_t *art = event->payload;
+    if (!art) return;
 
-    /* Pick the best player using smart scoring.
-     *
-     * For multi-stream apps like Firefox (with multiple tabs
-     * producing audio, paused YouTube, etc.), simple "first Playing"
-     * picks the wrong player.  Score each candidate:
-     *
-     *   +100 : PlaybackStatus == "Playing"
-     *    +50 : PlaybackStatus == "Paused"
-     *    +30 : track_title matches a PipeWire media_name from our
-     *           monitored audio nodes (strong correlation signal)
-     *    +20 : has a non-empty track_title
-     *    +10 : has album art
-     */
-    int best_score = -1;
-    const evemon_mpris_player_t *best = NULL;
-    for (size_t i = 0; i < data->mpris_player_count; i++) {
-        const evemon_mpris_player_t *p = &data->mpris_players[i];
-        int score = 0;
-        if (strcmp(p->playback_status, "Playing") == 0) score += 100;
-        else if (strcmp(p->playback_status, "Paused") == 0) score += 50;
-        if (p->track_title[0]) score += 20;
-        if (p->art_url[0]) score += 10;
-        /* Correlate with PipeWire streams */
-        if (p->track_title[0] && data->pw_nodes) {
-            for (size_t j = 0; j < data->pw_node_count; j++) {
-                const evemon_pw_node_t *nd = &data->pw_nodes[j];
-                if (nd->pid != data->pid) continue;
-                if (!nd->media_name[0]) continue;
-                if (strstr(nd->media_name, p->track_title) ||
-                    strstr(p->track_title, nd->media_name)) {
-                    score += 30;
-                    break;
-                }
-            }
-        }
-        if (score > best_score) {
-            best_score = score;
-            best = p;
-        }
-    }
-    if (!best) best = &data->mpris_players[0];
+    /* Update album art */
+    pw_on_art_loaded(art->pixbuf, ctx);
+    snprintf(ctx->art_url_cached, sizeof(ctx->art_url_cached),
+             "%s", art->art_url);
 
-    /* Title */
-    if (best->track_title[0]) {
+    /* Update MPRIS metadata labels from the event payload */
+    if (art->track_title[0]) {
         char markup[512];
-        char *esc = g_markup_escape_text(best->track_title, -1);
+        char *esc = g_markup_escape_text(art->track_title, -1);
         snprintf(markup, sizeof(markup), "<b>%s</b>", esc);
         g_free(esc);
         gtk_label_set_markup(GTK_LABEL(ctx->media_title_label), markup);
@@ -626,9 +582,8 @@ static void pw_update_mpris(pw_ctx_t *ctx, const evemon_proc_data_t *data)
         gtk_label_set_text(GTK_LABEL(ctx->media_title_label), "");
     }
 
-    /* Artist */
-    if (best->track_artist[0]) {
-        char *esc = g_markup_escape_text(best->track_artist, -1);
+    if (art->track_artist[0]) {
+        char *esc = g_markup_escape_text(art->track_artist, -1);
         char markup[512];
         snprintf(markup, sizeof(markup),
                  "<span foreground=\"#8899bb\">%s</span>", esc);
@@ -638,9 +593,8 @@ static void pw_update_mpris(pw_ctx_t *ctx, const evemon_proc_data_t *data)
         gtk_label_set_text(GTK_LABEL(ctx->media_artist_label), "");
     }
 
-    /* Album */
-    if (best->track_album[0]) {
-        char *esc = g_markup_escape_text(best->track_album, -1);
+    if (art->track_album[0]) {
+        char *esc = g_markup_escape_text(art->track_album, -1);
         char markup[512];
         snprintf(markup, sizeof(markup),
                  "<span foreground=\"#778899\"><i>%s</i></span>", esc);
@@ -652,25 +606,25 @@ static void pw_update_mpris(pw_ctx_t *ctx, const evemon_proc_data_t *data)
 
     /* Playback status with icon */
     {
-        const char *icon = "⏹";
-        if (strcmp(best->playback_status, "Playing") == 0) icon = "▶";
-        else if (strcmp(best->playback_status, "Paused") == 0) icon = "⏸";
+        const char *icon = "\u23f9";
+        if (strcmp(art->playback_status, "Playing") == 0) icon = "\u25b6";
+        else if (strcmp(art->playback_status, "Paused") == 0) icon = "\u23f8";
 
         char status[128];
-        if (best->identity[0])
+        if (art->identity[0])
             snprintf(status, sizeof(status), "%s %s",
-                     icon, best->identity);
+                     icon, art->identity);
         else
             snprintf(status, sizeof(status), "%s %s",
-                     icon, best->playback_status);
+                     icon, art->playback_status);
         gtk_label_set_text(GTK_LABEL(ctx->media_status_label), status);
     }
 
     /* Position / Duration */
     {
         char pos_buf[32] = "", len_buf[32] = "", disp[80] = "";
-        format_duration(best->position_us, pos_buf, sizeof(pos_buf));
-        format_duration(best->length_us, len_buf, sizeof(len_buf));
+        format_duration(art->position_us, pos_buf, sizeof(pos_buf));
+        format_duration(art->length_us, len_buf, sizeof(len_buf));
         if (pos_buf[0] && len_buf[0])
             snprintf(disp, sizeof(disp), "%s / %s", pos_buf, len_buf);
         else if (len_buf[0])
@@ -680,31 +634,34 @@ static void pw_update_mpris(pw_ctx_t *ctx, const evemon_proc_data_t *data)
         gtk_label_set_text(GTK_LABEL(ctx->media_position_label), disp);
     }
 
-    /* Album art — async load for file://, https://, data: URIs */
-    if (best->art_url[0] &&
-        strcmp(best->art_url, ctx->art_url_cached) != 0) {
-        /* URL changed — cancel any in-flight load and start new one */
-        if (ctx->art_cancel) {
-            g_cancellable_cancel(ctx->art_cancel);
-            g_object_unref(ctx->art_cancel);
-            ctx->art_cancel = NULL;
-        }
-        snprintf(ctx->art_url_cached, sizeof(ctx->art_url_cached),
-                 "%s", best->art_url);
-        art_load_async(best->art_url, pw_on_art_loaded, ctx,
-                       &ctx->art_cancel);
-    } else if (ctx->art_pixbuf) {
-        GdkPixbuf *scaled = scale_art_pixbuf(ctx->art_pixbuf, 64);
-        gtk_image_set_from_pixbuf(GTK_IMAGE(ctx->media_art_image), scaled);
-        if (scaled) g_object_unref(scaled);
-    } else {
-        gtk_image_clear(GTK_IMAGE(ctx->media_art_image));
+    /* Show/hide the section based on whether we have metadata */
+    if (art->track_title[0] || art->playback_status[0]) {
+        gtk_widget_set_no_show_all(ctx->media_section, FALSE);
+        gtk_widget_show_all(ctx->media_section);
+        gtk_widget_set_no_show_all(ctx->media_section, TRUE);
+    } else if (ctx->media_section) {
+        gtk_widget_hide(ctx->media_section);
     }
+}
 
-    /* Show the section */
-    gtk_widget_set_no_show_all(ctx->media_section, FALSE);
-    gtk_widget_show_all(ctx->media_section);
-    gtk_widget_set_no_show_all(ctx->media_section, TRUE);
+/*
+ * Update the Now Playing section with MPRIS metadata.
+ *
+ * Album art loading and MPRIS label updates are now handled by the
+ * event bus (pw_on_album_art_event).  This function just ensures
+ * the media section visibility is correct when no MPRIS data is
+ * available.
+ */
+static void pw_update_mpris(pw_ctx_t *ctx, const evemon_proc_data_t *data)
+{
+    if (!data->mpris_players || data->mpris_player_count == 0) {
+        /* No MPRIS data — hide the section */
+        if (ctx->media_section)
+            gtk_widget_hide(ctx->media_section);
+        return;
+    }
+    /* The media section is shown/hidden by pw_on_album_art_event
+     * when events arrive from the audio service plugin. */
 }
 
 /* ── plugin callbacks ────────────────────────────────────────── */
@@ -895,8 +852,11 @@ static void pw_activate(void *opaque,
 {
     pw_ctx_t *ctx = opaque;
     ctx->host = services;
-    /* Meter timer is started lazily in pw_update() once we have audio nodes,
-     * to avoid running before the tree store is fully ready. */
+    /* Subscribe to album art events from the audio service plugin */
+    if (services->subscribe)
+        services->subscribe(services->host_ctx,
+                            EVEMON_EVENT_ALBUM_ART_UPDATED,
+                            pw_on_album_art_event, ctx);
 }
 
 static void pw_update(void *opaque, const evemon_proc_data_t *data)
@@ -1207,11 +1167,6 @@ static void pw_destroy(void *opaque)
         ctx->store = NULL;
     }
     if (ctx->css) g_object_unref(ctx->css);
-    if (ctx->art_cancel) {
-        g_cancellable_cancel(ctx->art_cancel);
-        g_object_unref(ctx->art_cancel);
-        ctx->art_cancel = NULL;
-    }
     if (ctx->art_pixbuf) g_object_unref(ctx->art_pixbuf);
     free(ctx);
 }

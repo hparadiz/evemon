@@ -14,6 +14,7 @@
 
 #include "../plugin_loader.h"
 #include "../plugin_broker.h"
+#include "../event_bus.h"
 
 #include <fontconfig/fontconfig.h>
 #include <pango/pangocairo.h>
@@ -4107,20 +4108,27 @@ void *ui_thread(void *arg)
         if (preg) {
             plugin_registry_init(preg);
 
-#ifdef HAVE_PIPEWIRE
+            /* Initialise the event bus before loading any plugins */
+            evemon_event_bus_init();
+
             /* Build host services table on the heap so it outlives this block */
             evemon_host_services_t *hsvc = calloc(1, sizeof(evemon_host_services_t));
             if (hsvc) {
                 hsvc->host_ctx          = &ctx;
+#ifdef HAVE_PIPEWIRE
                 hsvc->pw_meter_start    = host_pw_meter_start;
                 hsvc->pw_meter_stop     = host_pw_meter_stop;
                 hsvc->pw_meter_read     = host_pw_meter_read;
                 hsvc->spectro_start     = host_spectro_start;
                 hsvc->spectro_stop      = host_spectro_stop;
                 hsvc->spectro_get_target = host_spectro_get_target;
+#endif
+                /* Event bus wiring */
+                hsvc->subscribe         = host_event_subscribe;
+                hsvc->publish           = host_event_publish;
+                hsvc->unsubscribe       = host_event_unsubscribe;
                 plugin_registry_set_host_services(preg, hsvc);
             }
-#endif
 
             /* Resolve plugins directory.  Search order:
              *  1. <exe_dir>/plugins/    — for development (build/plugins/)
@@ -4193,6 +4201,9 @@ void *ui_thread(void *arg)
                         if (!inst->widget || !inst->plugin ||
                             !inst->plugin->id)
                             continue;
+                        /* Headless plugins have no tab */
+                        if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS)
+                            continue;
                         if (strcmp(inst->plugin->id, tab_order[o]) != 0)
                             continue;
                         const char *lbl = inst->plugin->name
@@ -4214,11 +4225,17 @@ void *ui_thread(void *arg)
                 /* Pass 2: remaining plugins in load order (skip last-order) */
                 for (size_t i = 0; i < preg->count; i++) {
                     if (added[i]) continue;
+                    plugin_instance_t *inst = &preg->instances[i];
+                    /* Headless plugins have no tab */
+                    if (inst->plugin &&
+                        inst->plugin->kind == EVEMON_PLUGIN_HEADLESS) {
+                        added[i] = TRUE;
+                        continue;
+                    }
                     /* Skip plugins reserved for pass 3 (last) */
                     if (inst_is_last_order(preg->instances[i].plugin,
                                            tab_order_last))
                         continue;
-                    plugin_instance_t *inst = &preg->instances[i];
                     if (!inst->widget) continue;
                     const char *lbl = (inst->plugin && inst->plugin->name)
                                     ? inst->plugin->name : "Plugin";
@@ -4475,6 +4492,7 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     ctx->pinned_capacity = 0;
 
     /* Clean up plugin system */
+    evemon_event_bus_destroy();
     broker_destroy();
     if (ctx->plugin_registry) {
         plugin_registry_destroy(ctx->plugin_registry);
