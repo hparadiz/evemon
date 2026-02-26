@@ -1,5 +1,5 @@
 /*
- * pipewire_scan.c – PipeWire audio connection scanner for the sidebar.
+ * pipewire_scan.c – PipeWire audio connection scanner for the detail panel.
  *
  * Connects to the PipeWire daemon via libpipewire, enumerates the
  * object graph (nodes, ports, links), and for a given PID shows:
@@ -512,7 +512,7 @@ int pw_snapshot(pw_graph_t *out)
 /* ── per-PID result building ─────────────────────────────────── */
 
 /*
- * Categories for the PipeWire sidebar tree.
+ * Categories for the PipeWire detail panel tree.
  */
 typedef enum {
     PW_CAT_OUTPUT,    /* streams sending audio out (playback)   */
@@ -939,7 +939,7 @@ void pipewire_scan_start(ui_ctx_t *ctx, pid_t pid)
 {
     /* Disabled: PipeWire audio is now handled entirely by the
      * PipeWire plugin (src/plugins/pipewire_plugin.c).  The old
-     * sidebar scanner is kept compiled but not called to avoid
+     * detail panel scanner is kept compiled but not called to avoid
      * conflicting PipeWire sink creation. */
     (void)ctx;
     (void)pid;

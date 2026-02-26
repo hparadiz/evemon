@@ -1,5 +1,5 @@
 /*
- * net_scan.c – dedicated network socket scanner for sidebar section.
+ * net_scan.c – dedicated network socket scanner for detail panel section.
  *
  * Enumerates network sockets for the selected process (and optionally
  * descendants), resolves addresses via /proc/net/{tcp,udp,tcp6,udp6},
@@ -572,5 +572,5 @@ void on_net_desc_toggled(GtkToggleButton *btn, gpointer data)
     ui_ctx_t *ctx = data;
     ctx->net_include_desc = gtk_toggle_button_get_active(btn);
     gtk_tree_store_clear(ctx->net_store);
-    sidebar_update(ctx);
+    proc_detail_update(ctx);
 }

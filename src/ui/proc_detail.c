@@ -1,7 +1,7 @@
 /*
- * sidebar.c – process detail sidebar: show selected-process info.
+ * proc_detail.c – process detail panel: show selected-process info.
  *
- * The sidebar now only contains the "Process Info" section with
+ * The detail panel contains the "Process Info" section with
  * basic metadata (PID, name, CPU%, RSS, etc.), Steam/Proton info,
  * and cgroup limits.  The old per-section data scanners (FD, env,
  * mmap, libs, network) have been retired in favour of the plugin
@@ -12,9 +12,9 @@
 #include "../steam.h"
 #include "../fdmon.h"
 
-/* ── sidebar: update detail panel from selection ─────────────── */
+/* ── process detail panel: update from selection ─────────────── */
 
-void sidebar_update(ui_ctx_t *ctx)
+void proc_detail_update(ui_ctx_t *ctx)
 {
     if (!gtk_widget_get_visible(ctx->sidebar))
         return;
@@ -237,7 +237,7 @@ void sidebar_update(ui_ctx_t *ctx)
 
     /* Scanning of FDs, environment, memory maps, libraries, and network
      * sockets is handled by the plugin system via the detail panel tabs.
-     * cgroup limits are still displayed inline in the sidebar. */
+     * cgroup limits are still displayed inline in the process detail panel. */
     if (pid > 0)
         cgroup_scan_start(ctx, (pid_t)pid);
 

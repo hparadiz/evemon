@@ -117,11 +117,11 @@ typedef struct {
 
     gboolean            follow_selection;
 
-    /* sidebar */
+    /* process detail panel */
     GtkWidget          *sidebar;
     GtkWidget          *sidebar_grid;
 
-    /* sidebar section collapse state & containers */
+    /* detail panel section collapse state & containers */
     gboolean            sb_info_collapsed;
     GtkWidget          *sb_info_content;     /* process info grid          */
     GtkWidget          *sb_info_header_arrow; /* ▼/▶ indicator             */
@@ -144,7 +144,7 @@ typedef struct {
     GtkLabel           *sb_cwd;
     GtkLabel           *sb_cmdline;
 
-    /* Steam/Proton metadata in sidebar */
+    /* Steam/Proton metadata in detail panel */
     GtkLabel           *sb_steam_game;
     GtkLabel           *sb_steam_appid;
     GtkLabel           *sb_steam_proton;
@@ -153,7 +153,7 @@ typedef struct {
     GtkLabel           *sb_steam_gamedir;
     GtkWidget          *sb_steam_frame;     /* container to show/hide */
 
-    /* cgroup resource limits in sidebar */
+    /* cgroup resource limits in detail panel */
     GtkLabel           *sb_cgroup_path;
     GtkLabel           *sb_cgroup_mem;
     GtkLabel           *sb_cgroup_mem_high;
@@ -169,7 +169,7 @@ typedef struct {
     GCancellable       *cgroup_cancel;
 
 #ifdef HAVE_PIPEWIRE
-    /* PipeWire sidebar scan state (used by pipewire_scan.c) */
+    /* PipeWire detail panel scan state (used by pipewire_scan.c) */
     GtkTreeStore       *pw_store;
     GtkTreeView        *pw_view;
     GtkCssProvider     *pw_css;
@@ -234,7 +234,7 @@ typedef struct {
     GtkWidget          *detail_paned;          /* current GtkPaned holding panel   */
     GtkWidget          *main_content;          /* tree_overlay (stable reference)  */
     GtkWidget          *content_box;           /* vbox holding menubar+content+status */
-    GtkWidget          *hpaned;                /* sidebar paned (tree | sidebar)   */
+    GtkWidget          *hpaned;                /* tree paned (tree | detail panel)  */
     GSList             *panel_pos_group;        /* radio group for position items   */
 } ui_ctx_t;
 
@@ -266,7 +266,7 @@ void spectrogram_stop(ui_ctx_t *ctx);
 uint32_t spectrogram_get_target_node(ui_ctx_t *ctx);
 gboolean spectrogram_on_draw(GtkWidget *widget, cairo_t *cr, gpointer data);
 
-/* sidebar signal callbacks for PipeWire tree */
+/* detail panel signal callbacks for PipeWire tree */
 void on_pw_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
                          GtkTreePath *path, gpointer data);
 void on_pw_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
@@ -289,7 +289,7 @@ static inline uint32_t spectrogram_get_target_node(void *ctx)
 
 #endif /* HAVE_PIPEWIRE */
 
-/* ── cgroup sidebar scan ─────────────────────────────────────── */
+/* ── cgroup detail panel scan ────────────────────────────────── */
 
 void cgroup_scan_start(ui_ctx_t *ctx, pid_t pid);
 
@@ -323,9 +323,9 @@ void     collect_descendant_pids(GtkTreeModel *model, GtkTreeIter *parent,
                                 pid_t **out, size_t *out_count,
                                 size_t *out_cap);
 
-/* ── sidebar ─────────────────────────────────────────────────── */
+/* ── process detail panel ────────────────────────────────────── */
 
-void sidebar_update(ui_ctx_t *ctx);
+void proc_detail_update(ui_ctx_t *ctx);
 
 /* ── cleanup (fix 6) ─────────────────────────────────────────── */
 

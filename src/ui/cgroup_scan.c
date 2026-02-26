@@ -1,5 +1,5 @@
 /*
- * cgroup_scan.c – cgroup resource limits display for the sidebar.
+ * cgroup_scan.c – cgroup resource limits display for the detail panel.
  *
  * Reads /proc/<pid>/cgroup to find the cgroup path, then reads
  * resource controller files from /sys/fs/cgroup/<path>/ to show

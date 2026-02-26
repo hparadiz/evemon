@@ -810,12 +810,12 @@ static void on_row_expanded(GtkTreeView *view,
     }
 }
 
-/* ── selection / sidebar interaction ─────────────────────────── */
+/* ── selection / detail panel interaction ─────────────────────── */
 
 static void on_selection_changed(GtkTreeSelection *sel, gpointer data)
 {
     (void)sel;
-    sidebar_update((ui_ctx_t *)data);
+    proc_detail_update((ui_ctx_t *)data);
 }
 
 /* ── Collapsible section constants ────────────────────────────── */
@@ -863,7 +863,7 @@ static void on_panel_position_changed(GtkCheckMenuItem *item, gpointer data)
  *   content_box (vbox):
  *     [0] menubar
  *     [1] outer_paned (vertical or horizontal depending on position)
- *           pack1 = tree area (hpaned containing tree_overlay + sidebar)
+ *           pack1 = tree area (hpaned containing tree_overlay)
  *           pack2 = detail_panel
  *     [2] status_ebox
  *
@@ -965,7 +965,7 @@ static void detail_panel_relayout(ui_ctx_t *ctx)
 }
 
 
-/* ── double-click: open sidebar for the activated row ─────────── */
+/* ── double-click: open detail panel for the activated row ────── */
 
 static void on_row_activated(GtkTreeView       *view,
                              GtkTreePath       *path,
@@ -1281,11 +1281,11 @@ static gboolean on_refresh(gpointer data)
     g_signal_handlers_unblock_by_func(ctx->view, on_row_expanded,  ctx);
     g_signal_handlers_unblock_by_func(tree_sel, on_selection_changed, ctx);
 
-    /* Update the sidebar detail panel for the selected process */
-    sidebar_update(ctx);
+    /* Update the process detail panel for the selected process */
+    proc_detail_update(ctx);
 
     /* ── Plugin broker dispatch ──────────────────────────────── */
-    /* After the sidebar updates, kick off the plugin data broker.
+    /* After the detail panel updates, kick off the plugin data broker.
      * Non-pinned instances follow the tree selection. */
     {
         plugin_registry_t *preg = ctx->plugin_registry;
@@ -1669,7 +1669,7 @@ static void reload_font_css(ui_ctx_t *ctx)
              ctx->font_size);
     gtk_css_provider_load_from_data(ctx->css, buf, -1, NULL);
 
-    /* Sidebar labels and frame title */
+    /* Detail panel labels and frame title */
     if (ctx->sidebar_css) {
         snprintf(buf, sizeof(buf),
                  "frame, label, checkbutton { font-size: %dpt; }",
@@ -2586,7 +2586,7 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
     if (state & GDK_MOD1_MASK)
         ctx->alt_pressed = FALSE;
 
-    /* Escape while sidebar has focus → return focus to the tree view */
+    /* Escape while detail panel has focus → return focus to the tree view */
     if (ev->keyval == GDK_KEY_Escape && state == 0) {
         GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(widget));
         if (focus && gtk_widget_get_visible(ctx->sidebar) &&
@@ -3123,7 +3123,7 @@ static void name_cell_data_func(GtkTreeViewColumn *col,
 /* ── Host service forwarding functions for PipeWire plugins ──── */
 #ifdef HAVE_PIPEWIRE
 /*
- * These bridge from the plugin API to the sidebar's pw_meter.c
+ * These bridge from the plugin API to the detail panel's pw_meter.c
  * and spectrogram.c implementations.  The host_ctx is a ui_ctx_t*.
  */
 static void host_pw_meter_start(void *host_ctx,
@@ -3543,10 +3543,10 @@ void *ui_thread(void *arg)
 
     gtk_overlay_add_overlay(GTK_OVERLAY(tree_overlay), pid_entry);
 
-    /* ── sidebar (detail panel) ───────────────────────────────── */
+    /* ── process detail panel ─────────────────────────────────── */
 
     /*
-     * Helper: create a collapsible sidebar section.
+     * Helper: create a collapsible detail panel section.
      *
      * Returns a GtkBox (vertical) containing:
      *   [0] separator
@@ -3849,7 +3849,7 @@ void *ui_thread(void *arg)
 
     #undef MAKE_SECTION
 
-    /* ── Pack sidebar content ───────────────────────────────────── */
+    /* ── Pack detail panel content ───────────────────────────────── */
     gtk_box_pack_start(GTK_BOX(sidebar_vbox), info_section, TRUE, TRUE, 0);
 
     gtk_container_add(GTK_CONTAINER(sidebar_scroll), sidebar_vbox);
@@ -3857,7 +3857,7 @@ void *ui_thread(void *arg)
     GtkWidget *sidebar_frame = gtk_frame_new(NULL);
     gtk_container_add(GTK_CONTAINER(sidebar_frame), sidebar_scroll);
 
-    /* Live CSS provider for sidebar font size (cascades to all children) */
+    /* Live CSS provider for detail panel font size (cascades to all children) */
     GtkCssProvider *sidebar_css = gtk_css_provider_new();
     {
         char sbuf[128];
@@ -3979,15 +3979,15 @@ void *ui_thread(void *arg)
     gtk_container_add(GTK_CONTAINER(status_ebox), status_hbox);
     gtk_widget_add_events(status_ebox, GDK_BUTTON_PRESS_MASK);
 
-    /* ── detail panel (wraps sidebar + plugin notebook) ──────── */
-    /* The detail panel now contains a horizontal paned:
+    /* ── detail panel (wraps process info + plugin notebook) ──── */
+    /* The detail panel contains a horizontal paned:
      *   pack1 = sidebar_frame  (Process Info / Steam / cgroup)
      *   pack2 = plugin notebook (tabs for FD, Env, Mmap, Libs, Net, …)
      * Opening the detail panel reveals both process info and plugin tabs. */
     GtkWidget *detail_panel = gtk_frame_new(NULL);
     gtk_widget_set_size_request(detail_panel, -1, 200);
 
-    /* Inner horizontal paned: sidebar | notebook */
+    /* Inner horizontal paned: process info | notebook */
     GtkWidget *detail_hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_widget_set_size_request(sidebar_frame, 280, -1);
     gtk_paned_pack1(GTK_PANED(detail_hpaned), sidebar_frame, FALSE, FALSE);
@@ -4039,7 +4039,7 @@ void *ui_thread(void *arg)
     ctx.pid_css   = pid_entry_css;
     ctx.pid_col   = pid_col;
 
-    /* Sidebar detail panel */
+    /* Process detail panel */
     ctx.sidebar            = sidebar_frame;
     ctx.sidebar_grid       = sidebar_vbox;
 
@@ -4066,7 +4066,7 @@ void *ui_thread(void *arg)
     ctx.sb_cwd        = sb_cwd;
     ctx.sb_cmdline    = sb_cmdline;
 
-    /* Steam/Proton sidebar */
+    /* Steam/Proton detail */
     ctx.sb_steam_game    = sb_steam_game;
     ctx.sb_steam_appid   = sb_steam_appid;
     ctx.sb_steam_proton  = sb_steam_proton;
@@ -4294,8 +4294,8 @@ void *ui_thread(void *arg)
                 g_free(added);
             }
 
-            /* The plugin notebook lives in the detail panel (separate
-             * from the sidebar).  It is NOT packed into sidebar_vbox. */
+            /* The plugin notebook lives in the detail panel alongside
+             * the process info.  It is NOT packed into sidebar_vbox. */
 
             ctx.plugin_registry = preg;
             ctx.plugin_notebook = notebook;
@@ -4404,7 +4404,7 @@ void *ui_thread(void *arg)
     g_signal_connect(window, "key-press-event",   G_CALLBACK(on_key_press),   &ctx);
     g_signal_connect(window, "key-release-event", G_CALLBACK(on_key_release), &ctx);
 
-    /* Double-click a row to open the sidebar */
+    /* Double-click a row to open the detail panel */
     g_signal_connect(tree, "row-activated", G_CALLBACK(on_row_activated), &ctx);
 
     /* Track user collapse / expand actions */
