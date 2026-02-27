@@ -3747,6 +3747,50 @@ static void on_font_decrease(GtkMenuItem *item, gpointer data)
     }
 }
 
+static void on_font_reset(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    ui_ctx_t *ctx = data;
+    ctx->font_size = FONT_SIZE_DEFAULT;
+    reload_font_css(ctx);
+    settings_get()->font_size = ctx->font_size;
+    settings_save();
+}
+
+static void on_menu_filter(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    ui_ctx_t *ctx = data;
+    if (!ctx->filter_entry) return;
+    if (gtk_widget_get_visible(ctx->filter_entry)) {
+        filter_cancel_hide_timer(ctx);
+        gtk_entry_set_text(GTK_ENTRY(ctx->filter_entry), "");
+        ctx->filter_text[0] = '\0';
+        switch_to_real_store(ctx);
+        gtk_widget_hide(ctx->filter_entry);
+        gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
+    } else {
+        filter_cancel_hide_timer(ctx);
+        gtk_widget_show(ctx->filter_entry);
+        gtk_widget_grab_focus(ctx->filter_entry);
+    }
+}
+
+static void on_menu_goto_pid(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    ui_ctx_t *ctx = data;
+    if (!ctx->pid_entry) return;
+    if (gtk_widget_get_visible(ctx->pid_entry)) {
+        gtk_entry_set_text(GTK_ENTRY(ctx->pid_entry), "");
+        gtk_widget_hide(ctx->pid_entry);
+        gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
+    } else {
+        gtk_widget_show(ctx->pid_entry);
+        gtk_widget_grab_focus(ctx->pid_entry);
+    }
+}
+
 /* ── column visibility toggle ─────────────────────────────────── */
 
 /*
@@ -4247,6 +4291,11 @@ void *ui_thread(void *arg)
     GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window), "ＥＶＥＭＯＮ");
     gtk_window_set_default_size(GTK_WINDOW(window), 1100, 700);
+
+    /* Accel group for displaying hotkey hints in menus.
+     * The actual key handling is in on_key_press. */
+    GtkAccelGroup *accel_group = gtk_accel_group_new();
+    gtk_window_add_accel_group(GTK_WINDOW(window), accel_group);
 
     /* Set the window icon from the embedded GResource PNG.
      *
@@ -4964,6 +5013,9 @@ void *ui_thread(void *arg)
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(file_item), file_menu);
 
     GtkWidget *exit_item = gtk_menu_item_new_with_label("Exit");
+    gtk_widget_add_accelerator(exit_item, "activate", accel_group,
+                               GDK_KEY_q, GDK_CONTROL_MASK,
+                               GTK_ACCEL_VISIBLE);
     g_signal_connect(exit_item, "activate", G_CALLBACK(on_menu_exit), window);
     gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), exit_item);
 
@@ -5015,15 +5067,42 @@ void *ui_thread(void *arg)
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),
                           gtk_separator_menu_item_new());
 
+    /* Filter & Go-to-PID with hotkey hints */
+    GtkWidget *filter_item = gtk_menu_item_new_with_label("Filter by Name");
+    gtk_widget_add_accelerator(filter_item, "activate", accel_group,
+                               GDK_KEY_f, GDK_CONTROL_MASK,
+                               GTK_ACCEL_VISIBLE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), filter_item);
+
+    GtkWidget *goto_pid_item = gtk_menu_item_new_with_label("Go to PID");
+    gtk_widget_add_accelerator(goto_pid_item, "activate", accel_group,
+                               GDK_KEY_g, GDK_CONTROL_MASK,
+                               GTK_ACCEL_VISIBLE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), goto_pid_item);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),
+                          gtk_separator_menu_item_new());
+
     GtkWidget *appear_menu = gtk_menu_new();
     GtkWidget *appear_item = gtk_menu_item_new_with_label("Appearance");
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(appear_item), appear_menu);
 
     GtkWidget *font_inc = gtk_menu_item_new_with_label("Increase Font");
+    gtk_widget_add_accelerator(font_inc, "activate", accel_group,
+                               GDK_KEY_plus, GDK_CONTROL_MASK,
+                               GTK_ACCEL_VISIBLE);
     GtkWidget *font_dec = gtk_menu_item_new_with_label("Decrease Font");
+    gtk_widget_add_accelerator(font_dec, "activate", accel_group,
+                               GDK_KEY_minus, GDK_CONTROL_MASK,
+                               GTK_ACCEL_VISIBLE);
+    GtkWidget *font_reset = gtk_menu_item_new_with_label("Reset Font");
+    gtk_widget_add_accelerator(font_reset, "activate", accel_group,
+                               GDK_KEY_0, GDK_CONTROL_MASK,
+                               GTK_ACCEL_VISIBLE);
 
     gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), font_inc);
     gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), font_dec);
+    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), font_reset);
 
     /* Theme picker submenu */
     gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu),
@@ -5531,8 +5610,11 @@ void *ui_thread(void *arg)
     }
 
     /* Font menu callbacks (need ctx address, so connect after ctx init) */
-    g_signal_connect(font_inc,  "activate", G_CALLBACK(on_font_increase),    &ctx);
-    g_signal_connect(font_dec,  "activate", G_CALLBACK(on_font_decrease),    &ctx);
+    g_signal_connect(font_inc,   "activate", G_CALLBACK(on_font_increase),    &ctx);
+    g_signal_connect(font_dec,   "activate", G_CALLBACK(on_font_decrease),    &ctx);
+    g_signal_connect(font_reset, "activate", G_CALLBACK(on_font_reset),       &ctx);
+    g_signal_connect(filter_item,   "activate", G_CALLBACK(on_menu_filter),   &ctx);
+    g_signal_connect(goto_pid_item, "activate", G_CALLBACK(on_menu_goto_pid), &ctx);
     g_signal_connect(detail_panel_toggle, "toggled",
                      G_CALLBACK(on_toggle_detail_panel), &ctx);
 
