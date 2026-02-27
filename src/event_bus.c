@@ -109,10 +109,18 @@ typedef struct {
 static void idle_dispatch_free(idle_dispatch_t *d)
 {
     if (d->owned_payload) {
-        evemon_album_art_payload_t *art = d->owned_payload;
-        if (art->pixbuf)
-            g_object_unref(art->pixbuf);
-        free(art);
+        if (d->event.type == EVEMON_EVENT_ALBUM_ART_UPDATED) {
+            evemon_album_art_payload_t *art = d->owned_payload;
+            if (art->pixbuf)
+                g_object_unref(art->pixbuf);
+            free(art);
+        } else if (d->event.type == EVEMON_EVENT_JSON_SNAPSHOT) {
+            evemon_json_payload_t *jp = d->owned_payload;
+            free((void *)jp->json);
+            free(jp);
+        } else {
+            free(d->owned_payload);
+        }
     }
     free(d);
 }
@@ -171,6 +179,22 @@ static idle_dispatch_t *event_to_idle(const evemon_event_t *event)
         pid_t *dst = malloc(sizeof(pid_t));
         if (dst) {
             *dst = *src;
+            d->event.payload = dst;
+            d->owned_payload = dst;
+        }
+    }
+    /* JSON_SNAPSHOT: deep-copy the JSON string */
+    else if (event->type == EVEMON_EVENT_JSON_SNAPSHOT && event->payload) {
+        const evemon_json_payload_t *src = event->payload;
+        evemon_json_payload_t *dst = calloc(1, sizeof(*dst));
+        if (dst) {
+            dst->source_pid = src->source_pid;
+            dst->len        = src->len;
+            char *jcopy     = malloc(src->len + 1);
+            if (jcopy) {
+                memcpy(jcopy, src->json, src->len + 1);
+                dst->json = jcopy;
+            }
             d->event.payload = dst;
             d->owned_payload = dst;
         }

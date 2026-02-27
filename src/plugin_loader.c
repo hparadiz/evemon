@@ -6,6 +6,7 @@
  */
 
 #include "plugin_loader.h"
+#include "settings.h"
 
 #include <dlfcn.h>
 #include <dirent.h>
@@ -164,6 +165,19 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
                 path, plugin->abi_version, evemon_PLUGIN_ABI_VERSION);
         dlclose(handle);
         return -1;
+    }
+
+    /* Check settings: skip plugins the user has disabled */
+    if (plugin->id && !settings_plugin_enabled(plugin->id)) {
+        fprintf(stdout, "evemon: skipping disabled plugin \"%s\" (%s)\n",
+                plugin->name ? plugin->name : "?",
+                plugin->id);
+        if (plugin->destroy)
+            plugin->destroy(plugin->plugin_ctx);
+        else
+            free(plugin);
+        dlclose(handle);
+        return 0;  /* not an error — intentionally skipped */
     }
 
     /* UI plugins must provide create_widget and update.

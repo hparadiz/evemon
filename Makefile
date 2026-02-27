@@ -24,8 +24,12 @@ X11_LDFLAGS := $(shell pkg-config --libs x11 2>/dev/null)
 FC_CFLAGS   := $(shell pkg-config --cflags fontconfig)
 FC_LDFLAGS  := $(shell pkg-config --libs fontconfig)
 
-CFLAGS  += $(GTK_CFLAGS) $(FC_CFLAGS)
-LDFLAGS += $(GTK_LDFLAGS) $(FC_LDFLAGS) $(X11_LDFLAGS)
+# Jansson (JSON settings file)
+JANSSON_CFLAGS  := $(shell pkg-config --cflags jansson 2>/dev/null)
+JANSSON_LDFLAGS := $(shell pkg-config --libs   jansson 2>/dev/null)
+
+CFLAGS  += $(GTK_CFLAGS) $(FC_CFLAGS) $(JANSSON_CFLAGS)
+LDFLAGS += $(GTK_LDFLAGS) $(FC_LDFLAGS) $(X11_LDFLAGS) $(JANSSON_LDFLAGS)
 
 # PipeWire (optional — audio connection info in sidebar)
 # Auto-detect: if libpipewire-0.3 is installed, enable the feature.
@@ -139,6 +143,10 @@ $(PLUGIN_DIR)/evemon_milkdrop_plugin.so: $(SRC_DIR)/plugins/milkdrop_plugin.c $(
 # Audio service headless plugin — owns album art loading (art_loader.c + libsoup)
 $(PLUGIN_DIR)/evemon_audio_service_plugin.so: $(SRC_DIR)/plugins/audio_service_plugin.c $(SRC_DIR)/art_loader.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
 	$(CC) $(PLUGIN_CFLAGS) $(SOUP_CFLAGS) -o $@ $(SRC_DIR)/plugins/audio_service_plugin.c $(SRC_DIR)/art_loader.c $(PLUGIN_LDFLAGS) $(SOUP_LDFLAGS)
+
+# JSON service headless plugin — serialises proc data to JSON (jansson)
+$(PLUGIN_DIR)/evemon_json_service_plugin.so: $(SRC_DIR)/plugins/json_service_plugin.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
+	$(CC) $(PLUGIN_CFLAGS) $(JANSSON_CFLAGS) -o $@ $(SRC_DIR)/plugins/json_service_plugin.c $(PLUGIN_LDFLAGS) $(JANSSON_LDFLAGS)
 
 plugins: $(PLUGIN_SOS)
 

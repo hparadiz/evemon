@@ -44,6 +44,7 @@ typedef enum {
     EVEMON_EVENT_ALBUM_ART_UPDATED,    /* payload: evemon_album_art_payload_t* */
     EVEMON_EVENT_AUDIO_STATE_CHANGED,  /* payload: reserved (NULL)       */
     EVEMON_EVENT_PID_EXITED,           /* payload: pid_t*                */
+    EVEMON_EVENT_JSON_SNAPSHOT,        /* payload: evemon_json_payload_t**/
     EVEMON_EVENT_CUSTOM                /* payload: user-defined          */
 } evemon_event_type_t;
 
@@ -92,6 +93,20 @@ typedef struct {
     int64_t     length_us;            /* track length in µs              */
     char        identity[128];        /* player identity                 */
 } evemon_album_art_payload_t;
+
+/*
+ * Payload for EVEMON_EVENT_JSON_SNAPSHOT.
+ * Published by the JSON service plugin each update cycle.
+ * `json` is a heap-allocated NUL-terminated JSON string;
+ * the publisher owns it — subscribers must strdup() if
+ * they want to keep it beyond the callback.
+ * `len` is strlen(json), provided for convenience.
+ */
+typedef struct {
+    const char *json;                 /* heap-allocated JSON string       */
+    size_t      len;                  /* strlen(json)                     */
+    pid_t       source_pid;           /* PID this snapshot describes      */
+} evemon_json_payload_t;
 
 /* ── Data needs bitmask ──────────────────────────────────────── */
 

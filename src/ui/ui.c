@@ -15,6 +15,7 @@
 #include "../plugin_loader.h"
 #include "../plugin_broker.h"
 #include "../event_bus.h"
+#include "../settings.h"
 
 #ifdef HAVE_PIPEWIRE
 #include "pipewire_graph.h"
@@ -35,6 +36,9 @@
 static void rebuild_filter_store(ui_ctx_t *ctx);
 static void sync_filter_store(ui_ctx_t *ctx);
 static void switch_to_real_store(ui_ctx_t *ctx);
+
+/* Forward declaration for PID navigation (used by settings preselect) */
+static void goto_pid(ui_ctx_t *ctx, pid_t target);
 
 /* Forward declarations for audio-only filter helpers */
 static void rebuild_audio_filter_store(ui_ctx_t *ctx);
@@ -115,6 +119,20 @@ int get_process_tree_node(const ptree_node_set_t *s, pid_t pinned_pid,
         if (s->pinned_pids[i] == pinned_pid && s->pids[i] == pid)
             return s->states[i];
     return PTREE_EXPANDED;   /* default */
+}
+
+/*
+ * has_process_tree_node – check if an explicit entry exists for a PID.
+ * Returns 1 if found, 0 if not.  Used by the audio filter to distinguish
+ * "user never touched this row" from "user explicitly expanded it".
+ */
+static int has_process_tree_node(const ptree_node_set_t *s, pid_t pinned_pid,
+                                 pid_t pid)
+{
+    for (size_t i = 0; i < s->count; i++)
+        if (s->pinned_pids[i] == pinned_pid && s->pids[i] == pid)
+            return 1;
+    return 0;
 }
 
 /* ── formatting helpers ──────────────────────────────────────── */
@@ -1056,6 +1074,8 @@ static void on_toggle_audio_only(GtkCheckMenuItem *item, gpointer data)
 {
     ui_ctx_t *ctx = data;
     ctx->show_audio_only = gtk_check_menu_item_get_active(item);
+    settings_get()->show_audio_only = ctx->show_audio_only;
+    settings_save();
 
     if (ctx->show_audio_only) {
         /* Build a filtered store showing only audio processes */
@@ -1467,7 +1487,10 @@ static void detail_panel_relayout(ui_ctx_t *ctx);
 static void on_toggle_detail_panel(GtkCheckMenuItem *item, gpointer data)
 {
     ui_ctx_t *ctx = data;
-    if (gtk_check_menu_item_get_active(item)) {
+    gboolean active = gtk_check_menu_item_get_active(item);
+    settings_get()->detail_panel_open = active;
+    settings_save();
+    if (active) {
         gtk_widget_show_all(ctx->detail_vbox);
 
         /* Only show the main (unpinned) detail panel if a process
@@ -1500,6 +1523,8 @@ static void on_proc_info_tray_toggle(GtkButton *btn, gpointer data)
     (void)btn;
     ui_ctx_t *ctx = data;
     ctx->proc_info_collapsed = !ctx->proc_info_collapsed;
+    settings_get()->proc_info_open = !ctx->proc_info_collapsed;
+    settings_save();
 
     gtk_revealer_set_reveal_child(
         GTK_REVEALER(ctx->proc_info_revealer), !ctx->proc_info_collapsed);
@@ -1535,6 +1560,8 @@ static void on_panel_position_changed(GtkCheckMenuItem *item, gpointer data)
         return;   /* no change */
     d->ctx->detail_panel_pos = d->pos;
     detail_panel_relayout(d->ctx);
+    settings_get()->detail_panel_position = (int)d->pos;
+    settings_save();
 }
 
 /*
@@ -1865,6 +1892,18 @@ static gboolean on_refresh(gpointer data)
         if (ctx->initial_refresh) {
             ctx->initial_refresh = FALSE;
             g_timeout_add(1000, on_refresh, ctx);
+
+            /* Select the preselected PID from settings (default: PID 1) */
+            {
+                pid_t sel_pid = settings_get()->preselected_pid;
+                if (sel_pid > 0)
+                    goto_pid(ctx, sel_pid);
+            }
+
+            /* Honour show_audio_only from settings on first load */
+            if (ctx->show_audio_only)
+                rebuild_audio_filter_store(ctx);
+
             /* Update status bar with first data before we drop this source */
             goto finish;
         }
@@ -2292,8 +2331,13 @@ static void on_theme_selected(GtkCheckMenuItem *item, gpointer data)
         return;  /* ignore deactivation of the old radio item */
 
     const char *name = gtk_menu_item_get_label(GTK_MENU_ITEM(item));
-    GtkSettings *settings = gtk_settings_get_default();
-    g_object_set(settings, "gtk-theme-name", name, NULL);
+    GtkSettings *gs = gtk_settings_get_default();
+    g_object_set(gs, "gtk-theme-name", name, NULL);
+
+    /* Persist theme choice */
+    evemon_settings_t *s = settings_get();
+    snprintf(s->theme, sizeof(s->theme), "%s", name);
+    settings_save();
 }
 
 /*
@@ -2984,7 +3028,37 @@ static void rebuild_audio_filter_store(ui_ctx_t *ctx)
 
     g_signal_handlers_block_by_func(ctx->view, on_row_collapsed, ctx);
     g_signal_handlers_block_by_func(ctx->view, on_row_expanded,  ctx);
-    expand_respecting_collapsed(ctx);
+
+    /* Audio filter: default to collapsed.  Only expand rows the user
+     * has explicitly expanded (has an entry of PTREE_EXPANDED in
+     * ptree_nodes).  Rows with no entry stay collapsed. */
+    {
+        GtkTreeModel *sm = GTK_TREE_MODEL(ctx->sort_model);
+        GtkTreeIter it;
+        gboolean ok = gtk_tree_model_get_iter_first(sm, &it);
+        while (ok) {
+            if (gtk_tree_model_iter_has_child(sm, &it)) {
+                GtkTreeIter child_it;
+                gtk_tree_model_sort_convert_iter_to_child_iter(
+                    ctx->sort_model, &child_it, &it);
+                GtkTreeModel *cm = gtk_tree_model_sort_get_model(
+                    ctx->sort_model);
+                gint pid;
+                gtk_tree_model_get(cm, &child_it, COL_PID, &pid, -1);
+                if (has_process_tree_node(&ctx->ptree_nodes,
+                                          PTREE_UNPINNED, (pid_t)pid)
+                    && get_process_tree_node(&ctx->ptree_nodes,
+                                             PTREE_UNPINNED, (pid_t)pid)
+                       == PTREE_EXPANDED) {
+                    GtkTreePath *p = gtk_tree_model_get_path(sm, &it);
+                    gtk_tree_view_expand_row(ctx->view, p, FALSE);
+                    gtk_tree_path_free(p);
+                }
+            }
+            ok = gtk_tree_model_iter_next(sm, &it);
+        }
+    }
+
     g_signal_handlers_unblock_by_func(ctx->view, on_row_collapsed, ctx);
     g_signal_handlers_unblock_by_func(ctx->view, on_row_expanded,  ctx);
 
@@ -3480,8 +3554,13 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
     ui_ctx_t *ctx = data;
 
     static GdkModifierType mod = 0;
-    if (mod == 0)
-        mod = detect_shortcut_modifier();
+    if (mod == 0) {
+        hotkey_mode_t hmode = settings_get()->hotkey_mode;
+        if (hmode == HOTKEY_MODE_MACOS)
+            mod = GDK_META_MASK;
+        else
+            mod = detect_shortcut_modifier();
+    }
 
     /* Mask out lock bits (Caps Lock, Num Lock, etc.) */
     guint state = ev->state & gtk_accelerator_get_default_mod_mask();
@@ -3651,6 +3730,8 @@ static void on_font_increase(GtkMenuItem *item, gpointer data)
     if (ctx->font_size < FONT_SIZE_MAX) {
         ctx->font_size++;
         reload_font_css(ctx);
+        settings_get()->font_size = ctx->font_size;
+        settings_save();
     }
 }
 
@@ -3661,7 +3742,70 @@ static void on_font_decrease(GtkMenuItem *item, gpointer data)
     if (ctx->font_size > FONT_SIZE_MIN) {
         ctx->font_size--;
         reload_font_css(ctx);
+        settings_get()->font_size = ctx->font_size;
+        settings_save();
     }
+}
+
+/* ── column visibility toggle ─────────────────────────────────── */
+
+/*
+ * Callback for View → Columns → <column name> check menu items.
+ * Toggles the column's visibility and persists the set of visible
+ * columns to settings.json.
+ */
+static void on_column_toggled(GtkCheckMenuItem *item, gpointer data)
+{
+    GtkTreeViewColumn *col = data;
+    gboolean active = gtk_check_menu_item_get_active(item);
+    gtk_tree_view_column_set_visible(col, active);
+
+    /* Rebuild the settings columns[] list from the tree view */
+    GtkTreeView *view = GTK_TREE_VIEW(
+        gtk_tree_view_column_get_tree_view(col));
+    GList *all_cols = gtk_tree_view_get_columns(view);
+
+    evemon_settings_t *s = settings_get();
+    s->column_count = 0;
+    for (GList *c = all_cols; c; c = c->next) {
+        GtkTreeViewColumn *tv_col = c->data;
+        if (gtk_tree_view_column_get_visible(tv_col)) {
+            const char *title = gtk_tree_view_column_get_title(tv_col);
+            if (title && s->column_count < SETTINGS_MAX_COLUMNS) {
+                snprintf(s->columns[s->column_count],
+                         SETTINGS_COL_NAME_MAX, "%s", title);
+                s->column_count++;
+            }
+        }
+    }
+    g_list_free(all_cols);
+    settings_save();
+}
+
+/*
+ * Build the View → Columns submenu with a check item for each
+ * tree view column.  Visibility is initialised from the current
+ * column state (which was set from settings at startup).
+ */
+static GtkWidget *build_columns_submenu(GtkTreeView *view)
+{
+    GtkWidget *menu = gtk_menu_new();
+    GList *cols = gtk_tree_view_get_columns(view);
+
+    for (GList *c = cols; c; c = c->next) {
+        GtkTreeViewColumn *tv_col = c->data;
+        const char *title = gtk_tree_view_column_get_title(tv_col);
+        if (!title || title[0] == '\0') continue;
+
+        GtkWidget *mi = gtk_check_menu_item_new_with_label(title);
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(mi),
+                                       gtk_tree_view_column_get_visible(tv_col));
+        g_signal_connect(mi, "toggled",
+                         G_CALLBACK(on_column_toggled), tv_col);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+    }
+    g_list_free(cols);
+    return menu;
 }
 
 /* ── status bar right-click context menu ──────────────────────── */
@@ -4101,7 +4245,7 @@ void *ui_thread(void *arg)
 
     /* ── window ──────────────────────────────────────────────── */
     GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "Everything Monitor");
+    gtk_window_set_title(GTK_WINDOW(window), "ＥＶＥＭＯＮ");
     gtk_window_set_default_size(GTK_WINDOW(window), 1100, 700);
 
     /* Set the window icon from the embedded GResource PNG.
@@ -4378,6 +4522,29 @@ void *ui_thread(void *arg)
             g_list_free(renderers);
         }
         g_list_free(cols);
+    }
+
+    /* Apply column visibility from settings.
+     * If columns[] is non-empty, only listed columns are visible. */
+    {
+        const evemon_settings_t *s = settings_get();
+        if (s->column_count > 0) {
+            GList *all = gtk_tree_view_get_columns(GTK_TREE_VIEW(tree));
+            for (GList *c = all; c; c = c->next) {
+                GtkTreeViewColumn *tv_col = c->data;
+                const char *title = gtk_tree_view_column_get_title(tv_col);
+                if (!title) continue;
+                gboolean found = FALSE;
+                for (int i = 0; i < s->column_count; i++) {
+                    if (strcmp(s->columns[i], title) == 0) {
+                        found = TRUE;
+                        break;
+                    }
+                }
+                gtk_tree_view_column_set_visible(tv_col, found);
+            }
+            g_list_free(all);
+        }
     }
 
     /* Register inverted sort functions so ▲ = largest/highest first. */
@@ -4839,6 +5006,12 @@ void *ui_thread(void *arg)
 
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), panel_pos_item);
 
+    /* Columns visibility submenu */
+    GtkWidget *columns_item = gtk_menu_item_new_with_label("Columns");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(columns_item),
+                              build_columns_submenu(GTK_TREE_VIEW(tree)));
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), columns_item);
+
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),
                           gtk_separator_menu_item_new());
 
@@ -4989,7 +5162,7 @@ void *ui_thread(void *arg)
     ctx.alt_pressed    = FALSE;
     ctx.css          = css;
     ctx.sidebar_css  = sidebar_css;
-    ctx.font_size    = FONT_SIZE_DEFAULT;
+    ctx.font_size    = settings_get()->font_size;
     ctx.ptree_nodes  = (ptree_node_set_t){ NULL, NULL, NULL, 0, 0 };
     ctx.follow_selection = FALSE;
 
@@ -5000,7 +5173,7 @@ void *ui_thread(void *arg)
     ctx.filter_css   = filt_css;
     ctx.name_col     = name_col;
     ctx.filter_text[0] = '\0';
-    ctx.show_audio_only = FALSE;
+    ctx.show_audio_only = settings_get()->show_audio_only;
 
     /* Go-to-PID */
     ctx.pid_entry = pid_entry;
@@ -5302,7 +5475,7 @@ void *ui_thread(void *arg)
                          ".evemon-plugins treeview,"
                          ".evemon-plugins label,"
                          ".evemon-plugins checkbutton { font-size: %dpt; }",
-                         FONT_SIZE_DEFAULT);
+                         settings_get()->font_size);
                 gtk_css_provider_load_from_data(ctx.plugin_css, pbuf, -1, NULL);
             }
             gtk_style_context_add_provider_for_screen(
@@ -5323,7 +5496,7 @@ void *ui_thread(void *arg)
     /* ── Finish detail panel setup: put notebook into the hpaned ── */
     ctx.detail_panel          = detail_panel;
     ctx.detail_vbox           = detail_vbox;
-    ctx.detail_panel_pos      = PANEL_POS_BOTTOM;
+    ctx.detail_panel_pos      = (panel_position_t)settings_get()->detail_panel_position;
     ctx.detail_panel_menu_item = GTK_CHECK_MENU_ITEM(detail_panel_toggle);
     ctx.detail_paned          = outer_paned;
     ctx.content_box           = vbox;
@@ -5334,7 +5507,7 @@ void *ui_thread(void *arg)
     ctx.proc_info_revealer  = proc_info_revealer;
     ctx.proc_info_toggle    = proc_info_toggle;
     ctx.proc_info_summary   = GTK_LABEL(proc_info_summary_w);
-    ctx.proc_info_collapsed = FALSE;
+    ctx.proc_info_collapsed = !settings_get()->proc_info_open;
 
     g_signal_connect(proc_info_toggle, "clicked",
                      G_CALLBACK(on_proc_info_tray_toggle), &ctx);
@@ -5429,12 +5602,36 @@ void *ui_thread(void *arg)
     g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), &ctx);
     g_timeout_add(50, on_refresh, &ctx);
 
+    /* ── Apply theme from settings ────────────────────────────── */
+    {
+        const evemon_settings_t *s = settings_get();
+        if (s->theme[0]) {
+            GtkSettings *gtk_s = gtk_settings_get_default();
+            g_object_set(gtk_s, "gtk-theme-name", s->theme, NULL);
+        }
+    }
+
+    /* ── Apply detail panel position layout before showing ────── */
+    if (ctx.detail_panel_pos != PANEL_POS_BOTTOM)
+        detail_panel_relayout(&ctx);
+
     /* ── show & run ──────────────────────────────────────────── */
     gtk_widget_show_all(window);
     gtk_widget_hide(menubar);        /* hidden by default; toggle via status-bar right-click */
-    /* Process info is inside detail_panel via the collapsible tray,
-     * so it becomes visible/hidden together with the detail panel. */
-    gtk_widget_hide(detail_vbox);    /* hidden by default; toggle via View → Detail Panel */
+
+    /* Detail panel: honour settings (default = hidden) */
+    if (settings_get()->detail_panel_open) {
+        gtk_check_menu_item_set_active(ctx.detail_panel_menu_item, TRUE);
+        /* proc info tray state */
+        if (ctx.proc_info_collapsed) {
+            gtk_revealer_set_reveal_child(
+                GTK_REVEALER(ctx.proc_info_revealer), FALSE);
+            gtk_button_set_label(GTK_BUTTON(ctx.proc_info_toggle), "▶");
+            gtk_widget_show(GTK_WIDGET(ctx.proc_info_summary));
+        }
+    } else {
+        gtk_widget_hide(detail_vbox);
+    }
     gtk_main();
 
     ui_ctx_destroy(&ctx);
