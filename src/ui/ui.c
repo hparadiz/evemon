@@ -16,6 +16,10 @@
 #include "../plugin_broker.h"
 #include "../event_bus.h"
 
+#ifdef HAVE_PIPEWIRE
+#include "pipewire_graph.h"
+#endif
+
 #include <fontconfig/fontconfig.h>
 #include <pango/pangocairo.h>
 #ifdef GDK_WINDOWING_X11
@@ -1894,6 +1898,10 @@ static gboolean on_refresh(gpointer data)
     /* Kick the highlight fade timer if any rows are newly born/dying */
     ensure_highlight_timer(ctx);
 
+    /* Refresh the set of PIDs with active PipeWire audio streams
+     * so the tree can show 🔊 next to audio-using processes. */
+    audio_pids_refresh(ctx);
+
     PROFILE_END(ui_render);
 
     /*
@@ -1991,10 +1999,13 @@ static gboolean on_refresh(gpointer data)
                 plugin_dispatch_clear_all(preg);
                 if (gtk_widget_get_visible(ctx->detail_panel))
                     gtk_widget_hide(ctx->detail_panel);
-            } else {
-                /* Start the broker gather (cancels any in-flight cycle) */
-                broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
             }
+
+            /* Start the broker gather.  When sel_pid <= 0 the broker
+             * still runs with zero tracked PIDs so it can take a
+             * PipeWire graph snapshot and deliver system-wide audio
+             * PIDs for the 🔊 tree-view icons. */
+            broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
         }
     }
 
@@ -3753,6 +3764,46 @@ static void highlight_cell_data_func(GtkTreeViewColumn *col,
  * own PID appears in the pinned set (regardless of whether the
  * current row is the pinned copy or the original tree entry).
  */
+/* ── Audio PID probing ────────────────────────────────────────
+ * Take a PipeWire graph snapshot and collect every PID that has
+ * an active audio stream.  Called once per refresh tick when the
+ * audio plugin is loaded.
+ */
+/*
+ * Broker callback: receives audio PIDs extracted from the PipeWire
+ * graph on the broker worker thread, delivered to us on the GTK
+ * main thread.  This replaces the old approach of calling
+ * pw_snapshot() directly on the main thread, which was unsafe
+ * (raced with the broker's own pw_snapshot on the worker thread
+ * via non-thread-safe pw_init / setenv calls → SIGSEGV).
+ */
+static void on_broker_audio_pids(const pid_t *pids, size_t count,
+                                 void *data)
+{
+    ui_ctx_t *ctx = data;
+    if (ctx->shutting_down)
+        return;
+
+    /* Grow the audio_pids array if needed */
+    if (count > ctx->audio_pid_cap) {
+        size_t new_cap = count < 64 ? 64 : count;
+        pid_t *tmp = realloc(ctx->audio_pids, new_cap * sizeof(pid_t));
+        if (!tmp) { ctx->audio_pid_count = 0; return; }
+        ctx->audio_pids   = tmp;
+        ctx->audio_pid_cap = new_cap;
+    }
+    memcpy(ctx->audio_pids, pids, count * sizeof(pid_t));
+    ctx->audio_pid_count = count;
+}
+
+void audio_pids_refresh(ui_ctx_t *ctx)
+{
+    /* Audio PIDs are now updated asynchronously via the broker
+     * callback (on_broker_audio_pids).  This function is kept
+     * as a no-op placeholder for callers that still reference it. */
+    (void)ctx;
+}
+
 static void name_cell_data_func(GtkTreeViewColumn *col,
                                 GtkCellRenderer   *cell,
                                 GtkTreeModel      *model,
@@ -3778,9 +3829,15 @@ static void name_cell_data_func(GtkTreeViewColumn *col,
     if (steam_label && steam_label[0])
         display = steam_label;
 
-    if (display && pid_is_pinned(ctx, (pid_t)pid)) {
+    gboolean is_pinned = display && pid_is_pinned(ctx, (pid_t)pid);
+    gboolean is_audio  = audio_pid_is_active(ctx, (pid_t)pid);
+
+    if (is_pinned || is_audio) {
         char buf[512];
-        snprintf(buf, sizeof(buf), "➡ %s", display);
+        const char *prefix = is_audio && is_pinned ? "\xF0\x9F\x94\x8A ➡ "
+                           : is_audio              ? "\xF0\x9F\x94\x8A "
+                           :                         "➡ ";
+        snprintf(buf, sizeof(buf), "%s%s", prefix, display ? display : "");
         g_object_set(cell, "text", buf, NULL);
     } else {
         g_object_set(cell, "text", display ? display : "", NULL);
@@ -4903,6 +4960,21 @@ void *ui_thread(void *arg)
             fprintf(stdout, "evemon: %d plugin(s) loaded from %s\n",
                     nloaded, plugin_dir);
 
+            /* Detect whether any loaded plugin needs PipeWire data;
+             * if so, enable audio-PID probing in the process tree. */
+            ctx.has_audio_plugin = FALSE;
+            for (size_t i = 0; i < preg->count; i++) {
+                if (preg->instances[i].plugin &&
+                    (preg->instances[i].plugin->data_needs &
+                     evemon_NEED_PIPEWIRE)) {
+                    ctx.has_audio_plugin = TRUE;
+                    fprintf(stdout, "evemon: audio plugin detected "
+                            "(%s) – enabling audio PID probing\n",
+                            preg->instances[i].plugin->id);
+                    break;
+                }
+            }
+
             /* Create a GtkNotebook for plugin tabs (detail panel) */
             GtkWidget *notebook = gtk_notebook_new();
             gtk_notebook_set_tab_pos(GTK_NOTEBOOK(notebook), GTK_POS_TOP);
@@ -5065,6 +5137,10 @@ void *ui_thread(void *arg)
             ctx.plugin_notebook = NULL;
         }
         ctx.plugin_broker = NULL;  /* broker is stateless (module-level) */
+
+        /* Register for audio PIDs delivered by the broker worker thread. */
+        if (ctx.has_audio_plugin)
+            broker_set_audio_callback(on_broker_audio_pids, &ctx);
     }
 
     /* ── Finish detail panel setup: put notebook into the hpaned ── */
@@ -5240,6 +5316,16 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     ctx->ptree_nodes.count       = 0;
     ctx->ptree_nodes.capacity    = 0;
 
+    /* Cancel the broker FIRST — a worker thread may still be running
+     * and its completion callback references ctx->audio_pids. */
+    broker_destroy();
+
+    /* Free the audio PID set (safe now that the broker is torn down) */
+    free(ctx->audio_pids);
+    ctx->audio_pids      = NULL;
+    ctx->audio_pid_count = 0;
+    ctx->audio_pid_cap   = 0;
+
     /* Free the pinned PIDs set */
     free(ctx->pinned_pids);
     ctx->pinned_pids     = NULL;
@@ -5256,7 +5342,6 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
 
     /* Clean up plugin system */
     evemon_event_bus_destroy();
-    broker_destroy();
     if (ctx->plugin_registry) {
         plugin_registry_destroy(ctx->plugin_registry);
         free(ctx->plugin_registry);

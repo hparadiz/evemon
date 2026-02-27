@@ -117,9 +117,19 @@ struct broker_cycle {
     /* Output: per-PID gathered data */
     broker_pid_data_t  *results;
     size_t              result_count;
+
+    /* Audio PID output: PIDs with active PipeWire audio streams.
+     * Extracted from the PW graph snapshot in the worker thread,
+     * delivered to the UI on the main thread via callback. */
+    pid_t              *audio_pids;
+    size_t              audio_pid_count;
 };
 
 static GCancellable *g_broker_cancel = NULL;
+
+/* Callback for delivering audio PIDs to the UI on the main thread */
+static broker_audio_pids_cb g_audio_pids_cb   = NULL;
+static void                *g_audio_pids_data = NULL;
 
 /* ── /proc readers ───────────────────────────────────────────── */
 
@@ -1288,6 +1298,11 @@ static void broker_thread_func(GTask        *task,
     (void)source_object;
     broker_cycle_t *cycle = task_data;
 
+    if (g_cancellable_is_cancelled(cancellable)) {
+        g_task_return_boolean(task, FALSE);
+        return;
+    }
+
 #ifdef HAVE_PIPEWIRE
     /* Take one PipeWire graph snapshot for the entire cycle.
      * The graph is global (not per-PID), so sharing it across all
@@ -1300,7 +1315,7 @@ static void broker_thread_func(GTask        *task,
 
     for (size_t i = 0; i < cycle->pid_count; i++) {
         if (g_cancellable_is_cancelled(cancellable))
-            return;
+            goto cleanup;
 
         broker_pid_data_t *d = &cycle->results[i];
         d->pid = cycle->pids[i];
@@ -1369,8 +1384,50 @@ static void broker_thread_func(GTask        *task,
     }
 
 #ifdef HAVE_PIPEWIRE
+    if (g_cancellable_is_cancelled(cancellable))
+        goto cleanup;
+
+    /* Extract system-wide audio PIDs from the PW graph before freeing it.
+     * This replaces the old approach of calling pw_snapshot() a second
+     * time on the GTK main thread, which raced with this worker thread. */
+    if (pw_have_graph) {
+        size_t acap = 64;
+        pid_t *apids = calloc(acap, sizeof(pid_t));
+        size_t acount = 0;
+        if (apids) {
+            for (size_t ai = 0; ai < pw_graph.node_count; ai++) {
+                const pw_snap_node_t *an = &pw_graph.nodes[ai];
+                if (an->pid <= 0) continue;
+                if (!strstr(an->media_class, "Audio") ||
+                    !strstr(an->media_class, "Stream"))
+                    continue;
+                /* De-duplicate */
+                gboolean adup = FALSE;
+                for (size_t aj = 0; aj < acount; aj++) {
+                    if (apids[aj] == an->pid) { adup = TRUE; break; }
+                }
+                if (adup) continue;
+                if (acount >= acap) {
+                    acap *= 2;
+                    pid_t *atmp = realloc(apids, acap * sizeof(pid_t));
+                    if (!atmp) break;
+                    apids = atmp;
+                }
+                apids[acount++] = an->pid;
+            }
+        }
+        cycle->audio_pids      = apids;
+        cycle->audio_pid_count = acount;
+
+        pw_graph_free(&pw_graph);
+    }
+
+    goto done;
+cleanup:
     if (pw_have_graph)
         pw_graph_free(&pw_graph);
+done:
+    ;
 #endif
 
     cycle->result_count = cycle->pid_count;
@@ -1398,6 +1455,11 @@ static void broker_complete(GObject      *source_object,
         broker_pid_data_t *d = &cycle->results[i];
         plugin_dispatch_update(cycle->reg, d->pid, &d->data);
     }
+
+    /* Deliver audio PIDs to the UI (main thread, safe to write) */
+    if (g_audio_pids_cb && cycle->audio_pids)
+        g_audio_pids_cb(cycle->audio_pids, cycle->audio_pid_count,
+                        g_audio_pids_data);
 }
 
 static void broker_cycle_free(gpointer data)
@@ -1409,6 +1471,7 @@ static void broker_cycle_free(gpointer data)
         broker_pid_data_free(&cycle->results[i]);
     free(cycle->results);
     free(cycle->pids);
+    free(cycle->audio_pids);
     free(cycle);
 }
 
@@ -1428,7 +1491,14 @@ void broker_start(plugin_registry_t *reg, void *fdmon)
     pid_t *pids = calloc(pid_cap, sizeof(pid_t));
     if (!pids) return;
     size_t npids = plugin_collect_tracked_pids(reg, pids, pid_cap);
-    if (npids == 0) {
+
+    /* Even when no plugin instance is tracking a PID (nothing
+     * double-clicked yet), we still need to run the cycle if the
+     * audio callback is registered so the worker thread can take a
+     * PipeWire graph snapshot and extract system-wide audio PIDs. */
+    gboolean need_audio_only = (npids == 0 && g_audio_pids_cb != NULL
+                                && (reg->combined_needs & evemon_NEED_PIPEWIRE));
+    if (npids == 0 && !need_audio_only) {
         free(pids);
         return;
     }
@@ -1441,20 +1511,28 @@ void broker_start(plugin_registry_t *reg, void *fdmon)
     cycle->fdmon = fdmon;
     cycle->needs = reg->combined_needs;
 
-    cycle->pids = calloc(npids, sizeof(pid_t));
-    if (!cycle->pids) { free(cycle); free(pids); return; }
-    memcpy(cycle->pids, pids, npids * sizeof(pid_t));
+    if (npids > 0) {
+        cycle->pids = calloc(npids, sizeof(pid_t));
+        if (!cycle->pids) { free(cycle); free(pids); return; }
+        memcpy(cycle->pids, pids, npids * sizeof(pid_t));
+
+        cycle->results = calloc(npids, sizeof(broker_pid_data_t));
+        if (!cycle->results) { free(cycle->pids); free(cycle); free(pids); return; }
+    }
     cycle->pid_count = npids;
     free(pids);  /* local copy no longer needed */
-
-    cycle->results = calloc(npids, sizeof(broker_pid_data_t));
-    if (!cycle->results) { free(cycle->pids); free(cycle); return; }
 
     /* Launch GTask */
     GTask *task = g_task_new(NULL, g_broker_cancel, broker_complete, NULL);
     g_task_set_task_data(task, cycle, broker_cycle_free);
     g_task_run_in_thread(task, broker_thread_func);
     g_object_unref(task);
+}
+
+void broker_set_audio_callback(broker_audio_pids_cb cb, void *user_data)
+{
+    g_audio_pids_cb   = cb;
+    g_audio_pids_data = user_data;
 }
 
 void broker_cancel(void)
@@ -1469,4 +1547,9 @@ void broker_cancel(void)
 void broker_destroy(void)
 {
     broker_cancel();
+
+    /* Clear the audio callback so no stale pointer is used
+     * if a late GTask completion fires after shutdown. */
+    g_audio_pids_cb   = NULL;
+    g_audio_pids_data = NULL;
 }

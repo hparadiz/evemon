@@ -278,6 +278,12 @@ typedef struct {
     /* set when on_destroy fires so timers don't touch dead widgets */
     gboolean            shutting_down;
 
+    /* audio PID set: PIDs with active PipeWire audio streams */
+    pid_t              *audio_pids;
+    size_t              audio_pid_count;
+    size_t              audio_pid_cap;
+    gboolean            has_audio_plugin;  /* TRUE if audio service plugin loaded */
+
     /* highlight animation timer: fires ~60 fps while rows are highlighted */
     guint               highlight_timer;
 
@@ -447,6 +453,19 @@ void proc_detail_update(ui_ctx_t *ctx);
 
 /* Update all pinned panels' header labels from tree-model data */
 void pinned_panels_update(ui_ctx_t *ctx);
+
+/* ── audio PID probing ────────────────────────────────────────── */
+
+/* Refresh the set of PIDs with active audio streams (PipeWire). */
+void audio_pids_refresh(ui_ctx_t *ctx);
+
+/* Returns TRUE if the given PID has an active audio stream. */
+static inline gboolean audio_pid_is_active(const ui_ctx_t *ctx, pid_t pid)
+{
+    for (size_t i = 0; i < ctx->audio_pid_count; i++)
+        if (ctx->audio_pids[i] == pid) return TRUE;
+    return FALSE;
+}
 
 /* ── cleanup (fix 6) ─────────────────────────────────────────── */
 
