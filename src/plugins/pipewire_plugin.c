@@ -24,6 +24,7 @@
 #include "../evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 /* ── UTF-8 helpers ───────────────────────────────────────────── */
 
@@ -38,6 +39,193 @@ static char *utf8_sanitize(const char *raw)
     if (!raw || !raw[0]) return g_strdup("");
     if (g_utf8_validate(raw, -1, NULL)) return g_strdup(raw);
     return g_utf8_make_valid(raw, -1);
+}
+
+/* ── BPM detection ───────────────────────────────────────────── */
+
+/*
+ * Onset-based BPM detector using autocorrelation.
+ *
+ * We sample the peak meter levels at ~50ms intervals (same rate as
+ * the existing meter timer).  From the combined L+R energy we derive
+ * an onset envelope by computing the positive first derivative
+ * (energy increase = onset).  An autocorrelation over the onset
+ * history reveals periodic peaks whose lag corresponds to the beat
+ * period.
+ *
+ * BPM range:  60–200 BPM (lags 300ms – 1000ms at 50ms resolution).
+ * History:    ~10 seconds (200 samples at 50ms).
+ * Output:     smoothed BPM value updated once per second.
+ */
+
+#define BPM_HIST_LEN      200    /* ~10s at 50ms sample rate       */
+#define BPM_SAMPLE_MS      50    /* matches meter_tick interval     */
+#define BPM_MIN             60.0f
+#define BPM_MAX            200.0f
+#define BPM_SMOOTH          0.15f /* EMA smoothing (lower = slower)  */
+#define BPM_ONSET_THRESH    0.02f /* minimum energy jump for onset   */
+#define BPM_CONFIDENCE_MIN  0.10f /* min autocorr peak for valid BPM */
+
+/*
+ * Track-wide BPM histogram — accumulates weighted votes across an
+ * entire track.  Each 1-BPM-wide bin from 60..199 collects confidence-
+ * weighted votes from every autocorrelation cycle.  The bin with the
+ * highest total weight is the dominant track tempo.
+ */
+#define BPM_HISTO_BINS     140    /* one bin per BPM: 60..199        */
+#define BPM_HISTO_BASE      60    /* lowest bin = 60 BPM             */
+
+typedef struct {
+    /* ── 10-second trailing detector ─────────────────────────── */
+    float  energy[BPM_HIST_LEN];   /* raw combined energy (0..1)     */
+    float  onset[BPM_HIST_LEN];    /* onset envelope (half-wave rect)*/
+    int    head;                    /* circular write index           */
+    int    filled;                  /* samples collected so far       */
+    float  bpm;                     /* current smoothed trailing BPM  */
+    float  confidence;              /* autocorrelation peak strength  */
+    int    update_counter;          /* counts samples to throttle     */
+
+    /* ── Track-wide accumulator ──────────────────────────────── */
+    float  histo[BPM_HISTO_BINS];  /* confidence-weighted vote bins   */
+    int    vote_count;              /* total votes cast this track     */
+    float  track_bpm;              /* dominant BPM across whole track  */
+} bpm_state_t;
+
+/*
+ * Reset the BPM detector — called on track change or seek.
+ * Clears all history so the new track starts with a clean slate.
+ */
+static void bpm_reset(bpm_state_t *bs)
+{
+    memset(bs->energy, 0, sizeof(bs->energy));
+    memset(bs->onset, 0, sizeof(bs->onset));
+    bs->head           = 0;
+    bs->filled         = 0;
+    bs->bpm            = 0.0f;
+    bs->confidence     = 0.0f;
+    bs->update_counter = 0;
+    memset(bs->histo, 0, sizeof(bs->histo));
+    bs->vote_count     = 0;
+    bs->track_bpm      = 0.0f;
+}
+
+/*
+ * Feed a new energy sample (0..1 combined L+R peak) into the detector.
+ * Called from the meter timer at ~50ms intervals.
+ */
+static void bpm_feed(bpm_state_t *bs, float energy)
+{
+    int prev = (bs->head + BPM_HIST_LEN - 1) % BPM_HIST_LEN;
+    float prev_e = (bs->filled > 0) ? bs->energy[prev] : 0.0f;
+
+    bs->energy[bs->head] = energy;
+
+    /* Onset = positive energy derivative (half-wave rectified) */
+    float diff = energy - prev_e;
+    bs->onset[bs->head] = (diff > BPM_ONSET_THRESH) ? diff : 0.0f;
+
+    bs->head = (bs->head + 1) % BPM_HIST_LEN;
+    if (bs->filled < BPM_HIST_LEN) bs->filled++;
+
+    /* Only recompute BPM every ~1 second (20 samples) */
+    bs->update_counter++;
+    if (bs->update_counter < 20) return;
+    bs->update_counter = 0;
+
+    /* Need at least 4 seconds of data for reliable detection */
+    if (bs->filled < 80) return;
+
+    /*
+     * Autocorrelation of the onset envelope.
+     * We scan lags corresponding to 60–200 BPM:
+     *   200 BPM = 300ms  → lag  6 samples (300/50)
+     *   60  BPM = 1000ms → lag 20 samples (1000/50)
+     */
+    int min_lag = (int)(60000.0f / (BPM_MAX * BPM_SAMPLE_MS));  /* 6  */
+    int max_lag = (int)(60000.0f / (BPM_MIN * BPM_SAMPLE_MS));  /* 20 */
+    if (max_lag >= bs->filled / 2) max_lag = bs->filled / 2 - 1;
+    if (min_lag < 1) min_lag = 1;
+    if (max_lag <= min_lag) return;
+
+    int    n = bs->filled;
+    float  best_corr = 0.0f;
+    int    best_lag  = 0;
+
+    /* Compute energy of the onset signal for normalisation */
+    float norm = 0.0f;
+    for (int i = 0; i < n; i++) {
+        int idx = (bs->head + BPM_HIST_LEN - n + i) % BPM_HIST_LEN;
+        norm += bs->onset[idx] * bs->onset[idx];
+    }
+    if (norm < 1e-8f) return;  /* silence — no onsets at all */
+
+    for (int lag = min_lag; lag <= max_lag; lag++) {
+        float sum = 0.0f;
+        int count = n - lag;
+        for (int i = 0; i < count; i++) {
+            int idx_a = (bs->head + BPM_HIST_LEN - n + i) % BPM_HIST_LEN;
+            int idx_b = (idx_a + lag) % BPM_HIST_LEN;
+            sum += bs->onset[idx_a] * bs->onset[idx_b];
+        }
+        float corr = sum / norm;
+        if (corr > best_corr) {
+            best_corr = corr;
+            best_lag  = lag;
+        }
+    }
+
+    bs->confidence = best_corr;
+
+    if (best_lag > 0 && best_corr >= BPM_CONFIDENCE_MIN) {
+        float period_ms = (float)best_lag * BPM_SAMPLE_MS;
+        float raw_bpm = 60000.0f / period_ms;
+
+        /* Clamp to valid range */
+        if (raw_bpm < BPM_MIN) raw_bpm *= 2.0f;
+        if (raw_bpm > BPM_MAX) raw_bpm *= 0.5f;
+
+        if (bs->bpm < 1.0f)
+            bs->bpm = raw_bpm;   /* first reading — snap */
+        else
+            bs->bpm = bs->bpm * (1.0f - BPM_SMOOTH) + raw_bpm * BPM_SMOOTH;
+
+        /* ── Accumulate into track-wide histogram ────────────── */
+        /* Cast a confidence-weighted vote into the 1-BPM-wide bin.
+         * Over a full track, the dominant tempo accumulates the
+         * most weight regardless of intros/bridges/breakdowns. */
+        int bin = (int)(raw_bpm + 0.5f) - BPM_HISTO_BASE;
+        if (bin >= 0 && bin < BPM_HISTO_BINS) {
+            bs->histo[bin] += best_corr;
+            bs->vote_count++;
+        }
+
+        /* Recompute track BPM from the histogram peak.
+         * Use a 3-bin weighted average around the peak for
+         * sub-BPM precision (e.g. 127.3 instead of 127). */
+        if (bs->vote_count >= 3) {
+            int best_bin = 0;
+            float best_w = 0.0f;
+            for (int b = 0; b < BPM_HISTO_BINS; b++) {
+                if (bs->histo[b] > best_w) {
+                    best_w = bs->histo[b];
+                    best_bin = b;
+                }
+            }
+            float w_sum = bs->histo[best_bin];
+            float bpm_sum = (float)(best_bin + BPM_HISTO_BASE) * w_sum;
+            if (best_bin > 0) {
+                w_sum   += bs->histo[best_bin - 1];
+                bpm_sum += (float)(best_bin - 1 + BPM_HISTO_BASE)
+                           * bs->histo[best_bin - 1];
+            }
+            if (best_bin < BPM_HISTO_BINS - 1) {
+                w_sum   += bs->histo[best_bin + 1];
+                bpm_sum += (float)(best_bin + 1 + BPM_HISTO_BASE)
+                           * bs->histo[best_bin + 1];
+            }
+            bs->track_bpm = (w_sum > 0.0f) ? bpm_sum / w_sum : 0.0f;
+        }
+    }
 }
 
 /* ── categories ──────────────────────────────────────────────── */
@@ -277,6 +465,13 @@ typedef struct {
     GdkPixbuf      *art_pixbuf;         /* cached album art pixbuf   */
     char            art_url_cached[512]; /* URL of cached art         */
 
+    /* BPM detection */
+    bpm_state_t     bpm;
+    GtkWidget      *bpm_label;          /* 10s trailing BPM              */
+    GtkWidget      *bpm_track_label;    /* full-track accumulated BPM    */
+    char            bpm_track_key[768]; /* "title\0artist" for change detect */
+    int64_t         bpm_last_pos_us;    /* last position for seek detection  */
+
     /* Event bus subscription ID (for cleanup in destroy) */
     int             event_sub_id;
 } pw_ctx_t;
@@ -460,6 +655,48 @@ static gboolean meter_tick(gpointer data)
     if (any_changed)
         gtk_widget_queue_draw(GTK_WIDGET(ctx->view));
 
+    /* ── BPM detection: feed combined peak energy ─────────── */
+    if (ctx->audio_node_count > 0 && ctx->host && ctx->host->pw_meter_read) {
+        float max_e = 0.0f;
+        for (size_t i = 0; i < ctx->audio_node_count; i++) {
+            int ll = 0, lr = 0;
+            ctx->host->pw_meter_read(ctx->host->host_ctx,
+                                     ctx->audio_node_ids[i], &ll, &lr);
+            float e = (ll + lr) / 2000.0f;  /* 0..1 combined */
+            if (e > max_e) max_e = e;
+        }
+        bpm_feed(&ctx->bpm, max_e);
+
+        /* Update trailing BPM label (10s window) */
+        if (ctx->bpm_label && GTK_IS_LABEL(ctx->bpm_label)) {
+            if (ctx->bpm.bpm >= BPM_MIN &&
+                ctx->bpm.confidence >= BPM_CONFIDENCE_MIN) {
+                char buf[96];
+                snprintf(buf, sizeof(buf),
+                    "<span foreground=\"#cc88ff\">~<b>%.0f</b></span>",
+                    ctx->bpm.bpm);
+                gtk_label_set_markup(GTK_LABEL(ctx->bpm_label), buf);
+            } else {
+                gtk_label_set_markup(GTK_LABEL(ctx->bpm_label),
+                    "<span foreground=\"#666666\">~\u2014</span>");
+            }
+        }
+
+        /* Update track-wide BPM label (histogram accumulator) */
+        if (ctx->bpm_track_label && GTK_IS_LABEL(ctx->bpm_track_label)) {
+            if (ctx->bpm.track_bpm >= BPM_MIN && ctx->bpm.vote_count >= 3) {
+                char buf[96];
+                snprintf(buf, sizeof(buf),
+                    "<span foreground=\"#88ddff\"><b>%.0f</b> BPM</span>",
+                    ctx->bpm.track_bpm);
+                gtk_label_set_markup(GTK_LABEL(ctx->bpm_track_label), buf);
+            } else {
+                gtk_label_set_markup(GTK_LABEL(ctx->bpm_track_label),
+                    "<span foreground=\"#666666\">\u2014 BPM</span>");
+            }
+        }
+    }
+
     return G_SOURCE_CONTINUE;
 }
 
@@ -542,6 +779,46 @@ static void pw_on_album_art_event(const evemon_event_t *event,
      * suspenders never hurt. */
     if (!ctx->media_title_label || !GTK_IS_LABEL(ctx->media_title_label))
         return;
+
+    /* ── Track change / seek detection for BPM reset ────────── */
+    {
+        /* Build a composite key from title+artist to detect track changes.
+         * Using both fields handles cases like "Intro" appearing on
+         * multiple albums by different artists. */
+        char new_key[768];
+        snprintf(new_key, sizeof(new_key), "%s\x01%s",
+                 art->track_title, art->track_artist);
+
+        if (new_key[0] && strcmp(new_key, ctx->bpm_track_key) != 0) {
+            /* Track changed — reset both trailing and track-wide BPM */
+            bpm_reset(&ctx->bpm);
+            snprintf(ctx->bpm_track_key, sizeof(ctx->bpm_track_key),
+                     "%s", new_key);
+            ctx->bpm_last_pos_us = art->position_us;
+            /* Show detecting state immediately */
+            if (ctx->bpm_label && GTK_IS_LABEL(ctx->bpm_label))
+                gtk_label_set_markup(GTK_LABEL(ctx->bpm_label),
+                    "<span foreground=\"#666666\">~\u2014</span>");
+            if (ctx->bpm_track_label && GTK_IS_LABEL(ctx->bpm_track_label))
+                gtk_label_set_markup(GTK_LABEL(ctx->bpm_track_label),
+                    "<span foreground=\"#666666\">\u2014 BPM</span>");
+        } else if (art->position_us >= 0 && ctx->bpm_last_pos_us >= 0) {
+            /* Seek detection: if position jumps backward by more than
+             * 3 seconds, the user seeked — reset the detector since
+             * the beat phase context has changed. */
+            int64_t delta = art->position_us - ctx->bpm_last_pos_us;
+            if (delta < -3000000) {  /* jumped back >3s */
+                bpm_reset(&ctx->bpm);
+                if (ctx->bpm_label && GTK_IS_LABEL(ctx->bpm_label))
+                    gtk_label_set_markup(GTK_LABEL(ctx->bpm_label),
+                        "<span foreground=\"#666666\">~\u2014</span>");
+                if (ctx->bpm_track_label && GTK_IS_LABEL(ctx->bpm_track_label))
+                    gtk_label_set_markup(GTK_LABEL(ctx->bpm_track_label),
+                        "<span foreground=\"#666666\">\u2014 BPM</span>");
+            }
+        }
+        ctx->bpm_last_pos_us = art->position_us;
+    }
 
     /* Update album art */
     pw_on_art_loaded(art->pixbuf, ctx);
@@ -765,6 +1042,22 @@ static GtkWidget *pw_create_widget(void *opaque)
         gtk_label_set_xalign(GTK_LABEL(ctx->media_position_label), 0.0f);
         gtk_box_pack_start(GTK_BOX(status_pos_box), ctx->media_position_label,
                            FALSE, FALSE, 0);
+
+        /* BPM indicators: trailing (~) on left, track-wide on right */
+        ctx->bpm_label = gtk_label_new("");
+        gtk_label_set_xalign(GTK_LABEL(ctx->bpm_label), 0.0f);
+        gtk_label_set_use_markup(GTK_LABEL(ctx->bpm_label), TRUE);
+
+        ctx->bpm_track_label = gtk_label_new("");
+        gtk_label_set_xalign(GTK_LABEL(ctx->bpm_track_label), 0.0f);
+        gtk_label_set_use_markup(GTK_LABEL(ctx->bpm_track_label), TRUE);
+
+        /* Pack: [status] [position]  ...spacer...  [~trail] [track BPM] */
+        gtk_box_pack_end(GTK_BOX(status_pos_box), ctx->bpm_track_label,
+                         FALSE, FALSE, 0);
+        gtk_box_pack_end(GTK_BOX(status_pos_box), ctx->bpm_label,
+                         FALSE, FALSE, 2);
+
         gtk_box_pack_start(GTK_BOX(text_box), status_pos_box,
                            FALSE, FALSE, 0);
 
@@ -779,8 +1072,10 @@ static GtkWidget *pw_create_widget(void *opaque)
                                 ctx->media_artist_label,
                                 ctx->media_album_label,
                                 ctx->media_status_label,
-                                ctx->media_position_label };
-        for (int i = 0; i < 5; i++)
+                                ctx->media_position_label,
+                                ctx->bpm_label,
+                                ctx->bpm_track_label };
+        for (int i = 0; i < 7; i++)
             gtk_style_context_add_provider(
                 gtk_widget_get_style_context(labels[i]),
                 GTK_STYLE_PROVIDER(media_css),
@@ -1117,6 +1412,14 @@ static void pw_clear(void *opaque)
         ctx->art_pixbuf = NULL;
     }
     ctx->art_url_cached[0] = '\0';
+    /* Reset BPM detector */
+    bpm_reset(&ctx->bpm);
+    ctx->bpm_track_key[0] = '\0';
+    ctx->bpm_last_pos_us = -1;
+    if (ctx->bpm_label && GTK_IS_LABEL(ctx->bpm_label))
+        gtk_label_set_text(GTK_LABEL(ctx->bpm_label), "");
+    if (ctx->bpm_track_label && GTK_IS_LABEL(ctx->bpm_track_label))
+        gtk_label_set_text(GTK_LABEL(ctx->bpm_track_label), "");
     /* Don't call pw_meter_stop here — the meter is shared. */
 }
 
@@ -1164,6 +1467,8 @@ static void pw_destroy(void *opaque)
     ctx->media_position_label = NULL;
     ctx->media_art_image      = NULL;
     ctx->media_section        = NULL;
+    ctx->bpm_label            = NULL;
+    ctx->bpm_track_label      = NULL;
 
     free(ctx);
 }
