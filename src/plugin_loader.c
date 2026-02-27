@@ -71,10 +71,10 @@ void plugin_registry_set_host_services(plugin_registry_t *reg,
 
 void plugin_registry_destroy(plugin_registry_t *reg)
 {
-    /* Build a set of unique dlopen handles to avoid double-close (M4) */
-    void **closed_handles = calloc(reg->count, sizeof(void *));
-    size_t nclosed = 0;
-
+    /* Pass 1: call every plugin's destroy() callback and free descriptors.
+     * We must finish ALL destroy() calls before any dlclose(), because a
+     * plugin's destroy function may reside in a .so shared with (or
+     * depended on by) another plugin.                                    */
     for (size_t i = 0; i < reg->count; i++) {
         plugin_instance_t *inst = &reg->instances[i];
         if (inst->plugin && inst->plugin->destroy)
@@ -82,7 +82,14 @@ void plugin_registry_destroy(plugin_registry_t *reg)
         /* Free the heap-allocated plugin descriptor (C1) */
         free(inst->plugin);
         inst->plugin = NULL;
+    }
 
+    /* Pass 2: close dlopen handles, deduplicating to avoid double-close (M4) */
+    void **closed_handles = calloc(reg->count, sizeof(void *));
+    size_t nclosed = 0;
+
+    for (size_t i = 0; i < reg->count; i++) {
+        plugin_instance_t *inst = &reg->instances[i];
         if (inst->handle) {
             int already = 0;
             if (closed_handles) {

@@ -183,7 +183,6 @@ typedef struct {
     GtkCssProvider     *filter_css;
     GtkCssProvider     *pid_css;
     int                 font_size;
-    gboolean            auto_font;
 
     gboolean            follow_selection;
 

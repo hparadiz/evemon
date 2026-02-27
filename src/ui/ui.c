@@ -3355,7 +3355,6 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
     case GDK_KEY_KP_Add:     /* Ctrl + numpad "+"           */
         if (ctx->font_size < FONT_SIZE_MAX) {
             ctx->font_size++;
-            ctx->auto_font = FALSE;
             reload_font_css(ctx);
         }
         return TRUE;
@@ -3364,7 +3363,6 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
     case GDK_KEY_KP_Subtract:/* Ctrl + numpad "-"           */
         if (ctx->font_size > FONT_SIZE_MIN) {
             ctx->font_size--;
-            ctx->auto_font = FALSE;
             reload_font_css(ctx);
         }
         return TRUE;
@@ -3372,7 +3370,6 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
     case GDK_KEY_0:          /* Ctrl + 0  → reset font size */
     case GDK_KEY_KP_0:
         ctx->font_size = FONT_SIZE_DEFAULT;
-        ctx->auto_font = FALSE;
         reload_font_css(ctx);
         return TRUE;
 
@@ -3418,7 +3415,6 @@ static void on_font_increase(GtkMenuItem *item, gpointer data)
     ui_ctx_t *ctx = data;
     if (ctx->font_size < FONT_SIZE_MAX) {
         ctx->font_size++;
-        ctx->auto_font = FALSE;
         reload_font_css(ctx);
     }
 }
@@ -3429,57 +3425,8 @@ static void on_font_decrease(GtkMenuItem *item, gpointer data)
     ui_ctx_t *ctx = data;
     if (ctx->font_size > FONT_SIZE_MIN) {
         ctx->font_size--;
-        ctx->auto_font = FALSE;
         reload_font_css(ctx);
     }
-}
-
-static void on_font_auto_toggle(GtkCheckMenuItem *item, gpointer data)
-{
-    ui_ctx_t *ctx = data;
-    ctx->auto_font = gtk_check_menu_item_get_active(item);
-}
-
-/* Recompute the auto-scaled font size based on physical pixel height. */
-static void recompute_auto_font(ui_ctx_t *ctx)
-{
-    if (!ctx->auto_font) return;
-
-    GtkWidget *w = GTK_WIDGET(ctx->view);
-    GtkAllocation alloc;
-    gtk_widget_get_allocation(gtk_widget_get_toplevel(w), &alloc);
-
-    /* Multiply by the scale factor to get real physical pixel height.
-     * On a 2K monitor scale_factor is typically 1; on a 4K monitor it's 2. */
-    int scale = gtk_widget_get_scale_factor(gtk_widget_get_toplevel(w));
-    int phys_height = alloc.height * scale;
-
-    /* Baseline: 9pt at 700 physical pixels. */
-    int new_size = (int)(9.0 * phys_height / 700.0 + 0.5);
-    if (new_size < FONT_SIZE_MIN) new_size = FONT_SIZE_MIN;
-    if (new_size > FONT_SIZE_MAX) new_size = FONT_SIZE_MAX;
-    if (new_size != ctx->font_size) {
-        ctx->font_size = new_size;
-        reload_font_css(ctx);
-    }
-}
-
-static gboolean on_window_configure(GtkWidget *widget, GdkEventConfigure *ev,
-                                    gpointer data)
-{
-    (void)widget;
-    (void)ev;
-    recompute_auto_font(data);
-    return FALSE;
-}
-
-/* Fired when the window moves to a monitor with a different scale factor. */
-static void on_scale_factor_changed(GObject *obj, GParamSpec *pspec,
-                                    gpointer data)
-{
-    (void)obj;
-    (void)pspec;
-    recompute_auto_font(data);
 }
 
 /* ── status bar right-click context menu ──────────────────────── */
@@ -4666,14 +4613,9 @@ void *ui_thread(void *arg)
 
     GtkWidget *font_inc = gtk_menu_item_new_with_label("Increase Font");
     GtkWidget *font_dec = gtk_menu_item_new_with_label("Decrease Font");
-    GtkWidget *font_auto = gtk_check_menu_item_new_with_label("Scale Font with Screen Size");
-    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(font_auto), FALSE);
 
     gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), font_inc);
     gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), font_dec);
-    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu),
-                          gtk_separator_menu_item_new());
-    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), font_auto);
 
     /* Theme picker submenu */
     gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu),
@@ -4813,7 +4755,6 @@ void *ui_thread(void *arg)
     ctx.css          = css;
     ctx.sidebar_css  = sidebar_css;
     ctx.font_size    = FONT_SIZE_DEFAULT;
-    ctx.auto_font    = FALSE;
     ctx.ptree_nodes  = (ptree_node_set_t){ NULL, NULL, NULL, 0, 0 };
     ctx.follow_selection = FALSE;
 
@@ -5183,7 +5124,6 @@ void *ui_thread(void *arg)
     /* Font menu callbacks (need ctx address, so connect after ctx init) */
     g_signal_connect(font_inc,  "activate", G_CALLBACK(on_font_increase),    &ctx);
     g_signal_connect(font_dec,  "activate", G_CALLBACK(on_font_decrease),    &ctx);
-    g_signal_connect(font_auto, "toggled",  G_CALLBACK(on_font_auto_toggle), &ctx);
     g_signal_connect(detail_panel_toggle, "toggled",
                      G_CALLBACK(on_toggle_detail_panel), &ctx);
 
@@ -5209,10 +5149,6 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_pid_entry_insert_text), NULL);
     g_signal_connect(tree_overlay, "get-child-position",
                      G_CALLBACK(on_overlay_get_child_position), &ctx);
-    g_signal_connect(window,    "configure-event",
-                     G_CALLBACK(on_window_configure), &ctx);
-    g_signal_connect(window,    "notify::scale-factor",
-                     G_CALLBACK(on_scale_factor_changed), &ctx);
 
     /* Right-click on status bar to toggle menu bar */
     g_signal_connect(status_ebox, "button-press-event",
