@@ -293,6 +293,7 @@ typedef struct {
     GtkTreeViewColumn  *name_col;
     char                filter_text[256];
     guint               filter_hide_timer; /* auto-hide after idle (0=none) */
+    gboolean            show_audio_only;  /* TRUE = show only audio processes */
 
     /* Go-to-PID (Ctrl+G) */
     GtkWidget          *pid_entry;

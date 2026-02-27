@@ -36,6 +36,14 @@ static void rebuild_filter_store(ui_ctx_t *ctx);
 static void sync_filter_store(ui_ctx_t *ctx);
 static void switch_to_real_store(ui_ctx_t *ctx);
 
+/* Forward declarations for audio-only filter helpers */
+static void rebuild_audio_filter_store(ui_ctx_t *ctx);
+static void sync_audio_filter_store(ui_ctx_t *ctx);
+
+/* Forward declarations for sort/expand helpers used by filter code */
+static void register_sort_funcs(GtkTreeModelSort *sm);
+static void expand_respecting_collapsed(ui_ctx_t *ctx);
+
 /* Forward declaration for expand helper */
 static void expand_respecting_collapsed_recurse(ui_ctx_t *ctx,
                                                  GtkTreeModel *model,
@@ -1042,6 +1050,26 @@ static void on_pinned_panel_unpin(GtkButton *btn, gpointer data)
     g_idle_add(pinned_panel_unpin_idle, copy);
 }
 
+/* ── Show Audio Processes Only toggle ──────────────────────────── */
+
+static void on_toggle_audio_only(GtkCheckMenuItem *item, gpointer data)
+{
+    ui_ctx_t *ctx = data;
+    ctx->show_audio_only = gtk_check_menu_item_get_active(item);
+
+    if (ctx->show_audio_only) {
+        /* Build a filtered store showing only audio processes */
+        rebuild_audio_filter_store(ctx);
+    } else {
+        /* If a name filter is active, rebuild that; otherwise switch
+         * back to the unfiltered real store. */
+        if (ctx->filter_text[0] != '\0')
+            rebuild_filter_store(ctx);
+        else
+            switch_to_real_store(ctx);
+    }
+}
+
 static void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
                                      pid_t pid, const char *name,
                                      const char *cmdline)
@@ -1063,6 +1091,17 @@ static void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
                              G_CALLBACK(on_toggle_pin), pd);
         }
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_pin);
+    }
+
+    /* ── Show Audio Processes Only toggle ── */
+    if (ctx->has_audio_plugin) {
+        GtkWidget *mi_audio = gtk_check_menu_item_new_with_label(
+            "Show Audio Processes Only");
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(mi_audio),
+                                       ctx->show_audio_only);
+        g_signal_connect(mi_audio, "toggled",
+                         G_CALLBACK(on_toggle_audio_only), ctx);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_audio);
     }
 
     /* ── separator ── */
@@ -1892,7 +1931,9 @@ static gboolean on_refresh(gpointer data)
      * This updates data in-place, preserving view state (expand,
      * selection, scroll).  A full rebuild only happens if the set
      * of matching processes has structurally changed. */
-    if (ctx->filter_text[0] != '\0')
+    if (ctx->show_audio_only)
+        sync_audio_filter_store(ctx);
+    else if (ctx->filter_text[0] != '\0')
         sync_filter_store(ctx);
 
     /* Kick the highlight fade timer if any rows are newly born/dying */
@@ -2521,9 +2562,10 @@ static gboolean row_name_matches(GtkTreeModel *model,
 /*
  * Deep-copy a subtree from `src` into `dst` under `dst_parent`.
  * Copies the row at `src_iter` and all its children, recursively.
+ * (Not static: also used by the audio-only filter helpers.)
  */
-static void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
-                         GtkTreeModel *src, GtkTreeIter *src_iter)
+void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
+                  GtkTreeModel *src, GtkTreeIter *src_iter)
 {
     GtkTreeIter dst_iter;
     gtk_tree_store_append(dst, &dst_iter, dst_parent);
@@ -2801,12 +2843,199 @@ static void sync_filter_store(ui_ctx_t *ctx)
     }
 }
 
+/* ── audio-only filter helpers ────────────────────────────────── */
+
 /*
- * Register inverted sort functions on a sort model.  Called each time
- * we create a new GtkTreeModelSort (which happens when switching
- * between the real store and the filter store).
+ * Walk the real store and copy every row whose PID is in the audio
+ * set (or is pinned) into dst as a top-level subtree, including all
+ * descendants.  Skips descendants of already-matched ancestors.
  */
-static void register_sort_funcs(GtkTreeModelSort *sm);
+static void find_and_copy_audio_matches(GtkTreeStore *dst,
+                                         GtkTreeModel *src,
+                                         GtkTreeIter  *parent,
+                                         const ui_ctx_t *ctx,
+                                         gboolean ancestor_matched)
+{
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(src, &iter, parent);
+    while (valid) {
+        gint pid = 0;
+        gtk_tree_model_get(src, &iter, COL_PID, &pid, -1);
+
+        /* Skip pinned-copy rows (they have COL_PINNED_ROOT != -1) */
+        gint pr = 0;
+        gtk_tree_model_get(src, &iter, COL_PINNED_ROOT, &pr, -1);
+        gboolean is_pinned_copy = (pr != (gint)PTREE_UNPINNED);
+
+        gboolean self_matches = !is_pinned_copy &&
+            (audio_pid_is_active(ctx, (pid_t)pid) ||
+             pid_is_pinned(ctx, (pid_t)pid));
+
+        if (ancestor_matched) {
+            /* Already copied as part of a parent's subtree – skip */
+        } else if (self_matches) {
+            copy_subtree(dst, NULL, src, &iter);
+        } else {
+            find_and_copy_audio_matches(dst, src, &iter, ctx, FALSE);
+        }
+
+        valid = gtk_tree_model_iter_next(src, &iter);
+    }
+}
+
+/*
+ * Count how many rows the audio filter would produce, for structural
+ * change detection in sync_audio_filter_store().
+ */
+static int count_audio_filter_matches(GtkTreeModel   *real,
+                                      GtkTreeIter    *parent,
+                                      const ui_ctx_t *ctx,
+                                      gboolean ancestor_matched)
+{
+    int count = 0;
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(real, &iter, parent);
+    while (valid) {
+        gint pid = 0;
+        gtk_tree_model_get(real, &iter, COL_PID, &pid, -1);
+
+        gint pr = 0;
+        gtk_tree_model_get(real, &iter, COL_PINNED_ROOT, &pr, -1);
+        gboolean is_pinned_copy = (pr != (gint)PTREE_UNPINNED);
+
+        gboolean self_matches = !is_pinned_copy &&
+            (audio_pid_is_active(ctx, (pid_t)pid) ||
+             pid_is_pinned(ctx, (pid_t)pid));
+
+        if (ancestor_matched) {
+            count++;
+            count += count_audio_filter_matches(real, &iter, ctx, TRUE);
+        } else if (self_matches) {
+            count++;
+            count += count_audio_filter_matches(real, &iter, ctx, TRUE);
+        } else {
+            count += count_audio_filter_matches(real, &iter, ctx, FALSE);
+        }
+        valid = gtk_tree_model_iter_next(real, &iter);
+    }
+    return count;
+}
+
+/*
+ * Rebuild the audio-only filter store from scratch.  Only processes
+ * with active audio streams (or that are pinned) are included as
+ * top-level entries with their full subtrees.
+ */
+static void rebuild_audio_filter_store(ui_ctx_t *ctx)
+{
+    /* Remember selected PID so we can re-select after model swap */
+    pid_t sel_pid = 0;
+    {
+        GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
+        GtkTreeModel *old_model = NULL;
+        GtkTreeIter sel_iter;
+        if (sel && gtk_tree_selection_get_selected(sel, &old_model, &sel_iter)) {
+            GtkTreeIter child_iter;
+            gtk_tree_model_sort_convert_iter_to_child_iter(
+                ctx->sort_model, &child_iter, &sel_iter);
+            GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
+                ctx->sort_model);
+            gint pid_val;
+            gtk_tree_model_get(child_model, &child_iter, COL_PID, &pid_val, -1);
+            sel_pid = (pid_t)pid_val;
+        }
+    }
+
+    /* Create a fresh filter store */
+    GtkTreeStore *fs = gtk_tree_store_new(NUM_COLS,
+        G_TYPE_INT, G_TYPE_INT, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
+        G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
+        G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
+        G_TYPE_INT64, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_STRING, G_TYPE_INT,
+        G_TYPE_INT64, G_TYPE_INT64, G_TYPE_INT);
+
+    find_and_copy_audio_matches(fs, GTK_TREE_MODEL(ctx->store), NULL,
+                                ctx, FALSE);
+
+    /* Replace old filter_store */
+    if (ctx->filter_store)
+        g_object_unref(ctx->filter_store);
+    ctx->filter_store = fs;
+
+    /* Save / restore sort column across the switch */
+    gint sort_col = GTK_TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID;
+    GtkSortType sort_order = GTK_SORT_ASCENDING;
+    gtk_tree_sortable_get_sort_column_id(
+        GTK_TREE_SORTABLE(ctx->sort_model), &sort_col, &sort_order);
+
+    GtkTreeModel *new_sort = gtk_tree_model_sort_new_with_model(
+        GTK_TREE_MODEL(fs));
+    ctx->sort_model = GTK_TREE_MODEL_SORT(new_sort);
+    register_sort_funcs(ctx->sort_model);
+
+    if (sort_col != GTK_TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID)
+        gtk_tree_sortable_set_sort_column_id(
+            GTK_TREE_SORTABLE(ctx->sort_model), sort_col, sort_order);
+
+    gtk_tree_view_set_model(ctx->view, new_sort);
+
+    g_signal_handlers_block_by_func(ctx->view, on_row_collapsed, ctx);
+    g_signal_handlers_block_by_func(ctx->view, on_row_expanded,  ctx);
+    expand_respecting_collapsed(ctx);
+    g_signal_handlers_unblock_by_func(ctx->view, on_row_collapsed, ctx);
+    g_signal_handlers_unblock_by_func(ctx->view, on_row_expanded,  ctx);
+
+    g_signal_connect(new_sort, "sort-column-changed",
+                     G_CALLBACK(on_sort_column_changed), ctx);
+
+    /* Re-select the previously-selected PID */
+    if (sel_pid > 0) {
+        GtkTreeIter found;
+        if (find_iter_by_pid(GTK_TREE_MODEL(fs), NULL, sel_pid, &found)) {
+            GtkTreePath *child_path = gtk_tree_model_get_path(
+                GTK_TREE_MODEL(fs), &found);
+            if (child_path) {
+                GtkTreePath *sort_path =
+                    gtk_tree_model_sort_convert_child_path_to_path(
+                        ctx->sort_model, child_path);
+                if (sort_path) {
+                    GtkTreeSelection *sel =
+                        gtk_tree_view_get_selection(ctx->view);
+                    gtk_tree_selection_select_path(sel, sort_path);
+                    gtk_tree_path_free(sort_path);
+                }
+                gtk_tree_path_free(child_path);
+            }
+        }
+    }
+}
+
+/*
+ * Incremental sync of the audio filter store.  If the set of audio
+ * PIDs has changed structurally, fall back to a full rebuild;
+ * otherwise update column values in place.
+ */
+static void sync_audio_filter_store(ui_ctx_t *ctx)
+{
+    if (!ctx->filter_store)
+        return;
+
+    GtkTreeModel *real = GTK_TREE_MODEL(ctx->store);
+
+    int expected = count_audio_filter_matches(real, NULL, ctx, FALSE);
+    int current  = count_store_rows(GTK_TREE_MODEL(ctx->filter_store), NULL);
+
+    if (expected != current) {
+        rebuild_audio_filter_store(ctx);
+        return;
+    }
+
+    if (!sync_filter_rows(ctx->filter_store, NULL, real))
+        rebuild_audio_filter_store(ctx);
+}
 
 /*
  * Expand every row in the tree view EXCEPT those whose PID appears
@@ -3108,7 +3337,10 @@ static gboolean on_filter_entry_key_release(GtkWidget *widget,
         filter_cancel_hide_timer(ctx);
         gtk_entry_set_text(GTK_ENTRY(ctx->filter_entry), "");
         ctx->filter_text[0] = '\0';
-        switch_to_real_store(ctx);
+        if (ctx->show_audio_only)
+            rebuild_audio_filter_store(ctx);
+        else
+            switch_to_real_store(ctx);
         gtk_widget_hide(ctx->filter_entry);
         gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
         return TRUE;
@@ -3132,7 +3364,10 @@ static gboolean on_filter_entry_key_release(GtkWidget *widget,
         filter_cancel_hide_timer(ctx);
         rebuild_filter_store(ctx);
     } else {
-        switch_to_real_store(ctx);
+        if (ctx->show_audio_only)
+            rebuild_audio_filter_store(ctx);
+        else
+            switch_to_real_store(ctx);
         filter_schedule_hide(ctx);
     }
 
@@ -4765,6 +5000,7 @@ void *ui_thread(void *arg)
     ctx.filter_css   = filt_css;
     ctx.name_col     = name_col;
     ctx.filter_text[0] = '\0';
+    ctx.show_audio_only = FALSE;
 
     /* Go-to-PID */
     ctx.pid_entry = pid_entry;
