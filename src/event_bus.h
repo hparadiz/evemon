@@ -70,10 +70,10 @@ void evemon_event_bus_publish(const evemon_event_t *event);
  * pointer signatures.  These are wired into host_services so
  * plugins call them indirectly via the services table.
  */
-void host_event_subscribe(void *host_ctx,
-                          evemon_event_type_t type,
-                          evemon_event_cb cb,
-                          void *user_data);
+int host_event_subscribe(void *host_ctx,
+                         evemon_event_type_t type,
+                         evemon_event_cb cb,
+                         void *user_data);
 
 void host_event_publish(void *host_ctx,
                         const evemon_event_t *event);

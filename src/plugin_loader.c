@@ -430,6 +430,9 @@ void plugin_dispatch_clear_all(plugin_registry_t *reg)
     for (size_t i = 0; i < reg->count; i++) {
         plugin_instance_t *inst = &reg->instances[i];
         if (!inst->plugin || !inst->plugin->clear) continue;
+        /* Skip pinned instances — they manage their own lifecycle
+         * and their widgets may already be destroyed by GTK. */
+        if (inst->pinned) continue;
         inst->plugin->clear(inst->plugin->plugin_ctx);
     }
 }

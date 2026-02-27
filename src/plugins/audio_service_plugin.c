@@ -26,6 +26,50 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ── Guard for async art load callbacks ──────────────────────── */
+
+/*
+ * Reference-counted guard that outlives the plugin context.
+ * Async art_load callbacks hold a pointer to this guard instead
+ * of directly to audio_svc_ctx_t.  When svc_destroy() frees the
+ * context, it marks the guard as dead.  The callback checks the
+ * flag before touching any context fields.
+ *
+ * Without this, destroying a plugin instance while an async HTTP
+ * art fetch is in-flight results in use-after-free (the GIO
+ * callback fires after free(ctx) → segfault).  g_cancellable_cancel
+ * sets a flag but does NOT prevent already-dispatched callbacks
+ * from running.
+ */
+typedef struct {
+    int                   ref_count;   /* manual refcount                  */
+    int                   dead;        /* set TRUE when ctx is freed       */
+    void                 *ctx;         /* back-pointer (NULL when dead)    */
+} art_load_guard_t;
+
+static art_load_guard_t *art_load_guard_new(void *ctx)
+{
+    art_load_guard_t *g = calloc(1, sizeof(art_load_guard_t));
+    if (!g) return NULL;
+    g->ref_count = 1;
+    g->dead      = 0;
+    g->ctx       = ctx;
+    return g;
+}
+
+static art_load_guard_t *art_load_guard_ref(art_load_guard_t *g)
+{
+    if (g) g->ref_count++;
+    return g;
+}
+
+static void art_load_guard_unref(art_load_guard_t *g)
+{
+    if (!g) return;
+    if (--g->ref_count <= 0)
+        free(g);
+}
+
 /* ── Per-instance context ────────────────────────────────────── */
 
 typedef struct {
@@ -41,16 +85,58 @@ typedef struct {
     int64_t     position_us;
     int64_t     length_us;
 
+    /* Tracked PID (set each update cycle) */
+    pid_t       tracked_pid;
+
+    /* PID that was active when the current art load was initiated.
+     * Used to discard stale art load completions after PID change. */
+    pid_t       art_load_pid;
+
     /* Loaded album art */
     GdkPixbuf  *art_pixbuf;
     GCancellable *art_cancel;
+
+    /* Guard for async art load callbacks (prevents use-after-free) */
+    art_load_guard_t *guard;
 } audio_svc_ctx_t;
 
 /* ── Art load callback ───────────────────────────────────────── */
 
+/*
+ * Called when async art loading completes.  user_data is an
+ * art_load_guard_t* (NOT the context directly) — the guard
+ * lets us detect if the plugin was destroyed while the load
+ * was in-flight.
+ */
 static void on_art_loaded(GdkPixbuf *pixbuf, void *user_data)
 {
-    audio_svc_ctx_t *ctx = user_data;
+    art_load_guard_t *guard = user_data;
+
+    /* If the plugin instance has been destroyed while we were
+     * loading, the context is freed — discard everything. */
+    if (!guard || guard->dead) {
+        if (pixbuf)
+            g_object_unref(pixbuf);
+        art_load_guard_unref(guard);
+        return;
+    }
+
+    audio_svc_ctx_t *ctx = guard->ctx;
+    art_load_guard_unref(guard);   /* release the load's ref */
+
+    /* If the tracked PID changed since we kicked off this art load,
+     * the result is stale — discard it to prevent publishing art
+     * for the wrong process (which can cause segfaults if the old
+     * process's plugin instance has already been torn down). */
+    if (ctx->art_load_pid != 0 && ctx->art_load_pid != ctx->tracked_pid) {
+        if (pixbuf)
+            g_object_unref(pixbuf);
+        if (ctx->art_cancel) {
+            g_object_unref(ctx->art_cancel);
+            ctx->art_cancel = NULL;
+        }
+        return;
+    }
 
     /* Replace cached pixbuf */
     if (ctx->art_pixbuf)
@@ -67,6 +153,7 @@ static void on_art_loaded(GdkPixbuf *pixbuf, void *user_data)
         evemon_album_art_payload_t payload;
         memset(&payload, 0, sizeof(payload));
         payload.pixbuf = ctx->art_pixbuf;  /* subscribers must ref if keeping */
+        payload.source_pid = ctx->tracked_pid;
         snprintf(payload.art_url, sizeof(payload.art_url),
                  "%s", ctx->art_url_cached);
         snprintf(payload.track_title, sizeof(payload.track_title),
@@ -116,8 +203,25 @@ select_best_player(const evemon_proc_data_t *data)
         const evemon_mpris_player_t *p = &data->mpris_players[i];
         int score = 0;
 
-        if (strcmp(p->playback_status, "Playing") == 0) score += 100;
-        else if (strcmp(p->playback_status, "Paused") == 0) score += 50;
+        /*
+         * Strongly prefer players that are actually playing.
+         * A "Playing" player should always win over "Paused" or
+         * "Stopped", since with multiple audio processes the
+         * user cares about the one producing sound right now.
+         *
+         * Use position_us > 0 as evidence the player has actually
+         * started playback (not just declared "Playing" with no
+         * content loaded).
+         */
+        if (strcmp(p->playback_status, "Playing") == 0) {
+            score += 200;
+            if (p->position_us > 0) score += 50;
+        } else if (strcmp(p->playback_status, "Paused") == 0) {
+            score += 50;
+            if (p->position_us > 0) score += 10;
+        }
+        /* "Stopped" players get no playback bonus */
+
         if (p->track_title[0]) score += 20;
         if (p->art_url[0]) score += 10;
 
@@ -156,6 +260,7 @@ static void svc_activate(void *opaque,
 static void svc_update(void *opaque, const evemon_proc_data_t *data)
 {
     audio_svc_ctx_t *ctx = opaque;
+    ctx->tracked_pid = data->pid;
 
     const evemon_mpris_player_t *best = select_best_player(data);
     if (!best) {
@@ -182,6 +287,7 @@ static void svc_update(void *opaque, const evemon_proc_data_t *data)
             if (ctx->host && ctx->host->publish) {
                 evemon_album_art_payload_t payload;
                 memset(&payload, 0, sizeof(payload));
+                payload.source_pid = ctx->tracked_pid;
                 evemon_event_t event = {
                     .type    = EVEMON_EVENT_ALBUM_ART_UPDATED,
                     .payload = &payload
@@ -217,7 +323,9 @@ static void svc_update(void *opaque, const evemon_proc_data_t *data)
         }
         snprintf(ctx->art_url_cached, sizeof(ctx->art_url_cached),
                  "%s", best->art_url);
-        art_load_async(best->art_url, on_art_loaded, ctx,
+        ctx->art_load_pid = ctx->tracked_pid;
+        art_load_async(best->art_url, on_art_loaded,
+                       art_load_guard_ref(ctx->guard),
                        &ctx->art_cancel);
     } else if (!best->art_url[0] && ctx->art_url_cached[0]) {
         /* Art URL cleared */
@@ -231,7 +339,7 @@ static void svc_update(void *opaque, const evemon_proc_data_t *data)
             ctx->art_pixbuf = NULL;
         }
         ctx->art_url_cached[0] = '\0';
-        on_art_loaded(NULL, ctx);  /* publish cleared state */
+        on_art_loaded(NULL, art_load_guard_ref(ctx->guard));  /* publish cleared state */
     } else {
         /* Same URL — re-publish with current pixbuf + updated metadata
          * (position/status may have changed even if art hasn't). */
@@ -239,6 +347,7 @@ static void svc_update(void *opaque, const evemon_proc_data_t *data)
             evemon_album_art_payload_t payload;
             memset(&payload, 0, sizeof(payload));
             payload.pixbuf = ctx->art_pixbuf;
+            payload.source_pid = ctx->tracked_pid;
             snprintf(payload.art_url, sizeof(payload.art_url),
                      "%s", ctx->art_url_cached);
             snprintf(payload.track_title, sizeof(payload.track_title),
@@ -290,6 +399,16 @@ static void svc_destroy(void *opaque)
 {
     audio_svc_ctx_t *ctx = opaque;
     svc_clear(opaque);
+    /* Mark the guard as dead so any in-flight async art load
+     * callbacks will see that the context is gone.  The guard
+     * itself is ref-counted and freed when the last reference
+     * (held by the pending callback) is released. */
+    if (ctx->guard) {
+        ctx->guard->dead = 1;
+        ctx->guard->ctx  = NULL;
+        art_load_guard_unref(ctx->guard);
+        ctx->guard = NULL;
+    }
     free(ctx);
 }
 
@@ -300,8 +419,11 @@ evemon_plugin_t *evemon_plugin_init(void)
     audio_svc_ctx_t *ctx = calloc(1, sizeof(audio_svc_ctx_t));
     if (!ctx) return NULL;
 
+    ctx->guard = art_load_guard_new(ctx);
+    if (!ctx->guard) { free(ctx); return NULL; }
+
     evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
-    if (!p) { free(ctx); return NULL; }
+    if (!p) { art_load_guard_unref(ctx->guard); free(ctx); return NULL; }
 
     p->abi_version   = evemon_PLUGIN_ABI_VERSION;
     p->name          = "Audio Service";

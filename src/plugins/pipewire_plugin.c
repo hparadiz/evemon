@@ -51,13 +51,14 @@ enum {
     PW_CAT_COUNT
 };
 
-static const char *cat_labels[PW_CAT_COUNT] = {
+/* Category labels — currently unused but kept for reference. */
+/* static const char *cat_labels[PW_CAT_COUNT] = {
     [PW_CAT_OUTPUT] = "Audio Output",
     [PW_CAT_INPUT]  = "Audio Input",
     [PW_CAT_VIDEO]  = "Video",
     [PW_CAT_MIDI]   = "MIDI",
     [PW_CAT_OTHER]  = "Other",
-};
+}; */
 
 enum {
     COL_TEXT,       /* plain text (display line)                */
@@ -242,13 +243,12 @@ static GtkCellRenderer *pw_meter_renderer_new(void)
 /* ── per-instance state ──────────────────────────────────────── */
 
 typedef struct {
-    /* Connection tree */
+    /* Connection list */
     GtkWidget      *main_box;
     GtkWidget      *scroll;
-    GtkTreeStore   *store;
+    GtkListStore   *store;
     GtkTreeView    *view;
     GtkCssProvider *css;
-    unsigned        collapsed;
     pid_t           last_pid;
 
     /* Spectrogram (embedded drawing area) */
@@ -276,6 +276,9 @@ typedef struct {
     GtkWidget      *media_position_label;
     GdkPixbuf      *art_pixbuf;         /* cached album art pixbuf   */
     char            art_url_cached[512]; /* URL of cached art         */
+
+    /* Event bus subscription ID (for cleanup in destroy) */
+    int             event_sub_id;
 } pw_ctx_t;
 
 /* ── classification ──────────────────────────────────────────── */
@@ -310,6 +313,21 @@ static const char *node_label(const evemon_pw_node_t *n)
     if (n->app_name[0])    return n->app_name;
     if (n->node_name[0])   return n->node_name;
     return "(unknown)";
+}
+
+/*
+ * Return true if a PipeWire node belongs to evemon itself
+ * (meter capture, spectrogram capture, or the monitor process).
+ * Checks every name field so we never display our own plumbing.
+ */
+static int is_evemon_node(const evemon_pw_node_t *n)
+{
+    if (!n) return 0;
+    if (strstr(n->node_name,  "evemon")) return 1;
+    if (strstr(n->app_name,   "evemon")) return 1;
+    if (strstr(n->node_desc,  "evemon")) return 1;
+    if (strstr(n->media_name, "evemon")) return 1;
+    return 0;
 }
 
 static const evemon_pw_node_t *find_node(const evemon_proc_data_t *data,
@@ -355,59 +373,8 @@ static char *pw_build_markup(const char *left_raw,
 
 /* ── signal callbacks ────────────────────────────────────────── */
 
-static void on_row_collapsed(GtkTreeView *v, GtkTreeIter *it,
-                             GtkTreePath *p, gpointer data)
-{
-    (void)v; (void)p;
-    pw_ctx_t *ctx = data;
-    gint cat = -1;
-    gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), it, COL_CAT, &cat, -1);
-    if (cat >= 0 && cat < PW_CAT_COUNT) ctx->collapsed |= (1u << cat);
-}
-
-static void on_row_expanded(GtkTreeView *v, GtkTreeIter *it,
-                            GtkTreePath *p, gpointer data)
-{
-    (void)v; (void)p;
-    pw_ctx_t *ctx = data;
-    gint cat = -1;
-    gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), it, COL_CAT, &cat, -1);
-    if (cat >= 0 && cat < PW_CAT_COUNT) ctx->collapsed &= ~(1u << cat);
-}
-
-static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
-                             gpointer data)
-{
-    (void)data;
-    if (ev->keyval != GDK_KEY_Return && ev->keyval != GDK_KEY_KP_Enter)
-        return FALSE;
-
-    GtkTreeView *view = GTK_TREE_VIEW(widget);
-    GtkTreeSelection *sel = gtk_tree_view_get_selection(view);
-    GtkTreeModel *model = NULL;
-    GtkTreeIter iter;
-
-    if (!gtk_tree_selection_get_selected(sel, &model, &iter))
-        return FALSE;
-
-    gint cat_id = -1;
-    gtk_tree_model_get(model, &iter, COL_CAT, &cat_id, -1);
-    if (cat_id < 0) return FALSE;
-
-    GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
-    if (!path) return FALSE;
-
-    if (gtk_tree_view_row_expanded(view, path))
-        gtk_tree_view_collapse_row(view, path);
-    else
-        gtk_tree_view_expand_row(view, path, FALSE);
-
-    gtk_tree_path_free(path);
-    return TRUE;
-}
-
 /*
- * Double-click a leaf row to switch spectrogram target.
+ * Double-click a row to switch spectrogram target.
  */
 static void on_row_activated(GtkTreeView *view, GtkTreePath *path,
                              GtkTreeViewColumn *col, gpointer data)
@@ -418,10 +385,6 @@ static void on_row_activated(GtkTreeView *view, GtkTreePath *path,
     GtkTreeModel *model = gtk_tree_view_get_model(view);
     GtkTreeIter iter;
     if (!gtk_tree_model_get_iter(model, &iter, path)) return;
-
-    gint cat_id = -1;
-    gtk_tree_model_get(model, &iter, COL_CAT, &cat_id, -1);
-    if (cat_id >= 0) return;
 
     guint node_id = 0;
     gtk_tree_model_get(model, &iter, COL_NODE_ID, &node_id, -1);
@@ -447,7 +410,8 @@ static gboolean on_spectro_draw(GtkWidget *widget, cairo_t *cr,
     pw_ctx_t *ctx = data;
     uint32_t target = 0;
     if (ctx->host && ctx->host->spectro_get_target)
-        target = ctx->host->spectro_get_target(ctx->host->host_ctx);
+        target = ctx->host->spectro_get_target(ctx->host->host_ctx,
+                     GTK_DRAWING_AREA(ctx->spectro_draw));
 
     if (target == 0) {
         int h = gtk_widget_get_allocated_height(widget);
@@ -475,27 +439,22 @@ static gboolean meter_tick(gpointer data)
         return G_SOURCE_CONTINUE;
 
     GtkTreeModel *model = GTK_TREE_MODEL(ctx->store);
-    GtkTreeIter parent;
-    gboolean pvalid = gtk_tree_model_iter_children(model, &parent, NULL);
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(model, &iter, NULL);
     int any_changed = 0;
 
-    while (pvalid) {
-        GtkTreeIter child;
-        gboolean cv = gtk_tree_model_iter_children(model, &child, &parent);
-        while (cv) {
-            guint nid = 0;
-            gtk_tree_model_get(model, &child, COL_NODE_ID, &nid, -1);
-            if (nid != 0) {
-                int ll = 0, lr = 0;
-                ctx->host->pw_meter_read(ctx->host->host_ctx,
-                                         nid, &ll, &lr);
-                gtk_tree_store_set(ctx->store, &child,
-                                   COL_LEVEL_L, ll, COL_LEVEL_R, lr, -1);
-                if (ll > 0 || lr > 0) any_changed = 1;
-            }
-            cv = gtk_tree_model_iter_next(model, &child);
+    while (valid) {
+        guint nid = 0;
+        gtk_tree_model_get(model, &iter, COL_NODE_ID, &nid, -1);
+        if (nid != 0) {
+            int ll = 0, lr = 0;
+            ctx->host->pw_meter_read(ctx->host->host_ctx,
+                                     nid, &ll, &lr);
+            gtk_list_store_set(ctx->store, &iter,
+                               COL_LEVEL_L, ll, COL_LEVEL_R, lr, -1);
+            if (ll > 0 || lr > 0) any_changed = 1;
         }
-        pvalid = gtk_tree_model_iter_next(model, &parent);
+        valid = gtk_tree_model_iter_next(model, &iter);
     }
 
     if (any_changed)
@@ -566,6 +525,24 @@ static void pw_on_album_art_event(const evemon_event_t *event,
     const evemon_album_art_payload_t *art = event->payload;
     if (!art) return;
 
+    /* If this instance has been cleared (no process selected), ignore
+     * all events — the widgets may be in an undefined state and we
+     * have nothing meaningful to display. */
+    if (ctx->last_pid <= 0) return;
+
+    /* Only accept events for the PID this plugin instance is tracking.
+     * Without this check, when multiple processes have audio playing,
+     * metadata from process B would overwrite process A's display. */
+    if (art->source_pid > 0 && art->source_pid != ctx->last_pid)
+        return;
+
+    /* Defensive: verify widgets are still alive before touching them.
+     * After pw_destroy the widget pointers are stale; the event bus
+     * unsubscribe should prevent us from reaching here, but belt and
+     * suspenders never hurt. */
+    if (!ctx->media_title_label || !GTK_IS_LABEL(ctx->media_title_label))
+        return;
+
     /* Update album art */
     pw_on_art_loaded(art->pixbuf, ctx);
     snprintf(ctx->art_url_cached, sizeof(ctx->art_url_cached),
@@ -577,9 +554,11 @@ static void pw_on_album_art_event(const evemon_event_t *event,
         char *esc = g_markup_escape_text(art->track_title, -1);
         snprintf(markup, sizeof(markup), "<b>%s</b>", esc);
         g_free(esc);
-        gtk_label_set_markup(GTK_LABEL(ctx->media_title_label), markup);
+        if (GTK_IS_LABEL(ctx->media_title_label))
+            gtk_label_set_markup(GTK_LABEL(ctx->media_title_label), markup);
     } else {
-        gtk_label_set_text(GTK_LABEL(ctx->media_title_label), "");
+        if (GTK_IS_LABEL(ctx->media_title_label))
+            gtk_label_set_text(GTK_LABEL(ctx->media_title_label), "");
     }
 
     if (art->track_artist[0]) {
@@ -588,9 +567,11 @@ static void pw_on_album_art_event(const evemon_event_t *event,
         snprintf(markup, sizeof(markup),
                  "<span foreground=\"#8899bb\">%s</span>", esc);
         g_free(esc);
-        gtk_label_set_markup(GTK_LABEL(ctx->media_artist_label), markup);
+        if (GTK_IS_LABEL(ctx->media_artist_label))
+            gtk_label_set_markup(GTK_LABEL(ctx->media_artist_label), markup);
     } else {
-        gtk_label_set_text(GTK_LABEL(ctx->media_artist_label), "");
+        if (GTK_IS_LABEL(ctx->media_artist_label))
+            gtk_label_set_text(GTK_LABEL(ctx->media_artist_label), "");
     }
 
     if (art->track_album[0]) {
@@ -599,9 +580,11 @@ static void pw_on_album_art_event(const evemon_event_t *event,
         snprintf(markup, sizeof(markup),
                  "<span foreground=\"#778899\"><i>%s</i></span>", esc);
         g_free(esc);
-        gtk_label_set_markup(GTK_LABEL(ctx->media_album_label), markup);
+        if (GTK_IS_LABEL(ctx->media_album_label))
+            gtk_label_set_markup(GTK_LABEL(ctx->media_album_label), markup);
     } else {
-        gtk_label_set_text(GTK_LABEL(ctx->media_album_label), "");
+        if (GTK_IS_LABEL(ctx->media_album_label))
+            gtk_label_set_text(GTK_LABEL(ctx->media_album_label), "");
     }
 
     /* Playback status with icon */
@@ -617,7 +600,8 @@ static void pw_on_album_art_event(const evemon_event_t *event,
         else
             snprintf(status, sizeof(status), "%s %s",
                      icon, art->playback_status);
-        gtk_label_set_text(GTK_LABEL(ctx->media_status_label), status);
+        if (GTK_IS_LABEL(ctx->media_status_label))
+            gtk_label_set_text(GTK_LABEL(ctx->media_status_label), status);
     }
 
     /* Position / Duration */
@@ -631,15 +615,18 @@ static void pw_on_album_art_event(const evemon_event_t *event,
             snprintf(disp, sizeof(disp), "/ %s", len_buf);
         else if (pos_buf[0])
             snprintf(disp, sizeof(disp), "%s", pos_buf);
-        gtk_label_set_text(GTK_LABEL(ctx->media_position_label), disp);
+        if (GTK_IS_LABEL(ctx->media_position_label))
+            gtk_label_set_text(GTK_LABEL(ctx->media_position_label), disp);
     }
 
     /* Show/hide the section based on whether we have metadata */
+    if (!ctx->media_section || !GTK_IS_WIDGET(ctx->media_section))
+        return;
     if (art->track_title[0] || art->playback_status[0]) {
         gtk_widget_set_no_show_all(ctx->media_section, FALSE);
         gtk_widget_show_all(ctx->media_section);
         gtk_widget_set_no_show_all(ctx->media_section, TRUE);
-    } else if (ctx->media_section) {
+    } else {
         gtk_widget_hide(ctx->media_section);
     }
 }
@@ -673,7 +660,7 @@ static GtkWidget *pw_create_widget(void *opaque)
     ctx->main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
     /* ── Connection tree ──────────────────────────────────────── */
-    ctx->store = gtk_tree_store_new(NUM_COLS,
+    ctx->store = gtk_list_store_new(NUM_COLS,
                                     G_TYPE_STRING, G_TYPE_STRING,
                                     G_TYPE_INT, G_TYPE_UINT,
                                     G_TYPE_INT, G_TYPE_INT);
@@ -684,7 +671,6 @@ static GtkWidget *pw_create_widget(void *opaque)
      * the ref in pw_destroy(). */
 
     gtk_tree_view_set_headers_visible(ctx->view, FALSE);
-    gtk_tree_view_set_enable_tree_lines(ctx->view, TRUE);
 
     GtkCellRenderer *cell = gtk_cell_renderer_text_new();
     g_object_set(cell, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
@@ -714,12 +700,6 @@ static GtkWidget *pw_create_widget(void *opaque)
     GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
     gtk_tree_selection_set_mode(sel, GTK_SELECTION_SINGLE);
 
-    g_signal_connect(ctx->view, "row-collapsed",
-                     G_CALLBACK(on_row_collapsed), ctx);
-    g_signal_connect(ctx->view, "row-expanded",
-                     G_CALLBACK(on_row_expanded), ctx);
-    g_signal_connect(ctx->view, "key-press-event",
-                     G_CALLBACK(on_key_press), ctx);
     g_signal_connect(ctx->view, "row-activated",
                      G_CALLBACK(on_row_activated), ctx);
 
@@ -854,7 +834,7 @@ static void pw_activate(void *opaque,
     ctx->host = services;
     /* Subscribe to album art events from the audio service plugin */
     if (services->subscribe)
-        services->subscribe(services->host_ctx,
+        ctx->event_sub_id = services->subscribe(services->host_ctx,
                             EVEMON_EVENT_ALBUM_ART_UPDATED,
                             pw_on_album_art_event, ctx);
 }
@@ -863,20 +843,19 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
 {
     pw_ctx_t *ctx = opaque;
 
-    if (!data->pw_nodes || data->pw_node_count == 0) {
-        gtk_tree_store_clear(ctx->store);
-        /* Don't call pw_meter_stop — the meter is shared across
-         * all plugin instances.  Just clear our local node list;
-         * stale meter streams for nodes that no longer exist are
-         * harmless (they produce silence / zero levels). */
-        ctx->audio_node_count = 0;
-        return;
-    }
-
     if (data->pid != ctx->last_pid) {
-        ctx->collapsed = 0;
         ctx->last_pid = data->pid;
         ctx->spectro_shown = FALSE;
+        gtk_list_store_clear(ctx->store);
+        ctx->audio_node_count = 0;
+    }
+
+    if (!data->pw_nodes || data->pw_node_count == 0) {
+        /* Keep the last known good display — don't clear the store.
+         * PipeWire snapshots are inherently racy; an empty result
+         * on one cycle doesn't mean the streams are gone.  The store
+         * is cleared explicitly on PID change (above) and in pw_clear(). */
+        return;
     }
 
     /* Build display entries.
@@ -903,11 +882,8 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
         const evemon_pw_node_t *node = &data->pw_nodes[ni];
         if (node->pid != data->pid) continue;
 
-        /* Skip evemon's own capture/meter streams — they appear in
-         * the PW graph as "evemon-meter-*" or "evemon-spectrogram"
-         * and confuse stream selection for the real audio source. */
-        if (strncmp(node->node_name, "evemon-", 7) == 0) continue;
-        if (strncmp(node->app_name, "evemon", 6) == 0) continue;
+        /* Skip evemon's own capture/meter/spectrogram streams. */
+        if (is_evemon_node(node)) continue;
 
         int cat = classify_node(node->media_class);
         const char *self = node_label(node);
@@ -936,6 +912,16 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
                 if (peers[k] == peer_id) { dup = 1; break; }
             if (!dup && np < 32) peers[np++] = peer_id;
         }
+
+        /* Filter out evemon's own nodes from the peer list so our
+         * meter/spectrogram capture streams never show as connections. */
+        size_t real_np = 0;
+        for (size_t pi = 0; pi < np; pi++) {
+            const evemon_pw_node_t *peer = find_node(data, peers[pi]);
+            if (is_evemon_node(peer)) continue;
+            peers[real_np++] = peers[pi];
+        }
+        np = real_np;
 
         if (np == 0) {
             if (ent_count >= ent_cap) {
@@ -983,118 +969,87 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
         }
     }
 
-    /* Count per category */
-    size_t cat_count[PW_CAT_COUNT] = {0};
-    for (size_t i = 0; i < ent_count; i++)
-        cat_count[ents[i].cat]++;
-
     GtkTreeModel *model = GTK_TREE_MODEL(ctx->store);
     GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(
         GTK_SCROLLED_WINDOW(ctx->scroll));
     double scroll_pos = gtk_adjustment_get_value(vadj);
 
-    GtkTreeIter cat_iters[PW_CAT_COUNT];
-    gboolean cat_exists[PW_CAT_COUNT];
-    memset(cat_exists, 0, sizeof(cat_exists));
-
+    /* Remember which node_id is currently selected so we can
+     * re-select it after the store is rebuilt. */
+    uint32_t sel_node_id = 0;
     {
-        GtkTreeIter top;
-        gboolean v = gtk_tree_model_iter_children(model, &top, NULL);
-        while (v) {
-            gint cid = -1;
-            gtk_tree_model_get(model, &top, COL_CAT, &cid, -1);
-            if (cid >= 0 && cid < PW_CAT_COUNT) {
-                cat_iters[cid] = top;
-                cat_exists[cid] = TRUE;
-            }
-            v = gtk_tree_model_iter_next(model, &top);
+        GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
+        GtkTreeIter sel_iter;
+        if (gtk_tree_selection_get_selected(sel, NULL, &sel_iter)) {
+            guint nid = 0;
+            gtk_tree_model_get(model, &sel_iter, COL_NODE_ID, &nid, -1);
+            sel_node_id = nid;
         }
     }
 
-    for (int c = 0; c < PW_CAT_COUNT; c++)
-        if (cat_exists[c] && cat_count[c] == 0) {
-            gtk_tree_store_remove(ctx->store, &cat_iters[c]);
-            cat_exists[c] = FALSE;
-        }
+    /* Update the flat list in place: reuse existing rows, append
+     * new ones, remove excess. */
+    GtkTreeIter iter;
+    gboolean iter_valid = gtk_tree_model_iter_children(model, &iter, NULL);
+    size_t ei = 0;
 
-    for (int c = 0; c < PW_CAT_COUNT; c++) {
-        if (cat_count[c] == 0) continue;
-
-        char hdr[128];
-        snprintf(hdr, sizeof(hdr), "%s (%zu)", cat_labels[c],
-                 cat_count[c]);
-        char *hdr_esc = g_markup_escape_text(hdr, -1);
-
-        GtkTreeIter parent;
-        if (!cat_exists[c]) {
-            gtk_tree_store_append(ctx->store, &parent, NULL);
-            gtk_tree_store_set(ctx->store, &parent,
-                               COL_TEXT, hdr, COL_MARKUP, hdr_esc,
-                               COL_CAT, (gint)c,
-                               COL_NODE_ID, (guint)0,
-                               COL_LEVEL_L, (gint)0,
-                               COL_LEVEL_R, (gint)0, -1);
-            cat_exists[c] = TRUE;
-            cat_iters[c] = parent;
-        } else {
-            parent = cat_iters[c];
-            gtk_tree_store_set(ctx->store, &parent,
-                               COL_TEXT, hdr,
-                               COL_MARKUP, hdr_esc, -1);
-        }
-        g_free(hdr_esc);
-
-        GtkTreeIter child;
-        gboolean cv = gtk_tree_model_iter_children(model, &child,
-                                                   &parent);
-        for (size_t i = 0; i < ent_count; i++) {
-            if (ents[i].cat != c) continue;
-            char *markup = pw_build_markup(ents[i].left,
-                                           ents[i].right,
-                                           ents[i].arrow);
-
-            /* Build plain-text display string */
-            char *plain;
-            if (ents[i].right && ents[i].arrow)
-                plain = g_strdup_printf("%s %s %s",
-                    ents[i].left, ents[i].arrow, ents[i].right);
-            else
-                plain = g_strdup(ents[i].left);
-
-            if (cv) {
-                gtk_tree_store_set(ctx->store, &child,
-                    COL_TEXT, plain,
-                    COL_MARKUP, markup,
-                    COL_CAT, (gint)-1,
-                    COL_NODE_ID, (guint)ents[i].node_id, -1);
-                cv = gtk_tree_model_iter_next(model, &child);
-            } else {
-                GtkTreeIter nc;
-                gtk_tree_store_append(ctx->store, &nc, &parent);
-                gtk_tree_store_set(ctx->store, &nc,
-                    COL_TEXT, plain,
-                    COL_MARKUP, markup,
-                    COL_CAT, (gint)-1,
-                    COL_NODE_ID, (guint)ents[i].node_id,
-                    COL_LEVEL_L, (gint)0,
-                    COL_LEVEL_R, (gint)0, -1);
-            }
-            g_free(markup);
-            g_free(plain);
-        }
-
-        while (cv) cv = gtk_tree_store_remove(ctx->store, &child);
-
-        GtkTreePath *cp = gtk_tree_model_get_path(model,
-                                                   &cat_iters[c]);
-        if (ctx->collapsed & (1u << c))
-            gtk_tree_view_collapse_row(ctx->view, cp);
+    while (ei < ent_count) {
+        char *markup = pw_build_markup(ents[ei].left,
+                                       ents[ei].right,
+                                       ents[ei].arrow);
+        char *plain;
+        if (ents[ei].right && ents[ei].arrow)
+            plain = g_strdup_printf("%s %s %s",
+                ents[ei].left, ents[ei].arrow, ents[ei].right);
         else
-            gtk_tree_view_expand_row(ctx->view, cp, FALSE);
-        gtk_tree_path_free(cp);
+            plain = g_strdup(ents[ei].left);
+
+        if (iter_valid) {
+            gtk_list_store_set(ctx->store, &iter,
+                COL_TEXT, plain,
+                COL_MARKUP, markup,
+                COL_CAT, (gint)ents[ei].cat,
+                COL_NODE_ID, (guint)ents[ei].node_id, -1);
+            iter_valid = gtk_tree_model_iter_next(model, &iter);
+        } else {
+            GtkTreeIter new_iter;
+            gtk_list_store_append(ctx->store, &new_iter);
+            gtk_list_store_set(ctx->store, &new_iter,
+                COL_TEXT, plain,
+                COL_MARKUP, markup,
+                COL_CAT, (gint)ents[ei].cat,
+                COL_NODE_ID, (guint)ents[ei].node_id,
+                COL_LEVEL_L, (gint)0,
+                COL_LEVEL_R, (gint)0, -1);
+        }
+        g_free(markup);
+        g_free(plain);
+        ei++;
     }
+
+    /* Remove excess rows */
+    while (iter_valid)
+        iter_valid = gtk_list_store_remove(ctx->store, &iter);
 
     gtk_adjustment_set_value(vadj, scroll_pos);
+
+    /* Re-select the previously selected node by node_id. */
+    if (sel_node_id != 0) {
+        GtkTreeIter si;
+        gboolean sv = gtk_tree_model_iter_children(model, &si, NULL);
+        while (sv) {
+            guint nid = 0;
+            gtk_tree_model_get(model, &si, COL_NODE_ID, &nid, -1);
+            if (nid == sel_node_id) {
+                GtkTreeSelection *sel =
+                    gtk_tree_view_get_selection(ctx->view);
+                gtk_tree_selection_select_iter(sel, &si);
+                break;
+            }
+            sv = gtk_tree_model_iter_next(model, &si);
+        }
+    }
+
     for (size_t i = 0; i < ent_count; i++) {
         g_free(ents[i].left);
         g_free(ents[i].right);
@@ -1116,7 +1071,8 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
                 uint32_t current = 0;
                 if (ctx->host->spectro_get_target)
                     current = ctx->host->spectro_get_target(
-                        ctx->host->host_ctx);
+                        ctx->host->host_ctx,
+                        GTK_DRAWING_AREA(ctx->spectro_draw));
                 int found = 0;
                 for (size_t i = 0; i < ctx->audio_node_count; i++)
                     if (ctx->audio_node_ids[i] == current)
@@ -1127,12 +1083,15 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
                         ctx->audio_node_ids[0]);
             }
         } else {
-            /* No audio output nodes for this process — but don't
-             * call pw_meter_stop since the meter is shared across
-             * all plugin instances.  Just stop spectrogram since
-             * that's per-plugin (owned draw area). */
-            if (ctx->host->spectro_stop)
-                ctx->host->spectro_stop(ctx->host->host_ctx);
+            /* No audio output nodes for this process — stop our own
+             * spectrogram (per-draw-area, safe for other instances).
+             * Don't call pw_meter_stop or pw_meter_remove_nodes since
+             * the meter is shared; stale streams read silence and are
+             * cleaned up in pw_destroy(). */
+            if (ctx->spectro_shown && ctx->spectro_draw &&
+                ctx->host->spectro_stop)
+                ctx->host->spectro_stop(ctx->host->host_ctx,
+                    GTK_DRAWING_AREA(ctx->spectro_draw));
         }
     }
 
@@ -1143,24 +1102,51 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
 static void pw_clear(void *opaque)
 {
     pw_ctx_t *ctx = opaque;
-    gtk_tree_store_clear(ctx->store);
+    gtk_list_store_clear(ctx->store);
     ctx->last_pid = 0;
     ctx->audio_node_count = 0;
+    /* Hide the media section so stale metadata isn't shown when
+     * no process is selected. */
+    if (ctx->media_section && GTK_IS_WIDGET(ctx->media_section))
+        gtk_widget_hide(ctx->media_section);
+    /* Clear album art */
+    if (ctx->media_art_image && GTK_IS_IMAGE(ctx->media_art_image))
+        gtk_image_clear(GTK_IMAGE(ctx->media_art_image));
+    if (ctx->art_pixbuf) {
+        g_object_unref(ctx->art_pixbuf);
+        ctx->art_pixbuf = NULL;
+    }
+    ctx->art_url_cached[0] = '\0';
     /* Don't call pw_meter_stop here — the meter is shared. */
 }
 
 static void pw_destroy(void *opaque)
 {
     pw_ctx_t *ctx = opaque;
+
+    /* Unsubscribe from the event bus BEFORE freeing ctx,
+     * otherwise deferred g_idle_add callbacks can dereference
+     * the freed user_data pointer → segfault. */
+    if (ctx->event_sub_id > 0 && ctx->host && ctx->host->unsubscribe) {
+        ctx->host->unsubscribe(ctx->host->host_ctx, ctx->event_sub_id);
+        ctx->event_sub_id = 0;
+    }
+
     if (ctx->meter_timer) {
         g_source_remove(ctx->meter_timer);
         ctx->meter_timer = 0;
     }
+    /* Don't call pw_meter_stop — the meter is shared across all plugin
+     * instances.  We remove only our own nodes via pw_meter_remove_nodes
+     * so other instances' streams remain intact. */
     if (ctx->host) {
-        if (ctx->host->pw_meter_stop)
-            ctx->host->pw_meter_stop(ctx->host->host_ctx);
-        if (ctx->host->spectro_stop)
-            ctx->host->spectro_stop(ctx->host->host_ctx);
+        if (ctx->audio_node_count > 0 && ctx->host->pw_meter_remove_nodes)
+            ctx->host->pw_meter_remove_nodes(ctx->host->host_ctx,
+                ctx->audio_node_ids, ctx->audio_node_count);
+        /* Stop our own spectrogram instance (per-draw-area, safe) */
+        if (ctx->spectro_draw && ctx->host->spectro_stop)
+            ctx->host->spectro_stop(ctx->host->host_ctx,
+                GTK_DRAWING_AREA(ctx->spectro_draw));
     }
     if (ctx->store) {
         g_object_unref(ctx->store);
@@ -1168,6 +1154,17 @@ static void pw_destroy(void *opaque)
     }
     if (ctx->css) g_object_unref(ctx->css);
     if (ctx->art_pixbuf) g_object_unref(ctx->art_pixbuf);
+
+    /* Null out widget pointers before free — defensive against
+     * any stale references that might still try to touch them. */
+    ctx->media_title_label    = NULL;
+    ctx->media_artist_label   = NULL;
+    ctx->media_album_label    = NULL;
+    ctx->media_status_label   = NULL;
+    ctx->media_position_label = NULL;
+    ctx->media_art_image      = NULL;
+    ctx->media_section        = NULL;
+
     free(ctx);
 }
 

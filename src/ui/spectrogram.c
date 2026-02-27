@@ -556,33 +556,63 @@ static void spectro_stop_internal(spectro_state_t *st)
     }
 }
 
-void spectrogram_stop(ui_ctx_t *ctx)
+/* ── per-instance lookup helpers ──────────────────────────────── */
+
+/*
+ * Find the spectro instance for a given draw area.
+ * Returns the index into ctx->spectro_instances[], or -1 if not found.
+ */
+static int spectro_find(ui_ctx_t *ctx, GtkWidget *draw_area)
 {
-    if (!ctx->spectro) return;
-    spectro_stop_internal(ctx->spectro);
-    free(ctx->spectro);
-    ctx->spectro = NULL;
+    for (size_t i = 0; i < ctx->spectro_count; i++) {
+        if (ctx->spectro_instances[i].draw_area == draw_area)
+            return (int)i;
+    }
+    return -1;
 }
 
-void spectrogram_start_for_node(ui_ctx_t *ctx, uint32_t node_id)
+void spectrogram_stop(ui_ctx_t *ctx, GtkDrawingArea *draw_area)
 {
-    /* If we're already capturing this exact node, do nothing */
-    if (ctx->spectro) {
-        spectro_state_t *old = ctx->spectro;
+    int idx = spectro_find(ctx, GTK_WIDGET(draw_area));
+    if (idx < 0) return;
+
+    spectro_state_t *st = ctx->spectro_instances[idx].state;
+    spectro_stop_internal(st);
+    free(st);
+
+    /* Compact: move last entry into this slot */
+    size_t last = ctx->spectro_count - 1;
+    if ((size_t)idx < last)
+        ctx->spectro_instances[idx] = ctx->spectro_instances[last];
+    ctx->spectro_instances[last].draw_area = NULL;
+    ctx->spectro_instances[last].state = NULL;
+    ctx->spectro_count--;
+}
+
+void spectrogram_start_for_node(ui_ctx_t *ctx, GtkDrawingArea *draw_area,
+                                uint32_t node_id)
+{
+    if (!draw_area) return;
+
+    /* If we're already capturing this exact node on this draw area, do nothing */
+    int idx = spectro_find(ctx, GTK_WIDGET(draw_area));
+    if (idx >= 0) {
+        spectro_state_t *old = ctx->spectro_instances[idx].state;
         if (old->target_node_id == node_id && old->running)
             return;
+        /* Stop existing capture on this draw area */
+        spectrogram_stop(ctx, draw_area);
     }
 
-    /* Stop any existing capture */
-    spectrogram_stop(ctx);
-
     if (node_id == 0) return;
+
+    if (ctx->spectro_count >= SPECTRO_MAX_INSTANCES) return;
 
     spectro_state_t *st = calloc(1, sizeof(*st));
     if (!st) return;
 
     st->target_node_id = node_id;
-    st->draw_area      = GTK_DRAWING_AREA(ctx->spectro_draw);
+    st->draw_area      = draw_area;
     st->ui_ctx         = ctx;
     st->running        = 1;
 
@@ -697,7 +727,10 @@ void spectrogram_start_for_node(ui_ctx_t *ctx, uint32_t node_id)
     /* Start the GTK redraw timer at ~60 fps for smooth scrolling */
     st->timer_id = g_timeout_add(16, spectro_tick, st);
 
-    ctx->spectro = st;
+    /* Register in the per-instance array */
+    size_t slot = ctx->spectro_count++;
+    ctx->spectro_instances[slot].draw_area = GTK_WIDGET(draw_area);
+    ctx->spectro_instances[slot].state = st;
 
     /* Connect our draw handler to the plugin's drawing area.
      * The plugin may have its own placeholder handler; ours renders
@@ -715,17 +748,19 @@ fail:
 
 /* ── draw signal (connected in ui.c) ─────────────────────────── */
 
-uint32_t spectrogram_get_target_node(ui_ctx_t *ctx)
+uint32_t spectrogram_get_target_node(ui_ctx_t *ctx, GtkDrawingArea *draw_area)
 {
-    if (!ctx->spectro) return 0;
-    spectro_state_t *st = ctx->spectro;
+    int idx = spectro_find(ctx, GTK_WIDGET(draw_area));
+    if (idx < 0) return 0;
+    spectro_state_t *st = ctx->spectro_instances[idx].state;
     return st->target_node_id;
 }
 
 gboolean spectrogram_on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     ui_ctx_t *ctx = data;
-    if (!ctx->spectro) {
+    int idx = spectro_find(ctx, widget);
+    if (idx < 0) {
         /* No active capture — draw a dark background with hint text */
         (void)gtk_widget_get_allocated_width(widget);
         int h = gtk_widget_get_allocated_height(widget);
@@ -740,7 +775,7 @@ gboolean spectrogram_on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
         cairo_show_text(cr, "No audio stream");
         return FALSE;
     }
-    return on_spectro_draw(widget, cr, ctx->spectro);
+    return on_spectro_draw(widget, cr, ctx->spectro_instances[idx].state);
 }
 
 #endif /* HAVE_PIPEWIRE */

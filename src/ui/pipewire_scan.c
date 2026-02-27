@@ -913,7 +913,7 @@ static void pw_scan_complete(GObject      *source_object,
     if (t->audio_node_count > 0) {
         /* Only auto-start spectrogram if user has explicitly shown it */
         if (ctx->sb_spectro_user_shown) {
-            uint32_t current_node = spectrogram_get_target_node(ctx);
+            uint32_t current_node = spectrogram_get_target_node(ctx, NULL);
             int found_current = 0;
             for (size_t i = 0; i < t->audio_node_count; i++) {
                 if (t->audio_node_ids[i] == current_node) {
@@ -922,13 +922,14 @@ static void pw_scan_complete(GObject      *source_object,
                 }
             }
             if (!found_current)
-                spectrogram_start_for_node(ctx, t->audio_node_ids[0]);
+                spectrogram_start_for_node(ctx, NULL,
+                                           t->audio_node_ids[0]);
         }
 
         /* Start peak meters for all audio output nodes */
         pw_meter_start(ctx, t->audio_node_ids, t->audio_node_count);
     } else {
-        spectrogram_stop(ctx);
+        spectrogram_stop(ctx, NULL);
         pw_meter_stop(ctx);
     }
 }
@@ -1032,7 +1033,7 @@ void on_pw_row_activated(GtkTreeView *view, GtkTreePath *path,
 
     /* Mark that the user explicitly wants the spectrogram visible */
     ctx->sb_spectro_user_shown = TRUE;
-    spectrogram_start_for_node(ctx, (uint32_t)node_id);
+    spectrogram_start_for_node(ctx, NULL, (uint32_t)node_id);
 }
 
 #endif /* HAVE_PIPEWIRE */

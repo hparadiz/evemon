@@ -84,6 +84,76 @@ void set_process_tree_node(ptree_node_set_t *s, pid_t pinned_pid,
 int  get_process_tree_node(const ptree_node_set_t *s, pid_t pinned_pid,
                            pid_t pid);
 
+/* ── pinned process detail panel ───────────────────────────────── */
+
+/*
+ * Per-pinned-process detail panel.  Each pinned PID gets a complete
+ * clone of the main detail panel: collapsible process-info tray
+ * with all metadata labels, a full plugin notebook (including
+ * headless audio service + milkdrop), and independent data tracking.
+ */
+typedef struct pinned_panel pinned_panel_t;
+struct pinned_panel {
+    pid_t              pid;             /* pinned PID                     */
+
+    /* GTK widget hierarchy */
+    GtkWidget         *outer_frame;     /* top-level container in pinned_box */
+    GtkWidget         *detail_hpaned;   /* horizontal paned: tray | notebook */
+
+    /* Collapsible process info tray (clone of main panel) */
+    GtkWidget         *sidebar_frame;   /* the frame holding sidebar_scroll  */
+    GtkWidget         *proc_info_revealer;
+    GtkWidget         *proc_info_toggle;
+    GtkLabel          *proc_info_summary;
+    gboolean           proc_info_collapsed;
+
+    /* Process info labels (same fields as main ctx->sb_*) */
+    GtkLabel          *sb_pid;
+    GtkLabel          *sb_ppid;
+    GtkLabel          *sb_user;
+    GtkLabel          *sb_name;
+    GtkLabel          *sb_cpu;
+    GtkLabel          *sb_rss;
+    GtkLabel          *sb_group_rss;
+    GtkLabel          *sb_group_cpu;
+    GtkLabel          *sb_io_read;
+    GtkLabel          *sb_io_write;
+    GtkLabel          *sb_net_send;
+    GtkLabel          *sb_net_recv;
+    GtkLabel          *sb_start_time;
+    GtkLabel          *sb_container;
+    GtkLabel          *sb_service;
+    GtkLabel          *sb_cwd;
+    GtkLabel          *sb_cmdline;
+
+    /* Steam/Proton metadata */
+    GtkLabel          *sb_steam_game;
+    GtkLabel          *sb_steam_appid;
+    GtkLabel          *sb_steam_proton;
+    GtkLabel          *sb_steam_runtime;
+    GtkLabel          *sb_steam_compat;
+    GtkLabel          *sb_steam_gamedir;
+    GtkWidget         *sb_steam_frame;
+
+    /* cgroup resource limits */
+    GtkLabel          *sb_cgroup_path;
+    GtkLabel          *sb_cgroup_mem;
+    GtkLabel          *sb_cgroup_mem_high;
+    GtkWidget         *sb_cgroup_mem_high_key;
+    GtkLabel          *sb_cgroup_swap;
+    GtkWidget         *sb_cgroup_swap_key;
+    GtkLabel          *sb_cgroup_cpu;
+    GtkLabel          *sb_cgroup_pids;
+    GtkLabel          *sb_cgroup_io;
+    GtkWidget         *sb_cgroup_io_key;
+    GtkWidget         *sb_cgroup_frame;
+
+    /* Plugin system (independent per panel) */
+    GtkWidget         *notebook;        /* plugin notebook for this PID   */
+    int               *instance_ids;    /* plugin instance IDs we created */
+    size_t             n_instances;     /* count of instance IDs          */
+};
+
 /* ── detail panel dock position ───────────────────────────────── */
 
 typedef enum {
@@ -182,9 +252,15 @@ typedef struct {
     void               *pw_meter;          /* opaque pw_meter_state_t */
     guint               pw_meter_timer;    /* GTK timer for meter updates */
 
-    /* Spectrogram (real-time FFT visualisation of audio stream) */
-    GtkWidget          *spectro_draw;      /* GtkDrawingArea         */
-    void               *spectro;           /* opaque spectro_state_t */
+    /* Spectrogram instances (per-draw-area, no longer a singleton).
+     * Each active spectrogram has its own PW capture stream, FFT state,
+     * and waterfall image.  The array grows as needed. */
+#define SPECTRO_MAX_INSTANCES 16
+    struct {
+        GtkWidget *draw_area;          /* key: GtkDrawingArea*       */
+        void      *state;              /* spectro_state_t*           */
+    } spectro_instances[SPECTRO_MAX_INSTANCES];
+    size_t              spectro_count;
     gboolean            sb_spectro_user_shown; /* user explicitly showed spectrogram */
 #endif
 
@@ -222,6 +298,12 @@ typedef struct {
     size_t              pinned_count;
     size_t              pinned_capacity;
 
+    /* pinned detail panels (one per pinned PID) */
+    pinned_panel_t     *pinned_panels;   /* dynamic array                 */
+    size_t              pinned_panel_count;
+    size_t              pinned_panel_cap;
+    GtkWidget          *pinned_box;      /* GtkBox stacking pinned panels */
+
     /* plugin system */
     void               *plugin_registry; /* plugin_registry_t* (opaque to avoid header dep) */
     GtkWidget          *plugin_notebook; /* GtkNotebook holding plugin tabs */
@@ -229,6 +311,7 @@ typedef struct {
 
     /* detail panel (detachable plugin notebook) */
     GtkWidget          *detail_panel;         /* the frame wrapping the notebook  */
+    GtkWidget          *detail_vbox;          /* vbox: detail_panel + pinned_box  */
     panel_position_t    detail_panel_pos;      /* current dock position            */
     GtkCheckMenuItem   *detail_panel_menu_item;/* View → Detail Panel toggle       */
     GtkWidget          *detail_paned;          /* current GtkPaned holding panel   */
@@ -236,6 +319,12 @@ typedef struct {
     GtkWidget          *content_box;           /* vbox holding menubar+content+status */
     GtkWidget          *hpaned;                /* tree paned (tree | detail panel)  */
     GSList             *panel_pos_group;        /* radio group for position items   */
+
+    /* collapsible process info tray */
+    GtkWidget          *proc_info_revealer;   /* GtkRevealer wrapping sidebar_frame */
+    GtkWidget          *proc_info_toggle;     /* toggle button (▶/◀)               */
+    GtkLabel           *proc_info_summary;    /* compact summary shown when collapsed */
+    gboolean            proc_info_collapsed;  /* TRUE when process info is hidden   */
 } ui_ctx_t;
 
 /* ── PipeWire audio connection scanning & host services ───────── */
@@ -257,13 +346,16 @@ void pipewire_scan_start(ui_ctx_t *ctx, pid_t pid);
 /* peak meter – real-time L/R level monitoring for audio nodes */
 void pw_meter_start(ui_ctx_t *ctx, const uint32_t *node_ids, size_t count);
 void pw_meter_stop(ui_ctx_t *ctx);
+void pw_meter_remove_nodes(ui_ctx_t *ctx, const uint32_t *node_ids,
+                           size_t count);
 void pw_meter_read(ui_ctx_t *ctx, uint32_t node_id, int *level_l, int *level_r);
 GtkCellRenderer *pw_cell_renderer_meter_new(void);
 
 /* spectrogram – real-time audio FFT visualisation */
-void spectrogram_start_for_node(ui_ctx_t *ctx, uint32_t node_id);
-void spectrogram_stop(ui_ctx_t *ctx);
-uint32_t spectrogram_get_target_node(ui_ctx_t *ctx);
+void spectrogram_start_for_node(ui_ctx_t *ctx, GtkDrawingArea *draw_area,
+                                uint32_t node_id);
+void spectrogram_stop(ui_ctx_t *ctx, GtkDrawingArea *draw_area);
+uint32_t spectrogram_get_target_node(ui_ctx_t *ctx, GtkDrawingArea *draw_area);
 gboolean spectrogram_on_draw(GtkWidget *widget, cairo_t *cr, gpointer data);
 
 /* detail panel signal callbacks for PipeWire tree */
@@ -280,18 +372,42 @@ void on_pw_row_activated(GtkTreeView *view, GtkTreePath *path,
 static inline void pipewire_scan_start(void *ctx, pid_t pid)
 { (void)ctx; (void)pid; }
 
-static inline void spectrogram_start_for_node(void *ctx, uint32_t node_id)
-{ (void)ctx; (void)node_id; }
-static inline void spectrogram_stop(void *ctx)
-{ (void)ctx; }
-static inline uint32_t spectrogram_get_target_node(void *ctx)
-{ (void)ctx; return 0; }
+static inline void spectrogram_start_for_node(void *ctx,
+                                              GtkDrawingArea *da,
+                                              uint32_t node_id)
+{ (void)ctx; (void)da; (void)node_id; }
+static inline void spectrogram_stop(void *ctx, GtkDrawingArea *da)
+{ (void)ctx; (void)da; }
+static inline uint32_t spectrogram_get_target_node(void *ctx,
+                                                   GtkDrawingArea *da)
+{ (void)ctx; (void)da; return 0; }
 
 #endif /* HAVE_PIPEWIRE */
 
 /* ── cgroup detail panel scan ────────────────────────────────── */
 
 void cgroup_scan_start(ui_ctx_t *ctx, pid_t pid);
+
+/*
+ * Synchronous cgroup update for pinned panels.
+ * Reads cgroup limits for the given PID and writes results directly
+ * to the provided labels (avoids needing full ui_ctx_t pointer).
+ */
+typedef struct {
+    GtkLabel  *path;
+    GtkLabel  *mem;
+    GtkLabel  *mem_high;
+    GtkWidget *mem_high_key;
+    GtkLabel  *swap;
+    GtkWidget *swap_key;
+    GtkLabel  *cpu;
+    GtkLabel  *pids;
+    GtkLabel  *io;
+    GtkWidget *io_key;
+    GtkWidget *frame;       /* the cgroup section container */
+} cgroup_label_set_t;
+
+void cgroup_update_labels(pid_t pid, const cgroup_label_set_t *ls);
 
 /* ── device labelling ────────────────────────────────────────── */
 
@@ -326,6 +442,11 @@ void     collect_descendant_pids(GtkTreeModel *model, GtkTreeIter *parent,
 /* ── process detail panel ────────────────────────────────────── */
 
 void proc_detail_update(ui_ctx_t *ctx);
+
+/* ── pinned detail panels ────────────────────────────────────── */
+
+/* Update all pinned panels' header labels from tree-model data */
+void pinned_panels_update(ui_ctx_t *ctx);
 
 /* ── cleanup (fix 6) ─────────────────────────────────────────── */
 

@@ -410,3 +410,130 @@ void cgroup_scan_start(ui_ctx_t *ctx, pid_t pid)
     g_task_run_in_thread(task, cgroup_scan_thread_func);
     g_object_unref(task);
 }
+
+/*
+ * Synchronous cgroup update for pinned panels.
+ * Reads limits on the calling thread and writes results directly
+ * to the provided label set.  This is safe because it's called
+ * from the GTK main thread (on_refresh → pinned_panels_update).
+ * cgroup reads are fast (<1 ms) so no async is needed.
+ */
+void cgroup_update_labels(pid_t pid, const cgroup_label_set_t *ls)
+{
+    cgroup_limits_t lim;
+    read_cgroup_limits(pid, &lim);
+
+    if (lim.cgroup_path[0] == '\0' || !lim.has_any_limit) {
+        gtk_widget_hide(ls->frame);
+        return;
+    }
+
+    /* Path */
+    gtk_label_set_text(ls->path, lim.cgroup_path);
+    gtk_widget_set_tooltip_text(GTK_WIDGET(ls->path), lim.cgroup_dir);
+
+    /* Memory */
+    if (lim.mem_max > 0 && lim.mem_current >= 0) {
+        char cur[32], max[32];
+        format_bytes(lim.mem_current, cur, sizeof(cur));
+        format_bytes(lim.mem_max, max, sizeof(max));
+        double pct = (double)lim.mem_current / (double)lim.mem_max * 100.0;
+        char combined[128];
+        snprintf(combined, sizeof(combined), "%s / %s (%.0f%%)", cur, max, pct);
+        gtk_label_set_text(ls->mem, combined);
+    } else if (lim.mem_current >= 0) {
+        char cur[32];
+        format_bytes(lim.mem_current, cur, sizeof(cur));
+        char combined[128];
+        snprintf(combined, sizeof(combined), "%s / unlimited", cur);
+        gtk_label_set_text(ls->mem, combined);
+    } else {
+        gtk_label_set_text(ls->mem, "–");
+    }
+
+    /* Memory high (soft limit) */
+    if (lim.mem_high > 0) {
+        char high[32];
+        format_bytes(lim.mem_high, high, sizeof(high));
+        gtk_label_set_text(ls->mem_high, high);
+        gtk_widget_show(GTK_WIDGET(ls->mem_high));
+        gtk_widget_show(ls->mem_high_key);
+    } else {
+        gtk_widget_hide(GTK_WIDGET(ls->mem_high));
+        gtk_widget_hide(ls->mem_high_key);
+    }
+
+    /* Swap */
+    if (lim.mem_swap_max > 0 && lim.mem_swap_current >= 0) {
+        char cur[32], max[32];
+        format_bytes(lim.mem_swap_current, cur, sizeof(cur));
+        format_bytes(lim.mem_swap_max, max, sizeof(max));
+        double pct = (double)lim.mem_swap_current / (double)lim.mem_swap_max * 100.0;
+        char combined[128];
+        snprintf(combined, sizeof(combined), "%s / %s (%.0f%%)", cur, max, pct);
+        gtk_label_set_text(ls->swap, combined);
+        gtk_widget_show(GTK_WIDGET(ls->swap));
+        gtk_widget_show(ls->swap_key);
+    } else {
+        gtk_widget_hide(GTK_WIDGET(ls->swap));
+        gtk_widget_hide(ls->swap_key);
+    }
+
+    /* CPU */
+    if (lim.cpu_quota > 0 && lim.cpu_period > 0) {
+        double pct = (double)lim.cpu_quota / (double)lim.cpu_period * 100.0;
+        double cores = (double)lim.cpu_quota / (double)lim.cpu_period;
+        char combined[128];
+        if (cores >= 1.0)
+            snprintf(combined, sizeof(combined), "%.0f%% (%.1f cores)", pct, cores);
+        else
+            snprintf(combined, sizeof(combined), "%.0f%%", pct);
+        gtk_label_set_text(ls->cpu, combined);
+    } else {
+        gtk_label_set_text(ls->cpu, "unlimited");
+    }
+
+    /* PIDs */
+    if (lim.pids_max > 0 && lim.pids_current >= 0) {
+        char combined[64];
+        snprintf(combined, sizeof(combined), "%" PRId64 " / %" PRId64,
+                 lim.pids_current, lim.pids_max);
+        gtk_label_set_text(ls->pids, combined);
+    } else if (lim.pids_current >= 0) {
+        char combined[64];
+        snprintf(combined, sizeof(combined), "%" PRId64 " / unlimited",
+                 lim.pids_current);
+        gtk_label_set_text(ls->pids, combined);
+    } else {
+        gtk_label_set_text(ls->pids, "–");
+    }
+
+    /* I/O */
+    if (lim.io_max[0] != '\0') {
+        gtk_label_set_text(ls->io, lim.io_max);
+        gtk_widget_show(GTK_WIDGET(ls->io));
+        gtk_widget_show(ls->io_key);
+    } else {
+        gtk_widget_hide(GTK_WIDGET(ls->io));
+        gtk_widget_hide(ls->io_key);
+    }
+
+    /* Show section */
+    gtk_widget_set_no_show_all(ls->frame, FALSE);
+    gtk_widget_show_all(ls->frame);
+    gtk_widget_set_no_show_all(ls->frame, TRUE);
+
+    /* Re-hide optional rows */
+    if (lim.mem_high <= 0) {
+        gtk_widget_hide(GTK_WIDGET(ls->mem_high));
+        gtk_widget_hide(ls->mem_high_key);
+    }
+    if (!(lim.mem_swap_max > 0 && lim.mem_swap_current >= 0)) {
+        gtk_widget_hide(GTK_WIDGET(ls->swap));
+        gtk_widget_hide(ls->swap_key);
+    }
+    if (lim.io_max[0] == '\0') {
+        gtk_widget_hide(GTK_WIDGET(ls->io));
+        gtk_widget_hide(ls->io_key);
+    }
+}

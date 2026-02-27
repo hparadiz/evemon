@@ -82,6 +82,7 @@ typedef enum {
  */
 typedef struct {
     GdkPixbuf  *pixbuf;               /* loaded art (may be NULL)        */
+    pid_t       source_pid;           /* PID this art belongs to         */
     char        art_url[512];         /* source URL                      */
     char        track_title[256];     /* current track title             */
     char        track_artist[256];    /* current track artist            */
@@ -359,12 +360,25 @@ typedef struct {
     void (*pw_meter_read)(void *host_ctx, uint32_t node_id,
                           int *level_l, int *level_r);
 
+    /*
+     * Remove specific node streams from the shared meter.
+     * Only the streams matching the given node IDs are torn down;
+     * all other streams remain intact.  This allows plugins to
+     * clean up their own audio nodes without nuking streams that
+     * belong to other plugin instances.
+     */
+    void (*pw_meter_remove_nodes)(void *host_ctx,
+                                  const uint32_t *node_ids, size_t count);
+
     /* ── PipeWire spectrogram ─────────────────────────────── */
 
     /*
      * Start real-time FFT spectrogram capture for a PipeWire node.
      * The host creates a passive capture stream, computes FFT, and
      * renders a scrolling waterfall into the provided GtkDrawingArea.
+     *
+     * Each draw_area gets its own independent spectrogram instance.
+     * Multiple plugins can have simultaneous spectrograms.
      *
      * draw_area: the GtkDrawingArea to render the spectrogram into.
      *            The plugin owns this widget; the host just draws.
@@ -376,26 +390,33 @@ typedef struct {
                           uint32_t node_id);
 
     /*
-     * Stop the spectrogram and release the capture stream.
+     * Stop the spectrogram for a specific draw area and release
+     * the capture stream.  Pass the same draw_area used in
+     * spectro_start().
      */
-    void (*spectro_stop)(void *host_ctx);
+    void (*spectro_stop)(void *host_ctx, GtkDrawingArea *draw_area);
 
     /*
-     * Get the currently active spectrogram target node ID.
-     * Returns 0 if no spectrogram is running.
+     * Get the currently active spectrogram target node ID for a
+     * specific draw area.  Returns 0 if no spectrogram is running
+     * for that area.
      */
-    uint32_t (*spectro_get_target)(void *host_ctx);
+    uint32_t (*spectro_get_target)(void *host_ctx,
+                                   GtkDrawingArea *draw_area);
 
     /* ── Event bus ─────────────────────────────────────────── */
 
     /*
      * Subscribe to events of a given type.  The callback is
      * always invoked on the GTK main thread.
+     *
+     * Returns a subscription ID (>0) that can be passed to
+     * unsubscribe(), or 0 on failure.
      */
-    void (*subscribe)(void *host_ctx,
-                      evemon_event_type_t type,
-                      evemon_event_cb cb,
-                      void *user_data);
+    int (*subscribe)(void *host_ctx,
+                     evemon_event_type_t type,
+                     evemon_event_cb cb,
+                     void *user_data);
 
     /*
      * Publish an event.  Thread-safe: if called off the main

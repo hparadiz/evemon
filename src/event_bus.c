@@ -196,13 +196,13 @@ void evemon_event_bus_publish(const evemon_event_t *event)
 
 /* ── Host-side wrappers for evemon_host_services_t ───────────── */
 
-void host_event_subscribe(void *host_ctx,
-                          evemon_event_type_t type,
-                          evemon_event_cb cb,
-                          void *user_data)
+int host_event_subscribe(void *host_ctx,
+                         evemon_event_type_t type,
+                         evemon_event_cb cb,
+                         void *user_data)
 {
     (void)host_ctx;
-    evemon_event_bus_subscribe(type, cb, user_data);
+    return evemon_event_bus_subscribe(type, cb, user_data);
 }
 
 void host_event_publish(void *host_ctx,

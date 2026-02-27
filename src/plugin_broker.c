@@ -1214,19 +1214,16 @@ static void gather_fds(pid_t pid, broker_pid_data_t *d)
 /* ── PipeWire graph snapshot → evemon_pw_* conversion ────────── */
 
 #ifdef HAVE_PIPEWIRE
-static void gather_pipewire(broker_pid_data_t *d)
+static void gather_pipewire(broker_pid_data_t *d, const pw_graph_t *graph)
 {
-    pw_graph_t graph;
-    if (pw_snapshot(&graph) != 0)
-        return;
 
     /* Convert pw_snap_node_t[] → evemon_pw_node_t[] */
-    if (graph.node_count > 0) {
-        d->pw_nodes = calloc(graph.node_count, sizeof(evemon_pw_node_t));
+    if (graph->node_count > 0) {
+        d->pw_nodes = calloc(graph->node_count, sizeof(evemon_pw_node_t));
         if (d->pw_nodes) {
-            d->pw_node_cap = graph.node_count;
-            for (size_t i = 0; i < graph.node_count; i++) {
-                const pw_snap_node_t *s = &graph.nodes[i];
+            d->pw_node_cap = graph->node_count;
+            for (size_t i = 0; i < graph->node_count; i++) {
+                const pw_snap_node_t *s = &graph->nodes[i];
                 evemon_pw_node_t *n = &d->pw_nodes[i];
                 n->id        = s->id;
                 n->client_id = s->client_id;
@@ -1238,17 +1235,17 @@ static void gather_pipewire(broker_pid_data_t *d)
                 memcpy(n->media_name,  s->media_name,  sizeof(n->media_name));
             }
             d->data.pw_nodes = d->pw_nodes;
-            d->data.pw_node_count = graph.node_count;
+            d->data.pw_node_count = graph->node_count;
         }
     }
 
     /* Convert pw_snap_link_t[] → evemon_pw_link_t[] */
-    if (graph.link_count > 0) {
-        d->pw_links = calloc(graph.link_count, sizeof(evemon_pw_link_t));
+    if (graph->link_count > 0) {
+        d->pw_links = calloc(graph->link_count, sizeof(evemon_pw_link_t));
         if (d->pw_links) {
-            d->pw_link_cap = graph.link_count;
-            for (size_t i = 0; i < graph.link_count; i++) {
-                const pw_snap_link_t *s = &graph.links[i];
+            d->pw_link_cap = graph->link_count;
+            for (size_t i = 0; i < graph->link_count; i++) {
+                const pw_snap_link_t *s = &graph->links[i];
                 evemon_pw_link_t *l = &d->pw_links[i];
                 l->output_node = s->output_node_id;
                 l->output_port = s->output_port_id;
@@ -1256,17 +1253,17 @@ static void gather_pipewire(broker_pid_data_t *d)
                 l->input_port  = s->input_port_id;
             }
             d->data.pw_links = d->pw_links;
-            d->data.pw_link_count = graph.link_count;
+            d->data.pw_link_count = graph->link_count;
         }
     }
 
     /* Convert pw_snap_port_t[] → evemon_pw_port_t[] */
-    if (graph.port_count > 0) {
-        d->pw_ports = calloc(graph.port_count, sizeof(evemon_pw_port_t));
+    if (graph->port_count > 0) {
+        d->pw_ports = calloc(graph->port_count, sizeof(evemon_pw_port_t));
         if (d->pw_ports) {
-            d->pw_port_cap = graph.port_count;
-            for (size_t i = 0; i < graph.port_count; i++) {
-                const pw_snap_port_t *s = &graph.ports[i];
+            d->pw_port_cap = graph->port_count;
+            for (size_t i = 0; i < graph->port_count; i++) {
+                const pw_snap_port_t *s = &graph->ports[i];
                 evemon_pw_port_t *p = &d->pw_ports[i];
                 p->id      = s->id;
                 p->node_id = s->node_id;
@@ -1275,11 +1272,9 @@ static void gather_pipewire(broker_pid_data_t *d)
                 memcpy(p->format_dsp,  s->format_dsp,   sizeof(p->format_dsp));
             }
             d->data.pw_ports = d->pw_ports;
-            d->data.pw_port_count = graph.port_count;
+            d->data.pw_port_count = graph->port_count;
         }
     }
-
-    pw_graph_free(&graph);
 }
 #endif /* HAVE_PIPEWIRE */
 
@@ -1292,6 +1287,16 @@ static void broker_thread_func(GTask        *task,
 {
     (void)source_object;
     broker_cycle_t *cycle = task_data;
+
+#ifdef HAVE_PIPEWIRE
+    /* Take one PipeWire graph snapshot for the entire cycle.
+     * The graph is global (not per-PID), so sharing it across all
+     * PIDs avoids N redundant PW connections per cycle. */
+    pw_graph_t pw_graph;
+    int pw_have_graph = 0;
+    if (cycle->needs & evemon_NEED_PIPEWIRE)
+        pw_have_graph = (pw_snapshot(&pw_graph) == 0);
+#endif
 
     for (size_t i = 0; i < cycle->pid_count; i++) {
         if (g_cancellable_is_cancelled(cancellable))
@@ -1332,8 +1337,8 @@ static void broker_thread_func(GTask        *task,
             gather_threads(d->pid, d);
 
 #ifdef HAVE_PIPEWIRE
-        if (needs & evemon_NEED_PIPEWIRE)
-            gather_pipewire(d);
+        if ((needs & evemon_NEED_PIPEWIRE) && pw_have_graph)
+            gather_pipewire(d, &pw_graph);
 #endif
 
         /* MPRIS media metadata (uses GDBus, safe from worker thread) */
@@ -1362,6 +1367,11 @@ static void broker_thread_func(GTask        *task,
         /* Store fdmon context for evemon_net_io_get() */
         d->data.fdmon = cycle->fdmon;
     }
+
+#ifdef HAVE_PIPEWIRE
+    if (pw_have_graph)
+        pw_graph_free(&pw_graph);
+#endif
 
     cycle->result_count = cycle->pid_count;
     g_task_return_boolean(task, TRUE);

@@ -163,6 +163,7 @@ static gboolean meter_tick(gpointer data)
 
     for (size_t i = 0; i < ms->node_count; i++) {
         meter_node_t *mn = &ms->nodes[i];
+        if (!mn->stream) continue;   /* tombstoned slot */
 
         /* Consume the peak (reset to 0 after reading) */
         int raw_l = atomic_exchange_explicit(&mn->peak_l, 0, memory_order_relaxed);
@@ -250,12 +251,23 @@ fail:
  */
 static int meter_add_stream(pw_meter_state_t *ms, uint32_t node_id)
 {
-    if (ms->node_count >= METER_MAX_NODES) return -1;
+    /* Find a free slot: reuse a tombstoned entry first, then append */
+    size_t slot = ms->node_count;   /* default: append */
+    for (size_t i = 0; i < ms->node_count; i++) {
+        if (!ms->nodes[i].stream && ms->nodes[i].node_id == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot >= METER_MAX_NODES) return -1;
 
-    meter_node_t *mn = &ms->nodes[ms->node_count];
+    meter_node_t *mn = &ms->nodes[slot];
+    memset(mn, 0, sizeof(*mn));
     mn->node_id = node_id;
     atomic_store(&mn->peak_l, 0);
     atomic_store(&mn->peak_r, 0);
+    ms->display_l[slot] = 0.0f;
+    ms->display_r[slot] = 0.0f;
 
     char stream_name[64];
     snprintf(stream_name, sizeof(stream_name), "evemon-meter-%u", node_id);
@@ -293,10 +305,12 @@ static int meter_add_stream(pw_meter_state_t *ms, uint32_t node_id)
     if (ret < 0) {
         pw_stream_destroy(mn->stream);
         mn->stream = NULL;
+        mn->node_id = 0;
         return -1;
     }
 
-    ms->node_count++;
+    if (slot >= ms->node_count)
+        ms->node_count = slot + 1;
     return 0;
 }
 
@@ -318,10 +332,11 @@ void pw_meter_start(ui_ctx_t *ctx, const uint32_t *node_ids, size_t count)
     pw_thread_loop_lock(ms->loop);
 
     for (size_t i = 0; i < count; i++) {
-        /* Check if already monitored */
+        /* Check if already monitored (skip tombstoned slots) */
         int found = 0;
         for (size_t j = 0; j < ms->node_count; j++) {
-            if (ms->nodes[j].node_id == node_ids[i]) {
+            if (ms->nodes[j].stream &&
+                ms->nodes[j].node_id == node_ids[i]) {
                 found = 1;
                 break;
             }
@@ -344,12 +359,62 @@ void pw_meter_read(ui_ctx_t *ctx, uint32_t node_id,
     pw_meter_state_t *ms = ctx->pw_meter;
     if (!ms) return;
     for (size_t i = 0; i < ms->node_count; i++) {
-        if (ms->nodes[i].node_id == node_id) {
+        if (ms->nodes[i].stream &&
+            ms->nodes[i].node_id == node_id) {
             *level_l = (int)(ms->display_l[i] * 1000.0f + 0.5f);
             *level_r = (int)(ms->display_r[i] * 1000.0f + 0.5f);
             return;
         }
     }
+}
+
+/*
+ * Remove specific node streams from the shared meter.
+ * Only the streams matching the given node IDs are torn down;
+ * all other streams and the PW thread loop remain intact.
+ *
+ * This allows individual plugin instances to clean up their own
+ * audio nodes without nuking streams that belong to other instances.
+ */
+void pw_meter_remove_nodes(ui_ctx_t *ctx, const uint32_t *node_ids,
+                           size_t count)
+{
+    pw_meter_state_t *ms = ctx->pw_meter;
+    if (!ms || count == 0) return;
+
+    pw_thread_loop_lock(ms->loop);
+
+    for (size_t r = 0; r < count; r++) {
+        for (size_t i = 0; i < ms->node_count; i++) {
+            if (!ms->nodes[i].stream ||
+                ms->nodes[i].node_id != node_ids[r])
+                continue;
+
+            /* Tear down this stream and tombstone the slot.
+             * We must NOT compact by struct-copy because
+             * meter_node_t contains an embedded spa_hook
+             * (PipeWire listener list node).  Moving it
+             * corrupts PipeWire's internal linked list. */
+            pw_stream_disconnect(ms->nodes[i].stream);
+            pw_stream_destroy(ms->nodes[i].stream);
+            ms->nodes[i].stream  = NULL;
+            ms->nodes[i].node_id = 0;
+            ms->display_l[i]     = 0.0f;
+            ms->display_r[i]     = 0.0f;
+            break;  /* each node_id appears at most once */
+        }
+    }
+
+    pw_thread_loop_unlock(ms->loop);
+
+    /* If all streams are gone, tear down the PW connection entirely
+     * to free resources.  This is safe because meter_ensure_running()
+     * will recreate everything on the next pw_meter_start() call. */
+    int any_live = 0;
+    for (size_t i = 0; i < ms->node_count; i++)
+        if (ms->nodes[i].stream) { any_live = 1; break; }
+    if (!any_live)
+        pw_meter_stop(ctx);
 }
 
 /* ── Custom GtkCellRenderer for L/R meter bars ───────────────── */

@@ -399,6 +399,10 @@ static void on_copy_command(GtkMenuItem *item, gpointer data)
 
 /* ── pin / unpin helpers ─────────────────────────────────────── */
 
+/* Forward declarations for pinned detail panel create/destroy */
+static void pinned_panel_create(ui_ctx_t *ctx, pid_t pid);
+static void pinned_panel_destroy(ui_ctx_t *ctx, pid_t pid);
+
 static gboolean pid_is_pinned(const ui_ctx_t *ctx, pid_t pid)
 {
     for (size_t i = 0; i < ctx->pinned_count; i++)
@@ -438,11 +442,600 @@ static void on_toggle_pin(GtkMenuItem *item, gpointer data)
 {
     (void)item;
     pin_toggle_data_t *d = data;
-    if (pid_is_pinned(d->ctx, d->pid))
+    if (pid_is_pinned(d->ctx, d->pid)) {
         unpin_pid(d->ctx, d->pid);
-    else
+        pinned_panel_destroy(d->ctx, d->pid);
+    } else {
         pin_pid(d->ctx, d->pid);
+        pinned_panel_create(d->ctx, d->pid);
+    }
     free(d);
+}
+
+/* ── pinned detail panels: create / destroy ──────────────────── */
+
+/*
+ * Helper: find a pinned_panel_t by PID.
+ * Returns NULL if the panel has been destroyed (e.g. array compacted).
+ */
+static pinned_panel_t *find_pinned_panel_by_pid(ui_ctx_t *ctx, pid_t pid)
+{
+    for (size_t i = 0; i < ctx->pinned_panel_count; i++)
+        if (ctx->pinned_panels[i].pid == pid)
+            return &ctx->pinned_panels[i];
+    return NULL;
+}
+
+/*
+ * Callback data for the tray collapse toggle button.
+ * We store ctx + pid instead of a direct pointer into the
+ * pinned_panels array, because that array can be compacted
+ * when another panel is removed (invalidating raw pointers).
+ */
+typedef struct {
+    ui_ctx_t *ctx;
+    pid_t     pid;
+} pinned_tray_toggle_data_t;
+
+/*
+ * Callback for the tray collapse toggle button inside a pinned panel.
+ */
+static void on_pinned_tray_toggle(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    pinned_tray_toggle_data_t *td = data;
+    pinned_panel_t *pp = find_pinned_panel_by_pid(td->ctx, td->pid);
+    if (!pp) return;  /* panel was already destroyed */
+
+    pp->proc_info_collapsed = !pp->proc_info_collapsed;
+
+    gtk_revealer_set_reveal_child(
+        GTK_REVEALER(pp->proc_info_revealer), !pp->proc_info_collapsed);
+    gtk_button_set_label(GTK_BUTTON(pp->proc_info_toggle),
+                         pp->proc_info_collapsed ? "▶" : "◀");
+    gtk_widget_set_tooltip_text(pp->proc_info_toggle,
+                                pp->proc_info_collapsed
+                                    ? "Show process info"
+                                    : "Hide process info");
+    if (pp->proc_info_collapsed)
+        gtk_widget_show(GTK_WIDGET(pp->proc_info_summary));
+    else
+        gtk_widget_hide(GTK_WIDGET(pp->proc_info_summary));
+}
+
+/*
+ * Callback data for the "Unpin" button inside a pinned panel header.
+ */
+typedef struct {
+    ui_ctx_t *ctx;
+    pid_t     pid;
+} pinned_unpin_data_t;
+
+static void on_pinned_panel_unpin(GtkButton *btn, gpointer data);
+
+/*
+ * Helper macros for building the process info grid inside a pinned
+ * panel.  These are local to pinned_panel_create and write to a
+ * named GtkGrid variable.
+ */
+#define PP_ROW(grid, row, key_str, label_var) do { \
+    GtkWidget *_k = gtk_label_new(key_str); \
+    gtk_label_set_xalign(GTK_LABEL(_k), 0.0f); \
+    gtk_widget_set_halign(_k, GTK_ALIGN_START); \
+    PangoAttrList *_a = pango_attr_list_new(); \
+    pango_attr_list_insert(_a, pango_attr_weight_new(PANGO_WEIGHT_BOLD)); \
+    gtk_label_set_attributes(GTK_LABEL(_k), _a); \
+    pango_attr_list_unref(_a); \
+    GtkWidget *_v = gtk_label_new("–"); \
+    gtk_label_set_xalign(GTK_LABEL(_v), 0.0f); \
+    gtk_label_set_selectable(GTK_LABEL(_v), TRUE); \
+    gtk_label_set_ellipsize(GTK_LABEL(_v), PANGO_ELLIPSIZE_END); \
+    gtk_widget_set_halign(_v, GTK_ALIGN_START); \
+    gtk_widget_set_hexpand(_v, TRUE); \
+    gtk_grid_attach(GTK_GRID(grid), _k, 0, row, 1, 1); \
+    gtk_grid_attach(GTK_GRID(grid), _v, 1, row, 1, 1); \
+    label_var = GTK_LABEL(_v); \
+} while (0)
+
+#define PP_ROW_K(grid, row, key_str, label_var, key_var) do { \
+    GtkWidget *_k = gtk_label_new(key_str); \
+    gtk_label_set_xalign(GTK_LABEL(_k), 0.0f); \
+    gtk_widget_set_halign(_k, GTK_ALIGN_START); \
+    PangoAttrList *_a = pango_attr_list_new(); \
+    pango_attr_list_insert(_a, pango_attr_weight_new(PANGO_WEIGHT_BOLD)); \
+    gtk_label_set_attributes(GTK_LABEL(_k), _a); \
+    pango_attr_list_unref(_a); \
+    GtkWidget *_v = gtk_label_new("–"); \
+    gtk_label_set_xalign(GTK_LABEL(_v), 0.0f); \
+    gtk_label_set_selectable(GTK_LABEL(_v), TRUE); \
+    gtk_label_set_ellipsize(GTK_LABEL(_v), PANGO_ELLIPSIZE_MIDDLE); \
+    gtk_widget_set_halign(_v, GTK_ALIGN_START); \
+    gtk_widget_set_hexpand(_v, TRUE); \
+    gtk_grid_attach(GTK_GRID(grid), _k, 0, row, 1, 1); \
+    gtk_grid_attach(GTK_GRID(grid), _v, 1, row, 1, 1); \
+    label_var = GTK_LABEL(_v); \
+    key_var = _k; \
+} while (0)
+
+/*
+ * Create a new pinned detail panel for the given PID.
+ *
+ * This builds a complete clone of the main detail panel:
+ *   • Collapsible process info tray (all sb_* labels, Steam, cgroup)
+ *   • Full plugin notebook (ALL plugins including headless + milkdrop)
+ *   • Unpin button in the tray header
+ *
+ * The panel is appended to ctx->pinned_box and shown immediately.
+ */
+static void pinned_panel_create(ui_ctx_t *ctx, pid_t pid)
+{
+    plugin_registry_t *preg = ctx->plugin_registry;
+    if (!preg) return;
+
+    /* Grow the pinned_panels array if needed */
+    if (ctx->pinned_panel_count >= ctx->pinned_panel_cap) {
+        size_t newcap = ctx->pinned_panel_cap ? ctx->pinned_panel_cap * 2 : 8;
+        pinned_panel_t *tmp = realloc(ctx->pinned_panels,
+                                      newcap * sizeof(pinned_panel_t));
+        if (!tmp) return;
+        ctx->pinned_panels   = tmp;
+        ctx->pinned_panel_cap = newcap;
+    }
+
+    pinned_panel_t *pp = &ctx->pinned_panels[ctx->pinned_panel_count];
+    memset(pp, 0, sizeof(*pp));
+    pp->pid = pid;
+
+    /* ── Build process info grid (clone of main sidebar) ─────── */
+    GtkWidget *info_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(info_grid), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(info_grid), 8);
+
+    PP_ROW(info_grid, 0,  "PID",          pp->sb_pid);
+    PP_ROW(info_grid, 1,  "PPID",         pp->sb_ppid);
+    PP_ROW(info_grid, 2,  "User",         pp->sb_user);
+    PP_ROW(info_grid, 3,  "Name",         pp->sb_name);
+    PP_ROW(info_grid, 4,  "CPU%",         pp->sb_cpu);
+    PP_ROW(info_grid, 5,  "Memory (RSS)", pp->sb_rss);
+    PP_ROW(info_grid, 6,  "Group Memory", pp->sb_group_rss);
+    PP_ROW(info_grid, 7,  "Group CPU%",   pp->sb_group_cpu);
+    PP_ROW(info_grid, 8,  "Disk Read",    pp->sb_io_read);
+    PP_ROW(info_grid, 9,  "Disk Write",   pp->sb_io_write);
+    PP_ROW(info_grid, 10, "Net Send",     pp->sb_net_send);
+    PP_ROW(info_grid, 11, "Net Recv",     pp->sb_net_recv);
+    PP_ROW(info_grid, 12, "Start Time",   pp->sb_start_time);
+    PP_ROW(info_grid, 13, "Container",    pp->sb_container);
+    PP_ROW(info_grid, 14, "Service",      pp->sb_service);
+    PP_ROW(info_grid, 15, "CWD",          pp->sb_cwd);
+    PP_ROW(info_grid, 16, "Command",      pp->sb_cmdline);
+
+    /* ── Steam / Proton section ──────────────────────────────── */
+    GtkWidget *steam_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(steam_box),
+        gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+    {
+        GtkWidget *sh = gtk_label_new("Steam / Proton");
+        gtk_label_set_xalign(GTK_LABEL(sh), 0.0f);
+        PangoAttrList *a = pango_attr_list_new();
+        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(sh), a);
+        pango_attr_list_unref(a);
+        gtk_box_pack_start(GTK_BOX(steam_box), sh, FALSE, FALSE, 0);
+    }
+    GtkWidget *steam_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(steam_grid), 8);
+    gtk_box_pack_start(GTK_BOX(steam_box), steam_grid, FALSE, FALSE, 0);
+
+    PP_ROW(steam_grid, 0, "Game",           pp->sb_steam_game);
+    PP_ROW(steam_grid, 1, "App ID",         pp->sb_steam_appid);
+    PP_ROW(steam_grid, 2, "Proton",         pp->sb_steam_proton);
+    PP_ROW(steam_grid, 3, "Runtime",        pp->sb_steam_runtime);
+    PP_ROW(steam_grid, 4, "Compat Data",    pp->sb_steam_compat);
+    PP_ROW(steam_grid, 5, "Game Directory", pp->sb_steam_gamedir);
+    gtk_widget_set_no_show_all(steam_box, TRUE);
+    pp->sb_steam_frame = steam_box;
+
+    /* ── cgroup section ──────────────────────────────────────── */
+    GtkWidget *cgroup_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(cgroup_box),
+        gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+    {
+        GtkWidget *ch = gtk_label_new("cgroup Limits");
+        gtk_label_set_xalign(GTK_LABEL(ch), 0.0f);
+        PangoAttrList *a = pango_attr_list_new();
+        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(ch), a);
+        pango_attr_list_unref(a);
+        gtk_box_pack_start(GTK_BOX(cgroup_box), ch, FALSE, FALSE, 0);
+    }
+    GtkWidget *cgroup_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(cgroup_grid), 8);
+    gtk_box_pack_start(GTK_BOX(cgroup_box), cgroup_grid, FALSE, FALSE, 0);
+
+    PP_ROW(cgroup_grid, 0, "Path",   pp->sb_cgroup_path);
+    PP_ROW(cgroup_grid, 1, "Memory", pp->sb_cgroup_mem);
+    PP_ROW_K(cgroup_grid, 2, "Mem High", pp->sb_cgroup_mem_high,
+             pp->sb_cgroup_mem_high_key);
+    PP_ROW_K(cgroup_grid, 3, "Swap", pp->sb_cgroup_swap,
+             pp->sb_cgroup_swap_key);
+    PP_ROW(cgroup_grid, 4, "CPU",    pp->sb_cgroup_cpu);
+    PP_ROW(cgroup_grid, 5, "PIDs",   pp->sb_cgroup_pids);
+    PP_ROW_K(cgroup_grid, 6, "I/O",  pp->sb_cgroup_io, pp->sb_cgroup_io_key);
+    gtk_widget_set_no_show_all(cgroup_box, TRUE);
+    pp->sb_cgroup_frame = cgroup_box;
+
+    /* ── Assemble sidebar content ────────────────────────────── */
+    GtkWidget *info_content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(info_content), info_grid, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(info_content), steam_box, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(info_content), cgroup_box, FALSE, FALSE, 0);
+
+    GtkWidget *sidebar_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_margin_start(sidebar_vbox, 8);
+    gtk_widget_set_margin_end(sidebar_vbox, 8);
+    gtk_widget_set_margin_top(sidebar_vbox, 8);
+    gtk_widget_set_margin_bottom(sidebar_vbox, 8);
+    gtk_box_pack_start(GTK_BOX(sidebar_vbox), info_content, TRUE, TRUE, 0);
+
+    GtkWidget *sidebar_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sidebar_scroll),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(sidebar_scroll, 240, -1);
+    gtk_container_add(GTK_CONTAINER(sidebar_scroll), sidebar_vbox);
+
+    GtkWidget *sidebar_frame = gtk_frame_new(NULL);
+    gtk_container_add(GTK_CONTAINER(sidebar_frame), sidebar_scroll);
+    pp->sidebar_frame = sidebar_frame;
+
+    /* Apply main panel's sidebar CSS for font sizing */
+    if (ctx->sidebar_css)
+        gtk_style_context_add_provider(
+            gtk_widget_get_style_context(sidebar_frame),
+            GTK_STYLE_PROVIDER(ctx->sidebar_css),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    /* ── Collapsible tray (clone of main panel tray) ─────────── */
+    GtkWidget *revealer = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(revealer),
+                                     GTK_REVEALER_TRANSITION_TYPE_SLIDE_LEFT);
+    gtk_revealer_set_transition_duration(GTK_REVEALER(revealer),
+                                         200 /* SECTION_TRANSITION_MS */);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(revealer), TRUE);
+    gtk_widget_set_size_request(sidebar_frame, 280, -1);
+    gtk_container_add(GTK_CONTAINER(revealer), sidebar_frame);
+    pp->proc_info_revealer = revealer;
+
+    /* Toggle button */
+    GtkWidget *toggle_btn = gtk_button_new_with_label("◀");
+    gtk_widget_set_size_request(toggle_btn, 16, -1);
+    gtk_widget_set_tooltip_text(toggle_btn, "Hide process info");
+    pp->proc_info_toggle = toggle_btn;
+    pp->proc_info_collapsed = FALSE;
+
+    /* Compact inline summary (shown when collapsed) */
+    char init_summary[128];
+    snprintf(init_summary, sizeof(init_summary), "📌 PID %d", (int)pid);
+    GtkWidget *summary_w = gtk_label_new(init_summary);
+    gtk_label_set_angle(GTK_LABEL(summary_w), 90);
+    gtk_label_set_ellipsize(GTK_LABEL(summary_w), PANGO_ELLIPSIZE_END);
+    gtk_widget_set_valign(summary_w, GTK_ALIGN_CENTER);
+    gtk_widget_set_no_show_all(summary_w, TRUE);
+    gtk_widget_hide(summary_w);
+    pp->proc_info_summary = GTK_LABEL(summary_w);
+
+    /* Unpin button (at far left of tray) */
+    GtkWidget *unpin_btn = gtk_button_new_with_label("✕");
+    gtk_widget_set_tooltip_text(unpin_btn, "Unpin process");
+    gtk_widget_set_size_request(unpin_btn, 16, -1);
+
+    /* CSS for tray buttons + summary */
+    {
+        GtkCssProvider *tray_css = gtk_css_provider_new();
+        gtk_css_provider_load_from_data(tray_css,
+            "button { padding: 0; min-width: 14px; }"
+            ".proc-info-summary { padding: 2px 0; font-size: 9pt; }",
+            -1, NULL);
+        GtkWidget *widgets[] = { toggle_btn, summary_w, unpin_btn };
+        for (int i = 0; i < 3; i++)
+            gtk_style_context_add_provider(
+                gtk_widget_get_style_context(widgets[i]),
+                GTK_STYLE_PROVIDER(tray_css),
+                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(summary_w), "proc-info-summary");
+        g_object_unref(tray_css);
+    }
+
+    /* Connect tray toggle — pass pp (stable pointer after count++) */
+    /* NOTE: we connect after incrementing pinned_panel_count below
+     * so that pp is stable; but since realloc preserves the data
+     * and we're using the array index, we connect here and it's safe
+     * for this call since we already sized the array above. */
+
+    /* Connect unpin button */
+    pinned_unpin_data_t *ud = g_new(pinned_unpin_data_t, 1);
+    ud->ctx = ctx;
+    ud->pid = pid;
+    g_signal_connect(unpin_btn, "clicked",
+                     G_CALLBACK(on_pinned_panel_unpin), ud);
+    g_object_set_data_full(G_OBJECT(unpin_btn), "ud", ud, g_free);
+
+    /* Tray container: [unpin] [toggle] [summary] [revealer(sidebar)] */
+    GtkWidget *tray_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_pack_start(GTK_BOX(tray_box), unpin_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(tray_box), toggle_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(tray_box), summary_w, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(tray_box), revealer, FALSE, FALSE, 0);
+
+    /* ── Plugin notebook (ALL plugins, including headless + milkdrop) ── */
+    GtkWidget *notebook = gtk_notebook_new();
+    gtk_notebook_set_tab_pos(GTK_NOTEBOOK(notebook), GTK_POS_TOP);
+    gtk_notebook_set_scrollable(GTK_NOTEBOOK(notebook), TRUE);
+
+    /* Preferred tab order (same as main panel) */
+    static const char *tab_order[] = {
+        "org.evemon.pipewire",
+        "org.evemon.net",
+        NULL
+    };
+    static const char *tab_order_last[] = {
+        "org.evemon.milkdrop",
+        NULL
+    };
+    static const struct { const char *id; const char *label; }
+    pp_tab_overrides[] = {
+        { "org.evemon.net", "Network" },
+        { NULL, NULL }
+    };
+
+    size_t max_ids = preg->count + 16;
+    int *inst_ids = calloc(max_ids, sizeof(int));
+    size_t n_inst = 0;
+
+    /* Collect unique plugin IDs from the existing registry */
+    const char **seen_ids = calloc(max_ids, sizeof(const char *));
+    size_t n_seen = 0;
+
+    /* Helper: check if a plugin ID was already cloned */
+    #define PP_SEEN(id) ({ \
+        gboolean _f = FALSE; \
+        for (size_t _s = 0; _s < n_seen; _s++) \
+            if (strcmp(seen_ids[_s], (id)) == 0) { _f = TRUE; break; } \
+        _f; })
+
+    /* Helper: find override label */
+    #define PP_LABEL(inst) ({ \
+        const char *_l = ((inst)->plugin && (inst)->plugin->name) \
+                       ? (inst)->plugin->name : "Plugin"; \
+        if ((inst)->plugin && (inst)->plugin->id) { \
+            for (int _k = 0; pp_tab_overrides[_k].id; _k++) \
+                if (strcmp((inst)->plugin->id, pp_tab_overrides[_k].id) == 0) \
+                    { _l = pp_tab_overrides[_k].label; break; } \
+        } _l; })
+
+    /* Helper: check if plugin is in last-order list */
+    #define PP_IS_LAST(plugin) ({ \
+        gboolean _r = FALSE; \
+        if ((plugin) && (plugin)->id) { \
+            for (int _o = 0; tab_order_last[_o]; _o++) \
+                if (strcmp((plugin)->id, tab_order_last[_o]) == 0) \
+                    { _r = TRUE; break; } \
+        } _r; })
+
+    const size_t orig_count = preg->count;
+    gboolean *pass_added = g_new0(gboolean, orig_count);
+
+    /* Pass 1: preferred order */
+    for (int o = 0; tab_order[o]; o++) {
+        for (size_t i = 0; i < orig_count; i++) {
+            plugin_instance_t *orig = &preg->instances[i];
+            if (!orig->plugin || !orig->plugin->id) continue;
+            if (orig->plugin->kind == EVEMON_PLUGIN_HEADLESS) continue;
+            if (!orig->widget) continue;
+            if (strcmp(orig->plugin->id, tab_order[o]) != 0) continue;
+            if (PP_SEEN(orig->plugin->id)) continue;
+            seen_ids[n_seen++] = orig->plugin->id;
+
+            int new_id = plugin_instance_create(preg, orig->plugin->id);
+            if (new_id < 0) continue;
+            int idx = plugin_registry_find_by_id(preg, new_id);
+            if (idx < 0) continue;
+            plugin_instance_t *ni = &preg->instances[idx];
+            plugin_instance_set_pid(ni, pid, TRUE);
+            if (ni->widget) {
+                gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+                    ni->widget, gtk_label_new(PP_LABEL(ni)));
+            }
+            inst_ids[n_inst++] = new_id;
+            pass_added[i] = TRUE;
+        }
+    }
+
+    /* Pass 2: remaining (skip last-order) */
+    for (size_t i = 0; i < orig_count; i++) {
+        if (pass_added[i]) continue;
+        plugin_instance_t *orig = &preg->instances[i];
+        if (!orig->plugin || !orig->plugin->id) continue;
+        if (orig->plugin->kind == EVEMON_PLUGIN_HEADLESS) {
+            /* Clone headless plugins too (e.g. audio_service) */
+            if (PP_SEEN(orig->plugin->id)) continue;
+            seen_ids[n_seen++] = orig->plugin->id;
+            int new_id = plugin_instance_create(preg, orig->plugin->id);
+            if (new_id < 0) continue;
+            int idx = plugin_registry_find_by_id(preg, new_id);
+            if (idx < 0) continue;
+            plugin_instance_set_pid(&preg->instances[idx], pid, TRUE);
+            inst_ids[n_inst++] = new_id;
+            pass_added[i] = TRUE;
+            continue;
+        }
+        if (!orig->widget) continue;
+        if (PP_IS_LAST(orig->plugin)) continue;
+        if (PP_SEEN(orig->plugin->id)) continue;
+        seen_ids[n_seen++] = orig->plugin->id;
+
+        int new_id = plugin_instance_create(preg, orig->plugin->id);
+        if (new_id < 0) continue;
+        int idx = plugin_registry_find_by_id(preg, new_id);
+        if (idx < 0) continue;
+        plugin_instance_t *ni = &preg->instances[idx];
+        plugin_instance_set_pid(ni, pid, TRUE);
+        if (ni->widget) {
+            gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+                ni->widget, gtk_label_new(PP_LABEL(ni)));
+        }
+        inst_ids[n_inst++] = new_id;
+        pass_added[i] = TRUE;
+    }
+
+    /* Pass 3: last-order plugins (milkdrop etc.) — hidden by default */
+    for (int o = 0; tab_order_last[o]; o++) {
+        for (size_t i = 0; i < orig_count; i++) {
+            if (pass_added[i]) continue;
+            plugin_instance_t *orig = &preg->instances[i];
+            if (!orig->plugin || !orig->plugin->id) continue;
+            if (orig->plugin->kind == EVEMON_PLUGIN_HEADLESS) continue;
+            if (strcmp(orig->plugin->id, tab_order_last[o]) != 0) continue;
+            if (PP_SEEN(orig->plugin->id)) continue;
+            seen_ids[n_seen++] = orig->plugin->id;
+
+            int new_id = plugin_instance_create(preg, orig->plugin->id);
+            if (new_id < 0) continue;
+            int idx = plugin_registry_find_by_id(preg, new_id);
+            if (idx < 0) continue;
+            plugin_instance_t *ni = &preg->instances[idx];
+            plugin_instance_set_pid(ni, pid, TRUE);
+            if (ni->widget) {
+                gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+                    ni->widget, gtk_label_new(PP_LABEL(ni)));
+                /* Hidden by default — plugin auto-shows when active */
+                gtk_widget_set_no_show_all(ni->widget, TRUE);
+                gtk_widget_hide(ni->widget);
+                GtkWidget *tab_lbl = gtk_notebook_get_tab_label(
+                    GTK_NOTEBOOK(notebook), ni->widget);
+                if (tab_lbl) {
+                    gtk_widget_set_no_show_all(tab_lbl, TRUE);
+                    gtk_widget_hide(tab_lbl);
+                }
+            }
+            inst_ids[n_inst++] = new_id;
+            pass_added[i] = TRUE;
+        }
+    }
+
+    g_free(pass_added);
+    free(seen_ids);
+    #undef PP_SEEN
+    #undef PP_LABEL
+    #undef PP_IS_LAST
+
+    pp->instance_ids = inst_ids;
+    pp->n_instances  = n_inst;
+    pp->notebook     = notebook;
+
+    /* Apply plugin CSS class for font sizing */
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(notebook), "evemon-plugins");
+
+    /* ── Assemble: detail_hpaned (tray | notebook) inside a frame ── */
+    GtkWidget *hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_paned_pack1(GTK_PANED(hpaned), tray_box, FALSE, FALSE);
+    gtk_paned_pack2(GTK_PANED(hpaned), notebook, TRUE, FALSE);
+    pp->detail_hpaned = hpaned;
+
+    GtkWidget *outer = gtk_frame_new(NULL);
+    gtk_widget_set_size_request(outer, -1, 200);
+    gtk_container_add(GTK_CONTAINER(outer), hpaned);
+    pp->outer_frame = outer;
+
+    /* Pack into pinned_box and show */
+    gtk_box_pack_start(GTK_BOX(ctx->pinned_box), outer, TRUE, TRUE, 0);
+
+    ctx->pinned_panel_count++;
+
+    /* Connect tray toggle using ctx + pid (looked up at callback time)
+     * instead of a direct pointer into the pinned_panels array,
+     * which can be invalidated by array compaction when other
+     * panels are removed. */
+    {
+        pinned_tray_toggle_data_t *td = g_new(pinned_tray_toggle_data_t, 1);
+        td->ctx = ctx;
+        td->pid = pid;
+        g_signal_connect(toggle_btn, "clicked",
+                         G_CALLBACK(on_pinned_tray_toggle), td);
+        g_object_set_data_full(G_OBJECT(toggle_btn), "td", td, g_free);
+    }
+
+    gtk_widget_show_all(outer);
+    /* Restore summary hidden state after show_all */
+    gtk_widget_hide(summary_w);
+
+    /* Kick the broker so the new instances get data immediately */
+    broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
+}
+
+#undef PP_ROW
+#undef PP_ROW_K
+
+/*
+ * Destroy the pinned panel for the given PID.
+ * Removes all its plugin instances from the registry,
+ * destroys the GTK widgets, and compacts the array.
+ */
+static void pinned_panel_destroy(ui_ctx_t *ctx, pid_t pid)
+{
+    plugin_registry_t *preg = ctx->plugin_registry;
+
+    for (size_t i = 0; i < ctx->pinned_panel_count; i++) {
+        pinned_panel_t *pp = &ctx->pinned_panels[i];
+        if (pp->pid != pid) continue;
+
+        /* Destroy plugin instances */
+        if (preg) {
+            for (size_t j = 0; j < pp->n_instances; j++)
+                plugin_instance_destroy(preg, pp->instance_ids[j]);
+        }
+        free(pp->instance_ids);
+
+        /* Destroy the GTK widget tree */
+        if (pp->outer_frame)
+            gtk_widget_destroy(pp->outer_frame);
+
+        /* Compact the array */
+        for (size_t k = i; k + 1 < ctx->pinned_panel_count; k++)
+            ctx->pinned_panels[k] = ctx->pinned_panels[k + 1];
+        ctx->pinned_panel_count--;
+        return;
+    }
+}
+
+/* Unpin button callback inside a pinned panel header.
+ * We must defer the actual destroy to an idle callback because
+ * the unpin button is a *child* of the widget tree that
+ * pinned_panel_destroy() will destroy.  Destroying a widget
+ * while its "clicked" signal is still being emitted causes
+ * GTK to access freed memory when it unwinds the emission
+ * chain → segfault.
+ */
+static gboolean pinned_panel_unpin_idle(gpointer data)
+{
+    pinned_unpin_data_t *ud = data;
+    unpin_pid(ud->ctx, ud->pid);
+    pinned_panel_destroy(ud->ctx, ud->pid);
+    g_free(ud);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_pinned_panel_unpin(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    pinned_unpin_data_t *ud = data;
+    /* Schedule the destroy on the next idle iteration so the
+     * button signal emission can finish safely. */
+    pinned_unpin_data_t *copy = g_new(pinned_unpin_data_t, 1);
+    copy->ctx = ud->ctx;
+    copy->pid = ud->pid;
+    g_idle_add(pinned_panel_unpin_idle, copy);
 }
 
 static void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
@@ -832,10 +1425,55 @@ static void on_toggle_detail_panel(GtkCheckMenuItem *item, gpointer data)
 {
     ui_ctx_t *ctx = data;
     if (gtk_check_menu_item_get_active(item)) {
-        gtk_widget_show_all(ctx->detail_panel);
+        gtk_widget_show_all(ctx->detail_vbox);
+
+        /* Only show the main (unpinned) detail panel if a process
+         * is actually selected in the tree view.  Pinned panels
+         * remain visible regardless. */
+        GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
+        GList *rows = sel ? gtk_tree_selection_get_selected_rows(sel, NULL) : NULL;
+        if (!rows) {
+            gtk_widget_hide(ctx->detail_panel);
+        } else {
+            g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+            /* Restore proc info tray state after show_all */
+            if (ctx->proc_info_collapsed) {
+                gtk_revealer_set_reveal_child(
+                    GTK_REVEALER(ctx->proc_info_revealer), FALSE);
+                gtk_widget_show(GTK_WIDGET(ctx->proc_info_summary));
+            } else {
+                gtk_widget_hide(GTK_WIDGET(ctx->proc_info_summary));
+            }
+        }
     } else {
-        gtk_widget_hide(ctx->detail_panel);
+        gtk_widget_hide(ctx->detail_vbox);
     }
+}
+
+/* ── process info tray: collapse / expand ────────────────────── */
+
+static void on_proc_info_tray_toggle(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    ui_ctx_t *ctx = data;
+    ctx->proc_info_collapsed = !ctx->proc_info_collapsed;
+
+    gtk_revealer_set_reveal_child(
+        GTK_REVEALER(ctx->proc_info_revealer), !ctx->proc_info_collapsed);
+
+    /* Arrow: ◀ means "collapse left", ▶ means "expand right" */
+    gtk_button_set_label(GTK_BUTTON(ctx->proc_info_toggle),
+                         ctx->proc_info_collapsed ? "▶" : "◀");
+    gtk_widget_set_tooltip_text(ctx->proc_info_toggle,
+                                ctx->proc_info_collapsed
+                                    ? "Show process info"
+                                    : "Hide process info");
+
+    /* Show/hide the compact inline summary */
+    if (ctx->proc_info_collapsed)
+        gtk_widget_show(GTK_WIDGET(ctx->proc_info_summary));
+    else
+        gtk_widget_hide(GTK_WIDGET(ctx->proc_info_summary));
 }
 
 /* ── detail panel: change dock position ──────────────────────── */
@@ -872,18 +1510,18 @@ static void on_panel_position_changed(GtkCheckMenuItem *item, gpointer data)
  */
 static void detail_panel_relayout(ui_ctx_t *ctx)
 {
-    gboolean was_visible = gtk_widget_get_visible(ctx->detail_panel);
+    gboolean was_visible = gtk_widget_get_visible(ctx->detail_vbox);
 
-    /* Remove detail_panel and hpaned from their current parent.
+    /* Remove detail_vbox and hpaned from their current parent.
      * g_object_ref ensures they survive the container removal. */
-    g_object_ref(ctx->detail_panel);
+    g_object_ref(ctx->detail_vbox);
     g_object_ref(ctx->hpaned);
 
     GtkWidget *old_paned = ctx->detail_paned;
     if (old_paned) {
         /* The old paned is child [1] of content_box */
         gtk_container_remove(GTK_CONTAINER(old_paned), ctx->hpaned);
-        gtk_container_remove(GTK_CONTAINER(old_paned), ctx->detail_panel);
+        gtk_container_remove(GTK_CONTAINER(old_paned), ctx->detail_vbox);
         gtk_container_remove(GTK_CONTAINER(ctx->content_box), old_paned);
     }
 
@@ -917,11 +1555,11 @@ static void detail_panel_relayout(ui_ctx_t *ctx)
     GtkWidget *new_paned = gtk_paned_new(orient);
 
     if (panel_is_child1) {
-        gtk_paned_pack1(GTK_PANED(new_paned), ctx->detail_panel, FALSE, FALSE);
+        gtk_paned_pack1(GTK_PANED(new_paned), ctx->detail_vbox, FALSE, FALSE);
         gtk_paned_pack2(GTK_PANED(new_paned), ctx->hpaned, TRUE, FALSE);
     } else {
         gtk_paned_pack1(GTK_PANED(new_paned), ctx->hpaned, TRUE, FALSE);
-        gtk_paned_pack2(GTK_PANED(new_paned), ctx->detail_panel, FALSE, FALSE);
+        gtk_paned_pack2(GTK_PANED(new_paned), ctx->detail_vbox, FALSE, FALSE);
     }
 
     /* Set a reasonable default position for the divider */
@@ -949,7 +1587,7 @@ static void detail_panel_relayout(ui_ctx_t *ctx)
 
     ctx->detail_paned = new_paned;
 
-    g_object_unref(ctx->detail_panel);
+    g_object_unref(ctx->detail_vbox);
     g_object_unref(ctx->hpaned);
 
     /* Insert the new paned into content_box at position [1]
@@ -960,8 +1598,27 @@ static void detail_panel_relayout(ui_ctx_t *ctx)
 
     gtk_widget_show_all(new_paned);
 
+    /* Hide the main (unpinned) detail panel if nothing is selected */
+    {
+        GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
+        GList *rows = sel ? gtk_tree_selection_get_selected_rows(sel, NULL) : NULL;
+        if (!rows) {
+            gtk_widget_hide(ctx->detail_panel);
+        } else {
+            g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+            /* Restore proc info tray state after show_all */
+            if (ctx->proc_info_collapsed) {
+                gtk_revealer_set_reveal_child(
+                    GTK_REVEALER(ctx->proc_info_revealer), FALSE);
+                gtk_widget_show(GTK_WIDGET(ctx->proc_info_summary));
+            } else {
+                gtk_widget_hide(GTK_WIDGET(ctx->proc_info_summary));
+            }
+        }
+    }
+
     if (!was_visible)
-        gtk_widget_hide(ctx->detail_panel);
+        gtk_widget_hide(ctx->detail_vbox);
 }
 
 
@@ -1284,6 +1941,9 @@ static gboolean on_refresh(gpointer data)
     /* Update the process detail panel for the selected process */
     proc_detail_update(ctx);
 
+    /* Update pinned detail panels' header labels */
+    pinned_panels_update(ctx);
+
     /* ── Plugin broker dispatch ──────────────────────────────── */
     /* After the detail panel updates, kick off the plugin data broker.
      * Non-pinned instances follow the tree selection. */
@@ -1325,9 +1985,12 @@ static gboolean on_refresh(gpointer data)
                     plugin_instance_set_pid(inst, sel_pid, FALSE);
             }
 
-            /* If nothing is selected, clear all plugins */
+            /* If nothing is selected, clear all plugins and
+             * hide the main (unpinned) detail panel. */
             if (sel_pid <= 0) {
                 plugin_dispatch_clear_all(preg);
+                if (gtk_widget_get_visible(ctx->detail_panel))
+                    gtk_widget_hide(ctx->detail_panel);
             } else {
                 /* Start the broker gather (cancels any in-flight cycle) */
                 broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
@@ -2594,6 +3257,12 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev,
             gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
             return TRUE;
         }
+        /* Escape while tree view has focus → deselect the current row */
+        if (focus == GTK_WIDGET(ctx->view)) {
+            GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
+            gtk_tree_selection_unselect_all(sel);
+            return TRUE;
+        }
     }
 
     /* Left / Right arrow → collapse / expand selected row in tree view */
@@ -3146,25 +3815,32 @@ static void host_pw_meter_read(void *host_ctx, uint32_t node_id,
     pw_meter_read(c, node_id, level_l, level_r);
 }
 
+static void host_pw_meter_remove_nodes(void *host_ctx,
+                                       const uint32_t *node_ids,
+                                       size_t count)
+{
+    ui_ctx_t *c = host_ctx;
+    pw_meter_remove_nodes(c, node_ids, count);
+}
+
 static void host_spectro_start(void *host_ctx, GtkDrawingArea *draw_area,
                                uint32_t node_id)
 {
     ui_ctx_t *c = host_ctx;
-    /* Point the host's spectrogram draw widget at the plugin's area */
-    c->spectro_draw = GTK_WIDGET(draw_area);
-    spectrogram_start_for_node(c, node_id);
+    spectrogram_start_for_node(c, draw_area, node_id);
 }
 
-static void host_spectro_stop(void *host_ctx)
+static void host_spectro_stop(void *host_ctx, GtkDrawingArea *draw_area)
 {
     ui_ctx_t *c = host_ctx;
-    spectrogram_stop(c);
+    spectrogram_stop(c, draw_area);
 }
 
-static uint32_t host_spectro_get_target(void *host_ctx)
+static uint32_t host_spectro_get_target(void *host_ctx,
+                                        GtkDrawingArea *draw_area)
 {
     ui_ctx_t *c = host_ctx;
-    return spectrogram_get_target_node(c);
+    return spectrogram_get_target_node(c, draw_area);
 }
 #endif /* HAVE_PIPEWIRE */
 
@@ -3981,25 +4657,83 @@ void *ui_thread(void *arg)
 
     /* ── detail panel (wraps process info + plugin notebook) ──── */
     /* The detail panel contains a horizontal paned:
-     *   pack1 = sidebar_frame  (Process Info / Steam / cgroup)
+     *   pack1 = collapsible tray (toggle button + revealer(sidebar_frame))
      *   pack2 = plugin notebook (tabs for FD, Env, Mmap, Libs, Net, …)
-     * Opening the detail panel reveals both process info and plugin tabs. */
+     * The process info pane can be collapsed via the toggle button,
+     * giving full width to the plugin notebook. */
     GtkWidget *detail_panel = gtk_frame_new(NULL);
     gtk_widget_set_size_request(detail_panel, -1, 200);
 
-    /* Inner horizontal paned: process info | notebook */
-    GtkWidget *detail_hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    /* Wrap sidebar_frame in a GtkRevealer for slide animation */
+    GtkWidget *proc_info_revealer = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(proc_info_revealer),
+                                     GTK_REVEALER_TRANSITION_TYPE_SLIDE_LEFT);
+    gtk_revealer_set_transition_duration(GTK_REVEALER(proc_info_revealer),
+                                         SECTION_TRANSITION_MS);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(proc_info_revealer), TRUE);
     gtk_widget_set_size_request(sidebar_frame, 280, -1);
-    gtk_paned_pack1(GTK_PANED(detail_hpaned), sidebar_frame, FALSE, FALSE);
+    gtk_container_add(GTK_CONTAINER(proc_info_revealer), sidebar_frame);
+
+    /* Toggle button: thin handle on the LEFT to collapse/expand */
+    GtkWidget *proc_info_toggle = gtk_button_new_with_label("◀");
+    gtk_widget_set_size_request(proc_info_toggle, 16, -1);
+    gtk_widget_set_tooltip_text(proc_info_toggle, "Hide process info");
+
+    /* Compact inline summary label (vertical text, shown when collapsed) */
+    GtkWidget *proc_info_summary_w = gtk_label_new("–");
+    gtk_label_set_angle(GTK_LABEL(proc_info_summary_w), 90);
+    gtk_label_set_ellipsize(GTK_LABEL(proc_info_summary_w), PANGO_ELLIPSIZE_END);
+    gtk_widget_set_valign(proc_info_summary_w, GTK_ALIGN_CENTER);
+    gtk_widget_set_no_show_all(proc_info_summary_w, TRUE);
+    gtk_widget_hide(proc_info_summary_w);  /* hidden until collapsed */
+
+    {
+        /* Minimal padding for toggle button + summary label */
+        GtkCssProvider *tray_css = gtk_css_provider_new();
+        gtk_css_provider_load_from_data(tray_css,
+            "button { padding: 0; min-width: 14px; }"
+            ".proc-info-summary { padding: 2px 0; font-size: 9pt; }",
+            -1, NULL);
+        gtk_style_context_add_provider(
+            gtk_widget_get_style_context(proc_info_toggle),
+            GTK_STYLE_PROVIDER(tray_css),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        gtk_style_context_add_provider(
+            gtk_widget_get_style_context(proc_info_summary_w),
+            GTK_STYLE_PROVIDER(tray_css),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(proc_info_summary_w),
+            "proc-info-summary");
+        g_object_unref(tray_css);
+    }
+
+    /* Tray container: [toggle] [summary] [revealer(sidebar_frame)] */
+    GtkWidget *tray_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_pack_start(GTK_BOX(tray_box), proc_info_toggle, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(tray_box), proc_info_summary_w, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(tray_box), proc_info_revealer, FALSE, FALSE, 0);
+
+    /* Inner horizontal paned: tray (process info) | notebook */
+    GtkWidget *detail_hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_paned_pack1(GTK_PANED(detail_hpaned), tray_box, FALSE, FALSE);
     /* The notebook will be added to pack2 after plugin loading below. */
     gtk_container_add(GTK_CONTAINER(detail_panel), detail_hpaned);
 
+    /* Box to hold pinned-process detail panels (stacked vertically) */
+    GtkWidget *pinned_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    /* Wrapper: detail_panel on top, pinned panels below, scrollable */
+    GtkWidget *detail_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(detail_vbox), detail_panel, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(detail_vbox), pinned_box, FALSE, FALSE, 0);
+
     /* ── layout ──────────────────────────────────────────────── */
     /* Default: detail panel docked at bottom.
-     * outer_paned (vertical): pack1 = hpaned, pack2 = detail_panel */
+     * outer_paned (vertical): pack1 = hpaned, pack2 = detail_vbox */
     GtkWidget *outer_paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
     gtk_paned_pack1(GTK_PANED(outer_paned), hpaned, TRUE, FALSE);
-    gtk_paned_pack2(GTK_PANED(outer_paned), detail_panel, FALSE, FALSE);
+    gtk_paned_pack2(GTK_PANED(outer_paned), detail_vbox, FALSE, FALSE);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_pack_start(GTK_BOX(vbox), menubar, FALSE, FALSE, 0);
@@ -4092,14 +4826,20 @@ void *ui_thread(void *arg)
     /* Meter and spectrogram state are still used by host services */
     ctx.pw_meter       = NULL;
     ctx.pw_meter_timer = 0;
-    ctx.spectro_draw   = NULL;
-    ctx.spectro        = NULL;
+    ctx.spectro_count  = 0;
+    memset(ctx.spectro_instances, 0, sizeof(ctx.spectro_instances));
 #endif
 
     /* Pinned processes */
     ctx.pinned_pids     = NULL;
     ctx.pinned_count    = 0;
     ctx.pinned_capacity = 0;
+
+    /* Pinned detail panels */
+    ctx.pinned_panels      = NULL;
+    ctx.pinned_panel_count = 0;
+    ctx.pinned_panel_cap   = 0;
+    ctx.pinned_box         = pinned_box;
 
     /* ── Plugin system ───────────────────────────────────────── */
     {
@@ -4119,6 +4859,7 @@ void *ui_thread(void *arg)
                 hsvc->pw_meter_start    = host_pw_meter_start;
                 hsvc->pw_meter_stop     = host_pw_meter_stop;
                 hsvc->pw_meter_read     = host_pw_meter_read;
+                hsvc->pw_meter_remove_nodes = host_pw_meter_remove_nodes;
                 hsvc->spectro_start     = host_spectro_start;
                 hsvc->spectro_stop      = host_spectro_stop;
                 hsvc->spectro_get_target = host_spectro_get_target;
@@ -4328,12 +5069,22 @@ void *ui_thread(void *arg)
 
     /* ── Finish detail panel setup: put notebook into the hpaned ── */
     ctx.detail_panel          = detail_panel;
+    ctx.detail_vbox           = detail_vbox;
     ctx.detail_panel_pos      = PANEL_POS_BOTTOM;
     ctx.detail_panel_menu_item = GTK_CHECK_MENU_ITEM(detail_panel_toggle);
     ctx.detail_paned          = outer_paned;
     ctx.content_box           = vbox;
     ctx.hpaned                = hpaned;
     ctx.panel_pos_group       = pos_group;
+
+    /* Collapsible process info tray */
+    ctx.proc_info_revealer  = proc_info_revealer;
+    ctx.proc_info_toggle    = proc_info_toggle;
+    ctx.proc_info_summary   = GTK_LABEL(proc_info_summary_w);
+    ctx.proc_info_collapsed = FALSE;
+
+    g_signal_connect(proc_info_toggle, "clicked",
+                     G_CALLBACK(on_proc_info_tray_toggle), &ctx);
 
     if (ctx.plugin_notebook) {
         gtk_paned_pack2(GTK_PANED(detail_hpaned), ctx.plugin_notebook,
@@ -4433,9 +5184,9 @@ void *ui_thread(void *arg)
     /* ── show & run ──────────────────────────────────────────── */
     gtk_widget_show_all(window);
     gtk_widget_hide(menubar);        /* hidden by default; toggle via status-bar right-click */
-    /* sidebar_frame is now embedded inside detail_panel, so it becomes
-     * visible/hidden together with the detail panel. */
-    gtk_widget_hide(detail_panel);   /* hidden by default; toggle via View → Detail Panel */
+    /* Process info is inside detail_panel via the collapsible tray,
+     * so it becomes visible/hidden together with the detail panel. */
+    gtk_widget_hide(detail_vbox);    /* hidden by default; toggle via View → Detail Panel */
     gtk_main();
 
     ui_ctx_destroy(&ctx);
@@ -4457,9 +5208,13 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     }
 
 #ifdef HAVE_PIPEWIRE
-    /* Stop the spectrogram capture and peak meters
-     * (may have been started by the PipeWire plugin via host services) */
-    spectrogram_stop(ctx);
+    /* Stop all spectrogram instances and peak meters
+     * (may have been started by PipeWire plugins via host services) */
+    while (ctx->spectro_count > 0) {
+        GtkDrawingArea *da = GTK_DRAWING_AREA(
+            ctx->spectro_instances[0].draw_area);
+        spectrogram_stop(ctx, da);
+    }
     pw_meter_stop(ctx);
 #endif
 
@@ -4490,6 +5245,14 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     ctx->pinned_pids     = NULL;
     ctx->pinned_count    = 0;
     ctx->pinned_capacity = 0;
+
+    /* Free pinned detail panels (plugin instances freed by registry_destroy) */
+    for (size_t i = 0; i < ctx->pinned_panel_count; i++)
+        free(ctx->pinned_panels[i].instance_ids);
+    free(ctx->pinned_panels);
+    ctx->pinned_panels      = NULL;
+    ctx->pinned_panel_count = 0;
+    ctx->pinned_panel_cap   = 0;
 
     /* Clean up plugin system */
     evemon_event_bus_destroy();

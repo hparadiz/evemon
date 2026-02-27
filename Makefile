@@ -1,3 +1,5 @@
+MAKEFLAGS += -j$(shell nproc)
+
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 LIBDIR = $(PREFIX)/lib/evemon
@@ -71,8 +73,7 @@ BPF_OBJ := $(BUILD_DIR)/fdmon_ebpf_kern.o
 
 TARGET := $(BUILD_DIR)/evemon
 
-.PHONY: all clean run
-.PHONY: all clean run install uninstall
+.PHONY: all clean run debug gdb install uninstall
 
 all: $(TARGET) $(BPF_OBJ) plugins
 
@@ -146,6 +147,25 @@ clean:
 
 run: $(TARGET) $(BPF_OBJ) plugins
 	./$(TARGET)
+
+# ── Debug build ───────────────────────────────────────────────────
+# Usage:  make debug        — build with debug symbols
+#         make gdb          — build debug + launch under gdb
+#         sudo make gdb     — same, as root (needed for eBPF / procfs)
+
+DEBUG_CFLAGS  := $(subst -O2,-Og -g3,$(CFLAGS))
+DEBUG_CFLAGS  := $(filter-out -D_FORTIFY_SOURCE=2,$(DEBUG_CFLAGS))
+DEBUG_LDFLAGS := $(LDFLAGS)
+DEBUG_PLUGIN_CFLAGS := $(subst -O2,-Og -g3,$(PLUGIN_CFLAGS))
+DEBUG_PLUGIN_CFLAGS := $(filter-out -D_FORTIFY_SOURCE=2,$(DEBUG_PLUGIN_CFLAGS))
+
+debug: CFLAGS  := $(DEBUG_CFLAGS)
+debug: LDFLAGS := $(DEBUG_LDFLAGS)
+debug: PLUGIN_CFLAGS := $(DEBUG_PLUGIN_CFLAGS)
+debug: all
+
+gdb: debug
+	sudo gdb -q -ex run ./$(TARGET)
 
 # ── Install ──────────────────────────────────────────────────────
 

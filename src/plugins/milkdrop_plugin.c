@@ -970,6 +970,9 @@ typedef struct {
     /* Album art for overlay rendering */
     char      mpris_art_url[512];   /* cached art URL (detect changes) */
     GdkPixbuf *mpris_art_pixbuf;    /* loaded album art (any size)     */
+
+    /* Event bus subscription ID (for cleanup in destroy) */
+    int       event_sub_id;
 } md_ctx_t;
 
 /* ── sound analysis ──────────────────────────────────────────── */
@@ -2564,9 +2567,12 @@ static void md_start_capture(md_ctx_t *ctx)
 static void md_stop_capture(md_ctx_t *ctx)
 {
     ctx->running=0; ctx->capture_started=0;
-    /* Don't call pw_meter_stop — the meter is shared across all
-     * plugin instances and tearing it down would kill monitoring
-     * for other tabs.  Just stop reading; stale streams are harmless. */
+    /* Remove only our own meter streams — the meter infrastructure is
+     * shared across all plugin instances. */
+    if (ctx->host && ctx->host->pw_meter_remove_nodes &&
+        ctx->audio_node_count > 0)
+        ctx->host->pw_meter_remove_nodes(ctx->host->host_ctx,
+            ctx->audio_node_ids, ctx->audio_node_count);
 }
 
 static gboolean audio_tick(gpointer data)
@@ -3197,7 +3203,7 @@ static void md_activate(void *opaque, const evemon_host_services_t *svc)
     ctx->host = svc;
     /* Subscribe to album art events from the audio service plugin */
     if (svc->subscribe)
-        svc->subscribe(svc->host_ctx,
+        ctx->event_sub_id = svc->subscribe(svc->host_ctx,
                        EVEMON_EVENT_ALBUM_ART_UPDATED,
                        md_on_album_art_event, ctx);
 }
@@ -3215,6 +3221,12 @@ static void md_on_album_art_event(const evemon_event_t *event,
     md_ctx_t *ctx = user_data;
     const evemon_album_art_payload_t *art = event->payload;
     if (!art) return;
+
+    /* Ignore events for a different PID (prevents cross-pollination
+     * between the main panel and pinned detail panels). */
+    if (art->source_pid > 0 && ctx->last_pid > 0 &&
+        art->source_pid != ctx->last_pid)
+        return;
 
     /* Update MPRIS metadata fields */
     snprintf(ctx->mpris_title, sizeof(ctx->mpris_title),
@@ -3368,6 +3380,15 @@ static void md_clear(void *opaque)
 static void md_destroy(void *opaque)
 {
     md_ctx_t *ctx=opaque;
+
+    /* Unsubscribe from the event bus BEFORE freeing ctx,
+     * otherwise a deferred album art event will invoke the
+     * callback with a dangling user_data pointer → segfault. */
+    if (ctx->event_sub_id > 0 && ctx->host && ctx->host->unsubscribe) {
+        ctx->host->unsubscribe(ctx->host->host_ctx, ctx->event_sub_id);
+        ctx->event_sub_id = 0;
+    }
+
     if (ctx->fullscreen && ctx->fs_window) {
         /* reparent back before destroying window */
         g_object_ref(ctx->fs_overlay);
