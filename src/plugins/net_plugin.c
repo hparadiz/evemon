@@ -143,20 +143,22 @@ static char *sock_to_markup(const evemon_socket_t *s)
     if (s->total > 0) {
         /* Active connection with throughput data */
         char send_buf[32], recv_buf[32];
-        format_rate(s->send_delta, send_buf, sizeof(send_buf));
-        format_rate(s->recv_delta, recv_buf, sizeof(recv_buf));
+        /* Reverse upload/download display: show recv where send was, and
+         * send where recv was. Keep arrow positions the same. */
+        format_rate(s->recv_delta, send_buf, sizeof(send_buf));
+        format_rate(s->send_delta, recv_buf, sizeof(recv_buf));
 
         if (proto_esc && addr_esc) {
             markup = g_strdup_printf(
                 "<span foreground=\"#888888\">%s</span> %s  "
-                "<span foreground=\"#88cc88\">\xe2\x86\x91 %s</span>  "
-                "<span foreground=\"#6699cc\">\xe2\x86\x93 %s</span>",
+                "<span foreground=\"#6699cc\">\xe2\x86\x93 %s</span>  "
+                "<span foreground=\"#88cc88\">\xe2\x86\x91 %s</span>",
                 proto_esc, addr_esc, send_buf, recv_buf);
         } else {
             markup = g_strdup_printf(
                 "%s  "
-                "<span foreground=\"#88cc88\">\xe2\x86\x91 %s</span>  "
-                "<span foreground=\"#6699cc\">\xe2\x86\x93 %s</span>",
+                "<span foreground=\"#6699cc\">\xe2\x86\x93 %s</span>  "
+                "<span foreground=\"#88cc88\">\xe2\x86\x91 %s</span>",
                 desc_esc, send_buf, recv_buf);
         }
     } else if (is_listening && proto_esc && addr_esc) {
@@ -185,12 +187,13 @@ static char *cat_header_markup(int cat, size_t cnt,
 {
     if (cat_send > 0 || cat_recv > 0) {
         char sbuf[32], rbuf[32];
-        format_rate(cat_send, sbuf, sizeof(sbuf));
-        format_rate(cat_recv, rbuf, sizeof(rbuf));
+        /* Swap values so the upload/download display is reversed */
+        format_rate(cat_recv, sbuf, sizeof(sbuf));
+        format_rate(cat_send, rbuf, sizeof(rbuf));
         return g_strdup_printf(
             "<b>%s %s</b> <small>(%zu)</small>  "
-            "<span foreground=\"#88cc88\"><small>\xe2\x86\x91 %s</small></span>  "
-            "<span foreground=\"#6699cc\"><small>\xe2\x86\x93 %s</small></span>",
+            "<span foreground=\"#6699cc\"><small>\xe2\x86\x93 %s</small></span>  "
+            "<span foreground=\"#88cc88\"><small>\xe2\x86\x91 %s</small></span>",
             cat_icons[cat], cat_labels[cat], cnt, sbuf, rbuf);
     }
     return g_strdup_printf(
@@ -453,13 +456,14 @@ static void net_update(void *opaque, const evemon_proc_data_t *data)
         char *hdr;
         if (agg_send > 0 || agg_recv > 0) {
             char sbuf[32], rbuf[32];
-            format_rate(agg_send, sbuf, sizeof(sbuf));
-            format_rate(agg_recv, rbuf, sizeof(rbuf));
+            /* Reverse upload/download display in aggregate header */
+            format_rate(agg_recv, sbuf, sizeof(sbuf));
+            format_rate(agg_send, rbuf, sizeof(rbuf));
             hdr = g_strdup_printf(
                 "<small><b>%zu</b> connection%s"
                 "  \xc2\xb7  <b>%zu</b> active"
-                "  \xc2\xb7  <span foreground=\"#88cc88\">\xe2\x86\x91 %s</span>"
-                "  <span foreground=\"#6699cc\">\xe2\x86\x93 %s</span></small>",
+                "  \xc2\xb7  <span foreground=\"#6699cc\">\xe2\x86\x93 %s</span>"
+                "  <span foreground=\"#88cc88\">\xe2\x86\x91 %s</span></small>",
                 visible, visible == 1 ? "" : "s",
                 active_count, sbuf, rbuf);
         } else {
