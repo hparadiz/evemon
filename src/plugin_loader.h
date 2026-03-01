@@ -31,6 +31,7 @@ typedef struct {
     gboolean          pinned;        /* TRUE = pinned, FALSE = follows  */
     int               instance_id;   /* unique instance counter         */
     char              so_path[4096]; /* absolute path to the .so file   */
+    gboolean          is_active;     /* TRUE = in a notebook tab, FALSE = floating window */
 } plugin_instance_t;
 
 /* ── Plugin registry ─────────────────────────────────────────── */
@@ -110,6 +111,13 @@ int plugin_reload(plugin_registry_t *reg, const char *so_path);
  */
 void plugin_instance_set_pid(plugin_instance_t *inst, pid_t pid,
                              gboolean pinned);
+
+/*
+ * Notify a plugin instance whether it lives in a notebook tab (active=TRUE)
+ * or a standalone floating window (active=FALSE).  Calls plugin->set_active()
+ * if the plugin provides it.  Safe to call with any inst pointer.
+ */
+void plugin_instance_set_active(plugin_instance_t *inst, gboolean active);
 
 /*
  * Dispatch update() to all instances tracking a given PID.

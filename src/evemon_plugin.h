@@ -583,6 +583,20 @@ typedef struct {
      */
     int (*is_available)(void *ctx);
 
+    /*
+     * (Optional) Called by the host when the plugin's placement context
+     * changes.  `active` is non-zero when the instance lives inside a
+     * notebook tab (and should show/hide its tab label as needed), zero
+     * when it lives in a standalone floating window (where there is no
+     * tab to manipulate).
+     *
+     * Plugins that previously walked gtk_widget_get_parent() to discover
+     * whether they were in a notebook should use this instead.  NULL is
+     * safe — older plugins without this callback are always treated as
+     * notebook-hosted (is_active = TRUE) so their behaviour is unchanged.
+     */
+    void (*set_active)(void *ctx, int active);
+
 } evemon_plugin_t;
 
 /* ── Plugin init function signature ──────────────────────────── */

@@ -154,6 +154,19 @@ struct pinned_panel {
     size_t             n_instances;     /* count of instance IDs          */
 };
 
+/* ── floating plugin window ───────────────────────────────────── */
+
+/*
+ * A single plugin instance opened as its own top-level window.
+ * Created by right-click → "Open Plugin as Window".
+ * Destroyed when the user closes the window.
+ */
+typedef struct {
+    int        instance_id;   /* plugin_registry instance ID      */
+    pid_t      pid;           /* PID the plugin is tracking       */
+    GtkWidget *window;        /* the GtkWindow                    */
+} plugin_window_t;
+
 /* ── detail panel dock position ───────────────────────────────── */
 
 typedef enum {
@@ -316,6 +329,11 @@ typedef struct {
     void               *plugin_broker;   /* broker state (opaque void*)     */
     char                plugin_dir[4096]; /* directory scanned for .so files */
     GtkWidget          *plugins_menu_item; /* top-level "Plugins" menu item  */
+
+    /* floating plugin windows (right-click → Open Plugin as Window) */
+    plugin_window_t    *plugin_windows;  /* dynamic array                  */
+    size_t              plugin_window_count;
+    size_t              plugin_window_cap;
 
     /* detail panel (detachable plugin notebook) */
     GtkWidget          *detail_panel;         /* the frame wrapping the notebook  */

@@ -1158,6 +1158,175 @@ static void on_toggle_audio_only(GtkCheckMenuItem *item, gpointer data)
     }
 }
 
+/* ── floating plugin window ─────────────────────────────────────── */
+
+typedef struct {
+    ui_ctx_t   *ctx;
+    pid_t       pid;
+    char        proc_name[256];
+    char        plugin_id[SETTINGS_PLUGIN_ID_MAX];
+} open_plugin_window_data_t;
+
+/*
+ * Called when the user closes a floating plugin window (delete-event,
+ * fires BEFORE widget destruction).
+ *
+ * We must destroy the plugin instance before GTK tears down the window's
+ * widget hierarchy, because plugin->destroy() may reference the widget
+ * (cancel timers, unref pixbufs, etc.).  If we waited for "destroy" the
+ * widget tree would already be mid-teardown → segfault.
+ *
+ * Sequence:
+ *   1. Find the tracking entry.
+ *   2. Unparent the plugin widget from its GtkFrame so the window's own
+ *      destroy cascade won't double-free it.
+ *   3. Call plugin_instance_destroy (calls plugin->destroy, frees ctx).
+ *   4. Destroy the now-empty window.
+ *   5. Return TRUE to suppress GTK's default delete-event handler
+ *      (which would call gtk_widget_destroy again).
+ */
+static gboolean on_plugin_window_delete(GtkWidget *window, GdkEvent *ev,
+                                        gpointer data)
+{
+    (void)ev;
+    ui_ctx_t *ctx = data;
+    plugin_registry_t *preg = ctx->plugin_registry;
+    if (!preg) {
+        /* No registry — let GTK handle it normally */
+        return FALSE;
+    }
+
+    for (size_t i = 0; i < ctx->plugin_window_count; i++) {
+        if (ctx->plugin_windows[i].window != window) continue;
+
+        int inst_id = ctx->plugin_windows[i].instance_id;
+
+        /* Step 1: find the instance and unparent its widget BEFORE
+         * plugin_instance_destroy touches it, so the window's own
+         * teardown won't reach it. */
+        int idx = plugin_registry_find_by_id(preg, inst_id);
+        if (idx >= 0 && preg->instances[idx].widget) {
+            GtkWidget *pw = preg->instances[idx].widget;
+            GtkWidget *parent = gtk_widget_get_parent(pw);
+            if (parent)
+                gtk_container_remove(GTK_CONTAINER(parent), pw);
+        }
+
+        /* Step 2: destroy the plugin instance (calls plugin->destroy). */
+        plugin_instance_destroy(preg, inst_id);
+
+        /* Step 3: compact the tracking array. */
+        for (size_t j = i; j + 1 < ctx->plugin_window_count; j++)
+            ctx->plugin_windows[j] = ctx->plugin_windows[j + 1];
+        ctx->plugin_window_count--;
+
+        /* Step 4: destroy the now-empty window. */
+        gtk_widget_destroy(window);
+
+        /* Step 5: suppress the default handler (window already destroyed). */
+        return TRUE;
+    }
+
+    /* Entry not found — fall through to default close behaviour. */
+    return FALSE;
+}
+
+/*
+ * Open a fresh instance of a plugin in its own GtkWindow, tracking `pid`.
+ */
+static void open_plugin_window(ui_ctx_t *ctx, pid_t pid,
+                               const char *proc_name,
+                               const char *plugin_id)
+{
+    plugin_registry_t *preg = ctx->plugin_registry;
+    if (!preg || !plugin_id) return;
+
+    int inst_id = plugin_instance_create(preg, plugin_id);
+    if (inst_id < 0) {
+        fprintf(stderr, "evemon: open_plugin_window: failed to create instance "
+                        "for %s\n", plugin_id);
+        return;
+    }
+
+    int idx = plugin_registry_find_by_id(preg, inst_id);
+    if (idx < 0) return;
+    plugin_instance_t *inst = &preg->instances[idx];
+    plugin_instance_set_pid(inst, pid, FALSE);
+
+    if (!inst->widget) {
+        /* headless — shouldn't be offered in the menu, but guard anyway */
+        plugin_instance_destroy(preg, inst_id);
+        return;
+    }
+
+    /* Tell the plugin it is NOT in a notebook tab (no tab label to manage) */
+    plugin_instance_set_active(inst, FALSE);
+
+    /* Build window title: "<PluginName> — <procname> (pid N)" */
+    char title[512];
+    const char *pname = inst->plugin && inst->plugin->name
+                      ? inst->plugin->name : plugin_id;
+    snprintf(title, sizeof(title), "%s — %s (pid %d)",
+             pname, proc_name, (int)pid);
+
+    GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(win), title);
+    gtk_window_set_default_size(GTK_WINDOW(win), 720, 480);
+
+    /* Apply plugin CSS so font sizes match the main UI */
+    if (ctx->plugin_css)
+        gtk_style_context_add_provider(
+            gtk_widget_get_style_context(win),
+            GTK_STYLE_PROVIDER(ctx->plugin_css),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    GtkWidget *frame = gtk_frame_new(NULL);
+    gtk_container_add(GTK_CONTAINER(frame), inst->widget);
+    gtk_container_add(GTK_CONTAINER(win), frame);
+
+    /* Track this window */
+    if (ctx->plugin_window_count >= ctx->plugin_window_cap) {
+        size_t newcap = ctx->plugin_window_cap ? ctx->plugin_window_cap * 2 : 8;
+        plugin_window_t *tmp = realloc(ctx->plugin_windows,
+                                       newcap * sizeof(plugin_window_t));
+        if (!tmp) {
+            plugin_instance_destroy(preg, inst_id);
+            gtk_widget_destroy(win);
+            return;
+        }
+        ctx->plugin_windows    = tmp;
+        ctx->plugin_window_cap = newcap;
+    }
+    ctx->plugin_windows[ctx->plugin_window_count++] = (plugin_window_t){
+        .instance_id = inst_id,
+        .pid         = pid,
+        .window      = win,
+    };
+
+    /* Clean up when closed.
+     * We use "delete-event" (fires BEFORE widget destruction) instead of
+     * "destroy" so we can safely call plugin_instance_destroy — which
+     * calls the plugin's own destroy() callback and may touch its widget —
+     * before GTK tears down the container hierarchy.  We unparent the
+     * plugin widget first so GTK won't double-free it when the window is
+     * subsequently destroyed. */
+    g_signal_connect(win, "delete-event",
+                     G_CALLBACK(on_plugin_window_delete), ctx);
+
+    gtk_widget_show_all(win);
+
+    /* Kick the broker so the new window gets data immediately */
+    broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
+}
+
+static void on_open_plugin_window(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    open_plugin_window_data_t *d = data;
+    open_plugin_window(d->ctx, d->pid, d->proc_name, d->plugin_id);
+    free(d);
+}
+
 static void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
                                      pid_t pid, const char *name,
                                      const char *cmdline)
@@ -1190,6 +1359,49 @@ static void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
         g_signal_connect(mi_audio, "toggled",
                          G_CALLBACK(on_toggle_audio_only), ctx);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_audio);
+    }
+
+    /* ── Open Plugin as Window submenu ── */
+    if (ctx->plugin_registry) {
+        plugin_registry_t *preg = ctx->plugin_registry;
+        GtkWidget *pw_menu = gtk_menu_new();
+        gboolean   any     = FALSE;
+
+        for (size_t i = 0; i < preg->count; i++) {
+            plugin_instance_t *inst = &preg->instances[i];
+            if (!inst->plugin || !inst->plugin->id) continue;
+            if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS) continue;
+            if (!inst->widget) continue;
+            if (!PLUGIN_IS_AVAILABLE(inst)) continue;
+
+            const char *lbl = inst->plugin->name ? inst->plugin->name
+                                                 : inst->plugin->id;
+            GtkWidget *mi_pw = gtk_menu_item_new_with_label(lbl);
+
+            open_plugin_window_data_t *wd =
+                malloc(sizeof(open_plugin_window_data_t));
+            if (wd) {
+                wd->ctx = ctx;
+                wd->pid = pid;
+                snprintf(wd->proc_name, sizeof(wd->proc_name), "%s", name);
+                snprintf(wd->plugin_id, sizeof(wd->plugin_id),
+                         "%s", inst->plugin->id);
+                g_signal_connect_data(mi_pw, "activate",
+                    G_CALLBACK(on_open_plugin_window), wd,
+                    (GClosureNotify)(void(*)(void))free, 0);
+            }
+            gtk_menu_shell_append(GTK_MENU_SHELL(pw_menu), mi_pw);
+            any = TRUE;
+        }
+
+        if (any) {
+            GtkWidget *pw_item =
+                gtk_menu_item_new_with_label("Open Plugin as Window");
+            gtk_menu_item_set_submenu(GTK_MENU_ITEM(pw_item), pw_menu);
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), pw_item);
+        } else {
+            gtk_widget_destroy(pw_menu);
+        }
     }
 
     /* ── separator ── */
@@ -2134,10 +2346,12 @@ static gboolean on_refresh(gpointer data)
                 }
             }
 
-            /* Update follow-selection instances to the selected PID */
+            /* Update follow-selection instances to the selected PID.
+             * Skip pinned and floating-window instances — they track
+             * a fixed PID and must not follow the tree selection. */
             for (size_t i = 0; i < preg->count; i++) {
                 plugin_instance_t *inst = &preg->instances[i];
-                if (!inst->pinned)
+                if (!inst->pinned && inst->is_active)
                     plugin_instance_set_pid(inst, sel_pid, FALSE);
             }
 
@@ -4453,6 +4667,7 @@ static void on_plugin_toggled(GtkCheckMenuItem *item, gpointer data)
                                     : inst->plugin->id;
                     gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
                         inst->widget, gtk_label_new(lbl));
+                    plugin_instance_set_active(inst, TRUE);
                 }
             }
             gtk_widget_show_all(notebook);
@@ -5857,6 +6072,7 @@ void *ui_thread(void *arg)
                         GtkWidget *label = gtk_label_new(lbl);
                         gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
                                                  inst->widget, label);
+                        plugin_instance_set_active(inst, TRUE);
                         added[i] = TRUE;
                     }
                 }
@@ -5891,6 +6107,7 @@ void *ui_thread(void *arg)
                     GtkWidget *label = gtk_label_new(lbl);
                     gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
                                              inst->widget, label);
+                    plugin_instance_set_active(inst, TRUE);
                     added[i] = TRUE;
                 }
 
@@ -5920,6 +6137,7 @@ void *ui_thread(void *arg)
                         gtk_notebook_append_page(
                             GTK_NOTEBOOK(notebook),
                             inst->widget, label);
+                        plugin_instance_set_active(inst, TRUE);
                         /* Hide the tab until the plugin activates it */
                         gtk_widget_set_no_show_all(inst->widget, TRUE);
                         gtk_widget_hide(inst->widget);
@@ -6197,6 +6415,24 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     ctx->pinned_panels      = NULL;
     ctx->pinned_panel_count = 0;
     ctx->pinned_panel_cap   = 0;
+
+    /* Close any floating plugin windows — destroy the GTK window (which
+     * fires on_plugin_window_destroyed → plugin_instance_destroy) and
+     * then free the tracking array.  We disconnect the signal first to
+     * avoid a double-free: plugin_registry_destroy below will also
+     * clean up any surviving instances. */
+    for (size_t i = 0; i < ctx->plugin_window_count; i++) {
+        if (ctx->plugin_windows[i].window) {
+            g_signal_handlers_disconnect_by_func(
+                ctx->plugin_windows[i].window,
+                G_CALLBACK(on_plugin_window_delete), ctx);
+            gtk_widget_destroy(ctx->plugin_windows[i].window);
+        }
+    }
+    free(ctx->plugin_windows);
+    ctx->plugin_windows      = NULL;
+    ctx->plugin_window_count = 0;
+    ctx->plugin_window_cap   = 0;
 
     /* Clean up plugin system */
     evemon_event_bus_destroy();

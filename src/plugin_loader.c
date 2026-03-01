@@ -208,8 +208,9 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
         return -1;
     }
 
-    inst->plugin = plugin;
-    inst->handle = handle;
+    inst->plugin    = plugin;
+    inst->handle    = handle;
+    inst->is_active = TRUE;  /* default: lives in a notebook tab */
     snprintf(inst->so_path, sizeof(inst->so_path), "%s", path);
 
     if (plugin->kind == EVEMON_PLUGIN_HEADLESS) {
@@ -349,8 +350,9 @@ int plugin_instance_create(plugin_registry_t *reg, const char *plugin_id)
     plugin_instance_t *inst = registry_alloc(reg);
     if (!inst) return -1;
 
-    inst->plugin = new_plugin;
-    inst->handle = handle;  /* shared handle — don't dlclose twice */
+    inst->plugin    = new_plugin;
+    inst->handle    = handle;  /* shared handle — don't dlclose twice */
+    inst->is_active = TRUE;  /* default: lives in a notebook tab */
 
     if (new_plugin->kind == EVEMON_PLUGIN_HEADLESS) {
         inst->widget = NULL;
@@ -455,6 +457,14 @@ void plugin_instance_set_pid(plugin_instance_t *inst, pid_t pid,
     inst->pinned      = pinned;
 }
 
+void plugin_instance_set_active(plugin_instance_t *inst, gboolean active)
+{
+    if (!inst) return;
+    inst->is_active = active;
+    if (inst->plugin && inst->plugin->set_active)
+        inst->plugin->set_active(inst->plugin->plugin_ctx, active ? 1 : 0);
+}
+
 /* ── Dispatch callbacks ──────────────────────────────────────── */
 
 void plugin_dispatch_update(plugin_registry_t *reg, pid_t pid,
@@ -486,6 +496,10 @@ void plugin_dispatch_clear_all(plugin_registry_t *reg)
         /* Skip pinned instances — they manage their own lifecycle
          * and their widgets may already be destroyed by GTK. */
         if (inst->pinned) continue;
+        /* Skip floating-window instances — they track a fixed PID
+         * independently of the tree selection and must not be cleared
+         * when the user deselects a process. */
+        if (!inst->is_active) continue;
         inst->plugin->clear(inst->plugin->plugin_ctx);
     }
 }

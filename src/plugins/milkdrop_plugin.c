@@ -973,6 +973,10 @@ typedef struct {
 
     /* Event bus subscription ID (for cleanup in destroy) */
     int       event_sub_id;
+
+    /* Set by the host: TRUE when this instance lives in a notebook tab.
+     * Used by md_update/md_clear to decide whether to show/hide the tab. */
+    int       is_active;
 } md_ctx_t;
 
 /* ── sound analysis ──────────────────────────────────────────── */
@@ -3277,7 +3281,7 @@ static void md_update(void *opaque, const evemon_proc_data_t *data)
         if (ctx->capture_started) md_stop_capture(ctx);
         ctx->audio_node_count=0;
         /* Hide the notebook tab when there are no audio streams */
-        if (ctx->main_box) {
+        if (ctx->main_box && ctx->is_active) {
             GtkWidget *nb = gtk_widget_get_parent(ctx->main_box);
             if (nb && GTK_IS_NOTEBOOK(nb)) {
                 gtk_widget_hide(ctx->main_box);
@@ -3312,7 +3316,7 @@ static void md_update(void *opaque, const evemon_proc_data_t *data)
     }
     if (ctx->audio_node_count) {
         /* Show the notebook tab now that we have audio streams */
-        if (ctx->main_box) {
+        if (ctx->main_box && ctx->is_active) {
             GtkWidget *nb = gtk_widget_get_parent(ctx->main_box);
             if (nb && GTK_IS_NOTEBOOK(nb)) {
                 gtk_widget_show(ctx->main_box);
@@ -3366,7 +3370,7 @@ static void md_clear(void *opaque)
     if (ctx->gl_area && GTK_IS_WIDGET(ctx->gl_area))
         gtk_widget_queue_draw(ctx->gl_area);
     /* Hide the notebook tab */
-    if (ctx->main_box) {
+    if (ctx->main_box && ctx->is_active) {
         GtkWidget *nb = gtk_widget_get_parent(ctx->main_box);
         if (nb && GTK_IS_NOTEBOOK(nb)) {
             gtk_widget_hide(ctx->main_box);
@@ -3413,6 +3417,13 @@ static void md_destroy(void *opaque)
 
 /* ── plugin descriptor ───────────────────────────────────────── */
 
+static void md_set_active(void *opaque, int active)
+{
+    md_ctx_t *ctx = opaque;
+    if (!ctx) return;
+    ctx->is_active = active;
+}
+
 __attribute__((visibility("default")))
 evemon_plugin_t *evemon_plugin_init(void)
 {
@@ -3439,6 +3450,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .clear         = md_clear,
         .destroy       = md_destroy,
         .activate      = md_activate,
+        .set_active    = md_set_active,
     };
     return p;
 }
