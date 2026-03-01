@@ -573,6 +573,16 @@ typedef struct {
      */
     evemon_plugin_kind_t kind;
 
+    /*
+     * (Optional) Returns non-zero if this plugin should be shown as a tab.
+     * Called on the GTK main thread when building the notebook.
+     *
+     * If NULL (e.g. plugins compiled against an older ABI), the plugin
+     * is always considered available.  Return 0 to suppress the tab
+     * entirely (e.g. a PipeWire plugin when PipeWire is not running).
+     */
+    int (*is_available)(void *ctx);
+
 } evemon_plugin_t;
 
 /* ── Plugin init function signature ──────────────────────────── */

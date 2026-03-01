@@ -348,3 +348,27 @@ bool settings_plugin_enabled(const char *plugin_id)
     /* Not listed → enabled by default */
     return true;
 }
+
+void settings_plugin_set_enabled(const char *plugin_id, bool enabled)
+{
+    if (!plugin_id) return;
+    evemon_settings_t *s = settings_get();
+
+    /* Update existing entry if present */
+    for (int i = 0; i < s->plugin_count; i++) {
+        if (strcmp(s->plugins[i].id, plugin_id) == 0) {
+            s->plugins[i].enabled = enabled;
+            settings_save();
+            return;
+        }
+    }
+
+    /* Add new entry if there's room */
+    if (s->plugin_count < SETTINGS_MAX_PLUGINS) {
+        snprintf(s->plugins[s->plugin_count].id,
+                 SETTINGS_PLUGIN_ID_MAX, "%s", plugin_id);
+        s->plugins[s->plugin_count].enabled = enabled;
+        s->plugin_count++;
+        settings_save();
+    }
+}

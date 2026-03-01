@@ -30,6 +30,7 @@
 #include <math.h>
 #include <signal.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include <utmpx.h>
 #include <pwd.h>
 
@@ -98,6 +99,15 @@ static void goto_pid(ui_ctx_t *ctx, pid_t target);
 /* Forward declarations for audio-only filter helpers */
 static void rebuild_audio_filter_store(ui_ctx_t *ctx);
 static void sync_audio_filter_store(ui_ctx_t *ctx);
+
+/*
+ * File-level macro: TRUE if a plugin instance should appear as a tab.
+ * Respects the optional is_available() callback; NULL pointer = always show.
+ * Used in the popup notebook builder, main panel builder, and Plugins menu.\n */
+#define PLUGIN_IS_AVAILABLE(inst) \
+    (!((inst)->plugin) || \
+     !(inst)->plugin->is_available || \
+     (inst)->plugin->is_available((inst)->plugin->plugin_ctx))
 
 /* Forward declarations for sort/expand helpers used by filter code */
 static void register_sort_funcs(GtkTreeModelSort *sm);
@@ -917,6 +927,7 @@ static void pinned_panel_create(ui_ctx_t *ctx, pid_t pid)
             if (!orig->plugin || !orig->plugin->id) continue;
             if (orig->plugin->kind == EVEMON_PLUGIN_HEADLESS) continue;
             if (!orig->widget) continue;
+            if (!PLUGIN_IS_AVAILABLE(orig)) continue;
             if (strcmp(orig->plugin->id, tab_order[o]) != 0) continue;
             if (PP_SEEN(orig->plugin->id)) continue;
             seen_ids[n_seen++] = orig->plugin->id;
@@ -955,6 +966,7 @@ static void pinned_panel_create(ui_ctx_t *ctx, pid_t pid)
             continue;
         }
         if (!orig->widget) continue;
+        if (!PLUGIN_IS_AVAILABLE(orig)) continue;
         if (PP_IS_LAST(orig->plugin)) continue;
         if (PP_SEEN(orig->plugin->id)) continue;
         seen_ids[n_seen++] = orig->plugin->id;
@@ -980,6 +992,7 @@ static void pinned_panel_create(ui_ctx_t *ctx, pid_t pid)
             plugin_instance_t *orig = &preg->instances[i];
             if (!orig->plugin || !orig->plugin->id) continue;
             if (orig->plugin->kind == EVEMON_PLUGIN_HEADLESS) continue;
+            if (!PLUGIN_IS_AVAILABLE(orig)) continue;
             if (strcmp(orig->plugin->id, tab_order_last[o]) != 0) continue;
             if (PP_SEEN(orig->plugin->id)) continue;
             seen_ids[n_seen++] = orig->plugin->id;
@@ -2271,6 +2284,23 @@ static void on_menu_exit(GtkMenuItem *item, gpointer data)
     (void)item;
     GtkWidget *window = data;
     gtk_widget_destroy(window);
+}
+
+static void on_menu_restart(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    (void)data;
+    /* Re-exec ourselves — picks up new plugin config on next load */
+    extern char **environ;
+    char path[4096];
+    ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (len > 0) {
+        path[len] = '\0';
+        char *argv[] = { path, NULL };
+        execve(path, argv, environ);
+    }
+    /* execve only returns on failure — fall back to exit */
+    gtk_main_quit();
 }
 
 /* ── GTK theme discovery & selection ──────────────────────────── */
@@ -4336,6 +4366,288 @@ static int inst_is_last_order(const evemon_plugin_t *p,
     return 0;
 }
 
+/* ── Plugins menu helpers ──────────────────────────────────────── */
+
+/*
+ * Data bag passed to each per-plugin checkbox and Reload item.
+ * Allocated with g_new0, freed via GClosureNotify(g_free).
+ */
+typedef struct {
+    ui_ctx_t   *ctx;
+    char        plugin_id[SETTINGS_PLUGIN_ID_MAX];
+    char        so_path[4096];
+} plugin_menu_item_data_t;
+
+static void plugin_menu_data_free(gpointer data, GClosure *closure)
+{
+    (void)closure;
+    g_free(data);
+}
+
+static void on_plugin_toggled(GtkCheckMenuItem *item, gpointer data)
+{
+    plugin_menu_item_data_t *d = data;
+    ui_ctx_t *ctx = d->ctx;
+    gboolean active = gtk_check_menu_item_get_active(item);
+
+    if (!ctx || !ctx->plugin_registry || d->so_path[0] == '\0')
+        return;
+
+    plugin_registry_t *preg = ctx->plugin_registry;
+
+    if (active) {
+        /* ── CHECK: enable + load ─────────────────────────────────── */
+
+        /* We may not have the plugin ID yet (plugin was never loaded or
+         * was skipped at startup because it was disabled).  Peek into
+         * the .so to get the ID so we can persist the enabled state
+         * before load_single_plugin's settings check runs. */
+        if (d->plugin_id[0] == '\0') {
+            void *h = dlopen(d->so_path, RTLD_NOW | RTLD_LOCAL);
+            if (h) {
+                evemon_plugin_init_fn init_fn =
+                    (evemon_plugin_init_fn)dlsym(h, "evemon_plugin_init");
+                if (init_fn) {
+                    evemon_plugin_t *p = init_fn();
+                    if (p && p->id)
+                        snprintf(d->plugin_id, sizeof(d->plugin_id),
+                                 "%s", p->id);
+                    if (p && p->destroy) p->destroy(p->plugin_ctx);
+                    else free(p);
+                }
+                dlclose(h);
+            }
+        }
+
+        /* Persist enabled state *before* reload so the settings check
+         * inside load_single_plugin sees it as enabled. */
+        settings_plugin_set_enabled(d->plugin_id[0] ? d->plugin_id : NULL,
+                                    true);
+
+        /* Remove any existing instances from this .so first so
+         * plugin_reload gets a clean slate (handles the case where the
+         * plugin was loaded at startup and then disabled). */
+        plugin_reload(preg, d->so_path);
+
+        /* Add any newly-loaded UI instance to the notebook. */
+        GtkWidget *notebook = ctx->plugin_notebook;
+        if (notebook) {
+            for (size_t i = 0; i < preg->count; i++) {
+                plugin_instance_t *inst = &preg->instances[i];
+                if (!inst->widget || !inst->plugin || !inst->plugin->id)
+                    continue;
+                if (strcmp(inst->so_path, d->so_path) != 0) continue;
+                if (!PLUGIN_IS_AVAILABLE(inst)) continue;
+                /* Skip if already present in the notebook */
+                gboolean found = FALSE;
+                int npages = gtk_notebook_get_n_pages(GTK_NOTEBOOK(notebook));
+                for (int p = 0; p < npages; p++) {
+                    if (gtk_notebook_get_nth_page(GTK_NOTEBOOK(notebook), p)
+                            == inst->widget) {
+                        found = TRUE; break;
+                    }
+                }
+                if (!found) {
+                    const char *lbl = inst->plugin->name
+                                    ? inst->plugin->name
+                                    : inst->plugin->id;
+                    gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+                        inst->widget, gtk_label_new(lbl));
+                }
+            }
+            gtk_widget_show_all(notebook);
+        }
+
+    } else {
+        /* ── UNCHECK: unload + disable ────────────────────────────── */
+
+        /* Collect the instance IDs for this .so before destroying them
+         * (plugin_instance_destroy compacts the array each call). */
+        int ids[256];
+        size_t n_ids = 0;
+        void *handle = NULL;
+        for (size_t i = 0; i < preg->count; i++) {
+            if (strcmp(preg->instances[i].so_path, d->so_path) != 0) continue;
+            /* Grab the plugin ID for settings if we don't have it yet */
+            if (d->plugin_id[0] == '\0' && preg->instances[i].plugin &&
+                preg->instances[i].plugin->id)
+                snprintf(d->plugin_id, sizeof(d->plugin_id),
+                         "%s", preg->instances[i].plugin->id);
+            if (n_ids < 256)
+                ids[n_ids++] = preg->instances[i].instance_id;
+            if (!handle)
+                handle = preg->instances[i].handle;
+        }
+
+        /* Remove the plugin's tabs from the notebook first */
+        GtkWidget *notebook = ctx->plugin_notebook;
+        if (notebook) {
+            for (size_t i = 0; i < preg->count; i++) {
+                if (strcmp(preg->instances[i].so_path, d->so_path) != 0)
+                    continue;
+                if (!preg->instances[i].widget) continue;
+                int page = gtk_notebook_page_num(GTK_NOTEBOOK(notebook),
+                                                 preg->instances[i].widget);
+                if (page >= 0)
+                    gtk_notebook_remove_page(GTK_NOTEBOOK(notebook), page);
+            }
+        }
+
+        /* Destroy all instances from this .so */
+        for (size_t i = 0; i < n_ids; i++)
+            plugin_instance_destroy(preg, ids[i]);
+
+        /* dlclose the shared handle (no surviving instances) */
+        if (handle)
+            dlclose(handle);
+
+        /* Persist disabled state */
+        settings_plugin_set_enabled(d->plugin_id[0] ? d->plugin_id : NULL,
+                                    false);
+    }
+}
+
+typedef struct { char path[4096]; char name[256]; } so_entry_t;
+
+static so_entry_t *scan_so_files(const char *dir, size_t *out_count)
+{
+    *out_count = 0;
+    DIR *dp = opendir(dir);
+    if (!dp) return NULL;
+
+    size_t cap = 16, count = 0;
+    so_entry_t *entries = calloc(cap, sizeof(so_entry_t));
+    if (!entries) { closedir(dp); return NULL; }
+
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        size_t len = strlen(de->d_name);
+        if (len < 4 || strcmp(de->d_name + len - 3, ".so") != 0) continue;
+        if (count >= cap) {
+            cap *= 2;
+            so_entry_t *tmp = realloc(entries, cap * sizeof(so_entry_t));
+            if (!tmp) break;
+            entries = tmp;
+        }
+        snprintf(entries[count].path, sizeof(entries[count].path),
+                 "%s/%s", dir, de->d_name);
+        const char *n = de->d_name;
+        if (strncmp(n, "lib", 3) == 0) n += 3;
+        snprintf(entries[count].name, sizeof(entries[count].name), "%s", n);
+        char *dot = strrchr(entries[count].name, '.');
+        if (dot) *dot = '\0';
+        count++;
+    }
+    closedir(dp);
+    *out_count = count;
+    return entries;
+}
+
+/*
+ * Rebuilds the Plugins submenu from scratch every time it's opened,
+ * so new .so files in the plugin directory appear immediately.
+ */
+static void on_plugins_menu_map(GtkWidget *menu, gpointer data)
+{
+    static gboolean rebuilding = FALSE;
+    if (rebuilding) return;
+    rebuilding = TRUE;
+
+    ui_ctx_t *ctx = data;
+
+    /* Guard against being called before ctx is fully initialised
+     * (e.g. a stray show signal during window construction). */
+    if (!ctx || !ctx->plugin_registry) {
+        rebuilding = FALSE;
+        return;
+    }
+
+    plugin_registry_t *preg = ctx->plugin_registry;
+
+    GList *children = gtk_container_get_children(GTK_CONTAINER(menu));
+    for (GList *l = children; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(children);
+
+    if (!preg || ctx->plugin_dir[0] == '\0') {
+        GtkWidget *mi = gtk_menu_item_new_with_label("(no plugin directory)");
+        gtk_widget_set_sensitive(mi, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+        gtk_widget_show_all(menu);
+        rebuilding = FALSE;
+        return;
+    }
+
+    size_t n_on_disk = 0;
+    so_entry_t *on_disk = scan_so_files(ctx->plugin_dir, &n_on_disk);
+
+    if (n_on_disk == 0) {
+        GtkWidget *mi = gtk_menu_item_new_with_label("(no plugins found)");
+        gtk_widget_set_sensitive(mi, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+        free(on_disk);
+        gtk_widget_show_all(menu);
+        rebuilding = FALSE;
+        return;
+    }
+
+    for (size_t s = 0; s < n_on_disk; s++) {
+        const char *so_path = on_disk[s].path;
+        const char *display = on_disk[s].name;
+
+        const char *plugin_id   = NULL;
+        const char *plugin_name = NULL;
+        gboolean    is_new      = TRUE;
+
+        for (size_t i = 0; i < preg->count; i++) {
+            if (strcmp(preg->instances[i].so_path, so_path) == 0) {
+                is_new = FALSE;
+                if (preg->instances[i].plugin) {
+                    plugin_id   = preg->instances[i].plugin->id;
+                    plugin_name = preg->instances[i].plugin->name;
+                }
+                break;
+            }
+        }
+
+        const char *label = plugin_name ? plugin_name
+                          : plugin_id   ? plugin_id
+                          :               display;
+
+        /* Loaded plugins reflect saved enabled state; unloaded plugins
+         * are shown unchecked — checking one loads it immediately. */
+        gboolean enabled = is_new ? FALSE
+                         : plugin_id ? (gboolean)settings_plugin_enabled(plugin_id)
+                         : TRUE;
+
+        /* Each plugin is a check-item directly in the Plugins menu. */
+        GtkWidget *chk = gtk_check_menu_item_new_with_label(label);
+
+        plugin_menu_item_data_t *chk_data = g_new0(plugin_menu_item_data_t, 1);
+        chk_data->ctx = ctx;
+        if (plugin_id)
+            snprintf(chk_data->plugin_id, sizeof(chk_data->plugin_id),
+                     "%s", plugin_id);
+        snprintf(chk_data->so_path, sizeof(chk_data->so_path), "%s", so_path);
+        g_signal_connect_data(chk, "toggled",
+            G_CALLBACK(on_plugin_toggled),
+            chk_data, plugin_menu_data_free, 0);
+
+        /* Block the handler while we restore the saved state so we don't
+         * overwrite settings during menu rebuild. */
+        g_signal_handlers_block_by_func(chk,
+            G_CALLBACK(on_plugin_toggled), chk_data);
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(chk), enabled);
+        g_signal_handlers_unblock_by_func(chk,
+            G_CALLBACK(on_plugin_toggled), chk_data);
+
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), chk);
+    }
+    free(on_disk);
+    gtk_widget_show_all(menu);
+    rebuilding = FALSE;
+}
+
 /* ── UI thread ───────────────────────────────────────────────── */
 
 void *ui_thread(void *arg)
@@ -5067,6 +5379,13 @@ void *ui_thread(void *arg)
     GtkWidget *file_item = gtk_menu_item_new_with_label("File");
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(file_item), file_menu);
 
+    GtkWidget *restart_item = gtk_menu_item_new_with_label("Restart");
+    g_signal_connect(restart_item, "activate",
+                     G_CALLBACK(on_menu_restart), window);
+    gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), restart_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(file_menu),
+                          gtk_separator_menu_item_new());
+
     GtkWidget *exit_item = gtk_menu_item_new_with_label("Exit");
     gtk_widget_add_accelerator(exit_item, "activate", accel_group,
                                GDK_KEY_q, GDK_CONTROL_MASK,
@@ -5169,6 +5488,14 @@ void *ui_thread(void *arg)
 
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), appear_item);
     gtk_menu_shell_append(GTK_MENU_SHELL(menubar), view_item);
+
+    /* Plugins menu — rebuilt dynamically each time it opens */
+    GtkWidget *plugins_menu = gtk_menu_new();
+    GtkWidget *plugins_item = gtk_menu_item_new_with_label("Plugins");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(plugins_item), plugins_menu);
+    /* on_plugins_menu_map needs ctx, but ctx isn't fully initialised yet;
+     * we connect the signal after ctx is set up (see below). */
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), plugins_item);
 
     /* Help menu */
     GtkWidget *help_menu = gtk_menu_new();
@@ -5452,6 +5779,11 @@ void *ui_thread(void *arg)
             fprintf(stdout, "evemon: %d plugin(s) loaded from %s\n",
                     nloaded, plugin_dir);
 
+            /* Remember the plugin directory so the Plugins menu can
+             * scan for new .so files at open time. */
+            snprintf(ctx.plugin_dir, sizeof(ctx.plugin_dir),
+                     "%s", plugin_dir);
+
             /* Detect whether any loaded plugin needs PipeWire data;
              * if so, enable audio-PID probing in the process tree. */
             ctx.has_audio_plugin = FALSE;
@@ -5509,6 +5841,8 @@ void *ui_thread(void *arg)
                         /* Headless plugins have no tab */
                         if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS)
                             continue;
+                        if (!PLUGIN_IS_AVAILABLE(inst))
+                            continue;
                         if (strcmp(inst->plugin->id, tab_order[o]) != 0)
                             continue;
                         const char *lbl = inst->plugin->name
@@ -5542,6 +5876,7 @@ void *ui_thread(void *arg)
                                            tab_order_last))
                         continue;
                     if (!inst->widget) continue;
+                    if (!PLUGIN_IS_AVAILABLE(inst)) continue;
                     const char *lbl = (inst->plugin && inst->plugin->name)
                                     ? inst->plugin->name : "Plugin";
                     if (inst->plugin && inst->plugin->id) {
@@ -5566,6 +5901,8 @@ void *ui_thread(void *arg)
                         plugin_instance_t *inst = &preg->instances[i];
                         if (!inst->widget || !inst->plugin ||
                             !inst->plugin->id)
+                            continue;
+                        if (!PLUGIN_IS_AVAILABLE(inst))
                             continue;
                         if (strcmp(inst->plugin->id,
                                    tab_order_last[o]) != 0)
@@ -5604,6 +5941,13 @@ void *ui_thread(void *arg)
 
             ctx.plugin_registry = preg;
             ctx.plugin_notebook = notebook;
+
+            /* Wire up the Plugins menu now that ctx is ready.
+             * Use "show" (not "map") so it fires only when the user
+             * actually opens the dropdown, not during show_all(window). */
+            g_signal_connect(plugins_menu, "show",
+                             G_CALLBACK(on_plugins_menu_map), &ctx);
+            ctx.plugins_menu_item = plugins_item;
 
             /* Live CSS provider for plugin notebook font size */
             gtk_style_context_add_class(

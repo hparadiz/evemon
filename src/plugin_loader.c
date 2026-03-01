@@ -210,6 +210,7 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
 
     inst->plugin = plugin;
     inst->handle = handle;
+    snprintf(inst->so_path, sizeof(inst->so_path), "%s", path);
 
     if (plugin->kind == EVEMON_PLUGIN_HEADLESS) {
         /* Headless plugins have no widget */
@@ -414,6 +415,37 @@ void plugin_registry_recalc_needs(plugin_registry_t *reg)
         if (reg->instances[i].plugin)
             reg->combined_needs |= reg->instances[i].plugin->data_needs;
     }
+}
+
+int plugin_reload(plugin_registry_t *reg, const char *so_path)
+{
+    if (!reg || !so_path) return 0;
+
+    /* Collect instance IDs that came from this .so, and the shared handle */
+    int     ids[256];
+    size_t  n_ids = 0;
+    void   *handle = NULL;
+
+    for (size_t i = 0; i < reg->count; i++) {
+        plugin_instance_t *inst = &reg->instances[i];
+        if (strcmp(inst->so_path, so_path) != 0) continue;
+        if (n_ids < 256)
+            ids[n_ids++] = inst->instance_id;
+        if (!handle)
+            handle = inst->handle;
+    }
+
+    /* Destroy all matching instances (plugin_instance_destroy compacts the
+     * array each time, so iterate by id rather than by index) */
+    for (size_t i = 0; i < n_ids; i++)
+        plugin_instance_destroy(reg, ids[i]);
+
+    /* Now dlclose the handle (no surviving instances share it any more) */
+    if (handle)
+        dlclose(handle);
+
+    /* Re-load the .so as a fresh plugin */
+    return (load_single_plugin(reg, so_path) == 0) ? 1 : 0;
 }
 
 void plugin_instance_set_pid(plugin_instance_t *inst, pid_t pid,

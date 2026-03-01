@@ -116,6 +116,12 @@ const char *settings_path(void);
  */
 bool settings_plugin_enabled(const char *plugin_id);
 
+/*
+ * Set a plugin's enabled/disabled state in settings and save.
+ * If the plugin id is not yet listed, it is added.
+ */
+void settings_plugin_set_enabled(const char *plugin_id, bool enabled);
+
 #ifdef __cplusplus
 }
 #endif

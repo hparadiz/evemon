@@ -30,6 +30,7 @@ typedef struct {
     pid_t             tracked_pid;   /* PID this instance is watching   */
     gboolean          pinned;        /* TRUE = pinned, FALSE = follows  */
     int               instance_id;   /* unique instance counter         */
+    char              so_path[4096]; /* absolute path to the .so file   */
 } plugin_instance_t;
 
 /* ── Plugin registry ─────────────────────────────────────────── */
@@ -94,6 +95,14 @@ int plugin_instance_destroy(plugin_registry_t *reg, int instance_id);
  * Recalculate the combined_needs bitmask from all active instances.
  */
 void plugin_registry_recalc_needs(plugin_registry_t *reg);
+
+/*
+ * Reload a single plugin .so by path: destroys every instance loaded
+ * from that path, dlcloses the handle, then re-loads the file.
+ * Returns the number of new instances created (1 on success, 0 on
+ * failure). The caller is responsible for rebuilding any UI tabs.
+ */
+int plugin_reload(plugin_registry_t *reg, const char *so_path);
 
 /*
  * Set the tracked PID for an instance.  If pinned is FALSE, the

@@ -314,6 +314,8 @@ typedef struct {
     void               *plugin_registry; /* plugin_registry_t* (opaque to avoid header dep) */
     GtkWidget          *plugin_notebook; /* GtkNotebook holding plugin tabs */
     void               *plugin_broker;   /* broker state (opaque void*)     */
+    char                plugin_dir[4096]; /* directory scanned for .so files */
+    GtkWidget          *plugins_menu_item; /* top-level "Plugins" menu item  */
 
     /* detail panel (detachable plugin notebook) */
     GtkWidget          *detail_panel;         /* the frame wrapping the notebook  */

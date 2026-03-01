@@ -117,7 +117,7 @@ PLUGIN_CFLAGS  := -Wall -Wextra -std=c11 -O2 -D_GNU_SOURCE -fPIC -shared \
                   $(GTK_CFLAGS) $(FC_CFLAGS)
 PLUGIN_LDFLAGS := $(GTK_LDFLAGS) $(FC_LDFLAGS)
 
-PLUGIN_SRCS := $(wildcard $(SRC_DIR)/plugins/*.c)
+PLUGIN_SRCS := $(filter-out $(SRC_DIR)/plugins/json_service_plugin.c, $(wildcard $(SRC_DIR)/plugins/*.c))
 PLUGIN_SOS  := $(patsubst $(SRC_DIR)/plugins/%.c,$(PLUGIN_DIR)/evemon_%.so,$(PLUGIN_SRCS))
 
 $(PLUGIN_DIR):
@@ -143,10 +143,6 @@ $(PLUGIN_DIR)/evemon_milkdrop_plugin.so: $(SRC_DIR)/plugins/milkdrop_plugin.c $(
 # Audio service headless plugin — owns album art loading (art_loader.c + libsoup)
 $(PLUGIN_DIR)/evemon_audio_service_plugin.so: $(SRC_DIR)/plugins/audio_service_plugin.c $(SRC_DIR)/art_loader.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
 	$(CC) $(PLUGIN_CFLAGS) $(SOUP_CFLAGS) -o $@ $(SRC_DIR)/plugins/audio_service_plugin.c $(SRC_DIR)/art_loader.c $(PLUGIN_LDFLAGS) $(SOUP_LDFLAGS)
-
-# JSON service headless plugin — serialises proc data to JSON (jansson)
-$(PLUGIN_DIR)/evemon_json_service_plugin.so: $(SRC_DIR)/plugins/json_service_plugin.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
-	$(CC) $(PLUGIN_CFLAGS) $(JANSSON_CFLAGS) -o $@ $(SRC_DIR)/plugins/json_service_plugin.c $(PLUGIN_LDFLAGS) $(JANSSON_LDFLAGS)
 
 plugins: $(PLUGIN_SOS)
 
