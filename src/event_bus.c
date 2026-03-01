@@ -114,6 +114,11 @@ static void idle_dispatch_free(idle_dispatch_t *d)
             if (art->pixbuf)
                 g_object_unref(art->pixbuf);
             free(art);
+        } else if (d->event.type == EVEMON_EVENT_FD_WRITE) {
+            /* owned_payload is evemon_fd_write_payload_t */
+            free(d->owned_payload);
+        } else if (d->event.type == EVEMON_EVENT_CHILD_EXEC) {
+            free(d->owned_payload);
         } else if (d->event.type == EVEMON_EVENT_JSON_SNAPSHOT) {
             evemon_json_payload_t *jp = d->owned_payload;
             free((void *)jp->json);
@@ -169,6 +174,26 @@ static idle_dispatch_t *event_to_idle(const evemon_event_t *event)
             *dst = *src;
             if (dst->pixbuf)
                 g_object_ref(dst->pixbuf);
+            d->event.payload = dst;
+            d->owned_payload = dst;
+        }
+    }
+    /* FD write events: deep-copy fixed-size payload */
+    else if (event->type == EVEMON_EVENT_FD_WRITE && event->payload) {
+        const evemon_fd_write_payload_t *src = event->payload;
+        evemon_fd_write_payload_t *dst = calloc(1, sizeof(*dst));
+        if (dst) {
+            *dst = *src;
+            d->event.payload = dst;
+            d->owned_payload = dst;
+        }
+    }
+    /* CHILD_EXEC: deep-copy fixed-size payload */
+    else if (event->type == EVEMON_EVENT_CHILD_EXEC && event->payload) {
+        const evemon_exec_payload_t *src = event->payload;
+        evemon_exec_payload_t *dst = malloc(sizeof(*dst));
+        if (dst) {
+            *dst = *src;
             d->event.payload = dst;
             d->owned_payload = dst;
         }

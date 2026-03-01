@@ -124,4 +124,34 @@ void submit_sock_event(fdmon_ctx_t *ctx, pid_t tgid,
                        uint32_t raddr, uint16_t rport,
                        uint32_t bytes, int is_send);
 
+/* Dynamic write monitoring helpers (eBPF backend) */
+int  fdmon_write_enable(struct fdmon_ctx *ctx);
+void fdmon_write_disable(struct fdmon_ctx *ctx);
+int  fdmon_add_pid_fd(struct fdmon_ctx *ctx, pid_t pid, int fd);
+int  fdmon_remove_pid_fd(struct fdmon_ctx *ctx, pid_t pid, int fd);
+
+/*
+ * Orphan-stdout mode: when enabled, the eBPF backend automatically
+ * registers fd 1 and fd 2 of every newly exec'd process whose stdout
+ * or stderr is NOT a real TTY (e.g. pipes to nowhere, /dev/null, log
+ * files).  This captures "lost" output from cron jobs, services, and
+ * any other processes whose output is silently discarded.
+ *
+ * Enabling this also implicitly calls fdmon_write_enable() to ensure
+ * the write tracepoints are attached.
+ *
+ * Returns 0 on success, -1 if the eBPF backend is unavailable.
+ */
+int  fdmon_orphan_stdout_enable(struct fdmon_ctx *ctx);
+void fdmon_orphan_stdout_disable(struct fdmon_ctx *ctx);
+
+/*
+ * Watched-parent table: register a parent PID so any child that calls
+ * execve() has its fd 1/2 inserted into the BPF map immediately in the
+ * reader thread — before the child can write.
+ * fd_mask: bit0 = fd1, bit1 = fd2.
+ */
+int  fdmon_watch_parent_fds(struct fdmon_ctx *ctx, pid_t pid, int fd_mask);
+void fdmon_unwatch_parent_fds(struct fdmon_ctx *ctx, pid_t pid);
+
 #endif /* evemon_FDMON_INTERNAL_H */

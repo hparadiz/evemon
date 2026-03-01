@@ -15,6 +15,7 @@
 #include "../plugin_loader.h"
 #include "../plugin_broker.h"
 #include "../event_bus.h"
+#include "../fdmon_internal.h"
 #include "../settings.h"
 
 #ifdef HAVE_PIPEWIRE
@@ -31,6 +32,60 @@
 #include <unistd.h>
 #include <utmpx.h>
 #include <pwd.h>
+
+/* Host helper: request eBPF monitor for a (pid,fd) pair */
+static int host_monitor_fd_subscribe(void *host_ctx, pid_t pid, int fd)
+{
+    if (!host_ctx) return -1;
+    ui_ctx_t *ctx = host_ctx;
+    if (!ctx->mon || !ctx->mon->fdmon) return -1;
+    /* Ensure write probe is attached */
+    if (fdmon_write_enable(ctx->mon->fdmon) != 0)
+        return -1;
+    return fdmon_add_pid_fd(ctx->mon->fdmon, pid, fd);
+}
+
+static void host_monitor_fd_unsubscribe(void *host_ctx, pid_t pid, int fd)
+{
+    if (!host_ctx) return;
+    ui_ctx_t *ctx = host_ctx;
+    if (!ctx->mon || !ctx->mon->fdmon) return;
+    fdmon_remove_pid_fd(ctx->mon->fdmon, pid, fd);
+}
+
+static int host_monitor_watch_children(void *host_ctx, pid_t pid, int fd_mask)
+{
+    if (!host_ctx) return -1;
+    ui_ctx_t *ctx = host_ctx;
+    if (!ctx->mon || !ctx->mon->fdmon) return -1;
+    /* Ensure the write probes and exec tracepoint are attached */
+    if (fdmon_write_enable(ctx->mon->fdmon) != 0) return -1;
+    return fdmon_watch_parent_fds(ctx->mon->fdmon, pid, fd_mask);
+}
+
+static void host_monitor_unwatch_children(void *host_ctx, pid_t pid)
+{
+    if (!host_ctx) return;
+    ui_ctx_t *ctx = host_ctx;
+    if (!ctx->mon || !ctx->mon->fdmon) return;
+    fdmon_unwatch_parent_fds(ctx->mon->fdmon, pid);
+}
+
+static int host_orphan_capture_enable(void *host_ctx)
+{
+    if (!host_ctx) return -1;
+    ui_ctx_t *ctx = host_ctx;
+    if (!ctx->mon || !ctx->mon->fdmon) return -1;
+    return fdmon_orphan_stdout_enable(ctx->mon->fdmon);
+}
+
+static void host_orphan_capture_disable(void *host_ctx)
+{
+    if (!host_ctx) return;
+    ui_ctx_t *ctx = host_ctx;
+    if (!ctx->mon || !ctx->mon->fdmon) return;
+    fdmon_orphan_stdout_disable(ctx->mon->fdmon);
+}
 
 /* Forward declarations for filter helpers */
 static void rebuild_filter_store(ui_ctx_t *ctx);
@@ -5354,6 +5409,14 @@ void *ui_thread(void *arg)
                 hsvc->subscribe         = host_event_subscribe;
                 hsvc->publish           = host_event_publish;
                 hsvc->unsubscribe       = host_event_unsubscribe;
+                /* eBPF fd monitoring helpers */
+                hsvc->monitor_fd_subscribe      = host_monitor_fd_subscribe;
+                hsvc->monitor_fd_unsubscribe    = host_monitor_fd_unsubscribe;
+                hsvc->monitor_watch_children    = host_monitor_watch_children;
+                hsvc->monitor_unwatch_children  = host_monitor_unwatch_children;
+                /* Orphan-capture (cron/daemon) mode */
+                hsvc->orphan_capture_enable  = host_orphan_capture_enable;
+                hsvc->orphan_capture_disable = host_orphan_capture_disable;
                 plugin_registry_set_host_services(preg, hsvc);
             }
 

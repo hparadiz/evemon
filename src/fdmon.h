@@ -212,6 +212,45 @@ typedef struct {
 int fdmon_sock_io_list(const fdmon_ctx_t *ctx, pid_t tgid,
                        fdmon_sock_io_t *out, size_t *count);
 
+/* ── orphan-stdout capture ───────────────────────────────────── */
+
+/*
+ * Enable "orphan-stdout" mode: automatically capture writes to fd 1
+ * and fd 2 from any newly exec'd process whose stdout/stderr is NOT a
+ * real terminal.  This catches output from:
+ *
+ *   • cron jobs  (stdout/stderr → pipe to nobody, or /dev/null)
+ *   • systemd/init services  (stdout redirected to the journal pipe)
+ *   • scripts run via `nohup`, `at`, SSH without a tty, etc.
+ *   • anything launched with its output going to a log file
+ *
+ * How it works:
+ *   The eBPF sched_process_exec tracepoint fires on every successful
+ *   execve().  When that event arrives in userspace, evemon reads
+ *   /proc/<pid>/fd/1 and /proc/<pid>/fd/2 via readlink().  If the
+ *   target is a pipe, a regular file, or /dev/null (i.e. not a PTY or
+ *   other /dev/tty* device), the (pid, fd) pair is inserted into the
+ *   monitored_pid_fds BPF map.  From then on, all write()/writev()/
+ *   pwrite64() calls to those fds are captured and published on the
+ *   event bus as EVEMON_EVENT_FD_WRITE events.
+ *
+ * Requires:
+ *   • eBPF backend must be active.
+ *   • The sched_process_exec tracepoint must be available on the kernel.
+ *   • CAP_BPF (or root).
+ *
+ * Returns 0 on success, -1 if unavailable (check errno).
+ * Implicitly calls fdmon_write_enable() so write tracepoints are live.
+ */
+int  fdmon_orphan_stdout_enable(fdmon_ctx_t *ctx);
+
+/*
+ * Disable orphan-stdout mode.  No new PIDs will be auto-registered.
+ * Already-registered (pid, fd) pairs in the BPF map remain until the
+ * process exits or fdmon_remove_pid_fd() is called explicitly.
+ */
+void fdmon_orphan_stdout_disable(fdmon_ctx_t *ctx);
+
 #ifdef __cplusplus
 }
 #endif

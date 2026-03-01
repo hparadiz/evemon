@@ -377,7 +377,12 @@ char *fd_path_to_markup(const char *path)
             case '\t': g_string_append(out, "→");  break;
             case '\n': g_string_append(out, "↵");  break;
             case '\r': g_string_append(out, "↵");  break;
-            default:   g_string_append_c(out, *p);  break;
+            default: {
+                char *esc = g_markup_escape_text(p, 1);
+                g_string_append(out, esc);
+                g_free(esc);
+                break;
+            }
             }
         }
         g_string_append(out, "</span>");
@@ -400,7 +405,12 @@ char *fd_path_to_markup(const char *path)
             case '\t': g_string_append(out, "→");  break;
             case '\n': g_string_append(out, "↵");  break;
             case '\r': g_string_append(out, "↵");  break;
-            default:   g_string_append_c(out, *p);  break;
+            default: {
+                char *esc = g_markup_escape_text(p, 1);
+                g_string_append(out, esc);
+                g_free(esc);
+                break;
+            }
             }
         }
         g_string_append(out, "</span>");

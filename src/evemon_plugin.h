@@ -45,6 +45,8 @@ typedef enum {
     EVEMON_EVENT_AUDIO_STATE_CHANGED,  /* payload: reserved (NULL)       */
     EVEMON_EVENT_PID_EXITED,           /* payload: pid_t*                */
     EVEMON_EVENT_JSON_SNAPSHOT,        /* payload: evemon_json_payload_t**/
+    EVEMON_EVENT_FD_WRITE,            /* payload: evemon_fd_write_payload_t* */
+    EVEMON_EVENT_CHILD_EXEC,           /* payload: evemon_exec_payload_t*    */
     EVEMON_EVENT_CUSTOM                /* payload: user-defined          */
 } evemon_event_type_t;
 
@@ -107,6 +109,30 @@ typedef struct {
     size_t      len;                  /* strlen(json)                     */
     pid_t       source_pid;           /* PID this snapshot describes      */
 } evemon_json_payload_t;
+
+/* Payload for EVEMON_EVENT_FD_WRITE: copy of data passed to write().
+ * `data` holds up to 4096 bytes of the write() buffer, matching the
+ * BPF capture limit (FDMON_BPF_WRITE_MAX).  `len` is the number of
+ * valid bytes.  Writes larger than 4096 bytes are truncated; `truncated`
+ * is set non-zero when the original write was larger than what was captured. */
+typedef struct {
+    pid_t  pid;   /* tid value from fdmon event (per-call) */
+    pid_t  tgid;  /* userspace TGID (process PID) */
+    int    fd;    /* file descriptor number */
+    size_t len;   /* number of valid bytes in data */
+    int    truncated; /* non-zero if original write > len */
+    char   data[4096];
+} evemon_fd_write_payload_t;
+
+/* Payload for EVEMON_EVENT_CHILD_EXEC: a process just called execve().
+ * Published for every exec, not just orphan-mode processes.
+ * Subscribers that are monitoring a parent PID can check ppid and
+ * immediately register the new pid's fds before it writes anything. */
+typedef struct {
+    pid_t  pid;          /* new process image PID (tgid)  */
+    pid_t  ppid;         /* parent PID at exec time (best-effort from /proc) */
+    char   path[256];    /* executable path (best effort) */
+} evemon_exec_payload_t;
 
 /* ── Data needs bitmask ──────────────────────────────────────── */
 
@@ -445,6 +471,24 @@ typedef struct {
      * by subscribe().
      */
     void (*unsubscribe)(void *host_ctx, int subscription_id);
+
+    /* Host helpers: request monitoring of a specific pid+fd pair
+     * via the eBPF backend. Returns 0 on success, -1 on failure. */
+    int  (*monitor_fd_subscribe)(void *host_ctx, pid_t pid, int fd);
+    void (*monitor_fd_unsubscribe)(void *host_ctx, pid_t pid, int fd);
+
+    /* Register a parent PID so any child it exec()s has its fd 1/2
+     * inserted into the BPF map immediately (in the reader thread,
+     * before the child can write).  fd_mask: bit0=fd1, bit1=fd2.
+     * Call unwatch when no longer monitoring that parent. */
+    int  (*monitor_watch_children)(void *host_ctx, pid_t pid, int fd_mask);
+    void (*monitor_unwatch_children)(void *host_ctx, pid_t pid);
+
+    /* Enable/disable orphan-capture mode: automatically intercept writes
+     * from any newly exec'd process whose stdout/stderr is not a TTY
+     * (cron jobs, systemd services, pipes, etc.). */
+    int  (*orphan_capture_enable)(void *host_ctx);
+    void (*orphan_capture_disable)(void *host_ctx);
 
 } evemon_host_services_t;
 
