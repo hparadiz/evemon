@@ -9,6 +9,8 @@
 
 #include "../proc.h"
 #include "../profile.h"
+#include "../evemon_plugin.h"
+#include "../settings.h"
 
 #include <gtk/gtk.h>
 #include <stdio.h>
@@ -476,15 +478,103 @@ gboolean find_iter_by_pid(GtkTreeModel *model, GtkTreeIter *parent,
 void     collect_descendant_pids(GtkTreeModel *model, GtkTreeIter *parent,
                                 pid_t **out, size_t *out_count,
                                 size_t *out_cap);
+pid_t    get_row_pinned_root(GtkTreeModel *model, GtkTreeIter *iter);
 
 /* ── process detail panel ────────────────────────────────────── */
 
 void proc_detail_update(ui_ctx_t *ctx);
 
-/* ── pinned detail panels ────────────────────────────────────── */
+/* ── pin toggle callback data ───────────────────────────────── */
+typedef struct {
+    ui_ctx_t *ctx;
+    pid_t     pid;
+} pin_toggle_data_t;
+
+/* ── plugin availability macro ───────────────────────────────── */
+#ifndef PLUGIN_IS_AVAILABLE
+#define PLUGIN_IS_AVAILABLE(inst) \
+    (!((inst)->plugin) || \
+     !(inst)->plugin->is_available || \
+     (inst)->plugin->is_available((inst)->plugin->plugin_ctx))
+#endif
+
+/* ── autoscroll constants ────────────────────────────────────── */
+#define AUTOSCROLL_DEADZONE_FRAC 0.03
+#define AUTOSCROLL_INTERVAL      16      /* ~60 fps */
+#define AUTOSCROLL_SCALE         12.0
+
+/* ── font size constants ─────────────────────────────────────── */
+#define FONT_SIZE_MIN     6
+#define FONT_SIZE_MAX     30
+#define FONT_SIZE_DEFAULT 9
+
+/* ── pinned detail panels (ui_pinned.c) ──────────────────────── */
 
 /* Update all pinned panels' header labels from tree-model data */
 void pinned_panels_update(ui_ctx_t *ctx);
+
+gboolean pid_is_pinned(const ui_ctx_t *ctx, pid_t pid);
+void     pin_pid(ui_ctx_t *ctx, pid_t pid);
+void     unpin_pid(ui_ctx_t *ctx, pid_t pid);
+void     on_toggle_pin(GtkMenuItem *item, gpointer data);
+void     pinned_panel_create(ui_ctx_t *ctx, pid_t pid);
+void     pinned_panel_destroy(ui_ctx_t *ctx, pid_t pid);/* ── plugin window management (ui_plugins.c) ─────────────────── */
+
+void     open_plugin_window(ui_ctx_t *ctx, pid_t pid,
+                            const char *proc_name, const char *plugin_id);
+gboolean on_plugin_window_delete(GtkWidget *window, GdkEvent *ev,
+                                 gpointer data);
+void     on_plugin_toggled(GtkCheckMenuItem *item, gpointer data);
+void     on_plugins_menu_map(GtkWidget *menu, gpointer data);
+int      inst_is_last_order(const evemon_plugin_t *p, const char *list[]);
+void     show_open_plugin_as_window_menu(ui_ctx_t *ctx, GtkWidget *menu,
+                                         pid_t pid, const char *name);
+
+/* ── filter store (ui_filter.c) ──────────────────────────────── */
+
+void     copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
+                      GtkTreeModel *src, GtkTreeIter *src_iter);
+void     rebuild_filter_store(ui_ctx_t *ctx);
+void     sync_filter_store(ui_ctx_t *ctx);
+void     switch_to_real_store(ui_ctx_t *ctx);
+void     rebuild_audio_filter_store(ui_ctx_t *ctx);
+void     sync_audio_filter_store(ui_ctx_t *ctx);
+void     expand_respecting_collapsed(ui_ctx_t *ctx);
+void     expand_respecting_collapsed_recurse(ui_ctx_t *ctx,
+                                             GtkTreeModel *model,
+                                             GtkTreeIter *parent);
+void     register_sort_funcs(GtkTreeModelSort *sm);
+void     on_sort_column_changed(GtkTreeSortable *sortable, gpointer data);
+void     show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
+                                   pid_t pid, const char *name,
+                                   const char *cmdline);
+void     reload_font_css(ui_ctx_t *ctx);
+
+/* ── input handlers (ui_input.c) ─────────────────────────────── */
+
+void     filter_cancel_hide_timer(ui_ctx_t *ctx);
+void     goto_pid(ui_ctx_t *ctx, pid_t pid);
+void     stop_autoscroll(ui_ctx_t *ctx);
+gboolean autoscroll_tick(gpointer data);
+
+gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data);
+gboolean on_key_release(GtkWidget *w, GdkEventKey *ev, gpointer data);
+gboolean on_button_press(GtkWidget *w, GdkEventButton *ev, gpointer data);
+gboolean on_button_release(GtkWidget *w, GdkEventButton *ev, gpointer data);
+gboolean on_motion_notify(GtkWidget *w, GdkEventMotion *ev, gpointer data);
+gboolean on_focus_out(GtkWidget *w, GdkEventFocus *ev, gpointer data);
+gboolean on_filter_entry_key_release(GtkWidget *w, GdkEventKey *ev,
+                                     gpointer data);
+void     on_pid_entry_insert_text(GtkEditable *e, const gchar *text,
+                                  gint length, gint *position, gpointer data);
+gboolean on_pid_entry_key_release(GtkWidget *w, GdkEventKey *ev,
+                                  gpointer data);
+gboolean on_overlay_get_child_position(GtkOverlay *overlay, GtkWidget *child,
+                                       GdkRectangle *alloc, gpointer data);
+void     on_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
+                          GtkTreePath *path, gpointer data);
+void     on_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
+                         GtkTreePath *path, gpointer data);
 
 /* ── audio PID probing ────────────────────────────────────────── */
 
