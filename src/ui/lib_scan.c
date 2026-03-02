@@ -3,8 +3,7 @@
  *
  * Reads /proc/<pid>/maps, extracts loaded shared libraries from the
  * executable (r-x) code mappings, and presents them in a categorised
- * GtkTreeStore.  This is the Linux equivalent of Process Explorer's
- * DLL tab.
+ * GtkTreeStore.
  *
  * Categories:
  *   - System        — libraries under /usr/lib, /lib, /nix/store, etc.

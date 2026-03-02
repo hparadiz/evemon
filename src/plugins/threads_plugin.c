@@ -1,8 +1,7 @@
 /*
  * threads_plugin.c – Threads plugin for evemon.
  *
- * Displays the threads (tasks) of a process, analogous to the
- * Threads tab in Sysinternals Process Explorer.  Shows per-thread
+ * Displays the threads (tasks) of a process.  Shows per-thread
  * TID, name, state, CPU time, priority, nice, last CPU core, and
  * context switch counts.
  *

@@ -1,9 +1,9 @@
 /*
  * ui.c – GTK3 process-tree UI entry point and event handlers.
  *
- * Displays processes in a hierarchical GtkTreeView (like Sysinternals
- * Process Explorer / procmon on Windows).  Each process is nested under
- * its parent so you can expand/collapse entire process subtrees.
+ * Displays processes in a hierarchical GtkTreeView.
+ * Each process is nested under its parent so you can expand/collapse
+ * entire process subtrees.
  *
  * A GLib timeout fires every ~1 s, grabs the latest snapshot from the
  * monitor thread, rebuilds the GtkTreeStore, and re-expands any rows
