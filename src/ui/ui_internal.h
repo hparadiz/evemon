@@ -378,10 +378,22 @@ void pw_meter_read(ui_ctx_t *ctx, uint32_t node_id, int *level_l, int *level_r);
 GtkCellRenderer *pw_cell_renderer_meter_new(void);
 
 /* spectrogram – real-time audio FFT visualisation */
+typedef enum {
+    SPECTRO_THEME_CLASSIC = 0,
+    SPECTRO_THEME_HEAT,
+    SPECTRO_THEME_COOL,
+    SPECTRO_THEME_GREYSCALE,
+    SPECTRO_THEME_NEON,
+    SPECTRO_THEME_VIRIDIS,      /* vaporwave: navy → purple → pink → cyan → white */
+    SPECTRO_NUM_THEMES
+} spectro_theme_t;
+
 void spectrogram_start_for_node(ui_ctx_t *ctx, GtkDrawingArea *draw_area,
                                 uint32_t node_id);
 void spectrogram_stop(ui_ctx_t *ctx, GtkDrawingArea *draw_area);
 uint32_t spectrogram_get_target_node(ui_ctx_t *ctx, GtkDrawingArea *draw_area);
+void spectrogram_set_theme(ui_ctx_t *ctx, GtkDrawingArea *draw_area,
+                           spectro_theme_t theme);
 gboolean spectrogram_on_draw(GtkWidget *widget, cairo_t *cr, gpointer data);
 
 /* detail panel signal callbacks for PipeWire tree */

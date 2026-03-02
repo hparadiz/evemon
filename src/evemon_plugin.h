@@ -445,6 +445,17 @@ typedef struct {
     uint32_t (*spectro_get_target)(void *host_ctx,
                                    GtkDrawingArea *draw_area);
 
+    /*
+     * Set the colour theme for a spectrogram draw area.
+     * theme_index maps to the spectro_theme_t enum (see ui_internal.h):
+     *   0 = Classic, 1 = Heat, 2 = Cool, 3 = Greyscale,
+     *   4 = Neon,    5 = Viridis
+     * No-op if no spectrogram is running for that area.
+     */
+    void (*spectro_set_theme)(void *host_ctx,
+                              GtkDrawingArea *draw_area,
+                              unsigned theme_index);
+
     /* ── Event bus ─────────────────────────────────────────── */
 
     /*
@@ -489,6 +500,23 @@ typedef struct {
      * (cron jobs, systemd services, pipes, etc.). */
     int  (*orphan_capture_enable)(void *host_ctx);
     void (*orphan_capture_disable)(void *host_ctx);
+
+    /* ── Plugin-in-window launcher ─────────────────────────── */
+
+    /*
+     * Open a fresh instance of any registered plugin in its own
+     * floating GtkWindow, tracking `pid`.
+     *
+     * plugin_id:  reverse-DNS plugin identifier, e.g. "org.evemon.milkdrop"
+     * pid:        process to monitor in the new window
+     * proc_name:  human-readable process name (used in the window title)
+     *
+     * No-op if the plugin_id is not loaded.
+     */
+    void (*open_plugin_window)(void *host_ctx,
+                               const char *plugin_id,
+                               pid_t pid,
+                               const char *proc_name);
 
 } evemon_host_services_t;
 

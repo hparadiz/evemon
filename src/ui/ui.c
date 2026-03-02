@@ -4568,7 +4568,27 @@ static uint32_t host_spectro_get_target(void *host_ctx,
     ui_ctx_t *c = host_ctx;
     return spectrogram_get_target_node(c, draw_area);
 }
+
+static void host_spectro_set_theme(void *host_ctx,
+                                   GtkDrawingArea *draw_area,
+                                   unsigned theme_index)
+{
+    ui_ctx_t *c = host_ctx;
+    spectrogram_set_theme(c, draw_area, (spectro_theme_t)theme_index);
+}
 #endif /* HAVE_PIPEWIRE */
+
+/* Trampoline: open a plugin in a floating window (callable by plugins) */
+static void host_open_plugin_window(void *host_ctx,
+                                    const char *plugin_id,
+                                    pid_t pid,
+                                    const char *proc_name)
+{
+    ui_ctx_t *c = host_ctx;
+    open_plugin_window(c, pid,
+                       proc_name ? proc_name : "",
+                       plugin_id);
+}
 
 /* Helper: check if a plugin is in a load-last list */
 static int inst_is_last_order(const evemon_plugin_t *p,
@@ -5946,6 +5966,7 @@ void *ui_thread(void *arg)
                 hsvc->spectro_start     = host_spectro_start;
                 hsvc->spectro_stop      = host_spectro_stop;
                 hsvc->spectro_get_target = host_spectro_get_target;
+                hsvc->spectro_set_theme  = host_spectro_set_theme;
 #endif
                 /* Event bus wiring */
                 hsvc->subscribe         = host_event_subscribe;
@@ -5959,6 +5980,7 @@ void *ui_thread(void *arg)
                 /* Orphan-capture (cron/daemon) mode */
                 hsvc->orphan_capture_enable  = host_orphan_capture_enable;
                 hsvc->orphan_capture_disable = host_orphan_capture_disable;
+                hsvc->open_plugin_window     = host_open_plugin_window;
                 plugin_registry_set_host_services(preg, hsvc);
             }
 

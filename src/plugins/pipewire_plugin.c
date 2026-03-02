@@ -442,6 +442,7 @@ typedef struct {
     /* Spectrogram (embedded drawing area) */
     GtkWidget      *spectro_section;
     GtkWidget      *spectro_draw;
+    GtkWidget      *spectro_theme_combo;  /* theme selector dropdown */
     gboolean        spectro_shown;
 
     /* Host services (injected by activate()) */
@@ -471,6 +472,9 @@ typedef struct {
     GtkWidget      *bpm_track_label;    /* full-track accumulated BPM    */
     char            bpm_track_key[768]; /* "title\0artist" for change detect */
     int64_t         bpm_last_pos_us;    /* last position for seek detection  */
+
+    /* Cached process name for use in popup menus / window titles */
+    char            last_proc_name[256];
 
     /* Event bus subscription ID (for cleanup in destroy) */
     int             event_sub_id;
@@ -569,6 +573,78 @@ static char *pw_build_markup(const char *left_raw,
 /* ── signal callbacks ────────────────────────────────────────── */
 
 /*
+ * Right-click context menu on a tree-view row.
+ * Offers "Open Milkdrop in Window" for audio output/input rows.
+ */
+typedef struct {
+    pw_ctx_t *ctx;
+    guint     node_id;
+} pw_popup_data_t;
+
+static void on_pw_open_milkdrop(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    pw_popup_data_t *d = data;
+    pw_ctx_t *ctx = d->ctx;
+    g_free(d);
+
+    if (!ctx->host || !ctx->host->open_plugin_window) return;
+    ctx->host->open_plugin_window(ctx->host->host_ctx,
+                                  "org.evemon.milkdrop",
+                                  ctx->last_pid,
+                                  ctx->last_proc_name[0]
+                                      ? ctx->last_proc_name : "audio");
+}
+
+static gboolean on_pw_button_press(GtkWidget *widget, GdkEventButton *ev,
+                                    gpointer data)
+{
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 3)
+        return FALSE;
+
+    pw_ctx_t *ctx = data;
+    GtkTreeView  *view = GTK_TREE_VIEW(widget);
+    GtkTreeModel *model = gtk_tree_view_get_model(view);
+
+    /* Find the row under the cursor */
+    GtkTreePath *path = NULL;
+    if (!gtk_tree_view_get_path_at_pos(view,
+            (gint)ev->x, (gint)ev->y,
+            &path, NULL, NULL, NULL))
+        return FALSE;
+
+    GtkTreeIter iter;
+    if (!gtk_tree_model_get_iter(model, &iter, path)) {
+        gtk_tree_path_free(path);
+        return FALSE;
+    }
+    gtk_tree_path_free(path);
+
+    guint node_id = 0;
+    gtk_tree_model_get(model, &iter, COL_NODE_ID, &node_id, -1);
+    if (node_id == 0) return FALSE; /* header row, not a stream */
+
+    /* Select the row so it's obvious what we right-clicked */
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(view);
+    gtk_tree_selection_select_iter(sel, &iter);
+
+    /* Build popup */
+    GtkWidget *menu = gtk_menu_new();
+
+    GtkWidget *mi_md = gtk_menu_item_new_with_label("Open Milkdrop in Window");
+    pw_popup_data_t *pd = g_new0(pw_popup_data_t, 1);
+    pd->ctx     = ctx;
+    pd->node_id = node_id;
+    g_signal_connect(mi_md, "activate",
+                     G_CALLBACK(on_pw_open_milkdrop), pd);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_md);
+
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+    return TRUE;
+}
+
+/*
  * Double-click a row to switch spectrogram target.
  */
 static void on_row_activated(GtkTreeView *view, GtkTreePath *path,
@@ -595,6 +671,19 @@ static void on_row_activated(GtkTreeView *view, GtkTreePath *path,
         gtk_widget_show_all(ctx->spectro_section);
         gtk_widget_set_no_show_all(ctx->spectro_section, TRUE);
     }
+}
+
+/* ── spectrogram theme selector callback ─────────────────────── */
+
+static void on_spectro_theme_changed(GtkComboBox *combo, gpointer data)
+{
+    pw_ctx_t *ctx = data;
+    if (!ctx->host || !ctx->host->spectro_set_theme) return;
+    int active = gtk_combo_box_get_active(combo);
+    if (active < 0) return;
+    ctx->host->spectro_set_theme(ctx->host->host_ctx,
+                                  GTK_DRAWING_AREA(ctx->spectro_draw),
+                                  (unsigned)active);
 }
 
 /* ── spectrogram placeholder draw ────────────────────────────── */
@@ -979,6 +1068,8 @@ static GtkWidget *pw_create_widget(void *opaque)
 
     g_signal_connect(ctx->view, "row-activated",
                      G_CALLBACK(on_row_activated), ctx);
+    g_signal_connect(ctx->view, "button-press-event",
+                     G_CALLBACK(on_pw_button_press), ctx);
 
     ctx->scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(ctx->scroll),
@@ -1098,11 +1189,39 @@ static GtkWidget *pw_create_widget(void *opaque)
     gtk_container_add(GTK_CONTAINER(spectro_frame), ctx->spectro_draw);
 
     GtkWidget *spectro_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+
+    /* ── header row: label + theme dropdown ─────────────────── */
+    GtkWidget *spectro_header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+
     GtkWidget *spectro_label = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(spectro_label),
         "<small><b>Audio Spectrogram</b></small>");
     gtk_label_set_xalign(GTK_LABEL(spectro_label), 0.0f);
-    gtk_box_pack_start(GTK_BOX(spectro_box), spectro_label,
+    gtk_box_pack_start(GTK_BOX(spectro_header), spectro_label,
+                       TRUE, TRUE, 2);
+
+    ctx->spectro_theme_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(
+        GTK_COMBO_BOX_TEXT(ctx->spectro_theme_combo), "Classic");
+    gtk_combo_box_text_append_text(
+        GTK_COMBO_BOX_TEXT(ctx->spectro_theme_combo), "Heat");
+    gtk_combo_box_text_append_text(
+        GTK_COMBO_BOX_TEXT(ctx->spectro_theme_combo), "Cool");
+    gtk_combo_box_text_append_text(
+        GTK_COMBO_BOX_TEXT(ctx->spectro_theme_combo), "Greyscale");
+    gtk_combo_box_text_append_text(
+        GTK_COMBO_BOX_TEXT(ctx->spectro_theme_combo), "Neon");
+    gtk_combo_box_text_append_text(
+        GTK_COMBO_BOX_TEXT(ctx->spectro_theme_combo), "Vaporwave");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(ctx->spectro_theme_combo), 0);
+    gtk_widget_set_tooltip_text(ctx->spectro_theme_combo, "Spectrogram colour theme");
+    gtk_box_pack_end(GTK_BOX(spectro_header), ctx->spectro_theme_combo,
+                     FALSE, FALSE, 0);
+
+    g_signal_connect(ctx->spectro_theme_combo, "changed",
+                     G_CALLBACK(on_spectro_theme_changed), ctx);
+
+    gtk_box_pack_start(GTK_BOX(spectro_box), spectro_header,
                        FALSE, FALSE, 2);
     gtk_box_pack_start(GTK_BOX(spectro_box), spectro_frame,
                        FALSE, FALSE, 0);
@@ -1140,6 +1259,8 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
 
     if (data->pid != ctx->last_pid) {
         ctx->last_pid = data->pid;
+        snprintf(ctx->last_proc_name, sizeof(ctx->last_proc_name),
+                 "%s", data->name ? data->name : "");
         ctx->spectro_shown = FALSE;
         gtk_list_store_clear(ctx->store);
         ctx->audio_node_count = 0;

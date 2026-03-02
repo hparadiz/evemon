@@ -154,6 +154,9 @@ typedef struct {
     /* Running flag */
     int                    running;
 
+    /* Colour theme (index into spectro_theme_t) */
+    spectro_theme_t        theme;
+
     /* Signal handler id for the "draw" callback (so we can disconnect) */
     gulong                 draw_handler_id;
 
@@ -287,31 +290,114 @@ static const struct pw_stream_events stream_events = {
     .state_changed = on_stream_state_changed,
 };
 
+/* ── colour themes ───────────────────────────────────────────── */
+/* spectro_theme_t enum is declared in ui_internal.h */
+
 /* ── colour mapping (magnitude → packed ARGB pixel) ──────────── */
 
-static uint32_t mag_to_argb(float mag)
+static uint32_t mag_to_argb_themed(float mag, spectro_theme_t theme)
 {
     if (mag < 0.0f) mag = 0.0f;
     if (mag > 1.0f) mag = 1.0f;
 
-    float r, g, b;
-    if (mag < 0.25f) {
-        float t = mag / 0.25f;
-        r = 0.0f; g = 0.0f; b = 0.2f + 0.6f * t;
-    } else if (mag < 0.50f) {
-        float t = (mag - 0.25f) / 0.25f;
-        r = 0.0f; g = t; b = 0.8f * (1.0f - t) + 0.2f * t;
-    } else if (mag < 0.75f) {
-        float t = (mag - 0.50f) / 0.25f;
-        r = t; g = 1.0f; b = 0.2f * (1.0f - t);
-    } else {
-        float t = (mag - 0.75f) / 0.25f;
-        r = 1.0f; g = 1.0f; b = t;
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+
+    switch (theme) {
+
+    default:
+    case SPECTRO_THEME_CLASSIC:
+        if (mag < 0.25f) {
+            float t = mag / 0.25f;
+            r = 0.0f; g = 0.0f; b = 0.2f + 0.6f * t;
+        } else if (mag < 0.50f) {
+            float t = (mag - 0.25f) / 0.25f;
+            r = 0.0f; g = t; b = 0.8f * (1.0f - t) + 0.2f * t;
+        } else if (mag < 0.75f) {
+            float t = (mag - 0.50f) / 0.25f;
+            r = t; g = 1.0f; b = 0.2f * (1.0f - t);
+        } else {
+            float t = (mag - 0.75f) / 0.25f;
+            r = 1.0f; g = 1.0f; b = t;
+        }
+        break;
+
+    case SPECTRO_THEME_HEAT:
+        /* black → dark red → red → orange → yellow → white */
+        if (mag < 0.25f) {
+            float t = mag / 0.25f;
+            r = 0.5f * t; g = 0.0f; b = 0.0f;
+        } else if (mag < 0.50f) {
+            float t = (mag - 0.25f) / 0.25f;
+            r = 0.5f + 0.5f * t; g = 0.0f; b = 0.0f;
+        } else if (mag < 0.75f) {
+            float t = (mag - 0.50f) / 0.25f;
+            r = 1.0f; g = 0.5f * t; b = 0.0f;
+        } else {
+            float t = (mag - 0.75f) / 0.25f;
+            r = 1.0f; g = 0.5f + 0.5f * t; b = t;
+        }
+        break;
+
+    case SPECTRO_THEME_COOL:
+        /* black → deep indigo → violet → cyan → white */
+        if (mag < 0.33f) {
+            float t = mag / 0.33f;
+            r = 0.15f * t; g = 0.0f; b = 0.5f * t;
+        } else if (mag < 0.66f) {
+            float t = (mag - 0.33f) / 0.33f;
+            r = 0.15f + 0.15f * t; g = 0.5f * t; b = 0.5f + 0.5f * t;
+        } else {
+            float t = (mag - 0.66f) / 0.34f;
+            r = 0.30f + 0.70f * t; g = 0.5f + 0.5f * t; b = 1.0f;
+        }
+        break;
+
+    case SPECTRO_THEME_GREYSCALE:
+        r = g = b = mag;
+        break;
+
+    case SPECTRO_THEME_NEON:
+        /* black → magenta → hot pink → cyan → white */
+        if (mag < 0.30f) {
+            float t = mag / 0.30f;
+            r = 0.6f * t; g = 0.0f; b = 0.6f * t;
+        } else if (mag < 0.55f) {
+            float t = (mag - 0.30f) / 0.25f;
+            r = 0.6f + 0.4f * t; g = 0.0f; b = 0.6f - 0.3f * t;
+        } else if (mag < 0.80f) {
+            float t = (mag - 0.55f) / 0.25f;
+            r = 1.0f - 0.8f * t; g = 0.7f * t; b = 0.3f + 0.7f * t;
+        } else {
+            float t = (mag - 0.80f) / 0.20f;
+            r = 0.2f + 0.8f * t; g = 0.7f + 0.3f * t; b = 1.0f;
+        }
+        break;
+
+    case SPECTRO_THEME_VIRIDIS: {
+        /* Vaporwave: dark navy → deep purple → hot pink → cyan → white */
+        if (mag < 0.25f) {
+            float t = mag / 0.25f;
+            r = 0.04f + 0.10f * t; g = 0.02f + 0.03f * t; b = 0.18f + 0.32f * t;
+        } else if (mag < 0.50f) {
+            float t = (mag - 0.25f) / 0.25f;
+            r = 0.14f + 0.56f * t; g = 0.05f + 0.00f * t; b = 0.50f + 0.10f * t;
+        } else if (mag < 0.75f) {
+            float t = (mag - 0.50f) / 0.25f;
+            r = 0.70f + 0.10f * t; g = 0.05f + 0.65f * t; b = 0.60f + 0.30f * t;
+        } else {
+            float t = (mag - 0.75f) / 0.25f;
+            r = 0.80f + 0.20f * t; g = 0.70f + 0.30f * t; b = 0.90f + 0.10f * t;
+        }
+        break;
+    }
     }
 
     uint32_t ri = (uint32_t)(r * 255.0f + 0.5f);
     uint32_t gi = (uint32_t)(g * 255.0f + 0.5f);
     uint32_t bi = (uint32_t)(b * 255.0f + 0.5f);
+    if (ri > 255) ri = 255;
+    if (gi > 255) gi = 255;
+    if (bi > 255) bi = 255;
     return (0xFFu << 24) | (ri << 16) | (gi << 8) | bi;
 }
 
@@ -338,7 +424,7 @@ static void rebuild_wf_surface(spectro_state_t *st, int w, int h)
         int px_end   = (c + 1) * w / WATERFALL_COLS;
 
         for (int r = 0; r < WATERFALL_ROWS; r++) {
-            uint32_t argb = mag_to_argb(st->waterfall[src_col][r]);
+            uint32_t argb = mag_to_argb_themed(st->waterfall[src_col][r], st->theme);
             /* Low frequencies at bottom */
             int py_start = h - (r + 1) * h / WATERFALL_ROWS;
             int py_end   = h - r * h / WATERFALL_ROWS;
@@ -754,6 +840,24 @@ uint32_t spectrogram_get_target_node(ui_ctx_t *ctx, GtkDrawingArea *draw_area)
     if (idx < 0) return 0;
     spectro_state_t *st = ctx->spectro_instances[idx].state;
     return st->target_node_id;
+}
+
+void spectrogram_set_theme(ui_ctx_t *ctx, GtkDrawingArea *draw_area,
+                           spectro_theme_t theme)
+{
+    int idx = spectro_find(ctx, GTK_WIDGET(draw_area));
+    if (idx < 0) return;
+    spectro_state_t *st = ctx->spectro_instances[idx].state;
+    st->theme = theme;
+    /* Force the surface to be rebuilt on the next draw tick */
+    if (st->wf_surface) {
+        cairo_surface_destroy(st->wf_surface);
+        st->wf_surface = NULL;
+        st->wf_surface_w = 0;
+        st->wf_surface_h = 0;
+    }
+    if (draw_area && GTK_IS_WIDGET(draw_area))
+        gtk_widget_queue_draw(GTK_WIDGET(draw_area));
 }
 
 gboolean spectrogram_on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
