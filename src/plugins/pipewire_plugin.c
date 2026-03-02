@@ -667,6 +667,16 @@ static void on_row_activated(GtkTreeView *view, GtkTreePath *path,
         ctx->host->spectro_start(ctx->host->host_ctx,
                                  GTK_DRAWING_AREA(ctx->spectro_draw),
                                  (uint32_t)node_id);
+        /* Re-apply the currently selected theme so switching sources
+         * doesn't silently reset it to the default (Classic). */
+        if (ctx->host->spectro_set_theme && ctx->spectro_theme_combo) {
+            int active = gtk_combo_box_get_active(
+                GTK_COMBO_BOX(ctx->spectro_theme_combo));
+            if (active >= 0)
+                ctx->host->spectro_set_theme(ctx->host->host_ctx,
+                    GTK_DRAWING_AREA(ctx->spectro_draw),
+                    (unsigned)active);
+        }
         gtk_widget_set_no_show_all(ctx->spectro_section, FALSE);
         gtk_widget_show_all(ctx->spectro_section);
         gtk_widget_set_no_show_all(ctx->spectro_section, TRUE);
@@ -1493,10 +1503,20 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
                 for (size_t i = 0; i < ctx->audio_node_count; i++)
                     if (ctx->audio_node_ids[i] == current)
                         { found = 1; break; }
-                if (!found)
+                if (!found) {
                     ctx->host->spectro_start(ctx->host->host_ctx,
                         GTK_DRAWING_AREA(ctx->spectro_draw),
                         ctx->audio_node_ids[0]);
+                    /* Re-apply the selected theme after auto-switching nodes */
+                    if (ctx->host->spectro_set_theme && ctx->spectro_theme_combo) {
+                        int active = gtk_combo_box_get_active(
+                            GTK_COMBO_BOX(ctx->spectro_theme_combo));
+                        if (active >= 0)
+                            ctx->host->spectro_set_theme(ctx->host->host_ctx,
+                                GTK_DRAWING_AREA(ctx->spectro_draw),
+                                (unsigned)active);
+                    }
+                }
             }
         } else {
             /* No audio output nodes for this process — stop our own

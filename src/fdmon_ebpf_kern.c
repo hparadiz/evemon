@@ -131,10 +131,12 @@ struct {
  * Key = u32 pid (tgid).  Value = u8 fd_mask: bit 0 = fd 1, bit 1 = fd 2.
  * Populated by userspace for the selected root process; propagated to
  * children automatically by trace_sched_process_fork in kernel space.
+ * Entries are removed by trace_sched_process_exit so dead PIDs never
+ * accumulate.  Size matches the kernel default pid_max of 32768.
  */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 8192);
+    __uint(max_entries, 32768);
     __type(key, __u32);
     __type(value, __u8);
 } monitored_pids SEC(".maps");
@@ -838,6 +840,42 @@ int trace_tcp_recvmsg_ret(struct pt_regs *ctx)
 
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
                           &ev, sizeof(ev));
+    return 0;
+}
+
+/* ── sched_process_exit tracepoint ──────────────────────────── */
+
+/*
+ * Format (from /sys/kernel/debug/tracing/events/sched/sched_process_exit):
+ *   common header  (8 bytes)
+ *   char comm[16]; (offset 8)
+ *   pid_t pid;     (offset 24)
+ *   int prio;      (offset 28)
+ *
+ * pid here is the thread pid.  For the group leader (main thread) pid == tgid,
+ * which is what we store in monitored_pids, so we can safely delete it.
+ */
+struct sched_process_exit_args {
+    unsigned short common_type;
+    unsigned char  common_flags;
+    unsigned char  common_preempt_count;
+    int            common_pid;
+    char           comm[16];
+    __s32          pid;
+    int            prio;
+};
+
+SEC("tracepoint/sched/sched_process_exit")
+int trace_sched_process_exit(struct sched_process_exit_args *ctx)
+{
+    /* Only remove on the group-leader exit (pid == tgid).  Thread exits
+     * fire with pid == tid != tgid and should not remove the entry. */
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 tgid = (__u32)(pid_tgid >> 32);
+    __u32 pid  = (__u32)(pid_tgid & 0xffffffff);
+    if (pid != tgid) return 0;
+
+    bpf_map_delete_elem(&monitored_pids, &tgid);
     return 0;
 }
 

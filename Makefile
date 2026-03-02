@@ -144,6 +144,12 @@ $(PLUGIN_DIR)/evemon_milkdrop_plugin.so: $(SRC_DIR)/plugins/milkdrop_plugin.c $(
 $(PLUGIN_DIR)/evemon_audio_service_plugin.so: $(SRC_DIR)/plugins/audio_service_plugin.c $(SRC_DIR)/art_loader.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
 	$(CC) $(PLUGIN_CFLAGS) $(SOUP_CFLAGS) -o $@ $(SRC_DIR)/plugins/audio_service_plugin.c $(SRC_DIR)/art_loader.c $(PLUGIN_LDFLAGS) $(SOUP_LDFLAGS)
 
+# write_monitor_ui plugin needs GtkSourceView-4
+GSV_CFLAGS  := $(shell pkg-config --cflags gtksourceview-4 2>/dev/null)
+GSV_LDFLAGS := $(shell pkg-config --libs   gtksourceview-4 2>/dev/null)
+$(PLUGIN_DIR)/evemon_write_monitor_ui_plugin.so: $(SRC_DIR)/plugins/write_monitor_ui_plugin.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
+	$(CC) $(PLUGIN_CFLAGS) $(GSV_CFLAGS) -o $@ $< $(PLUGIN_LDFLAGS) $(GSV_LDFLAGS)
+
 plugins: $(PLUGIN_SOS)
 
 clean:

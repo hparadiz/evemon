@@ -518,6 +518,23 @@ int fdmon_ebpf_init(struct fdmon_ctx *ctx)
         }
     }
 
+    /* Resize monitored_pids to match the live kernel pid_max so the map
+     * can never be full as long as the kernel allows the PID to exist. */
+    {
+        __u32 pid_max = 32768; /* safe default */
+        FILE *f = fopen("/proc/sys/kernel/pid_max", "r");
+        if (f) {
+            unsigned long v;
+            if (fscanf(f, "%lu", &v) == 1 && v > 0 && v <= 4194304)
+                pid_max = (__u32)v;
+            fclose(f);
+        }
+        struct bpf_map *mpmap =
+            bpf_object__find_map_by_name(st->obj, "monitored_pids");
+        if (mpmap)
+            bpf_map__set_max_entries(mpmap, pid_max);
+    }
+
     if (bpf_object__load(st->obj) != 0) {
         fprintf(stderr,
             "evemon: BPF program load/verify failed (EACCES). "
