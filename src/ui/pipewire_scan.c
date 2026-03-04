@@ -188,7 +188,22 @@ static pthread_t        g_watcher_tid    = 0;
 static int              g_watcher_stop   = 0;
 
 /* Watcher-internal connection state (accessed only on watcher thread) */
+
+/*
+ * Each bound watcher node is individually heap-allocated so that
+ * realloc of the pointer array never invalidates the embedded spa_hook
+ * that PipeWire's listener list holds a pointer to, and so that
+ * user_data passed to pw_proxy_add_object_listener is stable.
+ */
+typedef struct pw_watcher_t pw_watcher_t;
 typedef struct {
+    struct pw_proxy *proxy;
+    struct spa_hook  listener;
+    size_t           node_index;  /* index into watcher->graph.nodes[] */
+    pw_watcher_t    *owner;       /* back-pointer to the watcher */
+} pw_watcher_bound_t;
+
+struct pw_watcher_t {
     struct pw_main_loop *loop;
     struct pw_context   *context;
     struct pw_core      *core;
@@ -204,16 +219,13 @@ typedef struct {
      * Subsequent add/remove events update g_live_graph directly. */
     pw_graph_t           graph;          /* work-in-progress during phase 0/1 */
 
-    /* Bound-node proxies for receiving pw_node_info */
-    struct {
-        struct pw_proxy *proxy;
-        struct spa_hook  listener;
-        uint32_t         id;
-        pw_graph_t      *graph;          /* points to this->graph */
-    } *bound;
+    /* Bound-node proxies for receiving pw_node_info.
+     * Array of pointers — each entry is individually heap-allocated
+     * so that realloc never moves the spa_hook or user_data pointer. */
+    pw_watcher_bound_t **bound;
     size_t               bound_count;
     size_t               bound_cap;
-} pw_watcher_t;
+};
 
 /* Forward declarations */
 static void watcher_on_global(void *data, uint32_t id,
@@ -323,8 +335,11 @@ static void watcher_on_node_info(void *data,
     if (!(info->change_mask & PW_NODE_CHANGE_MASK_PROPS) || !info->props)
         return;
 
-    /* The user_data pointer IS the node entry in the work graph */
-    pw_snap_node_t *n = data;
+    /* user_data is the stable pw_watcher_bound_t*, not a raw node pointer */
+    pw_watcher_bound_t *wb = data;
+    if (!wb->owner || wb->node_index >= wb->owner->graph.node_count)
+        return;
+    pw_snap_node_t *n = &wb->owner->graph.nodes[wb->node_index];
     const struct spa_dict *props = info->props;
 
     const char *pid_str = dict_get(props, PW_KEY_APP_PROCESS_ID);
@@ -389,25 +404,27 @@ static void watcher_on_global(void *data, uint32_t id,
             dict_copy(props, PW_KEY_MEDIA_NAME,       n->media_name,  sizeof(n->media_name));
         }
 
-        /* Bind to get full node info (PID, etc.) */
+        /* Bind to get full node info (PID, etc.).
+         * Each entry is individually heap-allocated so that a later
+         * realloc of the pointer array never moves the spa_hook that
+         * PipeWire holds a pointer to, and so user_data stays valid. */
         if (w->bound_count >= w->bound_cap) {
             size_t nc = w->bound_cap ? w->bound_cap * 2 : 64;
-            void *tmp = realloc(w->bound, nc * sizeof(*w->bound));
+            pw_watcher_bound_t **tmp = realloc(w->bound, nc * sizeof(*w->bound));
             if (!tmp) return;
             w->bound     = tmp;
             w->bound_cap = nc;
         }
-        size_t bi = w->bound_count++;
-        memset(&w->bound[bi], 0, sizeof(w->bound[bi]));
-        w->bound[bi].id    = id;
-        w->bound[bi].graph = &w->graph;
-        w->bound[bi].proxy = pw_registry_bind(w->registry, id,
-                                               type, version, 0);
-        if (w->bound[bi].proxy) {
-            /* user_data = pointer to the node entry we just pushed */
-            pw_proxy_add_object_listener(w->bound[bi].proxy,
-                                         &w->bound[bi].listener,
-                                         &g_watcher_node_events, n);
+        pw_watcher_bound_t *wb = calloc(1, sizeof(*wb));
+        if (!wb) return;
+        wb->node_index = w->graph.node_count - 1;  /* index of node just pushed */
+        wb->owner      = w;
+        wb->proxy      = pw_registry_bind(w->registry, id, type, version, 0);
+        w->bound[w->bound_count++] = wb;
+        if (wb->proxy) {
+            pw_proxy_add_object_listener(wb->proxy,
+                                         &wb->listener,
+                                         &g_watcher_node_events, wb);
         }
 
         /* After initial enumeration, publish immediately */
@@ -595,8 +612,9 @@ static void *pw_watcher_thread(void *arg)
 
     /* Teardown */
     for (size_t i = 0; i < w.bound_count; i++) {
-        if (w.bound[i].proxy)
-            pw_proxy_destroy(w.bound[i].proxy);
+        if (w.bound[i] && w.bound[i]->proxy)
+            pw_proxy_destroy(w.bound[i]->proxy);
+        free(w.bound[i]);
     }
     free(w.bound);
     pw_graph_free(&w.graph);

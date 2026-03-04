@@ -85,7 +85,8 @@ GLIB_LDFLAGS := $(shell pkg-config --libs   glib-2.0 gio-2.0 2>/dev/null)
 
 # Core objects use base CFLAGS only (no GTK), and declare EVEMON_NO_GTK
 # so evemon_plugin.h substitutes void* for GtkWidget*/GdkPixbuf*.
-CORE_CFLAGS := $(filter-out $(GTK_CFLAGS),$(CFLAGS)) $(GLIB_CFLAGS) -DEVEMON_NO_GTK
+# Use lazy assignment (=) so that debug:/gdb: CFLAGS overrides propagate.
+CORE_CFLAGS = $(filter-out $(GTK_CFLAGS),$(CFLAGS)) $(GLIB_CFLAGS) -DEVEMON_NO_GTK
 
 # ── GTK frontend + UI sources ────────────────────────────────────
 # Exclude the BPF kernel program, art_loader (plugin-only), and all
@@ -217,7 +218,7 @@ debug: PLUGIN_CFLAGS := $(DEBUG_PLUGIN_CFLAGS)
 debug: all
 
 gdb: debug
-	sudo gdb -q -ex run ./$(TARGET)
+	gdb -q -ex run ./$(TARGET)
 
 # ── Install ──────────────────────────────────────────────────────
 
