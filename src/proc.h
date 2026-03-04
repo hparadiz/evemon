@@ -61,6 +61,7 @@ typedef struct {
     pthread_cond_t   updated;    /* signalled when snapshot changes */
     int              running;    /* 0 = shutdown requested          */
     fdmon_ctx_t     *fdmon;      /* eBPF fd/network monitor (may be NULL) */
+    pid_t            preselect_pid; /* PID to fast-path on first scan (0 = none) */
 } monitor_state_t;
 
 /* ── Monitor (backend) API ──────────────────────────────────── */

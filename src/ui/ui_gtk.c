@@ -1024,6 +1024,21 @@ static gboolean on_refresh(gpointer data)
     int running = ctx->mon->running;
     size_t count = ctx->mon->snapshot.count;
 
+    /* One-shot: log when we first see a non-empty snapshot */
+    {
+        static gboolean _logged = FALSE;
+        if (!_logged && count > 0) {
+            _logged = TRUE;
+            extern struct timespec evemon_start_time;
+            struct timespec _now;
+            clock_gettime(CLOCK_MONOTONIC, &_now);
+            double _e = (double)(_now.tv_sec  - evemon_start_time.tv_sec)
+                      + (double)(_now.tv_nsec - evemon_start_time.tv_nsec) / 1e9;
+            printf("[evemon] on_refresh: first non-empty snapshot seen %.3f s after startup\n", _e);
+            fflush(stdout);
+        }
+    }
+
     proc_entry_t *local = NULL;
     if (count > 0) {
         local = malloc(count * sizeof(proc_entry_t));
@@ -1226,9 +1241,6 @@ static gboolean on_refresh(gpointer data)
     /* Kick the highlight fade timer if any rows are newly born/dying */
     ensure_highlight_timer(ctx);
 
-    /* Refresh the set of PIDs with active PipeWire audio streams
-     * so the tree can show 🔊 next to audio-using processes. */
-    audio_pids_refresh(ctx);
 
     PROFILE_END(ui_render);
 
@@ -1334,7 +1346,7 @@ static gboolean on_refresh(gpointer data)
             /* Start the broker gather.  When sel_pid <= 0 the broker
              * still runs with zero tracked PIDs so it can take a
              * PipeWire graph snapshot and deliver system-wide audio
-             * PIDs for the 🔊 tree-view icons. */
+             * PIDs for the tree-view audio icons. */
             broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
         }
     }
@@ -2102,7 +2114,7 @@ static void highlight_cell_data_func(GtkTreeViewColumn *col,
 }
 
 /*
- * Cell data function for the Name column: prepend "➡ " when the
+ * Cell data function for the Name column: prepend an arrow when the
  * process is pinned.  The process is considered "pinned" when its
  * own PID appears in the pinned set (regardless of whether the
  * current row is the pinned copy or the original tree entry).
@@ -2432,14 +2444,6 @@ static void on_broker_audio_pids(const pid_t *pids, size_t count,
     }
     memcpy(ctx->audio_pids, pids, count * sizeof(pid_t));
     ctx->audio_pid_count = count;
-}
-
-void audio_pids_refresh(ui_ctx_t *ctx)
-{
-    /* Audio PIDs are now updated asynchronously via the broker
-     * callback (on_broker_audio_pids).  This function is kept
-     * as a no-op placeholder for callers that still reference it. */
-    (void)ctx;
 }
 
 static void name_cell_data_func(GtkTreeViewColumn *col,
@@ -3888,7 +3892,7 @@ void *ui_thread(void *arg)
     }
 
     /* Set up the Name column cell data function so pinned processes
-     * get the ➡ prefix.  We need ctx to be initialised first. */
+     * get the arrow prefix.  We need ctx to be initialised first. */
     {
         GList *renderers = gtk_cell_layout_get_cells(
             GTK_CELL_LAYOUT(name_col));

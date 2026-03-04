@@ -529,6 +529,7 @@ void rebuild_audio_filter_store(ui_ctx_t *ctx)
     g_signal_connect(new_sort, "sort-column-changed",
                      G_CALLBACK(on_sort_column_changed), ctx);
 
+    gboolean selection_restored = FALSE;
     if (sel_pid > 0) {
         GtkTreeIter found;
         if (find_iter_by_pid(GTK_TREE_MODEL(fs), NULL, sel_pid, &found)) {
@@ -543,8 +544,23 @@ void rebuild_audio_filter_store(ui_ctx_t *ctx)
                         gtk_tree_view_get_selection(ctx->view);
                     gtk_tree_selection_select_path(sel, sort_path);
                     gtk_tree_path_free(sort_path);
+                    selection_restored = TRUE;
                 }
                 gtk_tree_path_free(child_path);
+            }
+        }
+    }
+
+    if (!selection_restored) {
+        GtkTreeIter first;
+        if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(ctx->sort_model), &first)) {
+            GtkTreePath *first_path = gtk_tree_model_get_path(
+                GTK_TREE_MODEL(ctx->sort_model), &first);
+            if (first_path) {
+                GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
+                gtk_tree_selection_select_path(sel, first_path);
+                gtk_tree_view_scroll_to_cell(ctx->view, first_path, NULL, FALSE, 0, 0);
+                gtk_tree_path_free(first_path);
             }
         }
     }

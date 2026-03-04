@@ -271,6 +271,7 @@ void update_store(GtkTreeStore       *store,
                   const proc_entry_t *entries,
                   size_t              count)
 {
+    static int first_update = 1;
     /* Build hash of new snapshot: PID → index */
     ht_entry_t *new_ht = calloc(HT_SIZE, sizeof(ht_entry_t));
     if (!new_ht) return;
@@ -357,8 +358,27 @@ void update_store(GtkTreeStore       *store,
             set_row_data(store, &new_iter, e);
 
             /* Stamp newly inserted process with a birth highlight */
-            gtk_tree_store_set(store, &new_iter,
-                               COL_HIGHLIGHT_BORN, mono_now_us(), -1);
+            if (!first_update)
+                gtk_tree_store_set(store, &new_iter,
+                                   COL_HIGHLIGHT_BORN, mono_now_us(), -1);
+
+            /* Expand PID 1 and PID 2 the moment their first child arrives */
+            if ((e->ppid == 1 || e->ppid == 2) && parent_iter) {
+                GtkTreeModel *sort = GTK_TREE_MODEL(
+                    gtk_tree_view_get_model(view));
+                GtkTreePath *cp = gtk_tree_model_get_path(
+                    GTK_TREE_MODEL(store), parent_iter);
+                if (cp && GTK_IS_TREE_MODEL_SORT(sort)) {
+                    GtkTreePath *sp2 =
+                        gtk_tree_model_sort_convert_child_path_to_path(
+                            GTK_TREE_MODEL_SORT(sort), cp);
+                    if (sp2) {
+                        gtk_tree_view_expand_row(view, sp2, TRUE);
+                        gtk_tree_path_free(sp2);
+                    }
+                    gtk_tree_path_free(cp);
+                }
+            }
 
             /* Add to existing map so children can find us */
             iter_map_add(&existing, e->pid, &new_iter);
@@ -370,6 +390,7 @@ void update_store(GtkTreeStore       *store,
     free(old_ht);
     free(existing.entries);
     free(inserted);
+    first_update = 0;
 }
 
 /*
@@ -516,6 +537,24 @@ void populate_store_initial(GtkTreeStore       *store,
             set_row_data(store, &iters[sidx], e);
             inserted[sidx] = 1;
 
+            /* As soon as a direct child of PID 1 or 2 is inserted,
+             * expand that parent so it is open immediately. */
+            if ((e->ppid == 1 || e->ppid == 2) && parent_iter) {
+                GtkTreeModel *sort = gtk_tree_view_get_model(view);
+                GtkTreePath *cp = gtk_tree_model_get_path(
+                    GTK_TREE_MODEL(store), parent_iter);
+                if (cp && GTK_IS_TREE_MODEL_SORT(sort)) {
+                    GtkTreePath *sp2 =
+                        gtk_tree_model_sort_convert_child_path_to_path(
+                            GTK_TREE_MODEL_SORT(sort), cp);
+                    if (sp2) {
+                        gtk_tree_view_expand_row(view, sp2, TRUE);
+                        gtk_tree_path_free(sp2);
+                    }
+                    gtk_tree_path_free(cp);
+                }
+            }
+
             /* Select and open the detail panel the instant the
              * preselected row lands in the store. */
             if (!preselected && preselect_pid > 0 &&
@@ -548,9 +587,6 @@ void populate_store_initial(GtkTreeStore       *store,
     free(ht);
     free(inserted);
     free(iters);
-
-    /* Expand everything on first load */
-    gtk_tree_view_expand_all(view);
 }
 
 /* ── pinned-process subtree management ───────────────────────── */

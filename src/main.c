@@ -8,6 +8,7 @@
 #include "proc.h"
 #include "profile.h"
 #include "fdmon.h"
+#include "settings.h"
 
 #include <gtk/gtk.h>
 #include <fontconfig/fontconfig.h>
@@ -17,6 +18,7 @@
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
+#include <getopt.h>
 
 /* Global debug flag (--debug enables verbose logging to stderr) */
 int evemon_debug = 0;
@@ -65,17 +67,45 @@ int main(int argc, char *argv[])
 {
     clock_gettime(CLOCK_MONOTONIC, &evemon_start_time);
 
-    /* Check for --debug before GTK consumes argv */
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--debug") == 0) {
+    /* ── CLI argument parsing ──────────────────────────────────── */
+    static const struct option long_opts[] = {
+        { "debug", no_argument,       NULL, 'd' },
+        { "pid",   required_argument, NULL, 'p' },
+        { "help",  no_argument,       NULL, 'h' },
+        { NULL, 0, NULL, 0 }
+    };
+
+    pid_t cli_pid = 0;
+    int opt;
+    while ((opt = getopt_long(argc, argv, "dp:h", long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'd':
             evemon_debug = 1;
-            /* Remove from argv so GTK doesn't complain */
-            for (int j = i; j < argc - 1; j++)
-                argv[j] = argv[j + 1];
-            argc--;
-            i--;
+            break;
+        case 'p':
+            cli_pid = (pid_t)atoi(optarg);
+            if (cli_pid <= 0) {
+                fprintf(stderr, "evemon: invalid PID '%s'\n", optarg);
+                return EXIT_FAILURE;
+            }
+            break;
+        case 'h':
+            printf("Usage: evemon [OPTIONS]\n"
+                   "\n"
+                   "Options:\n"
+                   "  -d, --debug        Enable verbose debug logging to stderr\n"
+                   "  -p, --pid <PID>    Pre-select a process by PID on startup\n"
+                   "  -h, --help         Show this help message\n");
+            return EXIT_SUCCESS;
+        default:
+            fprintf(stderr, "evemon: unknown option. Try --help.\n");
+            return EXIT_FAILURE;
         }
     }
+
+    /* Collapse consumed args so GTK only sees the remainder */
+    argc -= optind;
+    argv += optind;
 
     #define STARTUP_TS(label) do { \
         struct timespec _ts; \
@@ -99,6 +129,12 @@ int main(int argc, char *argv[])
         fprintf(stderr, "evemon: failed to initialise state\n");
         return EXIT_FAILURE;
     }
+
+    /* Fast-path the detail panel for the preselected PID.
+     * CLI --pid takes precedence over the saved setting. */
+    if (cli_pid > 0)
+        settings_get()->preselected_pid = cli_pid;
+    g_state.preselect_pid = settings_get()->preselected_pid;
 
     /* Create the eBPF fd/network monitor (best-effort: NULL on failure) */
     g_state.fdmon = fdmon_create(FDMON_BACKEND_AUTO);

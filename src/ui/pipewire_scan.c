@@ -317,7 +317,11 @@ static void watcher_publish(pw_watcher_t *w)
 static void watcher_on_node_info(void *data,
                                   const struct pw_node_info *info)
 {
-    if (!data || !info || !info->props) return;
+    if (!data || !info) return;
+
+    /* Only process updates that actually carry property data */
+    if (!(info->change_mask & PW_NODE_CHANGE_MASK_PROPS) || !info->props)
+        return;
 
     /* The user_data pointer IS the node entry in the work graph */
     pw_snap_node_t *n = data;
@@ -327,11 +331,32 @@ static void watcher_on_node_info(void *data,
     if (!pid_str) pid_str = dict_get(props, "pipewire.sec.pid");
     if (pid_str && n->pid == 0) n->pid = (pid_t)atoi(pid_str);
 
-    dict_copy(props, PW_KEY_APP_NAME,         n->app_name,    sizeof(n->app_name));
-    dict_copy(props, PW_KEY_NODE_NAME,        n->node_name,   sizeof(n->node_name));
-    dict_copy(props, PW_KEY_NODE_DESCRIPTION, n->node_desc,   sizeof(n->node_desc));
-    dict_copy(props, PW_KEY_MEDIA_CLASS,      n->media_class, sizeof(n->media_class));
-    dict_copy(props, PW_KEY_MEDIA_NAME,       n->media_name,  sizeof(n->media_name));
+    /* Only overwrite a field if the new value is non-empty,
+     * so incremental updates don't clobber previously-captured data. */
+#define DICT_COPY_IF_PRESENT(key, field) \
+    do { \
+        const char *_v = dict_get(props, key); \
+        if (_v && _v[0]) { \
+            snprintf(n->field, sizeof(n->field), "%s", _v); \
+            utf8_safe_truncate(n->field, sizeof(n->field)); \
+        } \
+    } while (0)
+
+    DICT_COPY_IF_PRESENT(PW_KEY_APP_NAME,         app_name);
+    DICT_COPY_IF_PRESENT(PW_KEY_NODE_NAME,        node_name);
+    DICT_COPY_IF_PRESENT(PW_KEY_NODE_DESCRIPTION, node_desc);
+    DICT_COPY_IF_PRESENT(PW_KEY_MEDIA_CLASS,      media_class);
+    DICT_COPY_IF_PRESENT(PW_KEY_MEDIA_NAME,       media_name);
+
+#undef DICT_COPY_IF_PRESENT
+
+    fprintf(stdout,
+            "[pw_watcher] node_info: id=%u pid=%d app_name='%s' "
+            "node_name='%s' node_desc='%s' media_class='%s' media_name='%s'\n",
+            n->id, (int)n->pid,
+            n->app_name, n->node_name, n->node_desc,
+            n->media_class, n->media_name);
+    fflush(stdout);
 
     /* Publish incrementally after initial enumeration is done,
      * so the live graph stays fresh on every node update. */

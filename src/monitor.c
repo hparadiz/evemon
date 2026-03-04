@@ -799,9 +799,10 @@ static void cpu_ht_set(cpu_prev_entry_t *ht, pid_t pid, unsigned long long ticks
 
 /* ── snapshot builder ────────────────────────────────────────── */
 
-static proc_snapshot_t build_snapshot(void)
+static proc_snapshot_t build_snapshot(monitor_state_t *state)
 {
     proc_snapshot_t snap = { .entries = NULL, .count = 0 };
+    int partial_published = 0;
 
     /* Detect the init system once */
     if (g_init_system == INIT_UNKNOWN)
@@ -893,6 +894,38 @@ static proc_snapshot_t build_snapshot(void)
         memset(&e->steam, 0, sizeof(e->steam));
 
         snap.count++;
+
+        /* ── Early partial-snapshot publish ─────────────────────
+         * If the caller asked for a preselect PID, publish as soon as
+         * we have scanned both PID 1 (init) and the target PID.  The
+         * UI can then open the detail panel without waiting for the
+         * rest of /proc to be read.  We publish by temporarily latching
+         * the partial snap; the final full snap overwrites it later.
+         * Only do this on the very first scan (state != NULL). */
+        if (state && state->preselect_pid > 0 &&
+            !partial_published && snap.count >= 2) {
+            int have_init   = 0;
+            int have_target = 0;
+            for (size_t _j = 0; _j < snap.count; _j++) {
+                if (snap.entries[_j].pid == 1)                    have_init   = 1;
+                if (snap.entries[_j].pid == state->preselect_pid) have_target = 1;
+            }
+            if (have_init && have_target) {
+                partial_published = 1;
+                /* Make a shallow copy of the entries seen so far */
+                proc_snapshot_t partial = { .count = snap.count };
+                partial.entries = malloc(snap.count * sizeof(proc_entry_t));
+                if (partial.entries) {
+                    memcpy(partial.entries, snap.entries,
+                           snap.count * sizeof(proc_entry_t));
+                    pthread_mutex_lock(&state->lock);
+                    proc_snapshot_free(&state->snapshot);
+                    state->snapshot = partial;
+                    pthread_cond_signal(&state->updated);
+                    pthread_mutex_unlock(&state->lock);
+                }
+            }
+        }
     }
 
     closedir(dp);
@@ -1017,7 +1050,7 @@ void *monitor_thread(void *arg)
 
         /* Build a fresh snapshot outside the lock */
         PROFILE_BEGIN(snapshot_build);
-        proc_snapshot_t snap = build_snapshot();
+        proc_snapshot_t snap = build_snapshot(state);
         PROFILE_END(snapshot_build);
 
         /* Compute CPU% from delta between previous and current ticks.
@@ -1111,10 +1144,22 @@ void *monitor_thread(void *arg)
 
         /* Swap it in */
         pthread_mutex_lock(&state->lock);
+        int _first = (state->snapshot.count == 0 && snap.count > 0);
         proc_snapshot_free(&state->snapshot);
         state->snapshot = snap;
         pthread_cond_signal(&state->updated);
         pthread_mutex_unlock(&state->lock);
+
+        if (_first) {
+            extern struct timespec evemon_start_time;
+            struct timespec _now;
+            clock_gettime(CLOCK_MONOTONIC, &_now);
+            double _e = (double)(_now.tv_sec  - evemon_start_time.tv_sec)
+                      + (double)(_now.tv_nsec - evemon_start_time.tv_nsec) / 1e9;
+            printf("[evemon] monitor: first snapshot ready %.3f s after startup (%zu procs)\n",
+                   _e, snap.count);
+            fflush(stdout);
+        }
 
         /* Sleep for the poll interval, but wake immediately on shutdown.
          * Use pthread_cond_timedwait so that broadcasting `updated`

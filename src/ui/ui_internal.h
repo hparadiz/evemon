@@ -579,9 +579,6 @@ void     on_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
 
 /* ── audio PID probing ────────────────────────────────────────── */
 
-/* Refresh the set of PIDs with active audio streams (PipeWire). */
-void audio_pids_refresh(ui_ctx_t *ctx);
-
 /* Returns TRUE if the given PID has an active audio stream. */
 static inline gboolean audio_pid_is_active(const ui_ctx_t *ctx, pid_t pid)
 {

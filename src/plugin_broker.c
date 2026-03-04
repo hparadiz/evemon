@@ -1270,6 +1270,18 @@ static void gather_pipewire(broker_pid_data_t *d, const pw_graph_t *graph)
             }
             d->data.pw_nodes = d->pw_nodes;
             d->data.pw_node_count = graph->node_count;
+
+            /* Debug: print nodes belonging to this PID */
+            for (size_t i = 0; i < graph->node_count; i++) {
+                const evemon_pw_node_t *n = &d->pw_nodes[i];
+                if (n->pid != d->pid) continue;
+                printf("[pw] pid=%-6d id=%-5u  class=%-30s  media=%-30s  node=%s\n",
+                       (int)n->pid, n->id,
+                       n->media_class[0] ? n->media_class : "-",
+                       n->media_name[0]  ? n->media_name  : "-",
+                       n->node_name[0]   ? n->node_name   : "-");
+            }
+            fflush(stdout);
         }
     }
 
