@@ -952,6 +952,8 @@ typedef struct {
     GtkWidget *embed_parent;     /* original parent container */
     int       fullscreen;        /* 1 when in fullscreen mode */
     int       fs_width, fs_height; /* fullscreen monitor resolution */
+    int       pending_fbo_w, pending_fbo_h; /* deferred FBO resize (0 = none) */
+    int       fs_toggle_pending; /* guard: toggling already in progress */
 
     /* audio source display */
     char      audio_app_name[128];  /* e.g. "Firefox" */
@@ -973,6 +975,10 @@ typedef struct {
 
     /* Event bus subscription ID (for cleanup in destroy) */
     int       event_sub_id;
+
+    /* per-instance debug/startup counters (were incorrectly file-static) */
+    int       first_render_done;  /* 0 until first frame is drawn */
+    int       dbg_frame_count;    /* counts early debug frames */
 
     /* Set by the host: TRUE when this instance lives in a notebook tab.
      * Used by md_update/md_clear to decide whether to show/hide the tab. */
@@ -1303,6 +1309,8 @@ static void gl_draw_colored_lines(md_ctx_t *ctx, color_vert_t *v, int count,
                           (void*)(2*sizeof(float)));
     glDrawArrays(mode, 0, count);
     glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glLineWidth(1.0f);
     glDisable(GL_BLEND);
 }
 
@@ -1361,8 +1369,10 @@ static void gl_draw_shape(md_ctx_t *ctx, float sx, float sy, float sr, float sa,
         glBufferData(GL_ARRAY_BUFFER, nb*sizeof(color_vert_t), bv, GL_STREAM_DRAW);
         glDrawArrays(GL_LINE_STRIP, 0, nb);
         free(bv);
+        glLineWidth(1.0f);
     }
     glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
     glDisable(GL_BLEND);
 }
 
@@ -1928,6 +1938,9 @@ static void gl_init_resources(md_ctx_t *ctx)
     }
 }
 
+/* Forward declaration — defined after md_toggle_fullscreen */
+static void md_resize_fbos(md_ctx_t *ctx, int w, int h);
+
 static gboolean redraw_tick(gpointer data)
 {
     md_ctx_t *ctx = data;
@@ -1959,6 +1972,15 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *glctx, gpointer data)
     md_ctx_t *ctx = data;
     if (!ctx->gl.gl_ready) return FALSE;
 
+    /* Apply a deferred FBO resize (triggered by fullscreen toggle).  We do
+     * this here because on_render is invoked with a valid, current GL context
+     * already bound by GtkGLArea — safe to issue GL calls. */
+    if (ctx->pending_fbo_w > 0 && ctx->pending_fbo_h > 0) {
+        md_resize_fbos(ctx, ctx->pending_fbo_w, ctx->pending_fbo_h);
+        ctx->pending_fbo_w = 0;
+        ctx->pending_fbo_h = 0;
+    }
+
     int ww = gtk_widget_get_allocated_width(GTK_WIDGET(area));
     int hh = gtk_widget_get_allocated_height(GTK_WIDGET(area));
     if (ww<=0||hh<=0) return FALSE;
@@ -1987,14 +2009,6 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *glctx, gpointer data)
     md_analyze_sound(ctx);
     md_render_frame(ctx);
 
-    static int first_render = 1;
-    if (first_render) {
-        if (evemon_debug)
-            fprintf(stderr,"milkdrop: first render frame, preset='%s' cur_fbo=%d\n",
-                    ctx->preset.name, ctx->cur_fbo);
-        first_render = 0;
-    }
-
     /* blit FBO result to GtkGLArea's framebuffer (NOT FBO 0!) */
     /* md_render_frame rendered into cur_fbo THEN swapped, so the
      * just-finished frame is at 1-cur_fbo (the pre-swap cur_fbo). */
@@ -2008,12 +2022,36 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *glctx, gpointer data)
     glUniform1i(glGetUniformLocation(ctx->gl.prog_blit,"uTex"),0);
     gl_draw_fullscreen_quad(ctx);
 
-    static int dbg_count = 0;
-    if (evemon_debug && dbg_count++ < 5) {
+    if (evemon_debug && ctx->dbg_frame_count < 5) {
+        ctx->dbg_frame_count++;
         GLenum err = glGetError();
         fprintf(stderr, "milkdrop: frame %d  gtk_fbo=%u display_fbo=%d tex=%u err=0x%x\n",
-                dbg_count, gtk_fbo, display_fbo, ctx->gl.fbo_tex[display_fbo], err);
+                ctx->dbg_frame_count, gtk_fbo, display_fbo,
+                ctx->gl.fbo_tex[display_fbo], err);
     }
+    if (!ctx->first_render_done) {
+        if (evemon_debug)
+            fprintf(stderr, "milkdrop: first render frame, preset='%s' cur_fbo=%d\n",
+                    ctx->preset.name, ctx->cur_fbo);
+        ctx->first_render_done = 1;
+    }
+
+    /* ── Restore GL state so GTK/Cairo/other widgets aren't poisoned ── */
+    /* Unbind our texture so the driver doesn't keep a reference alive  */
+    glBindTexture(GL_TEXTURE_2D, 0);
+    /* Unbind the program — GTK may use its own shaders or fixed-function */
+    glUseProgram(0);
+    /* Unbind our VAO/VBO so GTK's vertex state is clean */
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    /* Reset blend state to default */
+    glDisable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ZERO);
+    /* Reset line width to default */
+    glLineWidth(1.0f);
+    /* Restore the FBO binding to what GtkGLArea expects (its own FBO) */
+    glBindFramebuffer(GL_FRAMEBUFFER, gtk_fbo);
 
     /* request next frame */
     if (GTK_IS_WIDGET(area))
@@ -2133,6 +2171,9 @@ static void md_resize_fbos(md_ctx_t *ctx, int w, int h)
 {
     md_gl_t *g = &ctx->gl;
     if (!g->gl_ready) return;
+    if (!ctx->gl_area || !GTK_IS_WIDGET(ctx->gl_area)) return;
+    if (!gtk_widget_get_realized(ctx->gl_area)) return;
+    if (gtk_gl_area_get_error(GTK_GL_AREA(ctx->gl_area))) return;
 
     g->tex_w = w;
     g->tex_h = h;
@@ -2152,6 +2193,10 @@ static void md_resize_fbos(md_ctx_t *ctx, int w, int h)
 static void md_toggle_fullscreen(md_ctx_t *ctx)
 {
     if (!ctx->fs_overlay) return;
+    /* Prevent re-entrant toggle (e.g. rapid F-key presses before the WM
+     * has processed the previous fullscreen request). */
+    if (ctx->fs_toggle_pending) return;
+    ctx->fs_toggle_pending = 1;
 
     if (!ctx->fullscreen) {
         /* ── enter fullscreen ───────────────────────────────── */
@@ -2191,9 +2236,10 @@ static void md_toggle_fullscreen(md_ctx_t *ctx)
 
         ctx->fullscreen = 1;
 
-        /* Resize FBOs to native resolution for crisp rendering */
-        gtk_gl_area_make_current(GTK_GL_AREA(ctx->gl_area));
-        md_resize_fbos(ctx, ctx->fs_width, ctx->fs_height);
+        /* Defer the FBO resize to the next on_render call so we don't
+         * race with the unrealize/realize cycle caused by reparenting. */
+        ctx->pending_fbo_w = ctx->fs_width;
+        ctx->pending_fbo_h = ctx->fs_height;
 
         show_info(ctx, "Fullscreen %dx%d  (F or Esc to exit)",
                   ctx->fs_width, ctx->fs_height);
@@ -2215,12 +2261,15 @@ static void md_toggle_fullscreen(md_ctx_t *ctx)
         ctx->fs_window = NULL;
         ctx->fullscreen = 0;
 
-        /* Resize FBOs back to the compile-time default */
-        gtk_gl_area_make_current(GTK_GL_AREA(ctx->gl_area));
-        md_resize_fbos(ctx, MD_TEX_W, MD_TEX_H);
+        /* Defer the FBO resize to the next on_render call so we don't
+         * call gl ops while the widget may still be mid-realize. */
+        ctx->pending_fbo_w = MD_TEX_W;
+        ctx->pending_fbo_h = MD_TEX_H;
 
         show_info(ctx, "Windowed mode");
     }
+
+    ctx->fs_toggle_pending = 0;
 }
 
 static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)

@@ -435,7 +435,17 @@ static void on_process_selected(const evemon_event_t *ev, void *user_data)
     if (c->buf)
         gtk_text_buffer_set_text(c->buf, "", 0);
     gutter_entries_clear(c);
-    activate_pid(c, sel);
+    c->current_pid = sel;
+    if (sel != 0) {
+        int idx = c->combo ? gtk_combo_box_get_active(GTK_COMBO_BOX(c->combo)) : 0;
+        apply_selection(c, idx);
+        if (c->hsvc && c->hsvc->monitor_watch_children) {
+            int mask = (c->subscribed_fd_stdout ? 1 : 0) |
+                       (c->subscribed_fd_stderr ? 2 : 0);
+            if (mask)
+                c->hsvc->monitor_watch_children(c->hsvc->host_ctx, sel, mask);
+        }
+    }
 }
 
 static void on_check_gutter_toggled(GtkToggleButton *btn, gpointer user_data)
@@ -646,7 +656,17 @@ static void plugin_update(void *ctx, const evemon_proc_data_t *data)
         if (c->buf)
             gtk_text_buffer_set_text(c->buf, "", 0);
         gutter_entries_clear(c);
-        activate_pid(c, sel);
+        c->current_pid = sel;
+        if (sel != 0) {
+            int idx = c->combo ? gtk_combo_box_get_active(GTK_COMBO_BOX(c->combo)) : 0;
+            apply_selection(c, idx);
+            if (c->hsvc && c->hsvc->monitor_watch_children) {
+                int mask = (c->subscribed_fd_stdout ? 1 : 0) |
+                           (c->subscribed_fd_stderr ? 2 : 0);
+                if (mask)
+                    c->hsvc->monitor_watch_children(c->hsvc->host_ctx, sel, mask);
+            }
+        }
     }
     if (c->include_descendants &&
         (c->subscribed_fd_stdout || c->subscribed_fd_stderr) &&
