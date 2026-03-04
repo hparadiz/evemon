@@ -1034,8 +1034,7 @@ static gboolean on_refresh(gpointer data)
             clock_gettime(CLOCK_MONOTONIC, &_now);
             double _e = (double)(_now.tv_sec  - evemon_start_time.tv_sec)
                       + (double)(_now.tv_nsec - evemon_start_time.tv_nsec) / 1e9;
-            printf("[evemon] on_refresh: first non-empty snapshot seen %.3f s after startup\n", _e);
-            fflush(stdout);
+            evemon_log(LOG_DEBUG, "[evemon] on_refresh: first non-empty snapshot seen %.3f s after startup", _e);
         }
     }
 
@@ -2301,10 +2300,8 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
             if (!ctx->has_audio_plugin) {
                 ctx->has_audio_plugin = TRUE;
                 broker_set_audio_callback(on_broker_audio_pids, ctx);
-                fprintf(stdout,
-                        "evemon: audio plugin detected (%s) – "
-                        "enabling audio PID probing\n",
-                        inst->plugin->id);
+                evemon_log(LOG_INFO, "evemon: audio plugin detected (%s) – enabling audio PID probing",
+                           inst->plugin->id);
             }
         }
         return;
@@ -2316,9 +2313,7 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
     if (!inst->plugin->create_widget) return;
     inst->widget = inst->plugin->create_widget(inst->plugin->plugin_ctx);
     if (!inst->widget) {
-        fprintf(stderr,
-                "evemon: plugin %s: create_widget returned NULL\n",
-                inst->so_path);
+        evemon_log(LOG_ERROR, "evemon: plugin %s: create_widget returned NULL", inst->so_path);
         return;
     }
     /* Inject host services now that we're on the GTK main thread */
@@ -2369,10 +2364,10 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
         gtk_widget_show_all(inst->widget);
     }
 
-    fprintf(stdout, "evemon: loaded UI plugin \"%s\" (%s) v%s — tab added\n",
-            inst->plugin->name ? inst->plugin->name : "?",
-            inst->plugin->id   ? inst->plugin->id   : "?",
-            inst->plugin->version ? inst->plugin->version : "?");
+    evemon_log(LOG_INFO, "evemon: loaded UI plugin \"%s\" (%s) v%s — tab added",
+               inst->plugin->name    ? inst->plugin->name    : "?",
+               inst->plugin->id      ? inst->plugin->id      : "?",
+               inst->plugin->version ? inst->plugin->version : "?");
 }
 
 /*
@@ -2387,7 +2382,7 @@ static void on_plugin_scan_done_gtk(int n_loaded, void *user_data)
     if (ctx->shutting_down)
         return;
 
-    fprintf(stdout, "evemon: %d plugin(s) loaded (async)\n", n_loaded);
+    evemon_log(LOG_INFO, "evemon: %d plugin(s) loaded (async)", n_loaded);
 
     /* Select the first visible tab now that sorting is complete */
     if (ctx->plugin_notebook) {
@@ -3753,9 +3748,7 @@ void *ui_thread(void *arg)
                      * add the widgets to the notebook. */
                     free(ac);
                     int nloaded = plugin_loader_scan(preg, plugin_dir);
-                    fprintf(stdout,
-                            "evemon: %d plugin(s) loaded (sync fallback) "
-                            "from %s\n", nloaded, plugin_dir);
+                    evemon_log(LOG_INFO, "evemon: %d plugin(s) loaded (sync fallback) from %s", nloaded, plugin_dir);
 
                     /* Detect audio plugins */
                     for (size_t i = 0; i < preg->count; i++) {

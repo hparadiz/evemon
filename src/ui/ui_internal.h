@@ -8,6 +8,7 @@
 #define UI_INTERNAL_H
 
 #include "../proc.h"
+#include "../log.h"
 #include "../profile.h"
 #include "../evemon_plugin.h"
 #include "../settings.h"

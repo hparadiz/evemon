@@ -22,6 +22,7 @@
  */
 
 #include "../evemon_plugin.h"
+#include "../settings.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -694,6 +695,12 @@ static void on_spectro_theme_changed(GtkComboBox *combo, gpointer data)
     ctx->host->spectro_set_theme(ctx->host->host_ctx,
                                   GTK_DRAWING_AREA(ctx->spectro_draw),
                                   (unsigned)active);
+    /* Persist the selection so it survives a restart */
+    evemon_settings_t *s = settings_get();
+    if (s) {
+        s->spectro_theme = active;
+        settings_save();
+    }
 }
 
 /* ── spectrogram placeholder draw ────────────────────────────── */
@@ -1223,7 +1230,12 @@ static GtkWidget *pw_create_widget(void *opaque)
         GTK_COMBO_BOX_TEXT(ctx->spectro_theme_combo), "Neon");
     gtk_combo_box_text_append_text(
         GTK_COMBO_BOX_TEXT(ctx->spectro_theme_combo), "Vaporwave");
-    gtk_combo_box_set_active(GTK_COMBO_BOX(ctx->spectro_theme_combo), 0);
+    {
+        evemon_settings_t *s = settings_get();
+        int saved = (s && s->spectro_theme >= 0 && s->spectro_theme < 6)
+                    ? s->spectro_theme : 0;
+        gtk_combo_box_set_active(GTK_COMBO_BOX(ctx->spectro_theme_combo), saved);
+    }
     gtk_widget_set_tooltip_text(ctx->spectro_theme_combo, "Spectrogram colour theme");
     gtk_box_pack_end(GTK_BOX(spectro_header), ctx->spectro_theme_combo,
                      FALSE, FALSE, 0);

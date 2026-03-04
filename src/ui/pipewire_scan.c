@@ -350,13 +350,12 @@ static void watcher_on_node_info(void *data,
 
 #undef DICT_COPY_IF_PRESENT
 
-    fprintf(stdout,
-            "[pw_watcher] node_info: id=%u pid=%d app_name='%s' "
-            "node_name='%s' node_desc='%s' media_class='%s' media_name='%s'\n",
-            n->id, (int)n->pid,
-            n->app_name, n->node_name, n->node_desc,
-            n->media_class, n->media_name);
-    fflush(stdout);
+    evemon_log(LOG_AUDIO,
+               "[pw_watcher] node_info: id=%u pid=%d app_name='%s' "
+               "node_name='%s' node_desc='%s' media_class='%s' media_name='%s'",
+               n->id, (int)n->pid,
+               n->app_name, n->node_name, n->node_desc,
+               n->media_class, n->media_name);
 
     /* Publish incrementally after initial enumeration is done,
      * so the live graph stays fresh on every node update. */

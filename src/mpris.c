@@ -20,7 +20,7 @@
 #include "mpris.h"
 
 /* from main.c */
-extern int evemon_debug;
+#include "log.h"
 
 #include <gio/gio.h>
 #include <string.h>

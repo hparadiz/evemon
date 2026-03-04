@@ -163,8 +163,7 @@ void proc_detail_update(ui_ctx_t *ctx)
             clock_gettime(CLOCK_MONOTONIC, &now);
             double uptime = (double)(now.tv_sec  - evemon_start_time.tv_sec) +
                             (double)(now.tv_nsec - evemon_start_time.tv_nsec) / 1e9;
-            printf("[evemon] detail panel first updated %.3f s after startup\n", uptime);
-            fflush(stdout);
+            evemon_log(LOG_DEBUG, "[evemon] detail panel first updated %.3f s after startup", uptime);
         }
     }
 

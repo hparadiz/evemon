@@ -151,6 +151,11 @@ static int settings_load_from_file(evemon_settings_t *s, const char *path)
     if ((v = json_object_get(root, "show_audio_only")) && json_is_boolean(v))
         s->show_audio_only = json_boolean_value(v);
 
+    if ((v = json_object_get(root, "spectro_theme")) && json_is_integer(v)) {
+        int t = (int)json_integer_value(v);
+        if (t >= 0 && t < 16) s->spectro_theme = t;
+    }
+
     /* ── Columns ─────────────────────────────────────────────── */
 
     json_t *cols = json_object_get(root, "columns");
@@ -270,6 +275,8 @@ int settings_save(void)
                         json_integer((json_int_t)s->preselected_pid));
     json_object_set_new(root, "show_audio_only",
                         json_boolean(s->show_audio_only));
+    json_object_set_new(root, "spectro_theme",
+                        json_integer(s->spectro_theme));
 
     /* ── Columns ─────────────────────────────────────────────── */
 
@@ -334,6 +341,17 @@ evemon_settings_t *settings_get(void)
     }
     return &g_settings;
 }
+
+/* ── Re-exported symbols for plugin use ─────────────────────── */
+
+/*
+ * Thin wrappers so plugins loaded via dlopen (with RTLD_GLOBAL / -rdynamic)
+ * can access the settings singleton without depending on settings.h types.
+ * Plugins that include settings.h get the real typed API; these symbol
+ * names are declared as void* / int in evemon_plugin.h for ABI-only callers.
+ */
+void *evemon_settings_get(void) { return settings_get(); }
+int   evemon_settings_save(void) { return settings_save(); }
 
 /* ── Plugin query ────────────────────────────────────────────── */
 

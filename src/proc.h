@@ -7,8 +7,7 @@
 #include "steam.h"
 #include "fdmon.h"
 
-/* Global debug flag, set by --debug on the command line */
-extern int evemon_debug;
+#include "log.h"
 
 /* Maximum lengths for process info strings */
 #define PROC_NAME_MAX  256

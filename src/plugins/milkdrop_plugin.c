@@ -29,7 +29,7 @@
 #include <epoxy/gl.h>
 
 /* from main.c – resolved at dlopen time (-rdynamic) */
-extern int evemon_debug;
+#include "../log.h"
 
 /* ── compile-time knobs ──────────────────────────────────────── */
 

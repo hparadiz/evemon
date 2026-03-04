@@ -65,6 +65,7 @@ typedef struct {
     /* Behaviour */
     pid_t         preselected_pid;                /* PID to select on startup (0 = none) */
     bool          show_audio_only;               /* filter tree to audio processes */
+    int           spectro_theme;                 /* spectrogram colour theme index (0 = Classic) */
 
     /* Columns: ordered list of column names; visibility is implicit
      * (present = visible).  Empty array = show all defaults. */

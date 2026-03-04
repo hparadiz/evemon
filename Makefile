@@ -62,6 +62,7 @@ GRES_O   := $(BUILD_DIR)/evemon_resources.o
 # These compile without any GTK dependency and will eventually be
 # linked by all frontends (GTK, headless, terminal).
 CORE_SRCS := \
+    $(SRC_DIR)/log.c \
     $(SRC_DIR)/monitor.c \
     $(SRC_DIR)/plugin_broker.c \
     $(SRC_DIR)/plugin_loader.c \

@@ -664,6 +664,18 @@ void evemon_format_memory(long kb, char *buf, size_t bufsz);
 /* Format an epoch timestamp to fuzzy "2h 15m ago" string */
 void evemon_format_fuzzy_time(time_t epoch, char *buf, size_t bufsz);
 
+/*
+ * Persistent settings access.  Plugins may read/write evemon's
+ * settings.json via these re-exported symbols.  The returned pointer
+ * is the global singleton — modify fields then call settings_save().
+ * Do not cache the pointer across calls.
+ *
+ * evemon_settings_t is declared in settings.h.  Plugins that need
+ * field access must include settings.h alongside this header.
+ */
+void *evemon_settings_get(void);   /* returns evemon_settings_t* */
+int   evemon_settings_save(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -16,7 +16,7 @@
 #include "art_loader.h"
 
 /* from main.c */
-extern int evemon_debug;
+#include "log.h"
 
 #include <gio/gio.h>
 #include <libsoup/soup.h>
