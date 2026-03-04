@@ -408,15 +408,6 @@ static float md_eval_program(md_lexer_t *l, md_var_ctx_t *vc)
     return r;
 }
 
-static float md_eval(const char *expr, md_var_ctx_t *vc)
-    __attribute__((unused));
-static float md_eval(const char *expr, md_var_ctx_t *vc)
-{
-    if (!expr || !expr[0]) return 0;
-    md_lexer_t lex; md_lex(&lex, expr);
-    return md_eval_program(&lex, vc);
-}
-
 /*
  * Replay a pre-lexed token stream with a fresh variable context.
  * Resets cur and depth to 0 so the same lexer can be re-evaluated
@@ -808,7 +799,13 @@ static const char *WARP_FS =
     "uniform float uDecay;\n"
     "void main() {\n"
     "  vec3 c = texture(uTex, clamp(vUV, 0.0, 1.0)).rgb;\n"
-    "  fragColor = vec4(clamp(c * uDecay, 0.0, 1.0), 1.0);\n"
+    /* Always drain a tiny amount toward black so that feedback loops with
+     * decay near 1.0 still converge to black instead of grey-washing.
+     * 0.004 ≈ 1/250: at 60 fps the buffer drains fully in ~4 s even
+     * if decay=1.0, which is imperceptible during normal visual activity.
+     * The larger constant is needed to overcome echo passes that inject
+     * energy back into the buffer each frame. */
+    "  fragColor = vec4(clamp(c * uDecay - 0.004, 0.0, 1.0), 1.0);\n"
     "}\n";
 
 /* Fullscreen quad (for post-process, composite, echo) */
@@ -932,9 +929,11 @@ typedef struct {
 
     /* ── persistent scratch buffers (allocated once, reused every frame) */
     /* Warp mesh vertex data: avoids per-frame malloc in gl_warp_blit */
-    float  *mesh_verts;   /* MESH_FLOAT_COUNT floats */
+    float        *mesh_verts;    /* MESH_FLOAT_COUNT floats */
     /* Shape fill/border scratch: avoids per-call malloc in gl_draw_shape */
     color_vert_t *shape_scratch; /* SHAPE_SCRATCH_VERTS verts */
+    /* Wave vertex scratch: avoids 48 KB stack alloc per wave draw call */
+    color_vert_t *wave_verts;    /* MAX_WAVE_VERTS verts */
 
     /* ── cached uniform locations (looked up once after shader link) ── */
     /* prog_warp */
@@ -1659,10 +1658,12 @@ static void gl_warp_blit(md_ctx_t *ctx, md_preset_t *p)
     float s_x   = md_var_read(vc,"sx");
     float s_y   = md_var_read(vc,"sy");
     float decay = md_var_read(vc,"decay");
-    /* Clamp decay to prevent energy accumulation (white-out).
+    /* Clamp decay to prevent energy accumulation.
      * Values above 1.0 from per-frame code would amplify the
-     * feedback loop.  Cap at 1.0 and floor at 0. */
-    if (decay > 1.0f) decay = 1.0f;
+     * feedback loop.  Cap at 0.992 so the buffer always drains
+     * toward black even for presets that set decay = 1.0 exactly,
+     * preventing the grey-wash that otherwise builds up over time. */
+    if (decay > 0.992f) decay = 0.992f;
     if (decay < 0.0f) decay = 0.0f;
     int   wrap  = (int)md_var_read(vc,"wrap");
 
@@ -2052,34 +2053,31 @@ static void gl_draw_custom_waves(md_ctx_t *ctx)
         if (samples<2) samples=2;
         if (samples>MD_WAVEFORM_N) samples=MD_WAVEFORM_N;
         md_lexer_t *pf_lex = ctx->lex_wave_pf[wi];
-        md_var_ctx_t wvc;
-        memcpy(&wvc, &ctx->pf_vars, sizeof(md_var_ctx_t));
-        md_var_set(&wvc,"r",cw->r); md_var_set(&wvc,"g",cw->g);
-        md_var_set(&wvc,"b",cw->b); md_var_set(&wvc,"a",cw->a);
-        md_var_set(&wvc,"samples",(float)samples);
-        if (pf_lex) md_eval_precompiled(pf_lex, &wvc);
-        float br=md_var_read(&wvc,"r"), bg=md_var_read(&wvc,"g");
-        float bb=md_var_read(&wvc,"b"), ba=md_var_read(&wvc,"a");
-        samples=(int)md_var_read(&wvc,"samples");
-        if (samples<2) samples=2;
-        if (samples>MD_WAVEFORM_N) samples=MD_WAVEFORM_N;
 
-        color_vert_t verts[MAX_WAVE_VERTS];
+        color_vert_t *verts = ctx->gl.wave_verts; /* persistent — no stack alloc */
         int nv=0;
         /*
-         * Per-point loop: avoid a 13 KB memcpy per sample by keeping ONE
-         * md_var_ctx_t and pinning pointers to the 7 inputs that change
-         * each iteration.  Everything else (q-vars, colors, etc.) is
-         * already in wvc from the per-frame eval above.
+         * Single var context for both per-frame and per-point evaluation.
+         * One memcpy from pf_vars, seed all variables, run pf_lex in-place,
+         * then pin pointers for the per-point loop — zero extra copies.
          */
         md_var_ctx_t ppv;
-        memcpy(&ppv, &wvc, sizeof(md_var_ctx_t));
-        /* seed result variables in ppv so the pointers are valid */
+        memcpy(&ppv, &ctx->pf_vars, sizeof(md_var_ctx_t));
+        md_var_set(&ppv,"r",cw->r); md_var_set(&ppv,"g",cw->g);
+        md_var_set(&ppv,"b",cw->b); md_var_set(&ppv,"a",cw->a);
+        md_var_set(&ppv,"samples",(float)samples);
+        /* seed per-point variables so hash slots are allocated before pinning */
         md_var_set(&ppv,"sample",0); md_var_set(&ppv,"value1",0);
         md_var_set(&ppv,"value2",0);
         md_var_set(&ppv,"x",0.5f); md_var_set(&ppv,"y",0.5f);
-        md_var_set(&ppv,"r",br); md_var_set(&ppv,"g",bg);
-        md_var_set(&ppv,"b",bb); md_var_set(&ppv,"a",ba);
+        if (pf_lex) md_eval_precompiled(pf_lex, &ppv);
+        /* re-read wave-level outputs after per-frame eval */
+        float br = md_var_read(&ppv,"r"),  bg = md_var_read(&ppv,"g");
+        float bb = md_var_read(&ppv,"b"),  ba = md_var_read(&ppv,"a");
+        samples = (int)md_var_read(&ppv,"samples");
+        if (samples<2) samples=2;
+        if (samples>MD_WAVEFORM_N) samples=MD_WAVEFORM_N;
+        /* pin all per-point pointers */
         float *wp_sample = md_var_get(&ppv,"sample");
         float *wp_v1     = md_var_get(&ppv,"value1");
         float *wp_v2     = md_var_get(&ppv,"value2");
@@ -2170,15 +2168,16 @@ static void gl_draw_custom_shapes(md_ctx_t *ctx)
             if (sp_inst) *sp_inst = (float)ii;
             /* reset shape vars to preset defaults each instance
              * (the per-frame code may modify them) */
-            if (sp_x)   *sp_x   = cs->x;              if (sp_y)   *sp_y   = cs->y;
-            if (sp_rad) *sp_rad = cs->rad;             if (sp_ang) *sp_ang = cs->ang;
-            if (sp_r)   *sp_r   = cs->r;               if (sp_g)   *sp_g   = cs->g;
-            if (sp_b)   *sp_b   = cs->b;               if (sp_a)   *sp_a   = cs->a;
-            if (sp_r2)  *sp_r2  = cs->r2;              if (sp_g2)  *sp_g2  = cs->g2;
-            if (sp_b2)  *sp_b2  = cs->b2;              if (sp_a2)  *sp_a2  = cs->a2;
-            if (sp_br)  *sp_br  = cs->border_r;        if (sp_bg)  *sp_bg  = cs->border_g;
-            if (sp_bb)  *sp_bb  = cs->border_b;        if (sp_ba)  *sp_ba  = cs->border_a;
-            if (sp_add) *sp_add = (float)cs->additive; if (sp_thk) *sp_thk = (float)cs->thickOutline;
+            if (sp_x)   { *sp_x   = cs->x;   }       if (sp_y)   { *sp_y   = cs->y;   }
+            if (sp_rad) { *sp_rad = cs->rad;  }       if (sp_ang) { *sp_ang = cs->ang; }
+            if (sp_r)   { *sp_r   = cs->r;   }       if (sp_g)   { *sp_g   = cs->g;   }
+            if (sp_b)   { *sp_b   = cs->b;   }       if (sp_a)   { *sp_a   = cs->a;   }
+            if (sp_r2)  { *sp_r2  = cs->r2;  }       if (sp_g2)  { *sp_g2  = cs->g2;  }
+            if (sp_b2)  { *sp_b2  = cs->b2;  }       if (sp_a2)  { *sp_a2  = cs->a2;  }
+            if (sp_br)  { *sp_br  = cs->border_r; }  if (sp_bg)  { *sp_bg  = cs->border_g; }
+            if (sp_bb)  { *sp_bb  = cs->border_b; }  if (sp_ba)  { *sp_ba  = cs->border_a; }
+            if (sp_add) { *sp_add = (float)cs->additive; }
+            if (sp_thk) { *sp_thk = (float)cs->thickOutline; }
             if (pf_lex) md_eval_precompiled(pf_lex, &svc);
             float shx = (sp_x   ? *sp_x   : cs->x)   * (float)ctx->gl.tex_w;
             float shy = (1.0f - (sp_y   ? *sp_y   : cs->y)) * (float)ctx->gl.tex_h;
@@ -2269,8 +2268,10 @@ static void gl_video_echo(md_ctx_t *ctx)
     if (ea < 0.01f) return;
     float ez = md_var_read(vc,"echo_zoom");
     int eo = (int)md_var_read(vc,"echo_orient");
-    /* Clamp echo alpha to prevent energy accumulation */
-    if (ea > 1.0f) ea = 1.0f;
+    /* Cap echo alpha: values near 1.0 inject energy faster than the warp
+     * drain can remove it, causing white-out.  0.85 keeps the echo effect
+     * visually prominent while leaving headroom for the drain to dominate. */
+    if (ea > 0.85f) ea = 0.85f;
 
     /* We need to read from the current in-progress FBO but also
      * write to it.  Copy current → other, then blend other back
@@ -2305,6 +2306,10 @@ static void gl_post_process(md_ctx_t *ctx)
 {
     md_var_ctx_t *vc = &ctx->pf_vars;
     float gam = md_var_read(vc,"gamma");
+    /* Cap gamma: unbounded values from per-frame code drive mid-tones to
+     * white in the feedback loop.  2.5 is already very bright (equivalent
+     * to a strong monitor gamma boost) and sufficient for any preset. */
+    if (gam > 2.5f) gam = 2.5f;
     int br=(int)md_var_read(vc,"brighten"), dk=(int)md_var_read(vc,"darken");
     int sol=(int)md_var_read(vc,"solarize"), inv=(int)md_var_read(vc,"invert");
     if (!br && !dk && !sol && !inv && fabsf(gam-1.0f)<0.01f) return;
@@ -2459,6 +2464,7 @@ static void gl_init_resources(md_ctx_t *ctx)
     /* persistent scratch buffers — allocated once, reused every frame */
     g->mesh_verts   = malloc(MESH_FLOAT_COUNT * sizeof(float));
     g->shape_scratch = malloc(SHAPE_SCRATCH_VERTS * sizeof(color_vert_t));
+    g->wave_verts    = malloc(MAX_WAVE_VERTS * sizeof(color_vert_t));
 
     /* fullscreen quad VAO */
     float quad[] = {0,0, 1,0, 0,1, 1,1};
@@ -2676,6 +2682,7 @@ static void on_unrealize(GtkGLArea *area, gpointer data)
     /* free persistent scratch buffers */
     free(g->mesh_verts);    g->mesh_verts    = NULL;
     free(g->shape_scratch); g->shape_scratch = NULL;
+    free(g->wave_verts);    g->wave_verts    = NULL;
     g->gl_ready = 0;
 }
 
