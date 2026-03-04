@@ -35,6 +35,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 static void pw_graph_init(pw_graph_t *g)
 {
@@ -165,6 +167,31 @@ static void dict_copy(const struct spa_dict *d, const char *key,
     }
 }
 
+/*
+ * Safe integer parsers for untrusted PipeWire property strings (FIND-3).
+ * atoi() silently overflows and has no error detection; these helpers
+ * use strtol/strtoul with range validation and return 0 on any error.
+ */
+static pid_t parse_pid(const char *s)
+{
+    if (!s || !*s) return 0;
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno || *end || v <= 0 || v > (long)INT_MAX) return 0;
+    return (pid_t)v;
+}
+
+static uint32_t parse_u32(const char *s)
+{
+    if (!s || !*s) return 0;
+    char *end;
+    errno = 0;
+    unsigned long v = strtoul(s, &end, 10);
+    if (errno || *end || v > (unsigned long)UINT32_MAX) return 0;
+    return (uint32_t)v;
+}
+
 /* ── Persistent PipeWire watcher ────────────────────────────── */
 
 /*
@@ -254,46 +281,53 @@ static const struct pw_node_events g_watcher_node_events = {
     .info = watcher_on_node_info,
 };
 
-/* Deep-copy src into dst.  dst must be zeroed or freed first. */
-static void pw_graph_copy(pw_graph_t *dst, const pw_graph_t *src)
+/* Deep-copy src into dst.  Returns 0 on success, -1 if any allocation
+ * fails (dst is left zeroed on failure — no partial state).  dst must
+ * be zeroed or freed before calling.  FIND-4: atomic commit pattern so
+ * callers can detect and handle failure rather than silently getting an
+ * incomplete graph. */
+static int pw_graph_copy(pw_graph_t *dst, const pw_graph_t *src)
 {
-    memset(dst, 0, sizeof(*dst));
+    pw_graph_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+
     if (src->node_count) {
-        dst->nodes = malloc(src->node_count * sizeof(*dst->nodes));
-        if (dst->nodes) {
-            memcpy(dst->nodes, src->nodes,
-                   src->node_count * sizeof(*dst->nodes));
-            dst->node_count = src->node_count;
-            dst->node_cap   = src->node_count;
-        }
+        tmp.nodes = malloc(src->node_count * sizeof(*tmp.nodes));
+        if (!tmp.nodes) goto fail;
+        memcpy(tmp.nodes, src->nodes, src->node_count * sizeof(*tmp.nodes));
+        tmp.node_count = src->node_count;
+        tmp.node_cap   = src->node_count;
     }
     if (src->port_count) {
-        dst->ports = malloc(src->port_count * sizeof(*dst->ports));
-        if (dst->ports) {
-            memcpy(dst->ports, src->ports,
-                   src->port_count * sizeof(*dst->ports));
-            dst->port_count = src->port_count;
-            dst->port_cap   = src->port_count;
-        }
+        tmp.ports = malloc(src->port_count * sizeof(*tmp.ports));
+        if (!tmp.ports) goto fail;
+        memcpy(tmp.ports, src->ports, src->port_count * sizeof(*tmp.ports));
+        tmp.port_count = src->port_count;
+        tmp.port_cap   = src->port_count;
     }
     if (src->link_count) {
-        dst->links = malloc(src->link_count * sizeof(*dst->links));
-        if (dst->links) {
-            memcpy(dst->links, src->links,
-                   src->link_count * sizeof(*dst->links));
-            dst->link_count = src->link_count;
-            dst->link_cap   = src->link_count;
-        }
+        tmp.links = malloc(src->link_count * sizeof(*tmp.links));
+        if (!tmp.links) goto fail;
+        memcpy(tmp.links, src->links, src->link_count * sizeof(*tmp.links));
+        tmp.link_count = src->link_count;
+        tmp.link_cap   = src->link_count;
     }
     if (src->client_count) {
-        dst->clients = malloc(src->client_count * sizeof(*dst->clients));
-        if (dst->clients) {
-            memcpy(dst->clients, src->clients,
-                   src->client_count * sizeof(*dst->clients));
-            dst->client_count = src->client_count;
-            dst->client_cap   = src->client_count;
-        }
+        tmp.clients = malloc(src->client_count * sizeof(*tmp.clients));
+        if (!tmp.clients) goto fail;
+        memcpy(tmp.clients, src->clients,
+               src->client_count * sizeof(*tmp.clients));
+        tmp.client_count = src->client_count;
+        tmp.client_cap   = src->client_count;
     }
+
+    *dst = tmp;
+    return 0;
+
+fail:
+    pw_graph_free(&tmp);
+    memset(dst, 0, sizeof(*dst));
+    return -1;
 }
 
 /* Resolve node PIDs from client objects (in-place on graph). */
@@ -317,7 +351,11 @@ static void watcher_publish(pw_watcher_t *w)
     pw_graph_resolve_pids(&w->graph);
 
     pw_graph_t copy;
-    pw_graph_copy(&copy, &w->graph);
+    if (pw_graph_copy(&copy, &w->graph) != 0) {
+        evemon_log(LOG_ERROR, "[pw_watcher] pw_graph_copy failed (OOM) "
+                   "— skipping publish");
+        return;
+    }
 
     pthread_mutex_lock(&g_watcher_mutex);
     pw_graph_free(&g_live_graph);
@@ -344,7 +382,7 @@ static void watcher_on_node_info(void *data,
 
     const char *pid_str = dict_get(props, PW_KEY_APP_PROCESS_ID);
     if (!pid_str) pid_str = dict_get(props, "pipewire.sec.pid");
-    if (pid_str && n->pid == 0) n->pid = (pid_t)atoi(pid_str);
+    if (pid_str && n->pid == 0) n->pid = parse_pid(pid_str);
 
     /* Only overwrite a field if the new value is non-empty,
      * so incremental updates don't clobber previously-captured data. */
@@ -394,9 +432,9 @@ static void watcher_on_global(void *data, uint32_t id,
         if (props) {
             const char *pid_str = dict_get(props, PW_KEY_APP_PROCESS_ID);
             if (!pid_str) pid_str = dict_get(props, "pipewire.sec.pid");
-            n->pid = pid_str ? (pid_t)atoi(pid_str) : 0;
+            n->pid = parse_pid(pid_str);
             const char *cid = dict_get(props, PW_KEY_CLIENT_ID);
-            n->client_id = cid ? (uint32_t)atoi(cid) : 0;
+            n->client_id = parse_u32(cid);
             dict_copy(props, PW_KEY_APP_NAME,         n->app_name,    sizeof(n->app_name));
             dict_copy(props, PW_KEY_NODE_NAME,        n->node_name,   sizeof(n->node_name));
             dict_copy(props, PW_KEY_NODE_DESCRIPTION, n->node_desc,   sizeof(n->node_desc));
@@ -438,7 +476,7 @@ static void watcher_on_global(void *data, uint32_t id,
         c->id = id;
         const char *pid_str = dict_get(props, PW_KEY_APP_PROCESS_ID);
         if (!pid_str) pid_str = dict_get(props, "pipewire.sec.pid");
-        c->pid = pid_str ? (pid_t)atoi(pid_str) : 0;
+        c->pid = parse_pid(pid_str);
 
         if (w->initial_done) watcher_publish(w);
 
@@ -448,7 +486,7 @@ static void watcher_on_global(void *data, uint32_t id,
         if (!p) return;
         p->id = id;
         const char *nid = dict_get(props, PW_KEY_NODE_ID);
-        p->node_id = nid ? (uint32_t)atoi(nid) : 0;
+        p->node_id = parse_u32(nid);
         dict_copy(props, PW_KEY_PORT_NAME,      p->port_name,  sizeof(p->port_name));
         dict_copy(props, PW_KEY_PORT_ALIAS,     p->port_alias, sizeof(p->port_alias));
         dict_copy(props, PW_KEY_PORT_DIRECTION, p->direction,  sizeof(p->direction));
@@ -461,13 +499,13 @@ static void watcher_on_global(void *data, uint32_t id,
         l->id = id;
         const char *v;
         v = dict_get(props, PW_KEY_LINK_OUTPUT_NODE);
-        l->output_node_id = v ? (uint32_t)atoi(v) : 0;
+        l->output_node_id = parse_u32(v);
         v = dict_get(props, "link.output.port");
-        l->output_port_id = v ? (uint32_t)atoi(v) : 0;
+        l->output_port_id = parse_u32(v);
         v = dict_get(props, PW_KEY_LINK_INPUT_NODE);
-        l->input_node_id  = v ? (uint32_t)atoi(v) : 0;
+        l->input_node_id  = parse_u32(v);
         v = dict_get(props, "link.input.port");
-        l->input_port_id  = v ? (uint32_t)atoi(v) : 0;
+        l->input_port_id  = parse_u32(v);
 
         if (w->initial_done) watcher_publish(w);
     }
@@ -539,36 +577,8 @@ static void *pw_watcher_thread(void *arg)
 {
     (void)arg;
 
-    /* Set PIPEWIRE_REMOTE for sudo/pkexec like pw_snapshot() does */
-    char pw_remote_buf[256] = {0};
-    if (getuid() == 0 && !getenv("PIPEWIRE_REMOTE")) {
-        const char *uid_str = getenv("SUDO_UID");
-        if (!uid_str) uid_str = getenv("PKEXEC_UID");
-        if (uid_str) {
-            snprintf(pw_remote_buf, sizeof(pw_remote_buf),
-                     "/run/user/%s/pipewire-0", uid_str);
-        } else {
-            DIR *run_dir = opendir("/run/user");
-            if (run_dir) {
-                struct dirent *de;
-                while ((de = readdir(run_dir)) != NULL) {
-                    if (de->d_name[0] == '.') continue;
-                    if (strcmp(de->d_name, "0") == 0) continue;
-                    char probe[256];
-                    snprintf(probe, sizeof(probe),
-                             "/run/user/%s/pipewire-0", de->d_name);
-                    if (access(probe, F_OK) == 0) {
-                        snprintf(pw_remote_buf, sizeof(pw_remote_buf),
-                                 "%s", probe);
-                        break;
-                    }
-                }
-                closedir(run_dir);
-            }
-        }
-        if (pw_remote_buf[0])
-            setenv("PIPEWIRE_REMOTE", pw_remote_buf, 1);
-    }
+    /* PIPEWIRE_REMOTE is resolved in pw_watcher_start() on the main
+     * thread before this thread is spawned, so no setenv() here. */
 
     pw_init(NULL, NULL);
 
@@ -630,10 +640,71 @@ static void *pw_watcher_thread(void *arg)
 /*
  * Start the persistent watcher thread.
  * Called once from ui_gtk.c before gtk_main().
+ *
+ * PIPEWIRE_REMOTE is resolved here — on the main thread, before any
+ * PipeWire threads are spawned — so that setenv() is never called
+ * from multiple threads concurrently (POSIX data race on environ,
+ * FIND-2 / security_audit_2026-03-04.md).
  */
 void pw_watcher_start(void)
 {
     if (g_watcher_tid) return;
+
+    /* Resolve PIPEWIRE_REMOTE once on the main thread. */
+    if (getuid() == 0 && !getenv("PIPEWIRE_REMOTE")) {
+        char pw_remote_buf[256] = {0};
+        const char *uid_str = getenv("SUDO_UID");
+        if (!uid_str) uid_str = getenv("PKEXEC_UID");
+        if (uid_str) {
+            /* Validate that the UID string is purely numeric (OBS-A). */
+            int is_numeric = 1;
+            for (const char *p = uid_str; *p; p++) {
+                if (*p < '0' || *p > '9') { is_numeric = 0; break; }
+            }
+            if (is_numeric)
+                snprintf(pw_remote_buf, sizeof(pw_remote_buf),
+                         "/run/user/%s/pipewire-0", uid_str);
+        } else {
+            DIR *run_dir = opendir("/run/user");
+            if (run_dir) {
+                struct dirent *de;
+                while ((de = readdir(run_dir)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+                    if (strcmp(de->d_name, "0") == 0) continue;
+
+                    /* Validate d_name is a purely numeric UID (FIND-1). */
+                    int is_numeric = 1;
+                    for (const char *p = de->d_name; *p; p++) {
+                        if (*p < '0' || *p > '9') { is_numeric = 0; break; }
+                    }
+                    if (!is_numeric) continue;
+
+                    /* d_name is purely numeric (validated above), so the
+                     * path length is bounded: "/run/user/" (10) + UID
+                     * digits (≤10 for 32-bit) + "/pipewire-0" (11) < 40.
+                     * Use a larger intermediate buffer to silence the
+                     * -Wformat-truncation false positive. */
+                    char probe[PATH_MAX];
+                    snprintf(probe, sizeof(probe),
+                             "/run/user/%s/pipewire-0", de->d_name);
+
+                    /* Verify ownership matches the directory UID (FIND-1). */
+                    struct stat st;
+                    if (stat(probe, &st) != 0) continue;
+                    uid_t expected_uid = (uid_t)strtoul(de->d_name, NULL, 10);
+                    if (st.st_uid != expected_uid) continue;
+
+                    snprintf(pw_remote_buf, sizeof(pw_remote_buf),
+                             "%s", probe);
+                    break;
+                }
+                closedir(run_dir);
+            }
+        }
+        if (pw_remote_buf[0])
+            setenv("PIPEWIRE_REMOTE", pw_remote_buf, 1);
+    }
+
     pw_graph_init(&g_live_graph);
     g_watcher_stop = 0;
     pthread_create(&g_watcher_tid, NULL, pw_watcher_thread, NULL);
@@ -710,7 +781,7 @@ static void on_node_info(void *data, const struct pw_node_info *info)
     const char *pid_str = dict_get(props, PW_KEY_APP_PROCESS_ID);
     if (!pid_str)
         pid_str = dict_get(props, "pipewire.sec.pid");
-    n->pid = pid_str ? (pid_t)atoi(pid_str) : 0;
+    n->pid = parse_pid(pid_str);
 
     dict_copy(props, PW_KEY_APP_NAME,          n->app_name,    sizeof(n->app_name));
     dict_copy(props, PW_KEY_NODE_NAME,         n->node_name,   sizeof(n->node_name));
@@ -747,10 +818,10 @@ static void on_global(void *data, uint32_t id,
             const char *pid_str = dict_get(props, PW_KEY_APP_PROCESS_ID);
             if (!pid_str)
                 pid_str = dict_get(props, "pipewire.sec.pid");
-            n->pid = pid_str ? (pid_t)atoi(pid_str) : 0;
+            n->pid = parse_pid(pid_str);
 
             const char *cid_str = dict_get(props, PW_KEY_CLIENT_ID);
-            n->client_id = cid_str ? (uint32_t)atoi(cid_str) : 0;
+            n->client_id = parse_u32(cid_str);
 
             dict_copy(props, PW_KEY_APP_NAME,          n->app_name,    sizeof(n->app_name));
             dict_copy(props, PW_KEY_NODE_NAME,         n->node_name,   sizeof(n->node_name));
@@ -792,7 +863,7 @@ static void on_global(void *data, uint32_t id,
         const char *pid_str = dict_get(props, PW_KEY_APP_PROCESS_ID);
         if (!pid_str)
             pid_str = dict_get(props, "pipewire.sec.pid");
-        c->pid = pid_str ? (pid_t)atoi(pid_str) : 0;
+        c->pid = parse_pid(pid_str);
 
     } else if (strcmp(type, PW_TYPE_INTERFACE_Port) == 0) {
         if (!props) return;
@@ -801,7 +872,7 @@ static void on_global(void *data, uint32_t id,
         p->id = id;
 
         const char *nid = dict_get(props, PW_KEY_NODE_ID);
-        p->node_id = nid ? (uint32_t)atoi(nid) : 0;
+        p->node_id = parse_u32(nid);
 
         dict_copy(props, PW_KEY_PORT_NAME,      p->port_name,  sizeof(p->port_name));
         dict_copy(props, PW_KEY_PORT_ALIAS,     p->port_alias, sizeof(p->port_alias));
@@ -816,13 +887,13 @@ static void on_global(void *data, uint32_t id,
 
         const char *v;
         v = dict_get(props, PW_KEY_LINK_OUTPUT_NODE);
-        l->output_node_id = v ? (uint32_t)atoi(v) : 0;
+        l->output_node_id = parse_u32(v);
         v = dict_get(props, "link.output.port");
-        l->output_port_id = v ? (uint32_t)atoi(v) : 0;
+        l->output_port_id = parse_u32(v);
         v = dict_get(props, PW_KEY_LINK_INPUT_NODE);
-        l->input_node_id = v ? (uint32_t)atoi(v) : 0;
+        l->input_node_id = parse_u32(v);
         v = dict_get(props, "link.input.port");
-        l->input_port_id = v ? (uint32_t)atoi(v) : 0;
+        l->input_port_id = parse_u32(v);
     }
 }
 
@@ -888,9 +959,9 @@ int pw_snapshot(pw_graph_t *out)
         pthread_mutex_unlock(&g_watcher_mutex);
         return -1;   /* watcher not ready yet — caller will retry next cycle */
     }
-    pw_graph_copy(out, &g_live_graph);
+    int rc = pw_graph_copy(out, &g_live_graph);
     pthread_mutex_unlock(&g_watcher_mutex);
-    return 0;
+    return rc;
 }
 
 /* ── per-PID result building ─────────────────────────────────── */

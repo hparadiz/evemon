@@ -702,13 +702,8 @@ void spectrogram_start_for_node(ui_ctx_t *ctx, GtkDrawingArea *draw_area,
     st->ui_ctx         = ctx;
     st->running        = 1;
 
-    /* Ensure PIPEWIRE_REMOTE is set */
-    const char *sudo_uid = getenv("SUDO_UID");
-    if (sudo_uid && !getenv("PIPEWIRE_REMOTE")) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "/run/user/%s/pipewire-0", sudo_uid);
-        setenv("PIPEWIRE_REMOTE", buf, 1);
-    }
+    /* PIPEWIRE_REMOTE is set once at startup in pw_watcher_start()
+     * before any PipeWire threads are spawned (FIND-2). */
 
     pw_init(NULL, NULL);
 
