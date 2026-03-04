@@ -1110,6 +1110,43 @@ static void md_readback_pf_vars(md_ctx_t *ctx)
     }
 }
 
+/* ── vivid random color ─────────────────────────────────────── */
+/*
+ * Pick a random color guaranteed to be vivid and distinguishable.
+ * Strategy: random hue, saturation clamped to [sat_min, 1.0],
+ * value clamped to [val_min, val_max].  Converts HSV → RGB.
+ * This avoids near-gray, near-black, and near-white outcomes that
+ * make the wave invisible against both dark and bright backgrounds.
+ */
+static void md_random_vivid_color(float sat_min, float val_min, float val_max,
+                                   float *out_r, float *out_g, float *out_b)
+{
+    /* random hue [0, 360) */
+    float h = (float)g_random_int_range(0, 3600) / 10.0f;
+    /* saturation: avoid washed-out grays */
+    float s = sat_min + (1.0f - sat_min) *
+              ((float)g_random_int_range(0, 1000) / 999.0f);
+    /* value: avoid too dark or too white */
+    float v = val_min + (val_max - val_min) *
+              ((float)g_random_int_range(0, 1000) / 999.0f);
+
+    /* HSV → RGB (standard conversion) */
+    float hh = h / 60.0f;
+    int   i  = (int)hh % 6;
+    float f  = hh - (int)hh;
+    float p  = v * (1.0f - s);
+    float q  = v * (1.0f - s * f);
+    float t  = v * (1.0f - s * (1.0f - f));
+    switch (i) {
+    case 0: *out_r=v; *out_g=t; *out_b=p; break;
+    case 1: *out_r=q; *out_g=v; *out_b=p; break;
+    case 2: *out_r=p; *out_g=v; *out_b=t; break;
+    case 3: *out_r=p; *out_g=q; *out_b=v; break;
+    case 4: *out_r=t; *out_g=p; *out_b=v; break;
+    default: *out_r=v; *out_g=p; *out_b=q; break;
+    }
+}
+
 /* ── beat detection ──────────────────────────────────────────── */
 
 static int md_detect_beat(md_ctx_t *ctx)
@@ -2090,9 +2127,24 @@ static void md_mini_mashup(md_ctx_t *ctx, int save)
     int donor = g_random_int_range(0, ctx->lib.count);
     md_preset_t tmp; memset(&tmp, 0, sizeof(tmp));
     if (md_load_preset(&tmp, ctx->lib.paths[donor])) return;
-    /* mix in wave colors, motion, and a few interesting params */
-    ctx->preset.wave_r = tmp.wave_r; ctx->preset.wave_g = tmp.wave_g;
-    ctx->preset.wave_b = tmp.wave_b;
+    /* mix in wave colors, motion, and a few interesting params.
+     * If the donor's wave color is too dark/gray/white, replace it with
+     * a vivid HSV-derived color so the mashup is always visually distinct. */
+    {
+        float dr = tmp.wave_r, dg = tmp.wave_g, db = tmp.wave_b;
+        /* luminance and saturation check (BT.601) */
+        float lum  = 0.299f*dr + 0.587f*dg + 0.114f*db;
+        float cmax = fmaxf(dr, fmaxf(dg, db));
+        float cmin = fminf(dr, fminf(dg, db));
+        float sat  = (cmax > 0.001f) ? (cmax - cmin) / cmax : 0.0f;
+        if (lum < 0.15f || lum > 0.88f || sat < 0.20f) {
+            /* donor color is too dark, too bright, or too gray — generate vivid */
+            md_random_vivid_color(0.55f, 0.45f, 0.95f, &dr, &dg, &db);
+        }
+        ctx->preset.wave_r = dr;
+        ctx->preset.wave_g = dg;
+        ctx->preset.wave_b = db;
+    }
     ctx->preset.dx = tmp.dx; ctx->preset.dy = tmp.dy;
     ctx->preset.rot = tmp.rot; ctx->preset.sx = tmp.sx; ctx->preset.sy = tmp.sy;
     show_info(ctx, "Mini-mashup from: %s", tmp.name);
@@ -2400,9 +2452,12 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
             ctx->saved_preset = ctx->preset;
             ctx->has_saved_preset = 1;
         }
-        ctx->preset.wave_r = (float)(g_random_int_range(0,1000))/999.0f;
-        ctx->preset.wave_g = (float)(g_random_int_range(0,1000))/999.0f;
-        ctx->preset.wave_b = (float)(g_random_int_range(0,1000))/999.0f;
+        /* Use HSV-based generation: saturation ≥ 0.55, value in [0.45, 0.95]
+         * so we always get a vivid, legible color instead of lucky gray/white/black. */
+        md_random_vivid_color(0.55f, 0.45f, 0.95f,
+                              &ctx->preset.wave_r,
+                              &ctx->preset.wave_g,
+                              &ctx->preset.wave_b);
         show_info(ctx, "Wave color randomized (%.2f, %.2f, %.2f)",
                   ctx->preset.wave_r, ctx->preset.wave_g, ctx->preset.wave_b);
         return TRUE;
