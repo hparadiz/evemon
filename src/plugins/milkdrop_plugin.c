@@ -18,6 +18,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -144,24 +145,50 @@ enum {
 
 typedef struct { int type; float num_val; char str_val[64]; } md_token_t;
 typedef struct { char name[64]; float value; } md_var_t;
+
+/*
+ * Open-addressing hash table over a flat vars[] array.
+ * EXPR_MAX_VARS=192, table size must be a power-of-two > 192.
+ * 256 gives a max load factor of 0.75 — good collision rate.
+ * hash[] stores the index into vars[] + 1 (0 = empty bucket).
+ */
+#define VAR_HT_SIZE 256                  /* must be power of two        */
+#define VAR_HT_MASK (VAR_HT_SIZE - 1)
+
 typedef struct {
     md_var_t vars[EXPR_MAX_VARS];
     int      var_count;
+    uint8_t  ht[VAR_HT_SIZE];  /* index+1 into vars[], 0 = empty */
 } md_var_ctx_t;
+
+/* djb2-style hash truncated to table size */
+static inline unsigned md_var_hash(const char *s)
+{
+    unsigned h = 5381;
+    while (*s) h = ((h << 5) + h) ^ (unsigned char)*s++;
+    return h & VAR_HT_MASK;
+}
 
 static float *md_var_get(md_var_ctx_t *vc, const char *name)
 {
-    for (int i = 0; i < vc->var_count; i++)
-        if (strcmp(vc->vars[i].name, name) == 0)
+    unsigned h = md_var_hash(name);
+    for (unsigned probe = 0; probe < VAR_HT_SIZE; probe++) {
+        unsigned slot = (h + probe) & VAR_HT_MASK;
+        uint8_t  idx  = vc->ht[slot];
+        if (idx == 0) {
+            /* empty bucket — insert new variable here */
+            if (vc->var_count >= EXPR_MAX_VARS) return NULL;
+            int i = vc->var_count++;
+            strncpy(vc->vars[i].name, name, 63);
+            vc->vars[i].name[63] = 0;
+            vc->vars[i].value    = 0.0f;
+            vc->ht[slot] = (uint8_t)(i + 1);  /* store 1-based index */
             return &vc->vars[i].value;
-    if (vc->var_count < EXPR_MAX_VARS) {
-        int i = vc->var_count++;
-        strncpy(vc->vars[i].name, name, 63);
-        vc->vars[i].name[63] = 0;
-        vc->vars[i].value = 0.0f;
-        return &vc->vars[i].value;
+        }
+        if (strcmp(vc->vars[idx - 1].name, name) == 0)
+            return &vc->vars[idx - 1].value;
     }
-    return NULL;
+    return NULL;  /* table full (should not happen with load < 0.75) */
 }
 
 static void md_var_set(md_var_ctx_t *vc, const char *name, float val)
@@ -382,10 +409,26 @@ static float md_eval_program(md_lexer_t *l, md_var_ctx_t *vc)
 }
 
 static float md_eval(const char *expr, md_var_ctx_t *vc)
+    __attribute__((unused));
+static float md_eval(const char *expr, md_var_ctx_t *vc)
 {
     if (!expr || !expr[0]) return 0;
     md_lexer_t lex; md_lex(&lex, expr);
     return md_eval_program(&lex, vc);
+}
+
+/*
+ * Replay a pre-lexed token stream with a fresh variable context.
+ * Resets cur and depth to 0 so the same lexer can be re-evaluated
+ * each frame (or each mesh vertex) without re-lexing.
+ * The caller must not modify l->tokens.
+ */
+static float md_eval_precompiled(md_lexer_t *l, md_var_ctx_t *vc)
+{
+    if (!l || l->count == 0) return 0.0f;
+    l->cur   = 0;
+    l->depth = 0;
+    return md_eval_program(l, vc);
 }
 
 static void md_concat_lines(const char lines[][MAX_LINE_LEN], int n,
@@ -855,6 +898,17 @@ static const char *BLIT_FS =
 
 /* ── per-instance GL state ───────────────────────────────────── */
 
+/* Number of vertices in the warp mesh: (MESH_W+1)*(MESH_H+1) */
+#define MESH_VERT_COUNT  ((MESH_W+1)*(MESH_H+1))
+/* Each vertex: x,y (screen pos) + u,v (warped UV) = 4 floats */
+#define MESH_FLOAT_COUNT (MESH_VERT_COUNT * 4)
+
+/* Max vertices for the shape fill + border scratch buffer */
+#define SHAPE_SCRATCH_VERTS  (100 + 2)   /* sides(≤100) + 2 for fan */
+
+/* Vertex type for wave/shape drawing — defined here so md_gl_t can hold a pointer */
+typedef struct { float x, y, r, g, b, a; } color_vert_t;
+
 typedef struct {
     /* FBOs for feedback loop */
     GLuint fbo[2], fbo_tex[2];
@@ -875,6 +929,25 @@ typedef struct {
 
     /* current FBO texture dimensions (changes on fullscreen toggle) */
     int    tex_w, tex_h;
+
+    /* ── persistent scratch buffers (allocated once, reused every frame) */
+    /* Warp mesh vertex data: avoids per-frame malloc in gl_warp_blit */
+    float  *mesh_verts;   /* MESH_FLOAT_COUNT floats */
+    /* Shape fill/border scratch: avoids per-call malloc in gl_draw_shape */
+    color_vert_t *shape_scratch; /* SHAPE_SCRATCH_VERTS verts */
+
+    /* ── cached uniform locations (looked up once after shader link) ── */
+    /* prog_warp */
+    GLint  u_warp_tex,   u_warp_decay;
+    /* prog_post */
+    GLint  u_post_tex,   u_post_gamma, u_post_brighten, u_post_darken;
+    GLint  u_post_solarize, u_post_invert;
+    /* prog_echo */
+    GLint  u_echo_tex,   u_echo_alpha, u_echo_zoom, u_echo_orient;
+    /* prog_darken */
+    GLint  u_darken_aspect;
+    /* prog_blit */
+    GLint  u_blit_tex;
 } md_gl_t;
 
 /* ── per-instance plugin state ───────────────────────────────── */
@@ -1002,7 +1075,112 @@ typedef struct {
     int           fav_menu_sel;        /* cursor row in favorites menu      */
     int           fav_cycle;           /* Ctrl+F: cycle only favorites mode */
     int           fav_cycle_idx;       /* current position in fav cycle     */
+
+    /* ── pre-lexed expression cache (re-lex only on preset change) ── */
+    /*
+     * md_lexer_t is ~148 KB (2048 tokens × 72 bytes).  Allocating it on
+     * the stack inside the per-pixel mesh loop (1,813 calls/frame) causes
+     * ~268 MB/s of stack traffic and forces the kernel to grow the stack
+     * segment without ever shrinking it.  We pre-lex each program once
+     * per preset switch and replay the token stream each frame/vertex.
+     */
+    int           preset_serial;     /* bumped every time a new preset loads  */
+    int           lex_serial;        /* serial at which the lexers were built  */
+
+    /* pre-lexed programs for the active preset */
+    md_lexer_t   *lex_per_frame_init; /* per_frame_init code  */
+    md_lexer_t   *lex_per_frame;      /* per_frame code        */
+    md_lexer_t   *lex_per_pixel;      /* per_pixel (warp mesh) */
+    /* custom waves: per-point and per-frame for each wave slot */
+    md_lexer_t   *lex_wave_pf[MAX_CUSTOM_WAVES];
+    md_lexer_t   *lex_wave_pp[MAX_CUSTOM_WAVES];
+    /* custom shapes: per-frame for each shape slot */
+    md_lexer_t   *lex_shape_pf[MAX_CUSTOM_SHAPES];
+
+    /* persistent concat buffers — avoid 64 KB stack allocs each frame */
+    char          code_buf[MAX_EXPR_LINES * MAX_LINE_LEN];
 } md_ctx_t;
+
+/* ── pre-lexed cache management ─────────────────────────────── */
+
+static void md_lex_cache_free(md_ctx_t *ctx)
+{
+    free(ctx->lex_per_frame_init); ctx->lex_per_frame_init = NULL;
+    free(ctx->lex_per_frame);      ctx->lex_per_frame      = NULL;
+    free(ctx->lex_per_pixel);      ctx->lex_per_pixel      = NULL;
+    for (int i = 0; i < MAX_CUSTOM_WAVES; i++) {
+        free(ctx->lex_wave_pf[i]); ctx->lex_wave_pf[i] = NULL;
+        free(ctx->lex_wave_pp[i]); ctx->lex_wave_pp[i] = NULL;
+    }
+    for (int i = 0; i < MAX_CUSTOM_SHAPES; i++) {
+        free(ctx->lex_shape_pf[i]); ctx->lex_shape_pf[i] = NULL;
+    }
+    ctx->lex_serial = -1;
+    /* Return freed pages to the OS immediately so RSS doesn't drift upward
+     * as we cycle through presets.  malloc_trim(0) releases all releasable
+     * memory in the top of the heap back to the kernel. */
+    malloc_trim(0);
+}
+
+/* Allocate and lex one program; returns NULL if src is empty. */
+static md_lexer_t *md_lex_alloc(const char *src)
+{
+    if (!src || !src[0]) return NULL;
+    md_lexer_t *l = malloc(sizeof(md_lexer_t));
+    if (!l) return NULL;
+    md_lex(l, src);
+    return l;
+}
+
+/*
+ * Re-build all pre-lexed programs from the active preset.
+ * Called once each time preset_serial != lex_serial.
+ */
+static void md_lex_cache_rebuild(md_ctx_t *ctx)
+{
+    md_preset_t *p = &ctx->preset;
+    md_lex_cache_free(ctx);
+
+    if (p->per_frame_init_count > 0) {
+        md_concat_lines(p->per_frame_init, p->per_frame_init_count,
+                        ctx->code_buf, sizeof(ctx->code_buf));
+        ctx->lex_per_frame_init = md_lex_alloc(ctx->code_buf);
+    }
+    if (p->per_frame_count > 0) {
+        md_concat_lines(p->per_frame, p->per_frame_count,
+                        ctx->code_buf, sizeof(ctx->code_buf));
+        ctx->lex_per_frame = md_lex_alloc(ctx->code_buf);
+    }
+    if (p->per_pixel_count > 0) {
+        md_concat_lines(p->per_pixel, p->per_pixel_count,
+                        ctx->code_buf, sizeof(ctx->code_buf));
+        ctx->lex_per_pixel = md_lex_alloc(ctx->code_buf);
+    }
+    for (int i = 0; i < MAX_CUSTOM_WAVES; i++) {
+        md_custom_wave_t *cw = &p->waves[i];
+        if (!cw->enabled) continue;
+        if (cw->per_frame_count > 0) {
+            md_concat_lines(cw->per_frame, cw->per_frame_count,
+                            ctx->code_buf, sizeof(ctx->code_buf));
+            ctx->lex_wave_pf[i] = md_lex_alloc(ctx->code_buf);
+        }
+        if (cw->per_point_count > 0) {
+            md_concat_lines(cw->per_point, cw->per_point_count,
+                            ctx->code_buf, sizeof(ctx->code_buf));
+            ctx->lex_wave_pp[i] = md_lex_alloc(ctx->code_buf);
+        }
+    }
+    for (int i = 0; i < MAX_CUSTOM_SHAPES; i++) {
+        md_custom_shape_t *cs = &p->shapes[i];
+        if (!cs->enabled) continue;
+        if (cs->per_frame_count > 0) {
+            md_concat_lines(cs->per_frame, cs->per_frame_count,
+                            ctx->code_buf, sizeof(ctx->code_buf));
+            ctx->lex_shape_pf[i] = md_lex_alloc(ctx->code_buf);
+        }
+    }
+    ctx->lex_serial = ctx->preset_serial;
+}
 
 /* ── sound analysis ──────────────────────────────────────────── */
 
@@ -1061,6 +1239,7 @@ static void md_setup_pf_vars(md_ctx_t *ctx, md_preset_t *p)
 {
     md_var_ctx_t *vc = &ctx->pf_vars;
     vc->var_count = 0;
+    memset(vc->ht, 0, sizeof(vc->ht));  /* clear hash table alongside var_count */
     md_var_set(vc,"time",ctx->total_time);
     md_var_set(vc,"fps",1.0f/(ctx->frame_time+0.0001f));
     md_var_set(vc,"frame",(float)ctx->frame_count);
@@ -1343,6 +1522,7 @@ static int md_fav_recall(md_ctx_t *ctx, int slot)
     ctx->preset_loaded = 1;
     ctx->pf_init_done  = 1;   /* q_vars already seeded – skip zero-init */
     ctx->blending      = 0;
+    ctx->preset_serial++; /* invalidate pre-lexed cache */
     show_info(ctx, "\xe2\x98\x85 Recalled: %s", sv->name);
     return 1;
 }
@@ -1448,6 +1628,7 @@ static void md_load_preset_idx(md_ctx_t *ctx, int idx, int blend)
     } else {
         ctx->preset_loaded=1; ctx->pf_init_done=0;
         memset(ctx->q_vars,0,sizeof(ctx->q_vars));
+        ctx->preset_serial++; /* invalidate pre-lexed cache */
     }
 }
 
@@ -1492,37 +1673,76 @@ static void gl_warp_blit(md_ctx_t *ctx, md_preset_t *p)
     f[2]=10.54f+3*cosf(wt*0.786f+3);  f[3]=11.49f+4*cosf(wt*0.893f+5);
     float ax = 1, ay = (float)ctx->gl.tex_w/ctx->gl.tex_h;
 
-    int has_pp = p->per_pixel_count > 0;
-    char pp_code[MAX_EXPR_LINES * MAX_LINE_LEN];
-    if (has_pp) md_concat_lines(p->per_pixel, p->per_pixel_count, pp_code, sizeof(pp_code));
+    md_lexer_t *pp_lex = ctx->lex_per_pixel; /* pre-lexed, NULL if no per-pixel code */
 
-    /* Compute warped UV for each mesh vertex */
-    int nv = (MESH_W+1)*(MESH_H+1);
-    float *verts = malloc(nv * 4 * sizeof(float)); /* x,y, u,v per vertex */
+    /* Compute warped UV for each mesh vertex – use pre-allocated buffer */
+    float *verts = ctx->gl.mesh_verts; /* MESH_FLOAT_COUNT floats, never NULL after gl_init */
+
+    /*
+     * Per-pixel variable context: we keep ONE md_var_ctx_t on the stack and
+     * reset only the 4 per-vertex inputs (x, y, rad, ang) each iteration.
+     * This avoids a 13 KB memcpy for every one of the 1,813 mesh vertices.
+     * We pre-seed it from the per-frame var context, then find the indices
+     * of x/y/rad/ang once so we can update them directly by pointer.
+     */
+    /*
+     * Per-pixel variable context: ONE md_var_ctx_t copied once per frame.
+     * Input pointers (x, y, rad, ang) and output pointers (zoom … sy) are
+     * pinned by address so we never call the O(n) md_var_read/md_var_get
+     * inside the tight per-vertex loop — just direct float reads/writes.
+     */
+    md_var_ctx_t pp_vc;
+    /* inputs */
+    float *pp_x_ptr = NULL, *pp_y_ptr = NULL;
+    float *pp_rad_ptr = NULL, *pp_ang_ptr = NULL;
+    /* outputs */
+    float *pp_zoom = NULL, *pp_zexp = NULL, *pp_rot  = NULL, *pp_warp = NULL;
+    float *pp_cx   = NULL, *pp_cy   = NULL, *pp_dx   = NULL, *pp_dy   = NULL;
+    float *pp_sx   = NULL, *pp_sy   = NULL;
+    if (pp_lex) {
+        memcpy(&pp_vc, vc, sizeof(md_var_ctx_t));
+        /* ensure all variables exist in the context before pinning */
+        pp_x_ptr   = md_var_get(&pp_vc, "x");
+        pp_y_ptr   = md_var_get(&pp_vc, "y");
+        pp_rad_ptr = md_var_get(&pp_vc, "rad");
+        pp_ang_ptr = md_var_get(&pp_vc, "ang");
+        pp_zoom = md_var_get(&pp_vc, "zoom");    pp_zexp = md_var_get(&pp_vc, "zoomexp");
+        pp_rot  = md_var_get(&pp_vc, "rot");     pp_warp = md_var_get(&pp_vc, "warp");
+        pp_cx   = md_var_get(&pp_vc, "cx");      pp_cy   = md_var_get(&pp_vc, "cy");
+        pp_dx   = md_var_get(&pp_vc, "dx");      pp_dy   = md_var_get(&pp_vc, "dy");
+        pp_sx   = md_var_get(&pp_vc, "sx");      pp_sy   = md_var_get(&pp_vc, "sy");
+    }
 
     for (int my = 0; my <= MESH_H; my++) {
         for (int mx = 0; mx <= MESH_W; mx++) {
             float nx = (float)mx / MESH_W;
             float ny = (float)my / MESH_H;
 
-            /* per-pixel vars */
+            /* per-pixel vars: start from per-frame defaults */
             float pz=zoom, pe=zexp, pr=rot, pw=wrp;
             float pcx=cx, pcy=cy, pdx=d_x, pdy=d_y, psx=s_x, psy=s_y;
 
-            if (has_pp) {
+            if (pp_lex) {
                 float x2=nx*2-1, y2=ny*2-1;
                 float rad = sqrtf(x2*x2*ax*ax + y2*y2*ay*ay);
                 float ang = atan2f(y2*ay, x2*ax);
-                md_var_ctx_t pp_vc;
-                memcpy(&pp_vc, vc, sizeof(md_var_ctx_t));
-                md_var_set(&pp_vc,"x",nx); md_var_set(&pp_vc,"y",ny);
-                md_var_set(&pp_vc,"rad",rad); md_var_set(&pp_vc,"ang",ang);
-                md_eval(pp_code, &pp_vc);
-                pz=md_var_read(&pp_vc,"zoom"); pe=md_var_read(&pp_vc,"zoomexp");
-                pr=md_var_read(&pp_vc,"rot");  pw=md_var_read(&pp_vc,"warp");
-                pcx=md_var_read(&pp_vc,"cx");  pcy=md_var_read(&pp_vc,"cy");
-                pdx=md_var_read(&pp_vc,"dx");  pdy=md_var_read(&pp_vc,"dy");
-                psx=md_var_read(&pp_vc,"sx");  psy=md_var_read(&pp_vc,"sy");
+                /* write the 4 per-vertex inputs via pinned pointers */
+                if (pp_x_ptr)   *pp_x_ptr   = nx;
+                if (pp_y_ptr)   *pp_y_ptr   = ny;
+                if (pp_rad_ptr) *pp_rad_ptr = rad;
+                if (pp_ang_ptr) *pp_ang_ptr = ang;
+                md_eval_precompiled(pp_lex, &pp_vc);
+                /* read 10 outputs via pinned pointers — zero string compares */
+                if (pp_zoom) pz  = *pp_zoom;
+                if (pp_zexp) pe  = *pp_zexp;
+                if (pp_rot)  pr  = *pp_rot;
+                if (pp_warp) pw  = *pp_warp;
+                if (pp_cx)   pcx = *pp_cx;
+                if (pp_cy)   pcy = *pp_cy;
+                if (pp_dx)   pdx = *pp_dx;
+                if (pp_dy)   pdy = *pp_dy;
+                if (pp_sx)   psx = *pp_sx;
+                if (pp_sy)   psy = *pp_sy;
             }
 
             float x = nx*2-1, y = ny*2-1;
@@ -1562,13 +1782,12 @@ static void gl_warp_blit(md_ctx_t *ctx, md_preset_t *p)
     GLint wrapMode = wrap ? GL_REPEAT : GL_CLAMP_TO_EDGE;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapMode);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapMode);
-    glUniform1i(glGetUniformLocation(ctx->gl.prog_warp, "uTex"), 0);
-    glUniform1f(glGetUniformLocation(ctx->gl.prog_warp, "uDecay"),
-                fminf(fmaxf(decay, 0.0f), 1.0f));
+    glUniform1i(ctx->gl.u_warp_tex,   0);
+    glUniform1f(ctx->gl.u_warp_decay, fminf(fmaxf(decay, 0.0f), 1.0f));
 
     glBindVertexArray(ctx->gl.mesh_vao);
     glBindBuffer(GL_ARRAY_BUFFER, ctx->gl.mesh_vbo);
-    glBufferData(GL_ARRAY_BUFFER, nv*4*sizeof(float), verts, GL_STREAM_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, MESH_FLOAT_COUNT*sizeof(float), verts, GL_STREAM_DRAW);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)0);
     glEnableVertexAttribArray(1);
@@ -1579,7 +1798,7 @@ static void gl_warp_blit(md_ctx_t *ctx, md_preset_t *p)
 
     glDrawElements(GL_TRIANGLES, ctx->gl.mesh_index_count, GL_UNSIGNED_INT, 0);
     glBindVertexArray(0);
-    free(verts);
+    /* verts is ctx->gl.mesh_verts — persistent, do not free here */
 }
 
 /* Draw darken-center effect */
@@ -1588,14 +1807,12 @@ static void gl_darken_center(md_ctx_t *ctx)
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glUseProgram(ctx->gl.prog_darken);
-    glUniform1f(glGetUniformLocation(ctx->gl.prog_darken, "uAspect"),
-                (float)ctx->gl.tex_w/ctx->gl.tex_h);
+    glUniform1f(ctx->gl.u_darken_aspect, (float)ctx->gl.tex_w/ctx->gl.tex_h);
     gl_draw_fullscreen_quad(ctx);
     glDisable(GL_BLEND);
 }
 
 /* Upload wave/shape vertex data and draw */
-typedef struct { float x, y, r, g, b, a; } color_vert_t;
 
 static void gl_draw_colored_lines(md_ctx_t *ctx, color_vert_t *v, int count,
                                    GLenum mode, float width, int additive)
@@ -1634,9 +1851,9 @@ static void gl_draw_shape(md_ctx_t *ctx, float sx, float sy, float sr, float sa,
     float px = sx/w, py = sy/h;
     float rx = sr/w, ry = sr/h;
 
-    /* fill: triangle fan with center + rim */
-    int nv = sides + 2;
-    color_vert_t *fv = malloc(nv * sizeof(color_vert_t));
+    /* fill: triangle fan with center + rim — use pre-allocated scratch buffer */
+    int nv = sides + 2;   /* sides ≤ 100, so nv ≤ 102 ≤ SHAPE_SCRATCH_VERTS */
+    color_vert_t *fv = ctx->gl.shape_scratch;
     fv[0] = (color_vert_t){px, py, r1, g1, b1, fminf(a1,1)};
     for (int i = 0; i <= sides; i++) {
         float angle = sa + (float)i/sides * 2*(float)M_PI;
@@ -1659,12 +1876,12 @@ static void gl_draw_shape(md_ctx_t *ctx, float sx, float sy, float sr, float sa,
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(color_vert_t),
                           (void*)(2*sizeof(float)));
     glDrawArrays(GL_TRIANGLE_FAN, 0, nv);
-    free(fv);
+    /* fv is shape_scratch — persistent, do not free */
 
-    /* border */
+    /* border — reuse the same scratch buffer (fill is already uploaded) */
     if (ba > 0.001f) {
-        int nb = sides + 1;
-        color_vert_t *bv = malloc(nb * sizeof(color_vert_t));
+        int nb = sides + 1;  /* nb ≤ 101 ≤ SHAPE_SCRATCH_VERTS */
+        color_vert_t *bv = ctx->gl.shape_scratch;
         for (int i = 0; i <= sides; i++) {
             float angle = sa + (float)(i%sides)/sides * 2*(float)M_PI;
             bv[i] = (color_vert_t){
@@ -1675,7 +1892,7 @@ static void gl_draw_shape(md_ctx_t *ctx, float sx, float sy, float sr, float sa,
         glLineWidth(thick?2.5f:1.0f);
         glBufferData(GL_ARRAY_BUFFER, nb*sizeof(color_vert_t), bv, GL_STREAM_DRAW);
         glDrawArrays(GL_LINE_STRIP, 0, nb);
-        free(bv);
+        /* bv is shape_scratch — persistent, do not free */
         glLineWidth(1.0f);
     }
     glBindVertexArray(0);
@@ -1829,20 +2046,18 @@ static void gl_draw_custom_waves(md_ctx_t *ctx)
     for (int wi=0; wi<MAX_CUSTOM_WAVES; wi++) {
         md_custom_wave_t *cw = &ctx->preset.waves[wi];
         if (!cw->enabled || !cw->per_point_count) continue;
-        char pp_code[MAX_EXPR_LINES*MAX_LINE_LEN];
-        md_concat_lines(cw->per_point, cw->per_point_count, pp_code, sizeof(pp_code));
-        if (!pp_code[0]) continue;
+        md_lexer_t *pp_lex = ctx->lex_wave_pp[wi];
+        if (!pp_lex) continue;
         int samples=cw->samples;
         if (samples<2) samples=2;
         if (samples>MD_WAVEFORM_N) samples=MD_WAVEFORM_N;
-        char pf_code[MAX_EXPR_LINES*MAX_LINE_LEN];
-        md_concat_lines(cw->per_frame, cw->per_frame_count, pf_code, sizeof(pf_code));
+        md_lexer_t *pf_lex = ctx->lex_wave_pf[wi];
         md_var_ctx_t wvc;
         memcpy(&wvc, &ctx->pf_vars, sizeof(md_var_ctx_t));
         md_var_set(&wvc,"r",cw->r); md_var_set(&wvc,"g",cw->g);
         md_var_set(&wvc,"b",cw->b); md_var_set(&wvc,"a",cw->a);
         md_var_set(&wvc,"samples",(float)samples);
-        if (pf_code[0]) md_eval(pf_code, &wvc);
+        if (pf_lex) md_eval_precompiled(pf_lex, &wvc);
         float br=md_var_read(&wvc,"r"), bg=md_var_read(&wvc,"g");
         float bb=md_var_read(&wvc,"b"), ba=md_var_read(&wvc,"a");
         samples=(int)md_var_read(&wvc,"samples");
@@ -1851,25 +2066,53 @@ static void gl_draw_custom_waves(md_ctx_t *ctx)
 
         color_vert_t verts[MAX_WAVE_VERTS];
         int nv=0;
+        /*
+         * Per-point loop: avoid a 13 KB memcpy per sample by keeping ONE
+         * md_var_ctx_t and pinning pointers to the 7 inputs that change
+         * each iteration.  Everything else (q-vars, colors, etc.) is
+         * already in wvc from the per-frame eval above.
+         */
+        md_var_ctx_t ppv;
+        memcpy(&ppv, &wvc, sizeof(md_var_ctx_t));
+        /* seed result variables in ppv so the pointers are valid */
+        md_var_set(&ppv,"sample",0); md_var_set(&ppv,"value1",0);
+        md_var_set(&ppv,"value2",0);
+        md_var_set(&ppv,"x",0.5f); md_var_set(&ppv,"y",0.5f);
+        md_var_set(&ppv,"r",br); md_var_set(&ppv,"g",bg);
+        md_var_set(&ppv,"b",bb); md_var_set(&ppv,"a",ba);
+        float *wp_sample = md_var_get(&ppv,"sample");
+        float *wp_v1     = md_var_get(&ppv,"value1");
+        float *wp_v2     = md_var_get(&ppv,"value2");
+        float *wp_x      = md_var_get(&ppv,"x");
+        float *wp_y      = md_var_get(&ppv,"y");
+        float *wp_r      = md_var_get(&ppv,"r");
+        float *wp_g      = md_var_get(&ppv,"g");
+        float *wp_b_     = md_var_get(&ppv,"b");
+        float *wp_a      = md_var_get(&ppv,"a");
         for (int i=0; i<samples && nv<MAX_WAVE_VERTS; i++) {
-            md_var_ctx_t ppv;
-            memcpy(&ppv, &wvc, sizeof(md_var_ctx_t));
             float sf=(float)i/(samples-1);
             float v1 = cw->bSpectrum ? snd->spec[i%MD_FFT_HALF]*cw->scaling
                                      : snd->wave[0][i%MD_WAVEFORM_N]*cw->scaling;
             float v2 = cw->bSpectrum ? snd->spec[i%MD_FFT_HALF]*cw->scaling
                                      : snd->wave[1][i%MD_WAVEFORM_N]*cw->scaling;
-            md_var_set(&ppv,"sample",sf);
-            md_var_set(&ppv,"value1",v1); md_var_set(&ppv,"value2",v2);
-            md_var_set(&ppv,"x",0.5f+v1*0.5f); md_var_set(&ppv,"y",0.5f+v2*0.5f);
-            md_var_set(&ppv,"r",br); md_var_set(&ppv,"g",bg);
-            md_var_set(&ppv,"b",bb); md_var_set(&ppv,"a",ba);
-            md_eval(pp_code, &ppv);
-            float px=md_var_read(&ppv,"x"), py=1.0f-md_var_read(&ppv,"y");
+            if (wp_sample) *wp_sample = sf;
+            if (wp_v1)     *wp_v1     = v1;
+            if (wp_v2)     *wp_v2     = v2;
+            if (wp_x)      *wp_x      = 0.5f+v1*0.5f;
+            if (wp_y)      *wp_y      = 0.5f+v2*0.5f;
+            if (wp_r)      *wp_r      = br;
+            if (wp_g)      *wp_g      = bg;
+            if (wp_b_)     *wp_b_     = bb;
+            if (wp_a)      *wp_a      = ba;
+            md_eval_precompiled(pp_lex, &ppv);
+            float px = wp_x ? *wp_x : 0.5f;
+            float py = 1.0f - (wp_y ? *wp_y : 0.5f);
             verts[nv++]=(color_vert_t){
                 px, py,
-                md_var_read(&ppv,"r"), md_var_read(&ppv,"g"),
-                md_var_read(&ppv,"b"), fminf(md_var_read(&ppv,"a"),1)
+                wp_r  ? *wp_r  : br,
+                wp_g  ? *wp_g  : bg,
+                wp_b_ ? *wp_b_ : bb,
+                fminf(wp_a ? *wp_a : ba, 1)
             };
         }
         GLenum mode = cw->bUseDots ? GL_POINTS : GL_LINE_STRIP;
@@ -1885,44 +2128,72 @@ static void gl_draw_custom_shapes(md_ctx_t *ctx)
     for (int si=0; si<MAX_CUSTOM_SHAPES; si++) {
         md_custom_shape_t *cs = &ctx->preset.shapes[si];
         if (!cs->enabled) continue;
-        char pf_code[MAX_EXPR_LINES*MAX_LINE_LEN];
-        md_concat_lines(cs->per_frame, cs->per_frame_count, pf_code, sizeof(pf_code));
+        md_lexer_t *pf_lex = ctx->lex_shape_pf[si];
         int inst=cs->num_inst;
         if (inst<1) inst=1;
         if (inst>1024) inst=1024;
+        /*
+         * Pin all shape variable pointers once outside the instance loop.
+         * md_var_get is now O(1) with the hash table, but doing 20 lookups
+         * × up to 1024 instances is still wasteful.  One memcpy + pin
+         * outside, then direct pointer reads inside.
+         */
+        md_var_ctx_t svc;
+        memcpy(&svc, &ctx->pf_vars, sizeof(md_var_ctx_t));
+        /* seed all shape variables so the hash slots are allocated */
+        md_var_set(&svc,"x",cs->x);           md_var_set(&svc,"y",cs->y);
+        md_var_set(&svc,"rad",cs->rad);        md_var_set(&svc,"ang",cs->ang);
+        md_var_set(&svc,"sides",(float)cs->sides);
+        md_var_set(&svc,"r",cs->r);    md_var_set(&svc,"g",cs->g);
+        md_var_set(&svc,"b",cs->b);    md_var_set(&svc,"a",cs->a);
+        md_var_set(&svc,"r2",cs->r2);  md_var_set(&svc,"g2",cs->g2);
+        md_var_set(&svc,"b2",cs->b2);  md_var_set(&svc,"a2",cs->a2);
+        md_var_set(&svc,"border_r",cs->border_r); md_var_set(&svc,"border_g",cs->border_g);
+        md_var_set(&svc,"border_b",cs->border_b); md_var_set(&svc,"border_a",cs->border_a);
+        md_var_set(&svc,"additive",(float)cs->additive);
+        md_var_set(&svc,"thick",(float)cs->thickOutline);
+        md_var_set(&svc,"instance",0); md_var_set(&svc,"instances",(float)inst);
+        /* pin output pointers — valid for the lifetime of svc on this stack frame */
+        float *sp_x        = md_var_get(&svc,"x");        float *sp_y   = md_var_get(&svc,"y");
+        float *sp_rad      = md_var_get(&svc,"rad");       float *sp_ang = md_var_get(&svc,"ang");
+        float *sp_sides    = md_var_get(&svc,"sides");
+        float *sp_r        = md_var_get(&svc,"r");         float *sp_g   = md_var_get(&svc,"g");
+        float *sp_b        = md_var_get(&svc,"b");         float *sp_a   = md_var_get(&svc,"a");
+        float *sp_r2       = md_var_get(&svc,"r2");        float *sp_g2  = md_var_get(&svc,"g2");
+        float *sp_b2       = md_var_get(&svc,"b2");        float *sp_a2  = md_var_get(&svc,"a2");
+        float *sp_br       = md_var_get(&svc,"border_r");  float *sp_bg  = md_var_get(&svc,"border_g");
+        float *sp_bb       = md_var_get(&svc,"border_b");  float *sp_ba  = md_var_get(&svc,"border_a");
+        float *sp_add      = md_var_get(&svc,"additive");  float *sp_thk = md_var_get(&svc,"thick");
+        float *sp_inst     = md_var_get(&svc,"instance");
         for (int ii=0; ii<inst; ii++) {
-            md_var_ctx_t svc;
-            memcpy(&svc, &ctx->pf_vars, sizeof(md_var_ctx_t));
-            md_var_set(&svc,"x",cs->x); md_var_set(&svc,"y",cs->y);
-            md_var_set(&svc,"rad",cs->rad); md_var_set(&svc,"ang",cs->ang);
-            md_var_set(&svc,"sides",(float)cs->sides);
-            md_var_set(&svc,"r",cs->r); md_var_set(&svc,"g",cs->g);
-            md_var_set(&svc,"b",cs->b); md_var_set(&svc,"a",cs->a);
-            md_var_set(&svc,"r2",cs->r2); md_var_set(&svc,"g2",cs->g2);
-            md_var_set(&svc,"b2",cs->b2); md_var_set(&svc,"a2",cs->a2);
-            md_var_set(&svc,"border_r",cs->border_r);
-            md_var_set(&svc,"border_g",cs->border_g);
-            md_var_set(&svc,"border_b",cs->border_b);
-            md_var_set(&svc,"border_a",cs->border_a);
-            md_var_set(&svc,"additive",(float)cs->additive);
-            md_var_set(&svc,"thick",(float)cs->thickOutline);
-            md_var_set(&svc,"instance",(float)ii);
-            md_var_set(&svc,"instances",(float)inst);
-            if (pf_code[0]) md_eval(pf_code, &svc);
-            float sx=md_var_read(&svc,"x")*(float)ctx->gl.tex_w;
-            float sy=(1-md_var_read(&svc,"y"))*(float)ctx->gl.tex_h;
-            float sr=md_var_read(&svc,"rad")*fminf(ctx->gl.tex_w,ctx->gl.tex_h)*0.5f;
-            float sa=md_var_read(&svc,"ang");
-            int sides=(int)md_var_read(&svc,"sides");
-            gl_draw_shape(ctx, sx, sy, sr, sa, sides,
-                md_var_read(&svc,"r"), md_var_read(&svc,"g"),
-                md_var_read(&svc,"b"), md_var_read(&svc,"a"),
-                md_var_read(&svc,"r2"), md_var_read(&svc,"g2"),
-                md_var_read(&svc,"b2"), md_var_read(&svc,"a2"),
-                md_var_read(&svc,"border_r"), md_var_read(&svc,"border_g"),
-                md_var_read(&svc,"border_b"), md_var_read(&svc,"border_a"),
-                (int)md_var_read(&svc,"additive"),
-                (int)md_var_read(&svc,"thick"));
+            /* update only the two per-instance inputs */
+            if (sp_inst) *sp_inst = (float)ii;
+            /* reset shape vars to preset defaults each instance
+             * (the per-frame code may modify them) */
+            if (sp_x)   *sp_x   = cs->x;              if (sp_y)   *sp_y   = cs->y;
+            if (sp_rad) *sp_rad = cs->rad;             if (sp_ang) *sp_ang = cs->ang;
+            if (sp_r)   *sp_r   = cs->r;               if (sp_g)   *sp_g   = cs->g;
+            if (sp_b)   *sp_b   = cs->b;               if (sp_a)   *sp_a   = cs->a;
+            if (sp_r2)  *sp_r2  = cs->r2;              if (sp_g2)  *sp_g2  = cs->g2;
+            if (sp_b2)  *sp_b2  = cs->b2;              if (sp_a2)  *sp_a2  = cs->a2;
+            if (sp_br)  *sp_br  = cs->border_r;        if (sp_bg)  *sp_bg  = cs->border_g;
+            if (sp_bb)  *sp_bb  = cs->border_b;        if (sp_ba)  *sp_ba  = cs->border_a;
+            if (sp_add) *sp_add = (float)cs->additive; if (sp_thk) *sp_thk = (float)cs->thickOutline;
+            if (pf_lex) md_eval_precompiled(pf_lex, &svc);
+            float shx = (sp_x   ? *sp_x   : cs->x)   * (float)ctx->gl.tex_w;
+            float shy = (1.0f - (sp_y   ? *sp_y   : cs->y)) * (float)ctx->gl.tex_h;
+            float shr = (sp_rad ? *sp_rad : cs->rad) * fminf(ctx->gl.tex_w,ctx->gl.tex_h)*0.5f;
+            float sha = sp_ang   ? *sp_ang   : cs->ang;
+            int   shs = sp_sides ? (int)*sp_sides : cs->sides;
+            gl_draw_shape(ctx, shx, shy, shr, sha, shs,
+                sp_r  ? *sp_r  : cs->r,   sp_g  ? *sp_g  : cs->g,
+                sp_b  ? *sp_b  : cs->b,   sp_a  ? *sp_a  : cs->a,
+                sp_r2 ? *sp_r2 : cs->r2,  sp_g2 ? *sp_g2 : cs->g2,
+                sp_b2 ? *sp_b2 : cs->b2,  sp_a2 ? *sp_a2 : cs->a2,
+                sp_br ? *sp_br : cs->border_r, sp_bg ? *sp_bg : cs->border_g,
+                sp_bb ? *sp_bb : cs->border_b, sp_ba ? *sp_ba : cs->border_a,
+                sp_add ? (int)*sp_add : cs->additive,
+                sp_thk ? (int)*sp_thk : cs->thickOutline);
         }
     }
 }
@@ -2020,10 +2291,10 @@ static void gl_video_echo(md_ctx_t *ctx)
     glUseProgram(ctx->gl.prog_echo);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ctx->gl.fbo_tex[other]);
-    glUniform1i(glGetUniformLocation(ctx->gl.prog_echo, "uTex"), 0);
-    glUniform1f(glGetUniformLocation(ctx->gl.prog_echo, "uAlpha"), ea);
-    glUniform1f(glGetUniformLocation(ctx->gl.prog_echo, "uZoom"), ez);
-    glUniform1i(glGetUniformLocation(ctx->gl.prog_echo, "uOrient"), eo);
+    glUniform1i(ctx->gl.u_echo_tex,    0);
+    glUniform1f(ctx->gl.u_echo_alpha,  ea);
+    glUniform1f(ctx->gl.u_echo_zoom,   ez);
+    glUniform1i(ctx->gl.u_echo_orient, eo);
     gl_draw_fullscreen_quad(ctx);
     glDisable(GL_BLEND);
 }
@@ -2055,12 +2326,12 @@ static void gl_post_process(md_ctx_t *ctx)
     glUseProgram(ctx->gl.prog_post);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ctx->gl.fbo_tex[other]);
-    glUniform1i(glGetUniformLocation(ctx->gl.prog_post,"uTex"),0);
-    glUniform1f(glGetUniformLocation(ctx->gl.prog_post,"uGamma"),gam);
-    glUniform1i(glGetUniformLocation(ctx->gl.prog_post,"uBrighten"),br);
-    glUniform1i(glGetUniformLocation(ctx->gl.prog_post,"uDarken"),dk);
-    glUniform1i(glGetUniformLocation(ctx->gl.prog_post,"uSolarize"),sol);
-    glUniform1i(glGetUniformLocation(ctx->gl.prog_post,"uInvert"),inv);
+    glUniform1i(ctx->gl.u_post_tex,      0);
+    glUniform1f(ctx->gl.u_post_gamma,    gam);
+    glUniform1i(ctx->gl.u_post_brighten, br);
+    glUniform1i(ctx->gl.u_post_darken,   dk);
+    glUniform1i(ctx->gl.u_post_solarize, sol);
+    glUniform1i(ctx->gl.u_post_invert,   inv);
     gl_draw_fullscreen_quad(ctx);
 }
 
@@ -2088,6 +2359,7 @@ static void md_render_frame(md_ctx_t *ctx)
         if (ctx->blend_progress >= 1) {
             ctx->blending=0; ctx->preset=ctx->next_preset;
             ctx->pf_init_done=0; memset(ctx->q_vars,0,sizeof(ctx->q_vars));
+            ctx->preset_serial++; /* invalidate pre-lexed cache */
         }
     }
 
@@ -2107,16 +2379,16 @@ static void md_render_frame(md_ctx_t *ctx)
 
     md_setup_pf_vars(ctx, p);
 
-    if (!ctx->pf_init_done && p->per_frame_init_count>0) {
-        char code[MAX_EXPR_LINES*MAX_LINE_LEN];
-        md_concat_lines(p->per_frame_init, p->per_frame_init_count, code, sizeof(code));
-        md_eval(code, &ctx->pf_vars);
+    /* Rebuild pre-lexed token streams whenever the preset changes */
+    if (ctx->lex_serial != ctx->preset_serial)
+        md_lex_cache_rebuild(ctx);
+
+    if (!ctx->pf_init_done && ctx->lex_per_frame_init) {
+        md_eval_precompiled(ctx->lex_per_frame_init, &ctx->pf_vars);
         md_readback_pf_vars(ctx); ctx->pf_init_done=1;
     }
-    if (p->per_frame_count>0) {
-        char code[MAX_EXPR_LINES*MAX_LINE_LEN];
-        md_concat_lines(p->per_frame, p->per_frame_count, code, sizeof(code));
-        md_eval(code, &ctx->pf_vars);
+    if (ctx->lex_per_frame) {
+        md_eval_precompiled(ctx->lex_per_frame, &ctx->pf_vars);
         md_readback_pf_vars(ctx);
     }
 
@@ -2167,6 +2439,26 @@ static void gl_init_resources(md_ctx_t *ctx)
     g->prog_darken = gl_create_program(QUAD_VS, DARKEN_FS);
     g->prog_color  = gl_create_program(COLOR_VS, COLOR_FS);
     g->prog_blit   = gl_create_program(QUAD_VS, BLIT_FS);
+
+    /* cache uniform locations — avoids a hash lookup every frame */
+    g->u_warp_tex      = glGetUniformLocation(g->prog_warp,   "uTex");
+    g->u_warp_decay    = glGetUniformLocation(g->prog_warp,   "uDecay");
+    g->u_post_tex      = glGetUniformLocation(g->prog_post,   "uTex");
+    g->u_post_gamma    = glGetUniformLocation(g->prog_post,   "uGamma");
+    g->u_post_brighten = glGetUniformLocation(g->prog_post,   "uBrighten");
+    g->u_post_darken   = glGetUniformLocation(g->prog_post,   "uDarken");
+    g->u_post_solarize = glGetUniformLocation(g->prog_post,   "uSolarize");
+    g->u_post_invert   = glGetUniformLocation(g->prog_post,   "uInvert");
+    g->u_echo_tex      = glGetUniformLocation(g->prog_echo,   "uTex");
+    g->u_echo_alpha    = glGetUniformLocation(g->prog_echo,   "uAlpha");
+    g->u_echo_zoom     = glGetUniformLocation(g->prog_echo,   "uZoom");
+    g->u_echo_orient   = glGetUniformLocation(g->prog_echo,   "uOrient");
+    g->u_darken_aspect = glGetUniformLocation(g->prog_darken, "uAspect");
+    g->u_blit_tex      = glGetUniformLocation(g->prog_blit,   "uTex");
+
+    /* persistent scratch buffers — allocated once, reused every frame */
+    g->mesh_verts   = malloc(MESH_FLOAT_COUNT * sizeof(float));
+    g->shape_scratch = malloc(SHAPE_SCRATCH_VERTS * sizeof(color_vert_t));
 
     /* fullscreen quad VAO */
     float quad[] = {0,0, 1,0, 0,1, 1,1};
@@ -2326,7 +2618,7 @@ static gboolean on_render(GtkGLArea *area, GdkGLContext *glctx, gpointer data)
     glUseProgram(ctx->gl.prog_blit);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ctx->gl.fbo_tex[display_fbo]);
-    glUniform1i(glGetUniformLocation(ctx->gl.prog_blit,"uTex"),0);
+    glUniform1i(ctx->gl.u_blit_tex, 0);
     gl_draw_fullscreen_quad(ctx);
 
     if (evemon_debug && ctx->dbg_frame_count < 5) {
@@ -2381,6 +2673,9 @@ static void on_unrealize(GtkGLArea *area, gpointer data)
     glDeleteBuffers(1, &g->mesh_ebo);
     glDeleteVertexArrays(1, &g->wave_vao); glDeleteBuffers(1, &g->wave_vbo);
     glDeleteFramebuffers(2, g->fbo); glDeleteTextures(2, g->fbo_tex);
+    /* free persistent scratch buffers */
+    free(g->mesh_verts);    g->mesh_verts    = NULL;
+    free(g->shape_scratch); g->shape_scratch = NULL;
     g->gl_ready = 0;
 }
 
@@ -3939,6 +4234,7 @@ static void md_destroy(void *opaque)
         g_object_unref(ctx->mpris_art_pixbuf);
         ctx->mpris_art_pixbuf = NULL;
     }
+    md_lex_cache_free(ctx);
     md_lib_free(&ctx->lib);
     free(ctx);
 }
@@ -3962,6 +4258,7 @@ evemon_plugin_t *evemon_plugin_init(void)
     ctx->preset_duration = 30.0f;  /* auto-advance every 30s by default */
     ctx->prev_preset_idx = -1;
     ctx->show_nowplaying = 3;       /* full now-playing by default */
+    ctx->lex_serial      = -1;     /* force lex cache build on first frame */
     md_favorites_load(ctx);         /* restore favorites from disk */
 
     evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
