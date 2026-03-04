@@ -459,7 +459,8 @@ void update_store(GtkTreeStore *store, GtkTreeView *view,
                   const proc_entry_t *entries, size_t count);
 
 void populate_store_initial(GtkTreeStore *store, GtkTreeView *view,
-                            const proc_entry_t *entries, size_t count);
+                            const proc_entry_t *entries, size_t count,
+                            pid_t preselect_pid, ui_ctx_t *ctx);
 
 long compute_group_rss(GtkTreeStore *store, GtkTreeIter *parent);
 long compute_group_cpu(GtkTreeStore *store, GtkTreeIter *parent);

@@ -81,4 +81,12 @@ typedef struct {
 int  pw_snapshot(pw_graph_t *out);
 void pw_graph_free(pw_graph_t *g);
 
+/*
+ * Persistent watcher thread — keeps a live PipeWire connection so
+ * pw_snapshot() is a fast mutex-copy instead of a full IPC reconnect.
+ * Call pw_watcher_start() once before the first pw_snapshot().
+ */
+void pw_watcher_start(void);
+void pw_watcher_stop(void);
+
 #endif /* HAVE_PIPEWIRE */

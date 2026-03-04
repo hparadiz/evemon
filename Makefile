@@ -58,8 +58,40 @@ GRES_XML := $(SRC_DIR)/evemon.gresource.xml
 GRES_C   := $(BUILD_DIR)/evemon_resources.c
 GRES_O   := $(BUILD_DIR)/evemon_resources.o
 
-# Exclude the BPF kernel program and plugin-only modules from gcc compilation
-SRCS := $(filter-out $(SRC_DIR)/fdmon_ebpf_kern.c $(SRC_DIR)/art_loader.c, $(wildcard $(SRC_DIR)/*.c))
+# ── libevemon_core: toolkit-free sources ────────────────────────
+# These compile without any GTK dependency and will eventually be
+# linked by all frontends (GTK, headless, terminal).
+CORE_SRCS := \
+    $(SRC_DIR)/monitor.c \
+    $(SRC_DIR)/plugin_broker.c \
+    $(SRC_DIR)/plugin_loader.c \
+    $(SRC_DIR)/event_bus.c \
+    $(SRC_DIR)/fdmon.c \
+    $(SRC_DIR)/fdmon_ebpf.c \
+    $(SRC_DIR)/steam.c \
+    $(SRC_DIR)/settings.c \
+    $(SRC_DIR)/profile.c \
+    $(SRC_DIR)/mpris.c
+
+CORE_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(CORE_SRCS))
+CORE_LIB  := $(BUILD_DIR)/libevemon_core.a
+
+# GLib (needed by core: mpris.c uses GDBus/GLib, settings.c uses jansson but
+# settings.h pulls in glib via evemon_plugin.h indirectly).
+# GLib is a subset of GTK — it has no display dependency.
+GLIB_CFLAGS  := $(shell pkg-config --cflags glib-2.0 gio-2.0 2>/dev/null)
+GLIB_LDFLAGS := $(shell pkg-config --libs   glib-2.0 gio-2.0 2>/dev/null)
+
+# Core objects use base CFLAGS only (no GTK), and declare EVEMON_NO_GTK
+# so evemon_plugin.h substitutes void* for GtkWidget*/GdkPixbuf*.
+CORE_CFLAGS := $(filter-out $(GTK_CFLAGS),$(CFLAGS)) $(GLIB_CFLAGS) -DEVEMON_NO_GTK
+
+# ── GTK frontend + UI sources ────────────────────────────────────
+# Exclude the BPF kernel program, art_loader (plugin-only), and all
+# core sources (now in libevemon_core.a) from the per-file SRCS list.
+CORE_BASENAMES := $(notdir $(CORE_SRCS))
+ALL_MAIN_SRCS  := $(filter-out $(SRC_DIR)/fdmon_ebpf_kern.c $(SRC_DIR)/art_loader.c, $(wildcard $(SRC_DIR)/*.c))
+SRCS := $(filter-out $(addprefix $(SRC_DIR)/,$(CORE_BASENAMES)), $(ALL_MAIN_SRCS))
 
 # Retired sidebar scan modules (replaced by the plugin system).
 # They still live in src/ui/ for reference but are no longer compiled.
@@ -79,15 +111,24 @@ TARGET := $(BUILD_DIR)/evemon
 
 .PHONY: all clean run debug gdb install uninstall
 
-all: $(TARGET) $(BPF_OBJ) plugins
+all: $(CORE_LIB) $(TARGET) $(BPF_OBJ) plugins
 
-$(TARGET): $(OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
+$(CORE_LIB): $(CORE_OBJS) | $(BUILD_DIR)
+	ar rcs $@ $^
 
+# Core objects: compiled without GTK flags
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CORE_CFLAGS) -c -o $@ $<
+
+# GTK frontend binary links libevemon_core.a
+$(TARGET): $(OBJS) $(CORE_LIB)
+	$(CC) -o $@ $(OBJS) -L$(BUILD_DIR) -levemon_core $(LDFLAGS)
 
 $(BUILD_DIR)/ui/%.o: $(SRC_DIR)/ui/%.c | $(BUILD_DIR)/ui
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# main.c and other non-core top-level sources need full CFLAGS (GTK etc.)
+$(BUILD_DIR)/main.o: $(SRC_DIR)/main.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # GResource — compile XML + icon.png + font-logos.ttf into a C source, then into .o

@@ -6,16 +6,168 @@
  * and cgroup limits.  The old per-section data scanners (FD, env,
  * mmap, libs, network) have been retired in favour of the plugin
  * tab system in the detail panel.
+ *
+ * Performance note
+ * ────────────────
+ * proc_detail_update() is split into two phases so the panel appears
+ * instantly on selection:
+ *
+ *   Phase 1 (synchronous, fast):
+ *     – gtk_widget_show_all for the panel reveal
+ *     – all gtk_label_set_text calls (PID, CPU, RSS, …)
+ *     – hides the Steam/cgroup frames immediately
+ *
+ *   Phase 2 (deferred, via g_idle_add):
+ *     – steam_detect + ancestor walk (reads /proc/environ)
+ *     – cgroup_scan_start (reads /proc/cgroup + /sys/fs/cgroup/)
+ *
+ * Phase 2 only runs when the main loop is otherwise idle, so GTK gets
+ * to paint the panel with basic info before any file I/O happens.
+ * A generation counter (detail_gen) is incremented on each selection
+ * change; the idle callback aborts if the generation has moved on
+ * (i.e. the user already clicked somewhere else).
  */
 
 #include "ui_internal.h"
 #include "../steam.h"
 #include "../fdmon.h"
+#include <time.h>
+
+extern struct timespec evemon_start_time;
+
+/* ── deferred Steam/cgroup update context ─────────────────────── */
+
+typedef struct {
+    ui_ctx_t  *ctx;
+    pid_t      pid;
+    gchar     *name;
+    gchar     *cmdline;
+    gchar     *steam_label;
+    guint      generation;   /* ctx->detail_gen snapshot at enqueue time */
+} detail_deferred_t;
+
+/* Generation counter – bumped on every selection change */
+static guint detail_gen = 0;
+
+static gboolean detail_deferred_cb(gpointer data)
+{
+    detail_deferred_t *d = data;
+    ui_ctx_t *ctx = d->ctx;
+
+    /* Abort if the UI is shutting down or the user selected a different process */
+    if (ctx->shutting_down || d->generation != detail_gen) {
+        g_free(d->name);
+        g_free(d->cmdline);
+        g_free(d->steam_label);
+        free(d);
+        return G_SOURCE_REMOVE;
+    }
+
+    /* ── Steam / Proton metadata ─────────────────────────────── */
+    {
+        gboolean is_steam = (d->steam_label && d->steam_label[0]);
+        steam_info_t *si = NULL;
+
+        if (is_steam && d->pid > 0) {
+            si = steam_detect(d->pid, d->name, d->cmdline, NULL);
+
+            if (!si) {
+                /* Walk ancestors in the tree model to find Steam env vars */
+                GtkTreeModel *child_model =
+                    gtk_tree_model_sort_get_model(ctx->sort_model);
+                GtkTreeIter ancestor_iter;
+                /* Find the row for d->pid */
+                if (find_iter_by_pid(child_model, NULL,
+                                     d->pid, &ancestor_iter)) {
+                    while (!si) {
+                        GtkTreeIter parent_iter;
+                        if (!gtk_tree_model_iter_parent(child_model,
+                                                        &parent_iter,
+                                                        &ancestor_iter))
+                            break;
+                        ancestor_iter = parent_iter;
+                        gint anc_pid = 0;
+                        gchar *anc_name = NULL, *anc_cmd = NULL;
+                        gtk_tree_model_get(child_model, &ancestor_iter,
+                                           COL_PID,     &anc_pid,
+                                           COL_NAME,    &anc_name,
+                                           COL_CMDLINE, &anc_cmd, -1);
+                        steam_info_t *parent_si =
+                            steam_detect((pid_t)anc_pid,
+                                         anc_name, anc_cmd, NULL);
+                        g_free(anc_name);
+                        g_free(anc_cmd);
+                        if (parent_si) {
+                            si = steam_detect(d->pid, d->name,
+                                              d->cmdline, parent_si);
+                            if (!si)
+                                si = parent_si;
+                            else
+                                free(parent_si);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (si) {
+            gtk_label_set_text(ctx->sb_steam_game,
+                               si->game_name[0]      ? si->game_name      : "–");
+            gtk_label_set_text(ctx->sb_steam_appid,
+                               si->app_id[0]         ? si->app_id         : "–");
+            gtk_label_set_text(ctx->sb_steam_proton,
+                               si->proton_version[0] ? si->proton_version : "–");
+            gtk_label_set_text(ctx->sb_steam_runtime,
+                               si->runtime_layer[0]  ? si->runtime_layer  : "–");
+            gtk_label_set_text(ctx->sb_steam_compat,
+                               si->compat_data[0]    ? si->compat_data    : "–");
+            gtk_label_set_text(ctx->sb_steam_gamedir,
+                               si->game_dir[0]       ? si->game_dir       : "–");
+            gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sb_steam_gamedir),
+                                        si->game_dir[0] ? si->game_dir : NULL);
+            gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sb_steam_compat),
+                                        si->compat_data[0] ? si->compat_data : NULL);
+            gtk_widget_set_no_show_all(ctx->sb_steam_frame, FALSE);
+            gtk_widget_show_all(ctx->sb_steam_frame);
+            gtk_widget_set_no_show_all(ctx->sb_steam_frame, TRUE);
+            free(si);
+        } else {
+            gtk_widget_hide(ctx->sb_steam_frame);
+        }
+    }
+
+    /* ── cgroup limits ───────────────────────────────────────── */
+    if (d->pid > 0)
+        cgroup_scan_start(ctx, d->pid);
+
+    g_free(d->name);
+    g_free(d->cmdline);
+    g_free(d->steam_label);
+    free(d);
+    return G_SOURCE_REMOVE;
+}
 
 /* ── process detail panel: update from selection ─────────────── */
 
 void proc_detail_update(ui_ctx_t *ctx)
 {
+    /* Bump generation so any in-flight deferred idle is cancelled */
+    detail_gen++;
+
+    /* One-shot startup timing log */
+    {
+        static gboolean logged = FALSE;
+        if (!logged) {
+            logged = TRUE;
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double uptime = (double)(now.tv_sec  - evemon_start_time.tv_sec) +
+                            (double)(now.tv_nsec - evemon_start_time.tv_nsec) / 1e9;
+            printf("[evemon] detail panel first updated %.3f s after startup\n", uptime);
+            fflush(stdout);
+        }
+    }
+
     /* Only update if the detail panel area is toggled on by the user */
     if (!gtk_widget_get_visible(ctx->detail_vbox))
         return;
@@ -48,6 +200,8 @@ void proc_detail_update(ui_ctx_t *ctx)
         gtk_widget_hide(ctx->sb_cgroup_frame);
         return;
     }
+
+    /* ── Phase 1: reveal panel and paint all cheap labels ─────── */
 
     /* A process is selected – ensure the main detail panel is visible */
     if (gtk_widget_get_visible(ctx->detail_vbox) &&
@@ -182,91 +336,24 @@ void proc_detail_update(ui_ctx_t *ctx)
     gtk_label_set_text(ctx->sb_cwd,       cwd       ? cwd       : "–");
     gtk_label_set_text(ctx->sb_cmdline,   cmdline   ? cmdline   : "–");
 
-    /* ── Steam / Proton metadata ─────────────────────────────── */
-    {
-        /* The monitor already tagged this row via COL_STEAM_LABEL using
-         * multi-pass parent-inheritance.  Use that as the authoritative
-         * "is this a Steam process?" flag.  If it is, probe environ
-         * for the full metadata — trying the process itself first, then
-         * walking up ancestors until one has the Steam env vars. */
-        gboolean is_steam = (steam_label && steam_label[0]);
-        steam_info_t *si = NULL;
+    /* Hide Steam and cgroup frames immediately; the deferred idle will
+     * populate and re-show them if applicable. */
+    gtk_widget_hide(ctx->sb_steam_frame);
+    gtk_widget_hide(ctx->sb_cgroup_frame);
 
-        if (is_steam && pid > 0) {
-            si = steam_detect((pid_t)pid, name, cmdline, NULL);
-
-            /* If the process itself doesn't carry the env vars (common
-             * for Wine children that inherited via the process tree),
-             * walk up ancestors in the tree model until we find one
-             * whose environ does contain them, then re-detect with
-             * parent context so the child inherits. */
-            if (!si) {
-                GtkTreeIter ancestor = iter;
-                while (!si) {
-                    GtkTreeIter parent_iter;
-                    if (!gtk_tree_model_iter_parent(child_model, &parent_iter,
-                                                    &ancestor))
-                        break;
-                    ancestor = parent_iter;
-                    gint anc_pid = 0;
-                    gchar *anc_name = NULL, *anc_cmd = NULL;
-                    gtk_tree_model_get(child_model, &ancestor,
-                                       COL_PID, &anc_pid,
-                                       COL_NAME, &anc_name,
-                                       COL_CMDLINE, &anc_cmd, -1);
-                    steam_info_t *parent_si =
-                        steam_detect((pid_t)anc_pid, anc_name, anc_cmd, NULL);
-                    g_free(anc_name);
-                    g_free(anc_cmd);
-                    if (parent_si) {
-                        /* Re-detect the selected process with parent context */
-                        si = steam_detect((pid_t)pid, name, cmdline, parent_si);
-                        if (!si) {
-                            /* Fall back to using the parent's info directly */
-                            si = parent_si;
-                        } else {
-                            free(parent_si);
-                        }
-                    }
-                }
-            }
-        }
-
-        if (si) {
-            gtk_label_set_text(ctx->sb_steam_game,
-                               si->game_name[0]      ? si->game_name      : "–");
-            gtk_label_set_text(ctx->sb_steam_appid,
-                               si->app_id[0]         ? si->app_id         : "–");
-            gtk_label_set_text(ctx->sb_steam_proton,
-                               si->proton_version[0] ? si->proton_version : "–");
-            gtk_label_set_text(ctx->sb_steam_runtime,
-                               si->runtime_layer[0]  ? si->runtime_layer  : "–");
-            gtk_label_set_text(ctx->sb_steam_compat,
-                               si->compat_data[0]    ? si->compat_data    : "–");
-            gtk_label_set_text(ctx->sb_steam_gamedir,
-                               si->game_dir[0]       ? si->game_dir       : "–");
-            /* Tooltip on game dir for long paths */
-            gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sb_steam_gamedir),
-                                        si->game_dir[0] ? si->game_dir : NULL);
-            gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sb_steam_compat),
-                                        si->compat_data[0] ? si->compat_data : NULL);
-            /* no_show_all is TRUE so that the parent's show_all doesn't
-             * reveal us prematurely.  Temporarily clear it so our own
-             * show_all actually propagates to children.               */
-            gtk_widget_set_no_show_all(ctx->sb_steam_frame, FALSE);
-            gtk_widget_show_all(ctx->sb_steam_frame);
-            gtk_widget_set_no_show_all(ctx->sb_steam_frame, TRUE);
-            free(si);
-        } else {
-            gtk_widget_hide(ctx->sb_steam_frame);
+    /* ── Phase 2: enqueue deferred Steam + cgroup work ────────── */
+    if (pid > 0) {
+        detail_deferred_t *d = malloc(sizeof(*d));
+        if (d) {
+            d->ctx        = ctx;
+            d->pid        = (pid_t)pid;
+            d->name       = g_strdup(name);
+            d->cmdline    = g_strdup(cmdline);
+            d->steam_label = g_strdup(steam_label);
+            d->generation = detail_gen;
+            g_idle_add(detail_deferred_cb, d);
         }
     }
-
-    /* Scanning of FDs, environment, memory maps, libraries, and network
-     * sockets is handled by the plugin system via the detail panel tabs.
-     * cgroup limits are still displayed inline in the process detail panel. */
-    if (pid > 0)
-        cgroup_scan_start(ctx, (pid_t)pid);
 
     g_free(user); g_free(name); g_free(cpu_text);
     g_free(rss_text); g_free(grp_rss_text); g_free(grp_cpu_text);

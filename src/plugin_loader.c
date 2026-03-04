@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
 
 /* ── Host-provided utility functions ─────────────────────────── */
 
@@ -123,7 +124,7 @@ static plugin_instance_t *registry_alloc(plugin_registry_t *reg)
     plugin_instance_t *inst = &reg->instances[reg->count++];
     memset(inst, 0, sizeof(*inst));
     inst->tracked_pid = 0;
-    inst->pinned      = FALSE;
+    inst->pinned      = 0;
     inst->instance_id = g_next_instance_id++;
     return inst;
 }
@@ -210,7 +211,7 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
 
     inst->plugin    = plugin;
     inst->handle    = handle;
-    inst->is_active = TRUE;  /* default: lives in a notebook tab */
+    inst->is_active = 1;  /* default: lives in a notebook tab */
     snprintf(inst->so_path, sizeof(inst->so_path), "%s", path);
 
     if (plugin->kind == EVEMON_PLUGIN_HEADLESS) {
@@ -319,7 +320,274 @@ int plugin_loader_scan(plugin_registry_t *reg, const char *dir)
     return loaded;
 }
 
-/* ── Instance management ─────────────────────────────────────── */
+/* ── Asynchronous plugin scan ────────────────────────────────── */
+
+/*
+ * One pending plugin result, heap-allocated by the worker thread and
+ * freed after the main-thread idle callback has processed it.
+ */
+typedef struct {
+    plugin_registry_t  *reg;
+    int                 inst_id;   /* -1 = scan-done sentinel */
+    int                 n_loaded;  /* only valid for sentinel  */
+    plugin_loaded_cb    on_loaded;
+    plugin_scan_done_cb on_done;
+    void               *user_data;
+} async_plugin_result_t;
+
+static int async_loaded_idle(void *data)
+{
+    async_plugin_result_t *r = data;
+    if (r->inst_id == -1) {
+        /* Scan-done sentinel */
+        if (r->on_done)
+            r->on_done(r->n_loaded, r->user_data);
+    } else {
+        if (r->on_loaded)
+            r->on_loaded(r->reg, r->inst_id, r->user_data);
+    }
+    free(r);
+    return 0;  /* G_SOURCE_REMOVE */
+}
+
+typedef struct {
+    plugin_registry_t  *reg;
+    char                dir[4096];
+    plugin_post_fn      post_fn;
+    plugin_loaded_cb    on_loaded;
+    plugin_scan_done_cb on_done;
+    void               *user_data;
+} async_scan_args_t;
+
+/*
+ * Background pthread worker.  Scans the directory, dlopen-ing each .so
+ * and calling evemon_plugin_init().  Widget creation is deliberately
+ * deferred: each result is posted to the main thread via post_fn,
+ * where on_loaded() will call create_widget() and add the tab.
+ */
+static void *async_scan_worker(void *arg)
+{
+    async_scan_args_t *a = arg;
+
+    /* Verify directory permissions (same checks as plugin_loader_scan) */
+    struct stat dirstat;
+    int n_loaded = 0;
+
+    if (stat(a->dir, &dirstat) != 0)
+        goto done;
+
+    uid_t me = getuid();
+    uid_t sudo_uid = (uid_t)-1;
+    if (me == 0) {
+        const char *uid_str = getenv("SUDO_UID");
+        if (!uid_str)
+            uid_str = getenv("PKEXEC_UID");
+        if (uid_str) {
+            char *end = NULL;
+            unsigned long val = strtoul(uid_str, &end, 10);
+            if (end && end != uid_str && *end == '\0' && val > 0)
+                sudo_uid = (uid_t)val;
+        }
+    }
+
+    if (dirstat.st_uid != 0 && dirstat.st_uid != me &&
+        dirstat.st_uid != sudo_uid) {
+        fprintf(stderr,
+                "evemon: refusing to load plugins from %s "
+                "(owned by uid %u, expected root or %u)\n",
+                a->dir, (unsigned)dirstat.st_uid, (unsigned)me);
+        goto done;
+    }
+    if (dirstat.st_mode & S_IWOTH) {
+        fprintf(stderr,
+                "evemon: refusing to load plugins from %s "
+                "(directory is world-writable, mode %04o)\n",
+                a->dir, (unsigned)(dirstat.st_mode & 07777));
+        goto done;
+    }
+
+    {
+        DIR *dp = opendir(a->dir);
+        if (!dp)
+            goto done;
+
+        struct dirent *de;
+        while ((de = readdir(dp)) != NULL) {
+            size_t len = strlen(de->d_name);
+            if (len < 4 || strcmp(de->d_name + len - 3, ".so") != 0)
+                continue;
+
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/%s", a->dir, de->d_name);
+
+            /* ── Step 1: dlopen + init (background thread) ────── */
+            void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            if (!handle) {
+                fprintf(stderr, "evemon: plugin %s: %s\n", path, dlerror());
+                continue;
+            }
+
+            evemon_plugin_init_fn init_fn =
+                (evemon_plugin_init_fn)dlsym(handle, "evemon_plugin_init");
+            if (!init_fn) {
+                fprintf(stderr,
+                        "evemon: plugin %s: no evemon_plugin_init\n", path);
+                dlclose(handle);
+                continue;
+            }
+
+            evemon_plugin_t *plugin = init_fn();
+            if (!plugin) {
+                fprintf(stderr,
+                        "evemon: plugin %s: init returned NULL\n", path);
+                dlclose(handle);
+                continue;
+            }
+
+            if (plugin->abi_version != evemon_PLUGIN_ABI_VERSION) {
+                fprintf(stderr,
+                        "evemon: plugin %s: ABI version %d (expected %d)\n",
+                        path, plugin->abi_version, evemon_PLUGIN_ABI_VERSION);
+                if (plugin->destroy)
+                    plugin->destroy(plugin->plugin_ctx);
+                else
+                    free(plugin);
+                dlclose(handle);
+                continue;
+            }
+
+            if (plugin->id && !settings_plugin_enabled(plugin->id)) {
+                fprintf(stdout,
+                        "evemon: skipping disabled plugin \"%s\" (%s)\n",
+                        plugin->name ? plugin->name : "?",
+                        plugin->id);
+                if (plugin->destroy)
+                    plugin->destroy(plugin->plugin_ctx);
+                else
+                    free(plugin);
+                dlclose(handle);
+                continue;
+            }
+
+            /* Validate callbacks (headless vs UI) */
+            if (plugin->kind == EVEMON_PLUGIN_HEADLESS) {
+                if (!plugin->activate) {
+                    fprintf(stderr,
+                            "evemon: plugin %s: headless plugin missing "
+                            "activate()\n", path);
+                    if (plugin->destroy)
+                        plugin->destroy(plugin->plugin_ctx);
+                    else
+                        free(plugin);
+                    dlclose(handle);
+                    continue;
+                }
+            } else {
+                if (!plugin->create_widget || !plugin->update) {
+                    fprintf(stderr,
+                            "evemon: plugin %s: missing required callbacks\n",
+                            path);
+                    if (plugin->destroy)
+                        plugin->destroy(plugin->plugin_ctx);
+                    else
+                        free(plugin);
+                    dlclose(handle);
+                    continue;
+                }
+            }
+
+            /* ── Step 2: register instance (background thread) ── *
+             * We take a mutex-free shortcut here: the caller must not
+             * touch `reg` from another thread until on_done fires, so
+             * it is safe to call registry_alloc from this thread.     */
+            plugin_instance_t *inst = registry_alloc(a->reg);
+            if (!inst) {
+                if (plugin->destroy)
+                    plugin->destroy(plugin->plugin_ctx);
+                else
+                    free(plugin);
+                dlclose(handle);
+                continue;
+            }
+
+            inst->plugin    = plugin;
+            inst->handle    = handle;
+            inst->is_active = 1;
+            inst->widget    = NULL;  /* filled in by on_loaded on main thread */
+            snprintf(inst->so_path, sizeof(inst->so_path), "%s", path);
+
+            a->reg->combined_needs |= plugin->data_needs;
+
+            /* ── Step 3: post to main thread ───────────────────── */
+            async_plugin_result_t *r = malloc(sizeof(*r));
+            if (!r) {
+                /* OOM — continue; instance stays in registry but widget=NULL */
+                n_loaded++;
+                continue;
+            }
+            r->reg       = a->reg;
+            r->inst_id   = inst->instance_id;
+            r->n_loaded  = 0;
+            r->on_loaded = a->on_loaded;
+            r->on_done   = a->on_done;
+            r->user_data = a->user_data;
+            a->post_fn(async_loaded_idle, r);
+            n_loaded++;
+        }
+        closedir(dp);
+    }
+
+done:
+    fprintf(stdout, "evemon: async scan done: %d plugin(s) from %s\n",
+            n_loaded, a->dir);
+
+    /* Post the scan-done sentinel */
+    async_plugin_result_t *sentinel = malloc(sizeof(*sentinel));
+    if (sentinel) {
+        sentinel->reg       = a->reg;
+        sentinel->inst_id   = -1;  /* sentinel */
+        sentinel->n_loaded  = n_loaded;
+        sentinel->on_loaded = a->on_loaded;
+        sentinel->on_done   = a->on_done;
+        sentinel->user_data = a->user_data;
+        a->post_fn(async_loaded_idle, sentinel);
+    }
+
+    free(a);
+    return NULL;
+}
+
+int plugin_loader_scan_async(plugin_registry_t  *reg,
+                             const char         *dir,
+                             plugin_post_fn      post_fn,
+                             plugin_loaded_cb    on_loaded,
+                             plugin_scan_done_cb on_done,
+                             void               *user_data)
+{
+    if (!reg || !dir || !post_fn) return -1;
+
+    async_scan_args_t *a = malloc(sizeof(*a));
+    if (!a) return -1;
+
+    a->reg       = reg;
+    a->post_fn   = post_fn;
+    a->on_loaded = on_loaded;
+    a->on_done   = on_done;
+    a->user_data = user_data;
+    snprintf(a->dir, sizeof(a->dir), "%s", dir);
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&tid, &attr, async_scan_worker, a);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        free(a);
+        return -1;
+    }
+    return 0;
+}
 
 int plugin_instance_create(plugin_registry_t *reg, const char *plugin_id)
 {
@@ -352,7 +620,7 @@ int plugin_instance_create(plugin_registry_t *reg, const char *plugin_id)
 
     inst->plugin    = new_plugin;
     inst->handle    = handle;  /* shared handle — don't dlclose twice */
-    inst->is_active = TRUE;  /* default: lives in a notebook tab */
+    inst->is_active = 1;  /* default: lives in a notebook tab */
 
     if (new_plugin->kind == EVEMON_PLUGIN_HEADLESS) {
         inst->widget = NULL;
@@ -451,13 +719,13 @@ int plugin_reload(plugin_registry_t *reg, const char *so_path)
 }
 
 void plugin_instance_set_pid(plugin_instance_t *inst, pid_t pid,
-                             gboolean pinned)
+                             int pinned)
 {
     inst->tracked_pid = pid;
     inst->pinned      = pinned;
 }
 
-void plugin_instance_set_active(plugin_instance_t *inst, gboolean active)
+void plugin_instance_set_active(plugin_instance_t *inst, int active)
 {
     if (!inst) return;
     inst->is_active = active;
@@ -514,10 +782,10 @@ size_t plugin_collect_tracked_pids(const plugin_registry_t *reg,
             continue;
 
         /* Check for duplicates */
-        gboolean dup = FALSE;
+        int dup = 0;
         for (size_t j = 0; j < n; j++) {
             if (out[j] == inst->tracked_pid) {
-                dup = TRUE;
+                dup = 1;
                 break;
             }
         }

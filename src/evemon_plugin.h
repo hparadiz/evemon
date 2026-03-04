@@ -20,10 +20,23 @@
 #ifndef evemon_PLUGIN_H
 #define evemon_PLUGIN_H
 
-#include <gtk/gtk.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/types.h>
+
+/*
+ * GTK-dependent types.  Core (toolkit-free) code defines EVEMON_NO_GTK
+ * before including this header; GtkWidget and GdkPixbuf fields are
+ * replaced with void* so the header compiles without GTK headers.
+ * GTK plugins and UI code include gtk/gtk.h first and get real types.
+ */
+#ifdef EVEMON_NO_GTK
+typedef void  GtkWidget;
+typedef void  GdkPixbuf;
+typedef void  GtkDrawingArea;
+#else
+#include <gtk/gtk.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -84,7 +97,7 @@ typedef enum {
  * if they want to keep it beyond the callback.
  */
 typedef struct {
-    GdkPixbuf  *pixbuf;               /* loaded art (may be NULL)        */
+    GdkPixbuf  *pixbuf;               /* loaded art (may be NULL); cast to GdkPixbuf* in GTK code */
     pid_t       source_pid;           /* PID this art belongs to         */
     char        art_url[512];         /* source URL                      */
     char        track_title[256];     /* current track title             */
@@ -551,11 +564,13 @@ typedef struct {
     void               *plugin_ctx;
 
     /*
-     * Create the plugin's widget tree.  Called on the GTK main thread
+     * Create the plugin's widget tree.  Called on the UI main thread
      * once per instance.  The returned widget is placed by the host
      * into a tab/panel — the plugin has zero layout awareness.
      *
      * ctx = plugin_ctx from this struct.
+     * Returns a toolkit widget pointer (GtkWidget* for GTK frontend).
+     * Headless/terminal plugins return NULL.
      */
     GtkWidget *(*create_widget)(void *ctx);
 

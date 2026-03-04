@@ -1,17 +1,17 @@
 /*
  * plugin_broker.c – Single-gather data broker for plugin instances.
  *
- * Replaces the old 7× GTask approach with a single background gather
- * pass.  For each unique tracked PID, reads /proc data ONCE according
- * to the combined_needs bitmask, then dispatches results to all
- * instances on the GTK main thread.
+ * For each unique tracked PID, reads /proc data ONCE according to the
+ * combined_needs bitmask, then dispatches results to all instances via
+ * a frontend-agnostic completion callback.
  *
  * Data flow:
- *   1. broker_start() is called from on_refresh() on the main thread
+ *   1. broker_start() is called (from any thread) to kick a cycle
  *   2. Collects unique PIDs + combined data_needs from the registry
- *   3. Spawns a single GTask worker that gathers data for each PID
- *   4. broker_complete() fires on the main thread, dispatches update()
- *      to each plugin instance
+ *   3. Spawns a pthread worker that gathers data for each PID
+ *   4. Worker posts completion via broker_on_complete_cb, which the
+ *      active frontend wires to its own main-loop dispatch mechanism
+ *      (g_idle_add for GTK, QMetaObject::invokeMethod for Qt, etc.)
  */
 
 #include "plugin_broker.h"
@@ -29,6 +29,7 @@ extern int evemon_debug;
 #include <dirent.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
 /* Defined in ui/devices.c — resolves /dev/ paths to hardware names */
 extern void label_device(const char *path, char *desc, size_t descsz);
@@ -125,7 +126,30 @@ struct broker_cycle {
     size_t              audio_pid_count;
 };
 
-static GCancellable *g_broker_cancel = NULL;
+/* ── Pthread worker state ──────────────────────────────────────── */
+
+/*
+ * Cancel flag + mutex.  The worker checks g_broker_cancelled under
+ * g_broker_mutex at the start of each PID gather.
+ * g_broker_thread is 0 when no worker is running.
+ */
+static pthread_mutex_t  g_broker_mutex     = PTHREAD_MUTEX_INITIALIZER;
+static int              g_broker_cancelled = 0;
+static pthread_t        g_broker_thread    = 0;
+static int              g_broker_running   = 0;
+
+/*
+ * Frontend completion hook.
+ * Set once at startup by the active frontend (e.g. GTK uses g_idle_add).
+ * The hook receives a heap-allocated broker_cycle_t* and is responsible
+ * for calling broker_dispatch_cycle() and then broker_cycle_free() on it
+ * from the appropriate main-loop thread.
+ *
+ * broker_dispatch_cycle() is exported so frontends can call it:
+ *   void broker_dispatch_cycle(broker_cycle_t *cycle);
+ */
+static broker_complete_cb g_broker_complete_cb   = NULL;
+static void              *g_broker_complete_data = NULL;
 
 /* Callback for delivering audio PIDs to the UI on the main thread */
 static broker_audio_pids_cb g_audio_pids_cb   = NULL;
@@ -1288,20 +1312,22 @@ static void gather_pipewire(broker_pid_data_t *d, const pw_graph_t *graph)
 }
 #endif /* HAVE_PIPEWIRE */
 
-/* ── GTask worker thread ─────────────────────────────────────── */
+/* ── pthread worker thread ──────────────────────────────────── */
 
-static void broker_thread_func(GTask        *task,
-                                gpointer      source_object,
-                                gpointer      task_data,
-                                GCancellable *cancellable)
+static int broker_is_cancelled(void)
 {
-    (void)source_object;
-    broker_cycle_t *cycle = task_data;
+    pthread_mutex_lock(&g_broker_mutex);
+    int c = g_broker_cancelled;
+    pthread_mutex_unlock(&g_broker_mutex);
+    return c;
+}
 
-    if (g_cancellable_is_cancelled(cancellable)) {
-        g_task_return_boolean(task, FALSE);
-        return;
-    }
+static void *broker_thread_func(void *arg)
+{
+    broker_cycle_t *cycle = arg;
+
+    if (broker_is_cancelled())
+        goto cancelled;
 
 #ifdef HAVE_PIPEWIRE
     /* Take one PipeWire graph snapshot for the entire cycle.
@@ -1314,8 +1340,13 @@ static void broker_thread_func(GTask        *task,
 #endif
 
     for (size_t i = 0; i < cycle->pid_count; i++) {
-        if (g_cancellable_is_cancelled(cancellable))
-            goto cleanup;
+        if (broker_is_cancelled()) {
+#ifdef HAVE_PIPEWIRE
+            goto cleanup;   /* frees pw_graph if taken */
+#else
+            goto cancelled;
+#endif
+        }
 
         broker_pid_data_t *d = &cycle->results[i];
         d->pid = cycle->pids[i];
@@ -1384,12 +1415,12 @@ static void broker_thread_func(GTask        *task,
     }
 
 #ifdef HAVE_PIPEWIRE
-    if (g_cancellable_is_cancelled(cancellable))
+    if (broker_is_cancelled())
         goto cleanup;
 
     /* Extract system-wide audio PIDs from the PW graph before freeing it.
      * This replaces the old approach of calling pw_snapshot() a second
-     * time on the GTK main thread, which raced with this worker thread. */
+     * time on the main thread, which raced with this worker thread. */
     if (pw_have_graph) {
         size_t acap = 64;
         pid_t *apids = calloc(acap, sizeof(pid_t));
@@ -1402,9 +1433,9 @@ static void broker_thread_func(GTask        *task,
                     !strstr(an->media_class, "Stream"))
                     continue;
                 /* De-duplicate */
-                gboolean adup = FALSE;
+                int adup = 0;
                 for (size_t aj = 0; aj < acount; aj++) {
-                    if (apids[aj] == an->pid) { adup = TRUE; break; }
+                    if (apids[aj] == an->pid) { adup = 1; break; }
                 }
                 if (adup) continue;
                 if (acount >= acap) {
@@ -1428,26 +1459,38 @@ cleanup:
         pw_graph_free(&pw_graph);
 done:
     ;
-#endif
+#endif /* HAVE_PIPEWIRE */
 
     cycle->result_count = cycle->pid_count;
-    g_task_return_boolean(task, TRUE);
+
+cancelled:
+    /* Reached either after a clean gather or after cancel.
+     * Check the flag to decide whether to dispatch or just free. */
+    {
+        pthread_mutex_lock(&g_broker_mutex);
+        int was_cancelled = g_broker_cancelled;
+        g_broker_running = 0;
+        pthread_mutex_unlock(&g_broker_mutex);
+
+        if (!was_cancelled && g_broker_complete_cb)
+            g_broker_complete_cb(cycle, g_broker_complete_data);
+        else
+            broker_cycle_free(cycle);
+    }
+
+    return NULL;
 }
 
-/* ── Main-thread completion ──────────────────────────────────── */
+/* ── Main-thread dispatch (called by the frontend hook) ─────── */
 
-static void broker_complete(GObject      *source_object,
-                            GAsyncResult *result,
-                            gpointer      user_data)
+/*
+ * broker_dispatch_cycle() — call this on the main/UI thread after
+ * receiving a completed cycle from the broker_complete_cb hook.
+ * Dispatches data to plugins and delivers audio PIDs.
+ * The caller is responsible for calling broker_cycle_free() afterwards.
+ */
+void broker_dispatch_cycle(broker_cycle_t *cycle)
 {
-    (void)source_object;
-    (void)user_data;
-
-    GTask *task = G_TASK(result);
-    if (g_task_had_error(task))
-        return;
-
-    broker_cycle_t *cycle = g_task_get_task_data(task);
     if (!cycle) return;
 
     /* Dispatch results to plugins */
@@ -1462,9 +1505,8 @@ static void broker_complete(GObject      *source_object,
                         g_audio_pids_data);
 }
 
-static void broker_cycle_free(gpointer data)
+void broker_cycle_free(broker_cycle_t *cycle)
 {
-    broker_cycle_t *cycle = data;
     if (!cycle) return;
 
     for (size_t i = 0; i < cycle->pid_count; i++)
@@ -1477,16 +1519,21 @@ static void broker_cycle_free(gpointer data)
 
 /* ── Public API ──────────────────────────────────────────────── */
 
+void broker_set_complete_callback(broker_complete_cb cb, void *user_data)
+{
+    g_broker_complete_cb   = cb;
+    g_broker_complete_data = user_data;
+}
+
 void broker_start(plugin_registry_t *reg, void *fdmon)
 {
     if (!reg || reg->count == 0)
         return;
 
-    /* Cancel previous cycle */
+    /* Cancel previous cycle — join so we don't orphan threads */
     broker_cancel();
-    g_broker_cancel = g_cancellable_new();
 
-    /* Collect unique tracked PIDs — dynamically sized (H4) */
+    /* Collect unique tracked PIDs — dynamically sized */
     size_t pid_cap = reg->count > 0 ? reg->count : 16;
     pid_t *pids = calloc(pid_cap, sizeof(pid_t));
     if (!pids) return;
@@ -1496,8 +1543,8 @@ void broker_start(plugin_registry_t *reg, void *fdmon)
      * double-clicked yet), we still need to run the cycle if the
      * audio callback is registered so the worker thread can take a
      * PipeWire graph snapshot and extract system-wide audio PIDs. */
-    gboolean need_audio_only = (npids == 0 && g_audio_pids_cb != NULL
-                                && (reg->combined_needs & evemon_NEED_PIPEWIRE));
+    int need_audio_only = (npids == 0 && g_audio_pids_cb != NULL
+                           && (reg->combined_needs & evemon_NEED_PIPEWIRE));
     if (npids == 0 && !need_audio_only) {
         free(pids);
         return;
@@ -1522,11 +1569,25 @@ void broker_start(plugin_registry_t *reg, void *fdmon)
     cycle->pid_count = npids;
     free(pids);  /* local copy no longer needed */
 
-    /* Launch GTask */
-    GTask *task = g_task_new(NULL, g_broker_cancel, broker_complete, NULL);
-    g_task_set_task_data(task, cycle, broker_cycle_free);
-    g_task_run_in_thread(task, broker_thread_func);
-    g_object_unref(task);
+    /* Arm the cancel flag and launch a detached pthread */
+    pthread_mutex_lock(&g_broker_mutex);
+    g_broker_cancelled = 0;
+    g_broker_running   = 1;
+    pthread_mutex_unlock(&g_broker_mutex);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&g_broker_thread, &attr,
+                       broker_thread_func, cycle) != 0) {
+        pthread_attr_destroy(&attr);
+        pthread_mutex_lock(&g_broker_mutex);
+        g_broker_running = 0;
+        pthread_mutex_unlock(&g_broker_mutex);
+        broker_cycle_free(cycle);
+        return;
+    }
+    pthread_attr_destroy(&attr);
 }
 
 void broker_set_audio_callback(broker_audio_pids_cb cb, void *user_data)
@@ -1537,19 +1598,27 @@ void broker_set_audio_callback(broker_audio_pids_cb cb, void *user_data)
 
 void broker_cancel(void)
 {
-    if (g_broker_cancel) {
-        g_cancellable_cancel(g_broker_cancel);
-        g_object_unref(g_broker_cancel);
-        g_broker_cancel = NULL;
-    }
+    /* Signal the worker to stop */
+    pthread_mutex_lock(&g_broker_mutex);
+    int was_running = g_broker_running;
+    if (was_running)
+        g_broker_cancelled = 1;
+    pthread_mutex_unlock(&g_broker_mutex);
+
+    /* The worker is detached — we cannot join it.  Setting the cancel
+     * flag is sufficient; the worker will see it on its next check and
+     * free the cycle itself without calling the completion callback. */
+    (void)was_running;
 }
 
 void broker_destroy(void)
 {
     broker_cancel();
 
-    /* Clear the audio callback so no stale pointer is used
-     * if a late GTask completion fires after shutdown. */
-    g_audio_pids_cb   = NULL;
-    g_audio_pids_data = NULL;
+    /* Clear callbacks so no stale pointer is used if the worker
+     * fires its completion after shutdown begins. */
+    g_broker_complete_cb   = NULL;
+    g_broker_complete_data = NULL;
+    g_audio_pids_cb        = NULL;
+    g_audio_pids_data      = NULL;
 }

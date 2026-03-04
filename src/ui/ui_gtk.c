@@ -1105,7 +1105,8 @@ static gboolean on_refresh(gpointer data)
 
     if (g_first_refresh) {
         /* First time: full populate + expand all */
-        populate_store_initial(ctx->store, ctx->view, local, count);
+        populate_store_initial(ctx->store, ctx->view, local, count,
+                               settings_get()->preselected_pid, ctx);
         g_first_refresh = 0;
 
         /* Switch from fast startup poll to the normal 1-second interval */
@@ -1113,16 +1114,43 @@ static gboolean on_refresh(gpointer data)
             ctx->initial_refresh = FALSE;
             g_timeout_add(1000, on_refresh, ctx);
 
-            /* Select the preselected PID from settings (default: PID 1) */
+            /* Selection and detail panel are now handled inside
+             * populate_store_initial as soon as the preselected row
+             * is inserted.  Fall back to goto_pid only if the PID
+             * wasn't found during the initial populate (e.g. it
+             * appeared after the snapshot was taken). */
             {
                 pid_t sel_pid = settings_get()->preselected_pid;
-                if (sel_pid > 0)
+                GtkTreeSelection *psel = gtk_tree_view_get_selection(ctx->view);
+                GList *prows = psel ? gtk_tree_selection_get_selected_rows(psel, NULL) : NULL;
+                if (!prows && sel_pid > 0)
                     goto_pid(ctx, sel_pid);
+                else if (prows)
+                    g_list_free_full(prows, (GDestroyNotify)gtk_tree_path_free);
             }
 
             /* Honour show_audio_only from settings on first load */
             if (ctx->show_audio_only)
                 rebuild_audio_filter_store(ctx);
+
+            /* Kick the plugin broker immediately on first display so the
+             * detail panel is populated without waiting for the first
+             * 1-second tick.  We seed the selected PID ourselves here
+             * because on_selection_changed fires *after* goto_pid returns
+             * but the broker gather is asynchronous — starting it now
+             * lets it run in parallel while GTK renders the tree. */
+            {
+                plugin_registry_t *preg = ctx->plugin_registry;
+                if (preg && preg->count > 0) {
+                    pid_t sel_pid = settings_get()->preselected_pid;
+                    for (size_t i = 0; i < preg->count; i++) {
+                        plugin_instance_t *inst = &preg->instances[i];
+                        if (!inst->pinned && inst->is_active)
+                            plugin_instance_set_pid(inst, sel_pid, 0);
+                    }
+                    broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
+                }
+            }
 
             /* Update status bar with first data before we drop this source */
             goto finish;
@@ -2087,6 +2115,301 @@ static void highlight_cell_data_func(GtkTreeViewColumn *col,
 /*
  * Broker callback: receives audio PIDs extracted from the PipeWire
  * graph on the broker worker thread, delivered to us on the GTK
+/* ── Broker completion: GTK main-thread bridge ───────────────── */
+/*
+ * Called from the broker worker thread when a gather cycle finishes.
+ * Posts the cycle to the GTK main loop via g_idle_add so that
+ * broker_dispatch_cycle() runs on the main thread — matching the
+ * guarantee the old GTask completion callback provided.
+ */
+static gboolean on_broker_idle_dispatch(gpointer p)
+{
+    broker_cycle_t *cycle = p;
+    broker_dispatch_cycle(cycle);
+    broker_cycle_free(cycle);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_broker_complete_gtk(broker_cycle_t *cycle, void *user_data)
+{
+    (void)user_data;
+    g_idle_add(on_broker_idle_dispatch, cycle);
+}
+
+/* Forward declaration — defined after on_broker_complete_gtk. */
+static void on_broker_audio_pids(const pid_t *pids, size_t count, void *data);
+
+/* ── Async plugin loading ─────────────────────────────────────── */
+
+/*
+ * Tab ordering tables shared between on_plugin_loaded_gtk() and the
+ * old synchronous path (kept for reference).
+ */
+static const char *g_tab_order[] = {
+    "org.evemon.pipewire",
+    "org.evemon.net",
+    NULL
+};
+static const char *g_tab_order_last[] = {
+    "org.evemon.milkdrop",
+    NULL
+};
+static const struct { const char *id; const char *label; } g_tab_label_overrides[] = {
+    { "org.evemon.net", "Network" },
+    { NULL, NULL }
+};
+
+/* Heap-allocated context passed as user_data to the async scan. */
+typedef struct {
+    ui_ctx_t *ctx;
+} plugin_async_ctx_t;
+
+/*
+ * post_fn adapter: wraps g_idle_add so plugin_loader_scan_async() can
+ * schedule idle callbacks without depending on GTK headers itself.
+ */
+static void gtk_post_fn(int (*func)(void *), void *data)
+{
+    g_idle_add((GSourceFunc)func, data);
+}
+
+/*
+ * Determine the correct notebook insertion position for a newly loaded
+ * plugin, honoring the tab_order / tab_order_last priority scheme.
+ *
+ * Returns the 0-based page index to insert at (-1 = append at end).
+ */
+static int plugin_notebook_insert_pos(GtkNotebook     *nb,
+                                      plugin_registry_t *preg,
+                                      plugin_instance_t *new_inst)
+{
+    const char *new_id = new_inst->plugin ? new_inst->plugin->id : NULL;
+
+    /* Determine the priority tier of the new plugin:
+     *   0 = tab_order (front)
+     *   1 = normal (middle)
+     *   2 = tab_order_last (end, hidden)
+     */
+    int new_tier = 1;
+    if (new_id) {
+        for (int o = 0; g_tab_order[o]; o++)
+            if (strcmp(new_id, g_tab_order[o]) == 0) { new_tier = 0; break; }
+        if (new_tier == 1)
+            for (int o = 0; g_tab_order_last[o]; o++)
+                if (strcmp(new_id, g_tab_order_last[o]) == 0) { new_tier = 2; break; }
+    }
+
+    int npages = gtk_notebook_get_n_pages(nb);
+
+    if (new_tier == 0) {
+        /* Front-priority: insert before the first non-front-priority page,
+         * but after any existing front-priority pages with lower tab_order
+         * index. */
+        int new_order_idx = INT_MAX;
+        for (int o = 0; g_tab_order[o]; o++)
+            if (new_id && strcmp(new_id, g_tab_order[o]) == 0)
+                { new_order_idx = o; break; }
+
+        for (int p = 0; p < npages; p++) {
+            GtkWidget *child = gtk_notebook_get_nth_page(nb, p);
+            /* Find which instance owns this page */
+            for (size_t i = 0; i < preg->count; i++) {
+                if (preg->instances[i].widget == child) {
+                    const char *pid = preg->instances[i].plugin
+                                    ? preg->instances[i].plugin->id : NULL;
+                    /* Check if existing page is also front-priority */
+                    int existing_order = INT_MAX;
+                    for (int o = 0; g_tab_order[o]; o++)
+                        if (pid && strcmp(pid, g_tab_order[o]) == 0)
+                            { existing_order = o; break; }
+                    if (existing_order == INT_MAX || existing_order > new_order_idx)
+                        return p;  /* insert here */
+                    break;
+                }
+            }
+        }
+        return -1;  /* append */
+    }
+
+    if (new_tier == 2) {
+        /* Last-priority: always append at end */
+        return -1;
+    }
+
+    /* Normal tier: insert before the first last-priority page */
+    for (int p = 0; p < npages; p++) {
+        GtkWidget *child = gtk_notebook_get_nth_page(nb, p);
+        for (size_t i = 0; i < preg->count; i++) {
+            if (preg->instances[i].widget == child) {
+                const char *pid = preg->instances[i].plugin
+                                ? preg->instances[i].plugin->id : NULL;
+                for (int o = 0; g_tab_order_last[o]; o++)
+                    if (pid && strcmp(pid, g_tab_order_last[o]) == 0)
+                        return p;  /* insert before this last-tier page */
+                break;
+            }
+        }
+    }
+    return -1;  /* append */
+}
+
+/*
+ * Called on the GTK main thread for each plugin loaded by the async
+ * scan.  Finishes the GTK-thread work: create_widget(), activate(),
+ * append to notebook.
+ */
+static void on_plugin_loaded_gtk(plugin_registry_t *reg,
+                                 int inst_id,
+                                 void *user_data)
+{
+    plugin_async_ctx_t *ac = user_data;
+    ui_ctx_t *ctx = ac->ctx;
+
+    if (ctx->shutting_down)
+        return;
+
+    int idx = plugin_registry_find_by_id(reg, inst_id);
+    if (idx < 0)
+        return;
+
+    plugin_instance_t *inst = &reg->instances[idx];
+    if (!inst->plugin)
+        return;
+
+    /* Headless plugins: call activate() now that we're on the GTK main
+     * thread (deferred from the async worker which must not touch GTK). */
+    if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS) {
+        if (inst->plugin->activate && reg->host_services) {
+            inst->plugin->activate(inst->plugin->plugin_ctx,
+                                   reg->host_services);
+        }
+
+        /* Flag audio plugin if it needs PipeWire data */
+        if (inst->plugin->data_needs & evemon_NEED_PIPEWIRE) {
+            if (!ctx->has_audio_plugin) {
+                ctx->has_audio_plugin = TRUE;
+                broker_set_audio_callback(on_broker_audio_pids, ctx);
+                fprintf(stdout,
+                        "evemon: audio plugin detected (%s) – "
+                        "enabling audio PID probing\n",
+                        inst->plugin->id);
+            }
+        }
+        return;
+    }
+
+    /* UI plugin: create the widget on the GTK main thread.
+     * The async worker only does dlopen/init; widget creation must
+     * happen on the GTK thread. */
+    if (!inst->plugin->create_widget) return;
+    inst->widget = inst->plugin->create_widget(inst->plugin->plugin_ctx);
+    if (!inst->widget) {
+        fprintf(stderr,
+                "evemon: plugin %s: create_widget returned NULL\n",
+                inst->so_path);
+        return;
+    }
+    /* Inject host services now that we're on the GTK main thread */
+    if (inst->plugin->activate && reg->host_services)
+        inst->plugin->activate(inst->plugin->plugin_ctx, reg->host_services);
+
+    /* Determine the display label */
+    const char *lbl = inst->plugin->name ? inst->plugin->name : "Plugin";
+    if (inst->plugin->id) {
+        for (int k = 0; g_tab_label_overrides[k].id; k++) {
+            if (strcmp(inst->plugin->id, g_tab_label_overrides[k].id) == 0) {
+                lbl = g_tab_label_overrides[k].label;
+                break;
+            }
+        }
+    }
+
+    /* Is this a last-order (hidden) plugin? */
+    gboolean is_last = FALSE;
+    if (inst->plugin->id)
+        for (int o = 0; g_tab_order_last[o]; o++)
+            if (strcmp(inst->plugin->id, g_tab_order_last[o]) == 0)
+                { is_last = TRUE; break; }
+
+    /* Add to notebook at the correct position */
+    GtkWidget *notebook = ctx->plugin_notebook;
+    GtkWidget *tab_label = gtk_label_new(lbl);
+
+    int pos = plugin_notebook_insert_pos(GTK_NOTEBOOK(notebook), reg, inst);
+    if (pos < 0)
+        gtk_notebook_append_page(GTK_NOTEBOOK(notebook), inst->widget, tab_label);
+    else
+        gtk_notebook_insert_page(GTK_NOTEBOOK(notebook), inst->widget, tab_label, pos);
+
+    plugin_instance_set_active(inst, TRUE);
+
+    if (is_last) {
+        /* Hidden until the plugin activates it */
+        gtk_widget_set_no_show_all(inst->widget, TRUE);
+        gtk_widget_hide(inst->widget);
+        GtkWidget *tlbl = gtk_notebook_get_tab_label(
+            GTK_NOTEBOOK(notebook), inst->widget);
+        if (tlbl) {
+            gtk_widget_set_no_show_all(tlbl, TRUE);
+            gtk_widget_hide(tlbl);
+        }
+    } else {
+        gtk_widget_show_all(inst->widget);
+    }
+
+    fprintf(stdout, "evemon: loaded UI plugin \"%s\" (%s) v%s — tab added\n",
+            inst->plugin->name ? inst->plugin->name : "?",
+            inst->plugin->id   ? inst->plugin->id   : "?",
+            inst->plugin->version ? inst->plugin->version : "?");
+}
+
+/*
+ * Called on the GTK main thread once the async scan completes.
+ */
+static void on_plugin_scan_done_gtk(int n_loaded, void *user_data)
+{
+    plugin_async_ctx_t *ac = user_data;
+    ui_ctx_t *ctx = ac->ctx;
+    free(ac);
+
+    if (ctx->shutting_down)
+        return;
+
+    fprintf(stdout, "evemon: %d plugin(s) loaded (async)\n", n_loaded);
+
+    /* Select the first visible tab now that sorting is complete */
+    if (ctx->plugin_notebook) {
+        GtkNotebook *nb = GTK_NOTEBOOK(ctx->plugin_notebook);
+        int npages = gtk_notebook_get_n_pages(nb);
+        for (int p = 0; p < npages; p++) {
+            GtkWidget *child = gtk_notebook_get_nth_page(nb, p);
+            if (child && gtk_widget_get_visible(child)) {
+                gtk_notebook_set_current_page(nb, p);
+                break;
+            }
+        }
+    }
+
+    /* Wire audio callback if any audio plugin was already detected above */
+    if (ctx->has_audio_plugin)
+        broker_set_audio_callback(on_broker_audio_pids, ctx);
+
+    /* Kick an initial broker cycle now that all plugins are ready */
+    plugin_registry_t *preg = ctx->plugin_registry;
+    if (preg && preg->count > 0) {
+        pid_t sel_pid = settings_get()->preselected_pid;
+        for (size_t i = 0; i < preg->count; i++) {
+            plugin_instance_t *inst = &preg->instances[i];
+            if (!inst->pinned && inst->is_active)
+                plugin_instance_set_pid(inst, sel_pid, 0);
+        }
+        broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
+    }
+}
+
+/*
+ * Audio PIDs callback — called on the GTK main thread (inside
+ * broker_dispatch_cycle → on_broker_idle_dispatch → g_idle_add).
  * main thread.  This replaces the old approach of calling
  * pw_snapshot() directly on the main thread, which was unsafe
  * (raced with the broker's own pw_snapshot on the worker thread
@@ -3365,179 +3688,24 @@ void *ui_thread(void *arg)
 #endif
             }
 
-            int nloaded = plugin_loader_scan(preg, plugin_dir);
-            fprintf(stdout, "evemon: %d plugin(s) loaded from %s\n",
-                    nloaded, plugin_dir);
-
             /* Remember the plugin directory so the Plugins menu can
              * scan for new .so files at open time. */
             snprintf(ctx.plugin_dir, sizeof(ctx.plugin_dir),
                      "%s", plugin_dir);
 
-            /* Detect whether any loaded plugin needs PipeWire data;
-             * if so, enable audio-PID probing in the process tree. */
-            ctx.has_audio_plugin = FALSE;
-            for (size_t i = 0; i < preg->count; i++) {
-                if (preg->instances[i].plugin &&
-                    (preg->instances[i].plugin->data_needs &
-                     evemon_NEED_PIPEWIRE)) {
-                    ctx.has_audio_plugin = TRUE;
-                    fprintf(stdout, "evemon: audio plugin detected "
-                            "(%s) – enabling audio PID probing\n",
-                            preg->instances[i].plugin->id);
-                    break;
-                }
-            }
-
-            /* Create a GtkNotebook for plugin tabs (detail panel) */
+            /* Create the notebook immediately so the detail panel is
+             * shown at once — plugins stream in as they load. */
             GtkWidget *notebook = gtk_notebook_new();
             gtk_notebook_set_tab_pos(GTK_NOTEBOOK(notebook), GTK_POS_TOP);
             gtk_notebook_set_scrollable(GTK_NOTEBOOK(notebook), TRUE);
 
-            /* Add each plugin instance as a tab.
-             * Preferred order: PipeWire Audio first, then Network,
-             * then everything else in load order. */
-            {
-                static const char *tab_order[] = {
-                    "org.evemon.pipewire",
-                    "org.evemon.net",
-                    NULL
-                };
-
-                /* Plugins listed here are appended at the very end,
-                 * after the pass-2 "remaining" plugins, and are hidden
-                 * by default (the plugin itself shows them on demand). */
-                static const char *tab_order_last[] = {
-                    "org.evemon.milkdrop",
-                    NULL
-                };
-
-                /* Tab label overrides keyed by plugin id */
-                static const struct { const char *id; const char *label; }
-                tab_label_overrides[] = {
-                    { "org.evemon.net", "Network" },
-                    { NULL, NULL }
-                };
-
-                gboolean *added = g_new0(gboolean, preg->count);
-
-                /* Pass 1: add plugins in the preferred order */
-                for (int o = 0; tab_order[o]; o++) {
-                    for (size_t i = 0; i < preg->count; i++) {
-                        plugin_instance_t *inst = &preg->instances[i];
-                        if (!inst->widget || !inst->plugin ||
-                            !inst->plugin->id)
-                            continue;
-                        /* Headless plugins have no tab */
-                        if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS)
-                            continue;
-                        if (!PLUGIN_IS_AVAILABLE(inst))
-                            continue;
-                        if (strcmp(inst->plugin->id, tab_order[o]) != 0)
-                            continue;
-                        const char *lbl = inst->plugin->name
-                                        ? inst->plugin->name : "Plugin";
-                        for (int k = 0; tab_label_overrides[k].id; k++) {
-                            if (strcmp(inst->plugin->id,
-                                       tab_label_overrides[k].id) == 0) {
-                                lbl = tab_label_overrides[k].label;
-                                break;
-                            }
-                        }
-                        GtkWidget *label = gtk_label_new(lbl);
-                        gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
-                                                 inst->widget, label);
-                        plugin_instance_set_active(inst, TRUE);
-                        added[i] = TRUE;
-                    }
-                }
-
-                /* Pass 2: remaining plugins in load order (skip last-order) */
-                for (size_t i = 0; i < preg->count; i++) {
-                    if (added[i]) continue;
-                    plugin_instance_t *inst = &preg->instances[i];
-                    /* Headless plugins have no tab */
-                    if (inst->plugin &&
-                        inst->plugin->kind == EVEMON_PLUGIN_HEADLESS) {
-                        added[i] = TRUE;
-                        continue;
-                    }
-                    /* Skip plugins reserved for pass 3 (last) */
-                    if (inst_is_last_order(preg->instances[i].plugin,
-                                           tab_order_last))
-                        continue;
-                    if (!inst->widget) continue;
-                    if (!PLUGIN_IS_AVAILABLE(inst)) continue;
-                    const char *lbl = (inst->plugin && inst->plugin->name)
-                                    ? inst->plugin->name : "Plugin";
-                    if (inst->plugin && inst->plugin->id) {
-                        for (int k = 0; tab_label_overrides[k].id; k++) {
-                            if (strcmp(inst->plugin->id,
-                                       tab_label_overrides[k].id) == 0) {
-                                lbl = tab_label_overrides[k].label;
-                                break;
-                            }
-                        }
-                    }
-                    GtkWidget *label = gtk_label_new(lbl);
-                    gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
-                                             inst->widget, label);
-                    plugin_instance_set_active(inst, TRUE);
-                    added[i] = TRUE;
-                }
-
-                /* Pass 3: "load last" plugins, hidden by default */
-                for (int o = 0; tab_order_last[o]; o++) {
-                    for (size_t i = 0; i < preg->count; i++) {
-                        if (added[i]) continue;
-                        plugin_instance_t *inst = &preg->instances[i];
-                        if (!inst->widget || !inst->plugin ||
-                            !inst->plugin->id)
-                            continue;
-                        if (!PLUGIN_IS_AVAILABLE(inst))
-                            continue;
-                        if (strcmp(inst->plugin->id,
-                                   tab_order_last[o]) != 0)
-                            continue;
-                        const char *lbl = inst->plugin->name
-                                        ? inst->plugin->name : "Plugin";
-                        for (int k = 0; tab_label_overrides[k].id; k++) {
-                            if (strcmp(inst->plugin->id,
-                                       tab_label_overrides[k].id) == 0) {
-                                lbl = tab_label_overrides[k].label;
-                                break;
-                            }
-                        }
-                        GtkWidget *label = gtk_label_new(lbl);
-                        gtk_notebook_append_page(
-                            GTK_NOTEBOOK(notebook),
-                            inst->widget, label);
-                        plugin_instance_set_active(inst, TRUE);
-                        /* Hide the tab until the plugin activates it */
-                        gtk_widget_set_no_show_all(inst->widget, TRUE);
-                        gtk_widget_hide(inst->widget);
-                        GtkWidget *tab_lbl = gtk_notebook_get_tab_label(
-                            GTK_NOTEBOOK(notebook), inst->widget);
-                        if (tab_lbl) {
-                            gtk_widget_set_no_show_all(tab_lbl, TRUE);
-                            gtk_widget_hide(tab_lbl);
-                        }
-                        added[i] = TRUE;
-                    }
-                }
-
-                g_free(added);
-            }
-
             /* The plugin notebook lives in the detail panel alongside
-             * the process info.  It is NOT packed into sidebar_vbox. */
-
+             * the process info.  Pack it now so it appears immediately. */
             ctx.plugin_registry = preg;
             ctx.plugin_notebook = notebook;
+            ctx.has_audio_plugin = FALSE;
 
-            /* Wire up the Plugins menu now that ctx is ready.
-             * Use "show" (not "map") so it fires only when the user
-             * actually opens the dropdown, not during show_all(window). */
+            /* Wire up the Plugins menu now that ctx is ready. */
             g_signal_connect(plugins_menu, "show",
                              G_CALLBACK(on_plugins_menu_map), &ctx);
             ctx.plugins_menu_item = plugins_item;
@@ -3561,16 +3729,136 @@ void *ui_thread(void *arg)
                 gdk_screen_get_default(),
                 GTK_STYLE_PROVIDER(ctx.plugin_css),
                 GTK_STYLE_PROVIDER_PRIORITY_USER);
+
+            /* Start the async plugin scan.  Each plugin's create_widget()
+             * and notebook insertion happen on the GTK main thread as the
+             * background thread loads .so files, so the detail panel is
+             * never blocked.  on_plugin_scan_done_gtk kicks the first
+             * broker cycle once all plugins are registered. */
+            plugin_async_ctx_t *ac = malloc(sizeof(*ac));
+            if (ac) {
+                ac->ctx = &ctx;
+                if (plugin_loader_scan_async(preg, plugin_dir,
+                                             gtk_post_fn,
+                                             on_plugin_loaded_gtk,
+                                             on_plugin_scan_done_gtk,
+                                             ac) != 0) {
+                    /* Async scan failed — fall back to synchronous load.
+                     * plugin_loader_scan() calls create_widget() and
+                     * activate() itself, so all we need to do here is
+                     * add the widgets to the notebook. */
+                    free(ac);
+                    int nloaded = plugin_loader_scan(preg, plugin_dir);
+                    fprintf(stdout,
+                            "evemon: %d plugin(s) loaded (sync fallback) "
+                            "from %s\n", nloaded, plugin_dir);
+
+                    /* Detect audio plugins */
+                    for (size_t i = 0; i < preg->count; i++) {
+                        if (preg->instances[i].plugin &&
+                            (preg->instances[i].plugin->data_needs &
+                             evemon_NEED_PIPEWIRE))
+                            ctx.has_audio_plugin = TRUE;
+                    }
+                    if (ctx.has_audio_plugin)
+                        broker_set_audio_callback(on_broker_audio_pids, &ctx);
+
+                    /* Add UI plugin widgets to the notebook in tab order */
+                    for (int o = 0; g_tab_order[o]; o++) {
+                        for (size_t i = 0; i < preg->count; i++) {
+                            plugin_instance_t *inst = &preg->instances[i];
+                            if (!inst->widget || !inst->plugin ||
+                                !inst->plugin->id) continue;
+                            if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS)
+                                continue;
+                            if (!PLUGIN_IS_AVAILABLE(inst)) continue;
+                            if (strcmp(inst->plugin->id, g_tab_order[o]) != 0)
+                                continue;
+                            const char *lbl = inst->plugin->name
+                                            ? inst->plugin->name : "Plugin";
+                            for (int k = 0; g_tab_label_overrides[k].id; k++)
+                                if (strcmp(inst->plugin->id,
+                                           g_tab_label_overrides[k].id) == 0)
+                                    { lbl = g_tab_label_overrides[k].label; break; }
+                            gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+                                inst->widget, gtk_label_new(lbl));
+                            plugin_instance_set_active(inst, TRUE);
+                        }
+                    }
+                    for (size_t i = 0; i < preg->count; i++) {
+                        plugin_instance_t *inst = &preg->instances[i];
+                        if (!inst->widget || !inst->plugin) continue;
+                        if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS)
+                            continue;
+                        if (!PLUGIN_IS_AVAILABLE(inst)) continue;
+                        if (inst->is_active) continue;
+                        if (inst_is_last_order(inst->plugin, g_tab_order_last))
+                            continue;
+                        const char *lbl = inst->plugin->name
+                                        ? inst->plugin->name : "Plugin";
+                        if (inst->plugin->id)
+                            for (int k = 0; g_tab_label_overrides[k].id; k++)
+                                if (strcmp(inst->plugin->id,
+                                           g_tab_label_overrides[k].id) == 0)
+                                    { lbl = g_tab_label_overrides[k].label; break; }
+                        gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+                            inst->widget, gtk_label_new(lbl));
+                        plugin_instance_set_active(inst, TRUE);
+                    }
+                    for (int o = 0; g_tab_order_last[o]; o++) {
+                        for (size_t i = 0; i < preg->count; i++) {
+                            plugin_instance_t *inst = &preg->instances[i];
+                            if (!inst->widget || !inst->plugin ||
+                                !inst->plugin->id) continue;
+                            if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS)
+                                continue;
+                            if (!PLUGIN_IS_AVAILABLE(inst)) continue;
+                            if (inst->is_active) continue;
+                            if (strcmp(inst->plugin->id,
+                                       g_tab_order_last[o]) != 0) continue;
+                            const char *lbl = inst->plugin->name
+                                            ? inst->plugin->name : "Plugin";
+                            for (int k = 0; g_tab_label_overrides[k].id; k++)
+                                if (strcmp(inst->plugin->id,
+                                           g_tab_label_overrides[k].id) == 0)
+                                    { lbl = g_tab_label_overrides[k].label; break; }
+                            gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+                                inst->widget, gtk_label_new(lbl));
+                            plugin_instance_set_active(inst, TRUE);
+                            gtk_widget_set_no_show_all(inst->widget, TRUE);
+                            gtk_widget_hide(inst->widget);
+                            GtkWidget *tlbl = gtk_notebook_get_tab_label(
+                                GTK_NOTEBOOK(notebook), inst->widget);
+                            if (tlbl) {
+                                gtk_widget_set_no_show_all(tlbl, TRUE);
+                                gtk_widget_hide(tlbl);
+                            }
+                        }
+                    }
+                }
+            }
         } else {
             ctx.plugin_registry = NULL;
             ctx.plugin_notebook = NULL;
         }
         ctx.plugin_broker = NULL;  /* broker is stateless (module-level) */
 
-        /* Register for audio PIDs delivered by the broker worker thread. */
-        if (ctx.has_audio_plugin)
-            broker_set_audio_callback(on_broker_audio_pids, &ctx);
+        /* Wire the broker completion hook: the pthread worker posts the
+         * finished cycle via g_idle_add so dispatch runs on the GTK
+         * main thread — same guarantee the old GTask gave us. */
+        broker_set_complete_callback(on_broker_complete_gtk, NULL);
+
+        /* Audio callback is wired per-plugin in on_plugin_loaded_gtk /
+         * on_plugin_scan_done_gtk, so no registration needed here. */
     }
+
+#ifdef HAVE_PIPEWIRE
+    /* Start the persistent PipeWire watcher so pw_snapshot() is a fast
+     * mutex-copy instead of a full connect-enumerate-disconnect cycle.
+     * Start it after plugins are loaded so the watcher is ready by the
+     * time the first broker cycle runs. */
+    pw_watcher_start();
+#endif
 
     /* ── Finish detail panel setup: put notebook into the hpaned ── */
     ctx.detail_panel          = detail_panel;
@@ -3591,6 +3879,9 @@ void *ui_thread(void *arg)
     g_signal_connect(proc_info_toggle, "clicked",
                      G_CALLBACK(on_proc_info_tray_toggle), &ctx);
 
+    /* Pack the plugin notebook into the detail panel's horizontal paned.
+     * The notebook is created immediately (possibly empty) so the panel
+     * is shown at once; tabs appear as plugins load in the background. */
     if (ctx.plugin_notebook) {
         gtk_paned_pack2(GTK_PANED(detail_hpaned), ctx.plugin_notebook,
                         TRUE, FALSE);
@@ -3770,6 +4061,10 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     /* Cancel the broker FIRST — a worker thread may still be running
      * and its completion callback references ctx->audio_pids. */
     broker_destroy();
+
+#ifdef HAVE_PIPEWIRE
+    pw_watcher_stop();
+#endif
 
     /* Free the audio PID set (safe now that the broker is torn down) */
     free(ctx->audio_pids);

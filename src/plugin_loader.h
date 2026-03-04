@@ -13,6 +13,17 @@
 
 #include <stddef.h>
 
+/* When compiling without GTK (core library), gboolean is just int */
+#ifdef EVEMON_NO_GTK
+#ifndef gboolean
+typedef int gboolean;
+#endif
+#ifndef TRUE
+#define TRUE  1
+#define FALSE 0
+#endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -26,12 +37,12 @@ extern "C" {
 typedef struct {
     evemon_plugin_t  *plugin;        /* plugin descriptor (from .so)    */
     void             *handle;        /* dlopen handle                   */
-    GtkWidget        *widget;        /* root widget returned by create  */
+    void             *widget;        /* root widget returned by create_widget() */
     pid_t             tracked_pid;   /* PID this instance is watching   */
-    gboolean          pinned;        /* TRUE = pinned, FALSE = follows  */
+    int               pinned;        /* non-zero = pinned, 0 = follows selection */
     int               instance_id;   /* unique instance counter         */
     char              so_path[4096]; /* absolute path to the .so file   */
-    gboolean          is_active;     /* TRUE = in a notebook tab, FALSE = floating window */
+    int               is_active;     /* non-zero = in a notebook tab, 0 = floating window */
 } plugin_instance_t;
 
 /* ── Plugin registry ─────────────────────────────────────────── */
@@ -110,14 +121,14 @@ int plugin_reload(plugin_registry_t *reg, const char *so_path);
  * instance follows the tree selection.
  */
 void plugin_instance_set_pid(plugin_instance_t *inst, pid_t pid,
-                             gboolean pinned);
+                             int pinned);
 
 /*
  * Notify a plugin instance whether it lives in a notebook tab (active=TRUE)
  * or a standalone floating window (active=FALSE).  Calls plugin->set_active()
  * if the plugin provides it.  Safe to call with any inst pointer.
  */
-void plugin_instance_set_active(plugin_instance_t *inst, gboolean active);
+void plugin_instance_set_active(plugin_instance_t *inst, int active);
 
 /*
  * Dispatch update() to all instances tracking a given PID.
@@ -142,6 +153,65 @@ void plugin_dispatch_clear_all(plugin_registry_t *reg);
  */
 size_t plugin_collect_tracked_pids(const plugin_registry_t *reg,
                                    pid_t *out, size_t max_out);
+
+/* ── Asynchronous plugin scanning ───────────────────────────── */
+
+/*
+ * Callback fired on the GTK main thread for each plugin that has been
+ * successfully loaded from its .so file.
+ *
+ *   reg      – the registry (same pointer passed to scan_async)
+ *   inst_id  – instance_id of the newly added plugin instance
+ *   user_data – opaque pointer from plugin_loader_scan_async()
+ *
+ * The callback must call create_widget() and add the widget to the
+ * notebook (or perform any other GTK-thread work).  The plugin
+ * descriptor and handle are already stored in the registry; only
+ * the widget creation and host-services injection are deferred.
+ */
+typedef void (*plugin_loaded_cb)(plugin_registry_t *reg,
+                                 int inst_id,
+                                 void *user_data);
+
+/*
+ * Callback fired on the GTK main thread once all .so files in the
+ * directory have been processed (successfully or not).
+ *
+ *   n_loaded  – number of plugins successfully loaded
+ *   user_data – opaque pointer from plugin_loader_scan_async()
+ */
+typedef void (*plugin_scan_done_cb)(int n_loaded, void *user_data);
+
+/*
+ * Function type for posting a callback + data onto the main thread.
+ * The GTK frontend wires this to g_idle_add(); other frontends use
+ * their own main-loop dispatch mechanism.
+ *
+ *   func      – function to call on the main thread; returns 0 to
+ *               remove (one-shot), non-zero to keep scheduling.
+ *   data      – opaque pointer forwarded to func.
+ */
+typedef void (*plugin_post_fn)(int (*func)(void *), void *data);
+
+/*
+ * Scan `dir` for plugins asynchronously in a background pthread.
+ *
+ * For each successfully loaded plugin, `on_loaded` is posted to the
+ * main thread via `post_fn`.  When the scan completes, `on_done` is
+ * posted to the main thread.
+ *
+ * Thread-safety: only one async scan may run at a time.  The caller
+ * must not call plugin_loader_scan() or access plugin widget fields
+ * until `on_done` has fired.
+ *
+ * Returns 0 on success (thread started), -1 on failure.
+ */
+int plugin_loader_scan_async(plugin_registry_t  *reg,
+                             const char         *dir,
+                             plugin_post_fn      post_fn,
+                             plugin_loaded_cb    on_loaded,
+                             plugin_scan_done_cb on_done,
+                             void               *user_data);
 
 #ifdef __cplusplus
 }

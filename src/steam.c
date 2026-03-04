@@ -386,6 +386,15 @@ steam_info_t *steam_detect(pid_t pid, const char *comm, const char *cmdline,
                            const steam_info_t *parent_steam)
 {
     /*
+     * Fast-reject: kernel threads and early system processes (PID ≤ 10)
+     * are never Steam processes.  Avoid opening /proc/<pid>/environ for
+     * them at all — this is the most common case during the ancestor walk
+     * for ordinary (non-Steam) processes selected in the tree.
+     */
+    if (pid <= 10)
+        return NULL;
+
+    /*
      * Strategy:
      *   1. If the process is a known Steam launcher name → probe its environ.
      *   2. If the parent was already identified as Steam → inherit metadata.
@@ -403,6 +412,15 @@ steam_info_t *steam_detect(pid_t pid, const char *comm, const char *cmdline,
             strstr(cmdline, "SteamLinuxRuntime"))
             should_probe = 1;
     }
+
+    /*
+     * Fast-reject: if there's no parent Steam context AND this process
+     * doesn't look like a Steam launcher, skip the /proc/environ read
+     * entirely.  This avoids expensive I/O for every ancestor in the
+     * tree walk when a non-Steam process is selected.
+     */
+    if (!should_probe && !parent_steam)
+        return NULL;
 
     /* If we have Steam parent metadata, children inherit it */
     if (parent_steam && parent_steam->is_steam) {

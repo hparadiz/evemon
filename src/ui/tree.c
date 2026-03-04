@@ -464,7 +464,9 @@ long compute_group_cpu(GtkTreeStore *store, GtkTreeIter *parent)
 void populate_store_initial(GtkTreeStore       *store,
                             GtkTreeView        *view,
                             const proc_entry_t *entries,
-                            size_t              count)
+                            size_t              count,
+                            pid_t               preselect_pid,
+                            ui_ctx_t           *ctx)
 {
     if (count == 0) return;
 
@@ -482,6 +484,7 @@ void populate_store_initial(GtkTreeStore       *store,
 
     pid_t stack[64];
     int sp;
+    gboolean preselected = FALSE;
 
     for (size_t i = 0; i < count; i++) {
         if (inserted[i]) continue;
@@ -512,6 +515,33 @@ void populate_store_initial(GtkTreeStore       *store,
             gtk_tree_store_append(store, &iters[sidx], parent_iter);
             set_row_data(store, &iters[sidx], e);
             inserted[sidx] = 1;
+
+            /* Select and open the detail panel the instant the
+             * preselected row lands in the store. */
+            if (!preselected && preselect_pid > 0 &&
+                e->pid == preselect_pid && ctx) {
+                preselected = TRUE;
+                /* Build the sort-model path and select it */
+                GtkTreeModel *sort = gtk_tree_view_get_model(view);
+                GtkTreePath *child_path = gtk_tree_model_get_path(
+                    GTK_TREE_MODEL(store), &iters[sidx]);
+                if (child_path && GTK_IS_TREE_MODEL_SORT(sort)) {
+                    GtkTreePath *sort_path =
+                        gtk_tree_model_sort_convert_child_path_to_path(
+                            GTK_TREE_MODEL_SORT(sort), child_path);
+                    if (sort_path) {
+                        GtkTreeSelection *sel =
+                            gtk_tree_view_get_selection(view);
+                        gtk_tree_selection_select_path(sel, sort_path);
+                        gtk_tree_path_free(sort_path);
+                    }
+                    gtk_tree_path_free(child_path);
+                }
+                /* Open the detail panel immediately */
+                if (gtk_widget_get_visible(ctx->detail_vbox))
+                    gtk_widget_show_all(ctx->detail_panel);
+                proc_detail_update(ctx);
+            }
         }
     }
 

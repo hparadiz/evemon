@@ -15,10 +15,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Global debug flag (--debug enables verbose logging to stderr) */
 int evemon_debug = 0;
+
+/* Monotonic timestamp (seconds) recorded at program startup */
+struct timespec evemon_start_time;
 
 /* Global so the signal handler can reach it. */
 static monitor_state_t g_state;
@@ -59,6 +63,8 @@ static gboolean check_shutdown(gpointer data)
 
 int main(int argc, char *argv[])
 {
+    clock_gettime(CLOCK_MONOTONIC, &evemon_start_time);
+
     /* Check for --debug before GTK consumes argv */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--debug") == 0) {
@@ -71,12 +77,24 @@ int main(int argc, char *argv[])
         }
     }
 
+    #define STARTUP_TS(label) do { \
+        struct timespec _ts; \
+        clock_gettime(CLOCK_MONOTONIC, &_ts); \
+        double _e = (double)(_ts.tv_sec  - evemon_start_time.tv_sec) + \
+                    (double)(_ts.tv_nsec - evemon_start_time.tv_nsec) / 1e9; \
+        printf("[startup] %+7.3f s  %s\n", _e, label); \
+        fflush(stdout); \
+    } while (0)
+
+    STARTUP_TS("begin");
     profile_init();
+    STARTUP_TS("profile_init done");
     FcInit();
+    STARTUP_TS("FcInit done");
     g_set_prgname("evemon");
     gtk_init(&argc, &argv);
+    STARTUP_TS("gtk_init done");
 
-    //fprintf(stdout, "evemon: starting up...\n");
     if (monitor_state_init(&g_state) != 0) {
         fprintf(stderr, "evemon: failed to initialise state\n");
         return EXIT_FAILURE;
@@ -84,6 +102,7 @@ int main(int argc, char *argv[])
 
     /* Create the eBPF fd/network monitor (best-effort: NULL on failure) */
     g_state.fdmon = fdmon_create(FDMON_BACKEND_AUTO);
+    STARTUP_TS("fdmon_create done");
 
     /* Handle Ctrl-C gracefully */
     struct sigaction sa = { .sa_handler = on_sigint };
@@ -106,6 +125,8 @@ int main(int argc, char *argv[])
      * signal handler.
      */
     g_timeout_add(50, check_shutdown, NULL);
+
+    STARTUP_TS("ui_thread start");
 
     /* Run GTK UI on the main thread (ui_thread calls gtk_main) */
     ui_thread(&g_state);
