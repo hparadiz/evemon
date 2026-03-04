@@ -56,6 +56,9 @@
 #define PRESET_DIR \
     "/home/akujin/.local/share/Steam/steamapps/common/projectM/presets"
 
+#define MD_FAV_SLOTS   16
+#define MD_FAV_FILE    "/home/akujin/.config/evemon/milkdrop_favorites.ini"
+
 /* max vertices for wave/shape drawing */
 #define MAX_WAVE_VERTS  2048
 
@@ -441,6 +444,15 @@ typedef struct {
     md_custom_wave_t  waves[MAX_CUSTOM_WAVES];
     md_custom_shape_t shapes[MAX_CUSTOM_SHAPES];
 } md_preset_t;
+
+/* ── favorites slot ──────────────────────────────────────────── */
+
+typedef struct {
+    int         used;                  /* 1 if this slot has data */
+    char        name[256];             /* display name (preset name) */
+    md_preset_t preset;                /* full preset snapshot       */
+    float       q_vars[NUM_Q_VAR];     /* q-var state at save time   */
+} md_fav_slot_t;
 
 /* ── .milk parser ────────────────────────────────────────────── */
 
@@ -983,6 +995,13 @@ typedef struct {
     /* Set by the host: TRUE when this instance lives in a notebook tab.
      * Used by md_update/md_clear to decide whether to show/hide the tab. */
     int       is_active;
+
+    /* ── favorites ─────────────────────────────────────────── */
+    md_fav_slot_t favorites[MD_FAV_SLOTS];
+    int           show_fav_menu;       /* Ctrl+M: favorites overlay visible */
+    int           fav_menu_sel;        /* cursor row in favorites menu      */
+    int           fav_cycle;           /* Ctrl+F: cycle only favorites mode */
+    int           fav_cycle_idx;       /* current position in fav cycle     */
 } md_ctx_t;
 
 /* ── sound analysis ──────────────────────────────────────────── */
@@ -1108,6 +1127,257 @@ static void md_readback_pf_vars(md_ctx_t *ctx)
         char nm[8]; snprintf(nm,sizeof(nm),"q%d",i+1);
         ctx->q_vars[i] = md_var_read(&ctx->pf_vars, nm);
     }
+}
+
+/* ── favorites: save / load / recall / cycle ────────────────── */
+
+/* forward declaration – defined below */
+static void show_info(md_ctx_t *ctx, const char *fmt, ...);
+
+static void md_favorites_save(md_ctx_t *ctx)
+{
+    char dir[512];
+    strncpy(dir, MD_FAV_FILE, sizeof(dir)-1); dir[sizeof(dir)-1] = 0;
+    char *slash = strrchr(dir, '/');
+    if (slash) { *slash = 0; g_mkdir_with_parents(dir, 0755); }
+
+    FILE *f = fopen(MD_FAV_FILE, "w");
+    if (!f) return;
+    fprintf(f, "; MilkDrop favorites – managed by evemon\n\n");
+
+    for (int i = 0; i < MD_FAV_SLOTS; i++) {
+        md_fav_slot_t *s = &ctx->favorites[i];
+        if (!s->used) continue;
+        fprintf(f, "[slot%d]\n", i);
+        fprintf(f, "name=%s\n",     s->name);
+        fprintf(f, "filepath=%s\n", s->preset.filepath);
+        /* scalar fields */
+        fprintf(f, "fGammaAdj=%.6g\n",        s->preset.fGammaAdj);
+        fprintf(f, "fDecay=%.6g\n",            s->preset.fDecay);
+        fprintf(f, "fVideoEchoZoom=%.6g\n",    s->preset.fVideoEchoZoom);
+        fprintf(f, "fVideoEchoAlpha=%.6g\n",   s->preset.fVideoEchoAlpha);
+        fprintf(f, "nVideoEchoOrientation=%d\n",s->preset.nVideoEchoOrientation);
+        fprintf(f, "nWaveMode=%d\n",           s->preset.nWaveMode);
+        fprintf(f, "bAdditiveWaves=%d\n",      s->preset.bAdditiveWaves);
+        fprintf(f, "bWaveDots=%d\n",           s->preset.bWaveDots);
+        fprintf(f, "bWaveThick=%d\n",          s->preset.bWaveThick);
+        fprintf(f, "bModWaveAlphaByVolume=%d\n",s->preset.bModWaveAlphaByVolume);
+        fprintf(f, "bMaximizeWaveColor=%d\n",  s->preset.bMaximizeWaveColor);
+        fprintf(f, "bTexWrap=%d\n",            s->preset.bTexWrap);
+        fprintf(f, "bDarkenCenter=%d\n",       s->preset.bDarkenCenter);
+        fprintf(f, "bBrighten=%d\n",           s->preset.bBrighten);
+        fprintf(f, "bDarken=%d\n",             s->preset.bDarken);
+        fprintf(f, "bSolarize=%d\n",           s->preset.bSolarize);
+        fprintf(f, "bInvert=%d\n",             s->preset.bInvert);
+        fprintf(f, "fWaveAlpha=%.6g\n",        s->preset.fWaveAlpha);
+        fprintf(f, "fWaveScale=%.6g\n",        s->preset.fWaveScale);
+        fprintf(f, "fWaveSmoothing=%.6g\n",    s->preset.fWaveSmoothing);
+        fprintf(f, "fWaveParam=%.6g\n",        s->preset.fWaveParam);
+        fprintf(f, "fModWaveAlphaStart=%.6g\n",s->preset.fModWaveAlphaStart);
+        fprintf(f, "fModWaveAlphaEnd=%.6g\n",  s->preset.fModWaveAlphaEnd);
+        fprintf(f, "fWarpAnimSpeed=%.6g\n",    s->preset.fWarpAnimSpeed);
+        fprintf(f, "fWarpScale=%.6g\n",        s->preset.fWarpScale);
+        fprintf(f, "fZoomExponent=%.6g\n",     s->preset.fZoomExponent);
+        fprintf(f, "fShader=%.6g\n",           s->preset.fShader);
+        fprintf(f, "zoom=%.6g\n",              s->preset.zoom);
+        fprintf(f, "rot=%.6g\n",               s->preset.rot);
+        fprintf(f, "cx=%.6g\n",                s->preset.cx);
+        fprintf(f, "cy=%.6g\n",                s->preset.cy);
+        fprintf(f, "dx=%.6g\n",                s->preset.dx);
+        fprintf(f, "dy=%.6g\n",                s->preset.dy);
+        fprintf(f, "warp=%.6g\n",              s->preset.warp);
+        fprintf(f, "sx=%.6g\n",                s->preset.sx);
+        fprintf(f, "sy=%.6g\n",                s->preset.sy);
+        fprintf(f, "wave_r=%.6g\n",            s->preset.wave_r);
+        fprintf(f, "wave_g=%.6g\n",            s->preset.wave_g);
+        fprintf(f, "wave_b=%.6g\n",            s->preset.wave_b);
+        fprintf(f, "wave_x=%.6g\n",            s->preset.wave_x);
+        fprintf(f, "wave_y=%.6g\n",            s->preset.wave_y);
+        fprintf(f, "ob_size=%.6g\n",           s->preset.ob_size);
+        fprintf(f, "ob_r=%.6g\n",              s->preset.ob_r);
+        fprintf(f, "ob_g=%.6g\n",              s->preset.ob_g);
+        fprintf(f, "ob_b=%.6g\n",              s->preset.ob_b);
+        fprintf(f, "ob_a=%.6g\n",              s->preset.ob_a);
+        fprintf(f, "ib_size=%.6g\n",           s->preset.ib_size);
+        fprintf(f, "ib_r=%.6g\n",              s->preset.ib_r);
+        fprintf(f, "ib_g=%.6g\n",              s->preset.ib_g);
+        fprintf(f, "ib_b=%.6g\n",              s->preset.ib_b);
+        fprintf(f, "ib_a=%.6g\n",              s->preset.ib_a);
+        fprintf(f, "nMotionVectorsX=%.6g\n",   s->preset.nMotionVectorsX);
+        fprintf(f, "nMotionVectorsY=%.6g\n",   s->preset.nMotionVectorsY);
+        fprintf(f, "mv_dx=%.6g\n",             s->preset.mv_dx);
+        fprintf(f, "mv_dy=%.6g\n",             s->preset.mv_dy);
+        fprintf(f, "mv_l=%.6g\n",              s->preset.mv_l);
+        fprintf(f, "mv_r=%.6g\n",              s->preset.mv_r);
+        fprintf(f, "mv_g=%.6g\n",              s->preset.mv_g);
+        fprintf(f, "mv_b=%.6g\n",              s->preset.mv_b);
+        fprintf(f, "mv_a=%.6g\n",              s->preset.mv_a);
+        for (int q = 0; q < NUM_Q_VAR; q++)
+            fprintf(f, "q%d=%.8g\n", q+1, s->q_vars[q]);
+        fprintf(f, "\n");
+    }
+    fclose(f);
+}
+
+static void md_favorites_load(md_ctx_t *ctx)
+{
+    memset(ctx->favorites, 0, sizeof(ctx->favorites));
+    FILE *f = fopen(MD_FAV_FILE, "r");
+    if (!f) return;
+
+    char line[1024];
+    int  slot = -1;
+    while (fgets(line, sizeof(line), f)) {
+        /* strip newline */
+        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+        char *cr = strchr(line, '\r'); if (cr) *cr = 0;
+        /* skip blank / comment */
+        if (!line[0] || line[0] == ';') continue;
+        /* section header */
+        if (line[0] == '[') {
+            int s = -1;
+            if (sscanf(line, "[slot%d]", &s) == 1 && s >= 0 && s < MD_FAV_SLOTS)
+                slot = s;
+            else
+                slot = -1;
+            continue;
+        }
+        if (slot < 0) continue;
+        md_fav_slot_t *sv = &ctx->favorites[slot];
+        sv->used = 1;
+
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        const char *key = line, *val = eq+1;
+
+#define SF(field) if (!strcmp(key,#field)) sv->preset.field = (float)atof(val)
+#define SI(field) if (!strcmp(key,#field)) sv->preset.field = atoi(val)
+        if (!strcmp(key,"name"))     { strncpy(sv->name,          val, 255); sv->name[255]=0; }
+        if (!strcmp(key,"filepath")) { strncpy(sv->preset.filepath,val,1023); sv->preset.filepath[1023]=0; }
+        SF(fGammaAdj); SF(fDecay); SF(fVideoEchoZoom); SF(fVideoEchoAlpha);
+        SI(nVideoEchoOrientation); SI(nWaveMode);
+        SI(bAdditiveWaves); SI(bWaveDots); SI(bWaveThick);
+        SI(bModWaveAlphaByVolume); SI(bMaximizeWaveColor);
+        SI(bTexWrap); SI(bDarkenCenter);
+        SI(bBrighten); SI(bDarken); SI(bSolarize); SI(bInvert);
+        SF(fWaveAlpha); SF(fWaveScale); SF(fWaveSmoothing); SF(fWaveParam);
+        SF(fModWaveAlphaStart); SF(fModWaveAlphaEnd);
+        SF(fWarpAnimSpeed); SF(fWarpScale); SF(fZoomExponent); SF(fShader);
+        SF(zoom); SF(rot); SF(cx); SF(cy); SF(dx); SF(dy);
+        SF(warp); SF(sx); SF(sy);
+        SF(wave_r); SF(wave_g); SF(wave_b); SF(wave_x); SF(wave_y);
+        SF(ob_size); SF(ob_r); SF(ob_g); SF(ob_b); SF(ob_a);
+        SF(ib_size); SF(ib_r); SF(ib_g); SF(ib_b); SF(ib_a);
+        SF(nMotionVectorsX); SF(nMotionVectorsY);
+        SF(mv_dx); SF(mv_dy); SF(mv_l); SF(mv_r); SF(mv_g); SF(mv_b); SF(mv_a);
+        /* q-vars: q1 .. q32 */
+        if (key[0] == 'q' && key[1] >= '1' && key[1] <= '9') {
+            int qi = atoi(key+1) - 1;
+            if (qi >= 0 && qi < NUM_Q_VAR) sv->q_vars[qi] = (float)atof(val);
+        }
+#undef SF
+#undef SI
+    }
+    fclose(f);
+}
+
+/* Find the name to show for a preset: use the base filename without extension */
+static void md_fav_preset_label(md_ctx_t *ctx, char *out, int outsz)
+{
+    const char *fp = ctx->preset.filepath;
+    const char *base = strrchr(fp, '/');
+    base = base ? base+1 : fp;
+    strncpy(out, base, outsz-1); out[outsz-1] = 0;
+    /* strip .milk extension */
+    char *dot = strrchr(out, '.');
+    if (dot && !strcasecmp(dot, ".milk")) *dot = 0;
+    /* if preset has a human name, prefer it */
+    if (ctx->preset.name[0])
+        strncpy(out, ctx->preset.name, outsz-1);
+}
+
+static void md_fav_save_current(md_ctx_t *ctx)
+{
+    /* Check if already saved (same filepath → update in place) */
+    int target = -1;
+    for (int i = 0; i < MD_FAV_SLOTS; i++) {
+        if (ctx->favorites[i].used &&
+            strcmp(ctx->favorites[i].preset.filepath,
+                   ctx->preset.filepath) == 0) {
+            target = i;
+            break;
+        }
+    }
+    if (target < 0) {
+        /* Find first free slot */
+        for (int i = 0; i < MD_FAV_SLOTS; i++) {
+            if (!ctx->favorites[i].used) { target = i; break; }
+        }
+    }
+    if (target < 0) {
+        /* All slots full: evict slot 0, shift everything down */
+        memmove(&ctx->favorites[0], &ctx->favorites[1],
+                sizeof(md_fav_slot_t) * (MD_FAV_SLOTS-1));
+        target = MD_FAV_SLOTS - 1;
+        memset(&ctx->favorites[target], 0, sizeof(md_fav_slot_t));
+    }
+
+    md_fav_slot_t *sv = &ctx->favorites[target];
+    sv->used   = 1;
+    sv->preset = ctx->preset;
+    memcpy(sv->q_vars, ctx->q_vars, sizeof(ctx->q_vars));
+    md_fav_preset_label(ctx, sv->name, sizeof(sv->name));
+    md_favorites_save(ctx);
+    show_info(ctx, "\xe2\x98\x85 Saved: %s", sv->name);
+}
+
+/* Returns 1 on success, 0 if slot is empty */
+static int md_fav_recall(md_ctx_t *ctx, int slot)
+{
+    if (slot < 0 || slot >= MD_FAV_SLOTS) return 0;
+    md_fav_slot_t *sv = &ctx->favorites[slot];
+    if (!sv->used) return 0;
+    ctx->preset     = sv->preset;
+    memcpy(ctx->q_vars, sv->q_vars, sizeof(ctx->q_vars));
+    ctx->preset_loaded = 1;
+    ctx->pf_init_done  = 1;   /* q_vars already seeded – skip zero-init */
+    ctx->blending      = 0;
+    show_info(ctx, "\xe2\x98\x85 Recalled: %s", sv->name);
+    return 1;
+}
+
+static void md_fav_delete(md_ctx_t *ctx, int slot)
+{
+    if (slot < 0 || slot >= MD_FAV_SLOTS) return;
+    char name[256];
+    strncpy(name, ctx->favorites[slot].name, 255); name[255] = 0;
+    /* Compact: shift slots after 'slot' down by one */
+    for (int i = slot; i < MD_FAV_SLOTS-1; i++)
+        ctx->favorites[i] = ctx->favorites[i+1];
+    memset(&ctx->favorites[MD_FAV_SLOTS-1], 0, sizeof(md_fav_slot_t));
+    md_favorites_save(ctx);
+    show_info(ctx, "Removed: %s", name);
+}
+
+static void md_fav_cycle_next(md_ctx_t *ctx, int delta)
+{
+    /* Build a list of used slot indices */
+    int used[MD_FAV_SLOTS], nc = 0;
+    for (int i = 0; i < MD_FAV_SLOTS; i++)
+        if (ctx->favorites[i].used) used[nc++] = i;
+    if (nc == 0) {
+        show_info(ctx, "No favorites saved yet (Ctrl+S to save)");
+        return;
+    }
+    /* Find current position in the used list */
+    int pos = 0;
+    for (int i = 0; i < nc; i++) {
+        if (used[i] == ctx->fav_cycle_idx) { pos = i; break; }
+    }
+    pos = ((pos + delta) % nc + nc) % nc;
+    ctx->fav_cycle_idx = used[pos];
+    md_fav_recall(ctx, ctx->fav_cycle_idx);
 }
 
 /* ── vivid random color ─────────────────────────────────────── */
@@ -2345,9 +2615,11 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 
     switch (ev->keyval) {
 
-    /* ── SPACE: soft cut to next preset ──────────────────────── */
+    /* ── SPACE: next preset (or next favorite in fav_cycle mode) */
     case GDK_KEY_space:
-        if (shift) {
+        if (ctx->fav_cycle) {
+            md_fav_cycle_next(ctx, shift ? -1 : 1);
+        } else if (shift) {
             /* Shift+SPACE: hard cut to next */
             ctx->prev_preset_idx = ctx->preset_idx;
             md_load_preset_idx(ctx, ctx->preset_idx + 1, 0);
@@ -2389,6 +2661,8 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
             ctx->show_preset_name = !ctx->show_preset_name;
             show_info(ctx, "Preset name: %s",
                       ctx->show_preset_name ? "ON" : "OFF");
+        } else if (ctx->fav_cycle) {
+            md_fav_cycle_next(ctx, 1);
         } else {
             ctx->prev_preset_idx = ctx->preset_idx;
             md_load_preset_idx(ctx, ctx->preset_idx + 1, 1);
@@ -2399,10 +2673,14 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 
     /* ── P: previous preset ──────────────────────────────────── */
     case GDK_KEY_p: case GDK_KEY_P:
-        ctx->prev_preset_idx = ctx->preset_idx;
-        md_load_preset_idx(ctx, ctx->preset_idx - 1, 1);
-        show_info(ctx, "[%d/%d] %s", ctx->preset_idx+1,
-                  ctx->lib.count, ctx->lib.names[ctx->preset_idx]);
+        if (ctx->fav_cycle) {
+            md_fav_cycle_next(ctx, -1);
+        } else {
+            ctx->prev_preset_idx = ctx->preset_idx;
+            md_load_preset_idx(ctx, ctx->preset_idx - 1, 1);
+            show_info(ctx, "[%d/%d] %s", ctx->preset_idx+1,
+                      ctx->lib.count, ctx->lib.names[ctx->preset_idx]);
+        }
         return TRUE;
 
     /* ── R: toggle random/sequential ─────────────────────────── */
@@ -2482,10 +2760,14 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
         return TRUE;
     }
 
-    /* ── S: shuffle library ──────────────────────────────────── */
+    /* ── S: Ctrl+S = save favorite; plain S = shuffle library ── */
     case GDK_KEY_s: case GDK_KEY_S:
-        md_lib_shuffle(&ctx->lib);
-        show_info(ctx, "Library shuffled (%d presets)", ctx->lib.count);
+        if (ctrl) {
+            md_fav_save_current(ctx);
+        } else {
+            md_lib_shuffle(&ctx->lib);
+            show_info(ctx, "Library shuffled (%d presets)", ctx->lib.count);
+        }
         return TRUE;
 
     /* ── B / Shift+B: blend time adjust ──────────────────────── */
@@ -2560,27 +2842,89 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
         show_info(ctx, "Auto-advance: %.0fs", ctx->preset_duration);
         return TRUE;
 
-    /* ── M: cycle now-playing detail ──────────────────────────── */
+    /* ── M: Ctrl+M = fav menu; plain/Shift = now-playing ─────── */
     case GDK_KEY_m:
-        ctx->show_nowplaying = (ctx->show_nowplaying + 1) % 4;
-        { static const char *modes[] = {
-            "OFF", "Title only", "Title + Artist + Album", "Full"
-          };
-          show_info(ctx, "Now Playing: %s", modes[ctx->show_nowplaying]);
+        if (ctrl) {
+            ctx->show_fav_menu = !ctx->show_fav_menu;
+            if (ctx->show_fav_menu) {
+                ctx->fav_menu_sel = 0;
+                /* pre-select the currently-playing favorite if any */
+                for (int i = 0; i < MD_FAV_SLOTS; i++) {
+                    if (ctx->favorites[i].used &&
+                        strcmp(ctx->favorites[i].preset.filepath,
+                               ctx->preset.filepath) == 0)
+                        { ctx->fav_menu_sel = i; break; }
+                }
+            }
+        } else {
+            ctx->show_nowplaying = (ctx->show_nowplaying + 1) % 4;
+            static const char *modes[] = {
+                "OFF", "Title only", "Title + Artist + Album", "Full"
+            };
+            show_info(ctx, "Now Playing: %s", modes[ctx->show_nowplaying]);
         }
         return TRUE;
     case GDK_KEY_M:
-        /* Shift+M: jump straight to full */
-        ctx->show_nowplaying = 3;
-        show_info(ctx, "Now Playing: Full");
+        if (ctrl) {
+            ctx->show_fav_menu = !ctx->show_fav_menu;
+        } else {
+            /* Shift+M: jump straight to full */
+            ctx->show_nowplaying = 3;
+            show_info(ctx, "Now Playing: Full");
+        }
         return TRUE;
 
-    /* ── F / Escape: fullscreen toggle ────────────────────────── */
+    /* ── F: Ctrl+F = fav-cycle mode; plain F = fullscreen ────── */
     case GDK_KEY_f: case GDK_KEY_F:
-        md_toggle_fullscreen(ctx);
+        if (ctrl) {
+            ctx->fav_cycle = !ctx->fav_cycle;
+            show_info(ctx, "Favorites-only cycle: %s",
+                      ctx->fav_cycle ? "ON (Space/N/P cycle favs)" : "OFF");
+        } else {
+            md_toggle_fullscreen(ctx);
+        }
         return TRUE;
+
+    /* ── Favorites menu navigation (active when menu is open) ── */
+    case GDK_KEY_Up:
+        if (ctx->show_fav_menu) {
+            /* skip unused slots going upward */
+            int s = ctx->fav_menu_sel - 1;
+            while (s >= 0 && !ctx->favorites[s].used) s--;
+            if (s >= 0) ctx->fav_menu_sel = s;
+            return TRUE;
+        }
+        return FALSE;
+    case GDK_KEY_Down:
+        if (ctx->show_fav_menu) {
+            int s = ctx->fav_menu_sel + 1;
+            while (s < MD_FAV_SLOTS && !ctx->favorites[s].used) s++;
+            if (s < MD_FAV_SLOTS) ctx->fav_menu_sel = s;
+            return TRUE;
+        }
+        return FALSE;
+    case GDK_KEY_Return: case GDK_KEY_KP_Enter:
+        if (ctx->show_fav_menu) {
+            md_fav_recall(ctx, ctx->fav_menu_sel);
+            ctx->show_fav_menu = 0;
+            return TRUE;
+        }
+        return FALSE;
+    case GDK_KEY_Delete:
+        if (ctx->show_fav_menu) {
+            int prev = ctx->fav_menu_sel;
+            md_fav_delete(ctx, ctx->fav_menu_sel);
+            /* keep cursor on nearest remaining entry */
+            while (prev > 0 && !ctx->favorites[prev].used) prev--;
+            ctx->fav_menu_sel = prev;
+            return TRUE;
+        }
+        return FALSE;
+
+    /* ── Escape: close fav menu, then exit fullscreen ─────────── */
     case GDK_KEY_Escape:
-        if (ctx->fullscreen) { md_toggle_fullscreen(ctx); return TRUE; }
+        if (ctx->show_fav_menu) { ctx->show_fav_menu = 0; return TRUE; }
+        if (ctx->fullscreen)    { md_toggle_fullscreen(ctx); return TRUE; }
         return FALSE;
 
     /* ── F1: help overlay ────────────────────────────────────── */
@@ -2627,14 +2971,6 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
         ctx->effects_enabled = !ctx->effects_enabled;
         show_info(ctx, "Effects: %s",
                   ctx->effects_enabled ? "ON" : "OFF");
-        return TRUE;
-
-    /* ── 0-9: rate the current preset (just info) ────────────── */
-    case GDK_KEY_0: case GDK_KEY_1: case GDK_KEY_2: case GDK_KEY_3:
-    case GDK_KEY_4: case GDK_KEY_5: case GDK_KEY_6: case GDK_KEY_7:
-    case GDK_KEY_8: case GDK_KEY_9:
-        show_info(ctx, "Rated preset %d/10 (not saved)",
-                  ev->keyval - GDK_KEY_0);
         return TRUE;
 
     default: break;
@@ -2967,7 +3303,11 @@ static gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data)
             "",
             "B / Shift+B  Increase/decrease blend time",
             "+/-          Increase/decrease auto-advance time",
-            "0-9          Rate preset (display only)",
+            "",
+            "Ctrl+S       Save preset as favorite",
+            "Ctrl+M       Open/close favorites menu",
+            "Ctrl+F       Toggle favorites-only cycle mode",
+            "  In menu:   \xe2\x86\x91\xe2\x86\x93 navigate   Enter=load   Del=remove",
             "",
             "F1           This help screen",
             "F4           Toggle persistent preset name",
@@ -2978,7 +3318,7 @@ static gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data)
             "F11          Toggle all effects",
             "",
             "F            Toggle fullscreen",
-            "Escape       Exit fullscreen",
+            "Escape       Exit fullscreen / Close favorites menu",
             "",
             "Scroll       Next/previous preset",
             "Double-click Random preset",
@@ -3050,11 +3390,95 @@ static gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data)
     /* ── preset name (top-left, always or faded) ─────────────── */
     if (ctx->preset_loaded) {
         float name_alpha = ctx->show_preset_name ? 0.6f : 0.2f;
-        char dn[80]; strncpy(dn,ctx->preset.name,70); dn[70]=0;
-        if (strlen(ctx->preset.name)>70) strcat(dn,"...");
+        /* check whether this preset is a saved favorite */
+        int is_fav = 0;
+        for (int i = 0; i < MD_FAV_SLOTS; i++) {
+            if (ctx->favorites[i].used &&
+                strcmp(ctx->favorites[i].preset.filepath,
+                       ctx->preset.filepath) == 0)
+                { is_fav = 1; break; }
+        }
+        char dn[96];
+        if (is_fav) {
+            snprintf(dn, sizeof(dn), "\xe2\x98\x85 ");   /* UTF-8 ★ */
+            strncat(dn, ctx->preset.name, sizeof(dn)-4); dn[sizeof(dn)-1] = 0;
+        } else {
+            strncpy(dn, ctx->preset.name, 70); dn[70] = 0;
+            if (strlen(ctx->preset.name) > 70) strcat(dn, "\xe2\x80\xa6");
+        }
+        /* gold when favorited, plain white otherwise */
+        float nr = 1.0f, ng = is_fav ? 0.82f : 1.0f, nb = is_fav ? 0.15f : 1.0f;
         md_pango_left(cr, 6, 4, "Sans", 9,
                       PANGO_WEIGHT_NORMAL, PANGO_STYLE_NORMAL,
-                      dn, 1,1,1, name_alpha);
+                      dn, nr, ng, nb, name_alpha);
+        if (ctx->fav_cycle) {
+            md_pango_left(cr, 6, 17, "Sans", 8,
+                          PANGO_WEIGHT_BOLD, PANGO_STYLE_NORMAL,
+                          "FAV CYCLE", 1.0f, 0.82f, 0.15f, 0.65f);
+        }
+    }
+
+    /* ── favorites menu overlay (Ctrl+M) ─────────────────────── */
+    if (ctx->show_fav_menu) {
+        int used_count = 0;
+        for (int i = 0; i < MD_FAV_SLOTS; i++)
+            if (ctx->favorites[i].used) used_count++;
+
+        const float lh = 22.0f, pw = 460.0f;
+        float ph = 50.0f + (used_count > 0 ? used_count : 1) * lh + 8.0f;
+        float px = (ww - pw) * 0.5f, py = (hh - ph) * 0.5f;
+        if (py < 8.0f) py = 8.0f;
+
+        /* dark panel */
+        cairo_set_source_rgba(cr, 0.04, 0.04, 0.12, 0.93);
+        cairo_rectangle(cr, px, py, pw, ph);
+        cairo_fill(cr);
+        /* gold border */
+        cairo_set_source_rgba(cr, 1.0, 0.82, 0.15, 0.55);
+        cairo_set_line_width(cr, 1.5);
+        cairo_rectangle(cr, px, py, pw, ph);
+        cairo_stroke(cr);
+
+        /* title */
+        md_pango_left(cr, px+12, py+8, "Sans", 12,
+                      PANGO_WEIGHT_BOLD, PANGO_STYLE_NORMAL,
+                      "\xe2\x98\x85  Favorites", 1.0f, 0.82f, 0.15f, 0.95f);
+        /* hint */
+        md_pango_left(cr, px+pw-220.0f, py+12, "Monospace", 8,
+                      PANGO_WEIGHT_NORMAL, PANGO_STYLE_NORMAL,
+                      "\xe2\x86\x91\xe2\x86\x93 nav   Enter=load   Del=remove   Esc=close",
+                      0.5f, 0.5f, 0.5f, 0.8f);
+
+        float ry = py + 36.0f;
+        if (used_count == 0) {
+            md_pango_left(cr, px+16, ry+3, "Sans", 10,
+                          PANGO_WEIGHT_NORMAL, PANGO_STYLE_ITALIC,
+                          "No favorites yet \xe2\x80\x94 press Ctrl+S while a preset is running",
+                          0.55f, 0.55f, 0.55f, 0.85f);
+        } else {
+            for (int i = 0; i < MD_FAV_SLOTS; i++) {
+                if (!ctx->favorites[i].used) continue;
+                int sel = (i == ctx->fav_menu_sel);
+                if (sel) {
+                    cairo_set_source_rgba(cr, 1.0, 0.82, 0.15, 0.14);
+                    cairo_rectangle(cr, px+4, ry, pw-8, lh-1);
+                    cairo_fill(cr);
+                }
+                char row[320];
+                snprintf(row, sizeof(row), "\xe2\x98\x85  %s",
+                         ctx->favorites[i].name);
+                /* truncate if too long */
+                if (strlen(row) > 60) { row[60] = 0; strcat(row, "\xe2\x80\xa6"); }
+                md_pango_left(cr, px+16, ry+3, "Sans", 10,
+                              sel ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL,
+                              PANGO_STYLE_NORMAL, row,
+                              sel ? 1.0f  : 0.82f,
+                              sel ? 0.88f : 0.82f,
+                              sel ? 0.15f : 0.82f,
+                              sel ? 1.0f  : 0.72f);
+                ry += lh;
+            }
+        }
     }
 
     /* ── now-playing / audio source (bottom-right) ───────────── */
@@ -3538,6 +3962,7 @@ evemon_plugin_t *evemon_plugin_init(void)
     ctx->preset_duration = 30.0f;  /* auto-advance every 30s by default */
     ctx->prev_preset_idx = -1;
     ctx->show_nowplaying = 3;       /* full now-playing by default */
+    md_favorites_load(ctx);         /* restore favorites from disk */
 
     evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
     if (!p) { free(ctx); return NULL; }
