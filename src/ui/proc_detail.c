@@ -335,10 +335,11 @@ void proc_detail_update(ui_ctx_t *ctx)
     gtk_label_set_text(ctx->sb_cwd,       cwd       ? cwd       : "–");
     gtk_label_set_text(ctx->sb_cmdline,   cmdline   ? cmdline   : "–");
 
-    /* Hide Steam and cgroup frames immediately; the deferred idle will
-     * populate and re-show them if applicable. */
+    /* Hide Steam frame immediately; the deferred idle will re-show it.
+     * The cgroup frame is left as-is: cgroup_scan_complete will hide or
+     * update it once the async read finishes, avoiding a hide→show blink
+     * on every refresh tick. */
     gtk_widget_hide(ctx->sb_steam_frame);
-    gtk_widget_hide(ctx->sb_cgroup_frame);
 
     /* ── Phase 2: enqueue deferred Steam + cgroup work ────────── */
     if (pid > 0) {

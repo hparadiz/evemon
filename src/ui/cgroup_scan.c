@@ -367,23 +367,27 @@ static void cgroup_scan_complete(GObject      *source_object,
         gtk_widget_hide(ctx->sb_cgroup_io_key);
     }
 
-    /* Show the section — use the same show/hide pattern as Steam */
-    gtk_widget_set_no_show_all(ctx->sb_cgroup_frame, FALSE);
-    gtk_widget_show_all(ctx->sb_cgroup_frame);
-    gtk_widget_set_no_show_all(ctx->sb_cgroup_frame, TRUE);
+    /* Only run show_all when the frame is not yet visible; subsequent
+     * refreshes update labels and optional rows in place to avoid the
+     * show_all → re-hide flash. */
+    if (!gtk_widget_get_visible(ctx->sb_cgroup_frame)) {
+        gtk_widget_set_no_show_all(ctx->sb_cgroup_frame, FALSE);
+        gtk_widget_show_all(ctx->sb_cgroup_frame);
+        gtk_widget_set_no_show_all(ctx->sb_cgroup_frame, TRUE);
 
-    /* Re-hide optional rows that should stay hidden */
-    if (lim->mem_high <= 0) {
-        gtk_widget_hide(GTK_WIDGET(ctx->sb_cgroup_mem_high));
-        gtk_widget_hide(ctx->sb_cgroup_mem_high_key);
-    }
-    if (!(lim->mem_swap_max > 0 && lim->mem_swap_current >= 0)) {
-        gtk_widget_hide(GTK_WIDGET(ctx->sb_cgroup_swap));
-        gtk_widget_hide(ctx->sb_cgroup_swap_key);
-    }
-    if (lim->io_max[0] == '\0') {
-        gtk_widget_hide(GTK_WIDGET(ctx->sb_cgroup_io));
-        gtk_widget_hide(ctx->sb_cgroup_io_key);
+        /* After show_all, hide optional rows that are not applicable */
+        if (lim->mem_high <= 0) {
+            gtk_widget_hide(GTK_WIDGET(ctx->sb_cgroup_mem_high));
+            gtk_widget_hide(ctx->sb_cgroup_mem_high_key);
+        }
+        if (!(lim->mem_swap_max > 0 && lim->mem_swap_current >= 0)) {
+            gtk_widget_hide(GTK_WIDGET(ctx->sb_cgroup_swap));
+            gtk_widget_hide(ctx->sb_cgroup_swap_key);
+        }
+        if (lim->io_max[0] == '\0') {
+            gtk_widget_hide(GTK_WIDGET(ctx->sb_cgroup_io));
+            gtk_widget_hide(ctx->sb_cgroup_io_key);
+        }
     }
 }
 
@@ -518,22 +522,24 @@ void cgroup_update_labels(pid_t pid, const cgroup_label_set_t *ls)
         gtk_widget_hide(ls->io_key);
     }
 
-    /* Show section */
-    gtk_widget_set_no_show_all(ls->frame, FALSE);
-    gtk_widget_show_all(ls->frame);
-    gtk_widget_set_no_show_all(ls->frame, TRUE);
+    /* Only run show_all when the frame is not yet visible */
+    if (!gtk_widget_get_visible(ls->frame)) {
+        gtk_widget_set_no_show_all(ls->frame, FALSE);
+        gtk_widget_show_all(ls->frame);
+        gtk_widget_set_no_show_all(ls->frame, TRUE);
 
-    /* Re-hide optional rows */
-    if (lim.mem_high <= 0) {
-        gtk_widget_hide(GTK_WIDGET(ls->mem_high));
-        gtk_widget_hide(ls->mem_high_key);
-    }
-    if (!(lim.mem_swap_max > 0 && lim.mem_swap_current >= 0)) {
-        gtk_widget_hide(GTK_WIDGET(ls->swap));
-        gtk_widget_hide(ls->swap_key);
-    }
-    if (lim.io_max[0] == '\0') {
-        gtk_widget_hide(GTK_WIDGET(ls->io));
-        gtk_widget_hide(ls->io_key);
+        /* After show_all, hide optional rows that are not applicable */
+        if (lim.mem_high <= 0) {
+            gtk_widget_hide(GTK_WIDGET(ls->mem_high));
+            gtk_widget_hide(ls->mem_high_key);
+        }
+        if (!(lim.mem_swap_max > 0 && lim.mem_swap_current >= 0)) {
+            gtk_widget_hide(GTK_WIDGET(ls->swap));
+            gtk_widget_hide(ls->swap_key);
+        }
+        if (lim.io_max[0] == '\0') {
+            gtk_widget_hide(GTK_WIDGET(ls->io));
+            gtk_widget_hide(ls->io_key);
+        }
     }
 }
