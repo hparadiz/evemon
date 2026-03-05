@@ -1316,12 +1316,26 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
 
     ctx->audio_node_count = 0;
 
+    /* When PID 1 (init/systemd) is selected, show all output streams
+     * from every process — this process is typically selected on
+     * evemon startup so we should show the user active audio streams
+     * system wide. */
+    int is_init = (data->pid == 1);
+
     for (size_t ni = 0; ni < data->pw_node_count; ni++) {
         const evemon_pw_node_t *node = &data->pw_nodes[ni];
-        if (node->pid != data->pid) continue;
+        if (!is_init && node->pid != data->pid) continue;
 
         /* Skip evemon's own capture/meter/spectrogram streams. */
         if (is_evemon_node(node)) continue;
+
+        /* When showing all streams (init), only display audio output
+         * streams — keep the list focused and avoid flooding the UI
+         * with every microphone and MIDI device on the system. */
+        if (is_init) {
+            int cat = classify_node(node->media_class);
+            if (cat != PW_CAT_OUTPUT) continue;
+        }
 
         int cat = classify_node(node->media_class);
         const char *self = node_label(node);
