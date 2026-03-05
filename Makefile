@@ -123,8 +123,8 @@ DEB_TARGET  ?= $(if $(target),$(target),debian12)
 DEB_DEBUG   ?= $(if $(filter 1 true yes,$(debug)),1,0)
 
 # Map target name → Dockerfile directory
-DEB_DOCKERFILE_debian12  := packaging/debian12
-DEB_DOCKERFILE_debian13  := packaging/debian13
+DEB_DOCKERFILE_debian12   := packaging/debian12
+DEB_DOCKERFILE_debian13   := packaging/debian13
 DEB_DOCKERFILE_ubuntu2204 := packaging/ubuntu2204
 DEB_DOCKERFILE_ubuntu2404 := packaging/ubuntu2404
 

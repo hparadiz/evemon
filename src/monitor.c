@@ -799,10 +799,19 @@ static void cpu_ht_set(cpu_prev_entry_t *ht, pid_t pid, unsigned long long ticks
 
 /* ── snapshot builder ────────────────────────────────────────── */
 
-static proc_snapshot_t build_snapshot(monitor_state_t *state)
+/*
+ * out_published_early: set to 1 if the snapshot was already published
+ * inside this function (early partial publish after /proc pass, before
+ * the Steam enrichment pass).  The caller should still latch the
+ * returned snapshot as the final version, but should not treat it as
+ * the very first snapshot when counting publishes.
+ */
+static proc_snapshot_t build_snapshot(monitor_state_t *state,
+                                      int *out_published_early)
 {
     proc_snapshot_t snap = { .entries = NULL, .count = 0 };
     int partial_published = 0;
+    if (out_published_early) *out_published_early = 0;
 
     /* Detect the init system once */
     if (g_init_system == INIT_UNKNOWN)
@@ -929,6 +938,56 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state)
     }
 
     closedir(dp);
+
+    /* ── Mitigation #2: publish after first /proc pass ───────────
+     * The first /proc traversal is now complete.  All process names,
+     * cmdlines, users, memory, CPU ticks, etc. are populated.  Steam
+     * pointers are still NULL, but that is fine — the UI can render
+     * the full process tree immediately without waiting for the Steam
+     * environ scan (which can be slow on systems with many processes
+     * or Steam libraries on a slow filesystem).
+     *
+     * Only do this on the very first snapshot (state != NULL and the
+     * shared snapshot is still empty) and only when Steam is actually
+     * installed (otherwise there is no second publish and the normal
+     * path at the bottom of monitor_thread handles the single publish).
+     */
+    if (state && steam_is_available() && snap.count > 0) {
+        pthread_mutex_lock(&state->lock);
+        int is_first = (state->snapshot.count == 0);
+        pthread_mutex_unlock(&state->lock);
+
+        if (is_first) {
+            proc_snapshot_t early = { .count = snap.count };
+            early.entries = malloc(snap.count * sizeof(proc_entry_t));
+            if (early.entries) {
+                memcpy(early.entries, snap.entries,
+                       snap.count * sizeof(proc_entry_t));
+                /* steam pointers in the copy are all NULL here —
+                 * zero them out explicitly so the UI never sees a
+                 * dangling pointer from the memcpy. */
+                for (size_t _i = 0; _i < early.count; _i++)
+                    early.entries[_i].steam = NULL;
+
+                pthread_mutex_lock(&state->lock);
+                proc_snapshot_free(&state->snapshot);
+                state->snapshot = early;
+                pthread_cond_signal(&state->updated);
+                pthread_mutex_unlock(&state->lock);
+                if (out_published_early) *out_published_early = 1;
+
+                extern struct timespec evemon_start_time;
+                struct timespec _now;
+                clock_gettime(CLOCK_MONOTONIC, &_now);
+                double _e = (double)(_now.tv_sec  - evemon_start_time.tv_sec)
+                          + (double)(_now.tv_nsec - evemon_start_time.tv_nsec) / 1e9;
+                printf("[evemon] monitor: early snapshot published after /proc pass "
+                       "(%.3f s, %zu procs) — Steam enrichment pass starting\n",
+                       _e, snap.count);
+                fflush(stdout);
+            }
+        }
+    }
 
     /* ── Steam/Proton metadata: second pass ──────────────────── *
      * Skipped entirely when Steam is not installed on this system *
@@ -1063,7 +1122,8 @@ void *monitor_thread(void *arg)
 
         /* Build a fresh snapshot outside the lock */
         PROFILE_BEGIN(snapshot_build);
-        proc_snapshot_t snap = build_snapshot(state);
+        int snap_published_early = 0;
+        proc_snapshot_t snap = build_snapshot(state, &snap_published_early);
         PROFILE_END(snapshot_build);
 
         /* Compute CPU% from delta between previous and current ticks.
@@ -1157,7 +1217,8 @@ void *monitor_thread(void *arg)
 
         /* Swap it in */
         pthread_mutex_lock(&state->lock);
-        int _first = (state->snapshot.count == 0 && snap.count > 0);
+        int _first = ((state->snapshot.count == 0 || snap_published_early)
+                      && snap.count > 0);
         proc_snapshot_free(&state->snapshot);
         state->snapshot = snap;
         pthread_cond_signal(&state->updated);
@@ -1169,8 +1230,10 @@ void *monitor_thread(void *arg)
             clock_gettime(CLOCK_MONOTONIC, &_now);
             double _e = (double)(_now.tv_sec  - evemon_start_time.tv_sec)
                       + (double)(_now.tv_nsec - evemon_start_time.tv_nsec) / 1e9;
-            printf("[evemon] monitor: first snapshot ready %.3f s after startup (%zu procs)\n",
-                   _e, snap.count);
+            const char *_label = snap_published_early
+                ? "[evemon] monitor: Steam-enriched snapshot ready %.3f s after startup (%zu procs)\n"
+                : "[evemon] monitor: first snapshot ready %.3f s after startup (%zu procs)\n";
+            printf(_label, _e, snap.count);
             fflush(stdout);
         }
 
