@@ -119,7 +119,7 @@ TARGET := $(BUILD_DIR)/evemon
 # Output: dist/<target>/evemon_<version>_<arch>.deb
 
 DEB_VERSION ?= 0.1.0
-DEB_TARGET  ?= $(target)
+DEB_TARGET  ?= $(if $(target),$(target),debian12)
 
 # Map target name → Dockerfile directory
 DEB_DOCKERFILE_debian12  := packaging/debian12
@@ -130,37 +130,7 @@ DEB_DOCKERFILE_ubuntu2404 := packaging/ubuntu2404
 DEB_IMAGE   := evemon-builder-$(DEB_TARGET)
 DEB_OUTDIR  := $(CURDIR)/dist/$(DEB_TARGET)
 
-.PHONY: deb _deb_check
-
-_deb_check:
-	@if [ -z "$(DEB_TARGET)" ]; then \
-	    echo "Usage: make deb target=<debian12|debian13|ubuntu2204|ubuntu2404>"; \
-	    exit 1; \
-	fi
-	@DDIR="$(DEB_DOCKERFILE_$(DEB_TARGET))"; \
-	if [ -z "$$DDIR" ]; then \
-	    echo "Unknown target '$(DEB_TARGET)'. Valid: debian12 debian13 ubuntu2204 ubuntu2404"; \
-	    exit 1; \
-	fi; \
-	if [ ! -f "$$DDIR/Dockerfile" ]; then \
-	    echo "Dockerfile not found: $$DDIR/Dockerfile"; \
-	    exit 1; \
-	fi
-
-deb: _deb_check
-	@DDIR="$(DEB_DOCKERFILE_$(DEB_TARGET))"; \
-	mkdir -p "$(DEB_OUTDIR)"; \
-	echo "==> Building Docker image $(DEB_IMAGE) from $$DDIR"; \
-	docker build -t $(DEB_IMAGE) -f "$$DDIR/Dockerfile" .; \
-	echo "==> Running package build for target=$(DEB_TARGET)"; \
-	docker run --rm \
-	    -e VERSION=$(DEB_VERSION) \
-	    -v "$(CURDIR):/src:ro" \
-	    -v "$(DEB_OUTDIR):/out" \
-	    $(DEB_IMAGE)
-	@echo "==> .deb written to dist/$(DEB_TARGET)/"
-
-.PHONY: all clean run debug gdb install uninstall
+.PHONY: all clean run debug gdb install uninstall deb _deb_check
 
 all: $(CORE_LIB) $(TARGET) $(BPF_OBJ) plugins
 
@@ -243,6 +213,31 @@ $(PLUGIN_DIR)/evemon_write_monitor_ui_plugin.so: $(SRC_DIR)/plugins/write_monito
 	$(CC) $(PLUGIN_CFLAGS) $(GSV_CFLAGS) -o $@ $< $(PLUGIN_LDFLAGS) $(GSV_LDFLAGS)
 
 plugins: $(PLUGIN_SOS)
+
+deb:
+	@if [ -z "$(DEB_TARGET)" ]; then \
+	    echo "Usage: make deb target=<debian12|debian13|ubuntu2204|ubuntu2404>"; \
+	    exit 1; \
+	fi
+	@DDIR="$(DEB_DOCKERFILE_$(DEB_TARGET))"; \
+	if [ -z "$$DDIR" ]; then \
+	    echo "Unknown target '$(DEB_TARGET)'. Valid: debian12 debian13 ubuntu2204 ubuntu2404"; \
+	    exit 1; \
+	fi; \
+	if [ ! -f "$$DDIR/Dockerfile" ]; then \
+	    echo "Dockerfile not found: $$DDIR/Dockerfile"; \
+	    exit 1; \
+	fi; \
+	mkdir -p "$(DEB_OUTDIR)"; \
+	echo "==> Building Docker image $(DEB_IMAGE) from $$DDIR"; \
+	docker build -t $(DEB_IMAGE) -f "$$DDIR/Dockerfile" .; \
+	echo "==> Running package build for target=$(DEB_TARGET)"; \
+	docker run --rm \
+	    -e VERSION=$(DEB_VERSION) \
+	    -v "$(CURDIR):/src:ro" \
+	    -v "$(DEB_OUTDIR):/out" \
+	    $(DEB_IMAGE); \
+	echo "==> .deb written to dist/$(DEB_TARGET)/"
 
 clean:
 	rm -rf $(BUILD_DIR)

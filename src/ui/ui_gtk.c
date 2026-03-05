@@ -1393,6 +1393,141 @@ static void on_menu_restart(GtkMenuItem *item, gpointer data)
     gtk_main_quit();
 }
 
+static void on_menu_restart_as_admin(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    (void)data;
+
+    char exe[4096];
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (len <= 0) return;
+    exe[len] = '\0';
+
+    /* Helper: resolve a binary from /usr/bin or /usr/local/bin */
+    auto int find_bin(const char *name, char *out, size_t outsz);
+    int find_bin(const char *name, char *out, size_t outsz) {
+        snprintf(out, outsz, "/usr/bin/%s", name);
+        if (access(out, X_OK) == 0) return 1;
+        snprintf(out, outsz, "/usr/local/bin/%s", name);
+        if (access(out, X_OK) == 0) return 1;
+        return 0;
+    }
+
+    /* 1. Prefer pkexec — always shows a polite graphical auth dialog.
+     *    pkexec sanitizes the environment, so DISPLAY/WAYLAND_DISPLAY/
+     *    XAUTHORITY are stripped.  Pass them explicitly via:
+     *      pkexec env DISPLAY=… WAYLAND_DISPLAY=… XAUTHORITY=… evemon
+     *    pkexec refuses to run if its parent is already dead, so exec
+     *    directly (no fork) so the parent process stays alive. */
+    char pkexec_path[256];
+    if (find_bin("pkexec", pkexec_path, sizeof(pkexec_path))) {
+        const char *display     = getenv("DISPLAY");
+        const char *wayland_dpy = getenv("WAYLAND_DISPLAY");
+        const char *xauthority  = getenv("XAUTHORITY");
+
+        /* Build env var strings: "KEY=value" or NULL if unset */
+        char disp_str[256]  = "";
+        char wdpy_str[256]  = "";
+        char xaut_str[256]  = "";
+        if (display)     snprintf(disp_str, sizeof(disp_str),
+                                  "DISPLAY=%s", display);
+        if (wayland_dpy) snprintf(wdpy_str, sizeof(wdpy_str),
+                                  "WAYLAND_DISPLAY=%s", wayland_dpy);
+        if (xauthority)  snprintf(xaut_str, sizeof(xaut_str),
+                                  "XAUTHORITY=%s", xauthority);
+
+        /* Assemble argv: pkexec env [vars…] exe */
+        const char *argv[16];
+        int ai = 0;
+        argv[ai++] = pkexec_path;
+        argv[ai++] = "env";
+        if (display)     argv[ai++] = disp_str;
+        if (wayland_dpy) argv[ai++] = wdpy_str;
+        if (xauthority)  argv[ai++] = xaut_str;
+        argv[ai++] = exe;
+        argv[ai]   = NULL;
+
+        execv(pkexec_path, (char *const *)argv);
+        /* execv only returns on failure — fall through to sudo */
+    }
+
+    /* 2. Fall back to sudo with a GTK password dialog. */
+    char sudo_path[256];
+    if (find_bin("sudo", sudo_path, sizeof(sudo_path))) {
+        GtkWidget *dlg = gtk_dialog_new_with_buttons(
+            "Authentication required",
+            NULL, GTK_DIALOG_MODAL,
+            "_Cancel", GTK_RESPONSE_CANCEL,
+            "_OK",     GTK_RESPONSE_OK,
+            NULL);
+        gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_OK);
+
+        GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+        GtkWidget *label = gtk_label_new(
+            "Enter the root password to restart evemon as administrator:");
+        gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+        gtk_widget_set_margin_start(label, 12);
+        gtk_widget_set_margin_end(label, 12);
+        gtk_widget_set_margin_top(label, 12);
+        gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 4);
+
+        GtkWidget *entry = gtk_entry_new();
+        gtk_entry_set_visibility(GTK_ENTRY(entry), FALSE);
+        gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+        gtk_widget_set_margin_start(entry, 12);
+        gtk_widget_set_margin_end(entry, 12);
+        gtk_widget_set_margin_bottom(entry, 12);
+        gtk_box_pack_start(GTK_BOX(content), entry, FALSE, FALSE, 4);
+
+        gtk_widget_show_all(dlg);
+        gint resp = gtk_dialog_run(GTK_DIALOG(dlg));
+        if (resp != GTK_RESPONSE_OK) {
+            gtk_widget_destroy(dlg);
+            return;
+        }
+
+        const char *pw = gtk_entry_get_text(GTK_ENTRY(entry));
+
+        /* Write the password to a pipe that sudo -S reads from stdin. */
+        int pipefd[2];
+        if (pipe(pipefd) != 0) { gtk_widget_destroy(dlg); return; }
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* child: feed password via stdin, then exec sudo -S */
+            close(pipefd[1]);
+            dup2(pipefd[0], STDIN_FILENO);
+            close(pipefd[0]);
+            setsid();
+            char *argv[] = { sudo_path, "-S", exe, NULL };
+            execv(sudo_path, argv);
+            _exit(127);
+        }
+        gtk_widget_destroy(dlg);
+        if (pid > 0) {
+            /* parent: write password + newline, then close write end */
+            (void)write(pipefd[1], pw, strlen(pw));
+            (void)write(pipefd[1], "\n", 1);
+            close(pipefd[1]);
+            close(pipefd[0]);
+            gtk_main_quit();
+        } else {
+            close(pipefd[0]);
+            close(pipefd[1]);
+        }
+        return;
+    }
+
+    /* 3. No launcher found — show an error. */
+    GtkWidget *dlg = gtk_message_dialog_new(
+        NULL, GTK_DIALOG_MODAL,
+        GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+        "Could not find pkexec or sudo.\n"
+        "Run evemon as root manually.");
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+}
+
 /* ── GTK theme discovery & selection ──────────────────────────── */
 
 static int theme_name_cmp(const void *a, const void *b)
@@ -1586,6 +1721,7 @@ static char *read_os_release_field(const char *key)
 }
 
 #include "about.inc"
+#include "compat.inc"
 
 /* ── font helpers ─────────────────────────────────────────────── */
 
@@ -3293,6 +3429,16 @@ void *ui_thread(void *arg)
     g_signal_connect(restart_item, "activate",
                      G_CALLBACK(on_menu_restart), window);
     gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), restart_item);
+
+    GtkWidget *restart_admin_item =
+        gtk_menu_item_new_with_label("Restart as Administrator");
+    g_signal_connect(restart_admin_item, "activate",
+                     G_CALLBACK(on_menu_restart_as_admin), window);
+    /* Grey it out when we're already root */
+    if (geteuid() == 0)
+        gtk_widget_set_sensitive(restart_admin_item, FALSE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), restart_admin_item);
+
     gtk_menu_shell_append(GTK_MENU_SHELL(file_menu),
                           gtk_separator_menu_item_new());
 
@@ -3411,6 +3557,14 @@ void *ui_thread(void *arg)
     GtkWidget *help_menu = gtk_menu_new();
     GtkWidget *help_item = gtk_menu_item_new_with_label("Help");
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(help_item), help_menu);
+
+    GtkWidget *compat_item = gtk_menu_item_new_with_label("Compatibility…");
+    g_signal_connect(compat_item, "activate",
+                     G_CALLBACK(on_menu_compatibility), window);
+    gtk_menu_shell_append(GTK_MENU_SHELL(help_menu), compat_item);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(help_menu),
+                          gtk_separator_menu_item_new());
 
     GtkWidget *about_item = gtk_menu_item_new_with_label("About");
     g_signal_connect(about_item, "activate", G_CALLBACK(on_menu_about), window);
