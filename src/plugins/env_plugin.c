@@ -119,25 +119,29 @@ static char *env_to_markup(const char *text)
     }
 
     char *key_esc = g_markup_escape_text(text, (gssize)(eq - text));
-    char *val_esc = g_markup_escape_text(eq + 1, -1);
 
-    /* Truncate very long values for display (M1: UTF-8 safe) */
+    /* Truncate very long values before escaping so we never split an
+     * escape sequence (e.g. "&amp;") in the middle. */
     char *markup;
-    size_t val_len = g_utf8_strlen(val_esc, -1);
-    if (val_len > 120) {
-        gchar *trunc = g_utf8_substring(val_esc, 0, 120);
+    const char *raw_val = eq + 1;
+    size_t raw_len = g_utf8_strlen(raw_val, -1);
+    if (raw_len > 120) {
+        gchar *trunc = g_utf8_substring(raw_val, 0, 120);
+        char *val_esc = g_markup_escape_text(trunc, -1);
         markup = g_strdup_printf(
             "<b>%s</b>=<span foreground=\"#88aa88\">%s…</span>",
-            key_esc, trunc);
+            key_esc, val_esc);
+        g_free(val_esc);
         g_free(trunc);
     } else {
+        char *val_esc = g_markup_escape_text(raw_val, -1);
         markup = g_strdup_printf(
             "<b>%s</b>=<span foreground=\"#88aa88\">%s</span>",
             key_esc, val_esc);
+        g_free(val_esc);
     }
 
     g_free(key_esc);
-    g_free(val_esc);
     return markup;
 }
 
