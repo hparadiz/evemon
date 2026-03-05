@@ -2438,6 +2438,23 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
                 broker_set_audio_callback(on_broker_audio_pids, ctx);
                 evemon_log(LOG_INFO, "evemon: audio plugin detected (%s) – enabling audio PID probing",
                            inst->plugin->id);
+                /* Enable the View → Show Audio Processes Only menu item now
+                 * that the audio plugin is present. */
+                if (ctx->audio_only_menu_item) {
+                    gtk_widget_set_sensitive(
+                        GTK_WIDGET(ctx->audio_only_menu_item), TRUE);
+                    /* Sync check state in case the setting was loaded before
+                     * we knew whether the audio plugin would be available. */
+                    g_signal_handlers_block_by_func(
+                        ctx->audio_only_menu_item,
+                        on_toggle_audio_only, ctx);
+                    gtk_check_menu_item_set_active(
+                        ctx->audio_only_menu_item,
+                        ctx->show_audio_only);
+                    g_signal_handlers_unblock_by_func(
+                        ctx->audio_only_menu_item,
+                        on_toggle_audio_only, ctx);
+                }
             }
         }
         return;
@@ -3513,6 +3530,17 @@ void *ui_thread(void *arg)
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),
                           gtk_separator_menu_item_new());
 
+    /* Show Audio Processes Only – greyed out until the audio plugin loads */
+    GtkWidget *audio_only_item = gtk_check_menu_item_new_with_label(
+        "Show Audio Processes Only");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(audio_only_item),
+                                   settings_get()->show_audio_only);
+    gtk_widget_set_sensitive(audio_only_item, FALSE); /* enabled once audio plugin loads */
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), audio_only_item);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),
+                          gtk_separator_menu_item_new());
+
     GtkWidget *appear_menu = gtk_menu_new();
     GtkWidget *appear_item = gtk_menu_item_new_with_label("Appearance");
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(appear_item), appear_menu);
@@ -3911,8 +3939,22 @@ void *ui_thread(void *arg)
                              evemon_NEED_PIPEWIRE))
                             ctx.has_audio_plugin = TRUE;
                     }
-                    if (ctx.has_audio_plugin)
+                    if (ctx.has_audio_plugin) {
                         broker_set_audio_callback(on_broker_audio_pids, &ctx);
+                        if (ctx.audio_only_menu_item) {
+                            gtk_widget_set_sensitive(
+                                GTK_WIDGET(ctx.audio_only_menu_item), TRUE);
+                            g_signal_handlers_block_by_func(
+                                ctx.audio_only_menu_item,
+                                on_toggle_audio_only, &ctx);
+                            gtk_check_menu_item_set_active(
+                                ctx.audio_only_menu_item,
+                                ctx.show_audio_only);
+                            g_signal_handlers_unblock_by_func(
+                                ctx.audio_only_menu_item,
+                                on_toggle_audio_only, &ctx);
+                        }
+                    }
 
                     /* Add UI plugin widgets to the notebook in tab order */
                     for (int o = 0; g_tab_order[o]; o++) {
@@ -4016,6 +4058,9 @@ void *ui_thread(void *arg)
     ctx.detail_vbox           = detail_vbox;
     ctx.detail_panel_pos      = (panel_position_t)settings_get()->detail_panel_position;
     ctx.detail_panel_menu_item = GTK_CHECK_MENU_ITEM(detail_panel_toggle);
+    ctx.audio_only_menu_item   = GTK_CHECK_MENU_ITEM(audio_only_item);
+    g_signal_connect(audio_only_item, "toggled",
+                     G_CALLBACK(on_toggle_audio_only), &ctx);
     ctx.detail_paned          = outer_paned;
     ctx.content_box           = vbox;
     ctx.hpaned                = hpaned;

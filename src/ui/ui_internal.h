@@ -343,6 +343,7 @@ typedef struct {
     GtkWidget          *detail_vbox;          /* vbox: detail_panel + pinned_box  */
     panel_position_t    detail_panel_pos;      /* current dock position            */
     GtkCheckMenuItem   *detail_panel_menu_item;/* View → Detail Panel toggle       */
+    GtkCheckMenuItem   *audio_only_menu_item;  /* View → Show Audio Processes Only  */
     GtkWidget          *detail_paned;          /* current GtkPaned holding panel   */
     GtkWidget          *main_content;          /* tree_overlay (stable reference)  */
     GtkWidget          *content_box;           /* vbox holding menubar+content+status */
