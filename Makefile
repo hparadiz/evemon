@@ -111,6 +111,55 @@ BPF_OBJ := $(BUILD_DIR)/fdmon_ebpf_kern.o
 
 TARGET := $(BUILD_DIR)/evemon
 
+# ── Packaging targets ───────────────────────────────────────────
+# Usage:  make deb target=debian12
+#         make deb target=debian13
+#         make deb target=ubuntu2204
+#         make deb target=ubuntu2404
+# Output: dist/<target>/evemon_<version>_<arch>.deb
+
+DEB_VERSION ?= 0.1.0
+DEB_TARGET  ?= $(target)
+
+# Map target name → Dockerfile directory
+DEB_DOCKERFILE_debian12  := packaging/debian12
+DEB_DOCKERFILE_debian13  := packaging/debian13
+DEB_DOCKERFILE_ubuntu2204 := packaging/ubuntu2204
+DEB_DOCKERFILE_ubuntu2404 := packaging/ubuntu2404
+
+DEB_IMAGE   := evemon-builder-$(DEB_TARGET)
+DEB_OUTDIR  := $(CURDIR)/dist/$(DEB_TARGET)
+
+.PHONY: deb _deb_check
+
+_deb_check:
+	@if [ -z "$(DEB_TARGET)" ]; then \
+	    echo "Usage: make deb target=<debian12|debian13|ubuntu2204|ubuntu2404>"; \
+	    exit 1; \
+	fi
+	@DDIR="$(DEB_DOCKERFILE_$(DEB_TARGET))"; \
+	if [ -z "$$DDIR" ]; then \
+	    echo "Unknown target '$(DEB_TARGET)'. Valid: debian12 debian13 ubuntu2204 ubuntu2404"; \
+	    exit 1; \
+	fi; \
+	if [ ! -f "$$DDIR/Dockerfile" ]; then \
+	    echo "Dockerfile not found: $$DDIR/Dockerfile"; \
+	    exit 1; \
+	fi
+
+deb: _deb_check
+	@DDIR="$(DEB_DOCKERFILE_$(DEB_TARGET))"; \
+	mkdir -p "$(DEB_OUTDIR)"; \
+	echo "==> Building Docker image $(DEB_IMAGE) from $$DDIR"; \
+	docker build -t $(DEB_IMAGE) -f "$$DDIR/Dockerfile" .; \
+	echo "==> Running package build for target=$(DEB_TARGET)"; \
+	docker run --rm \
+	    -e VERSION=$(DEB_VERSION) \
+	    -v "$(CURDIR):/src:ro" \
+	    -v "$(DEB_OUTDIR):/out" \
+	    $(DEB_IMAGE)
+	@echo "==> .deb written to dist/$(DEB_TARGET)/"
+
 .PHONY: all clean run debug gdb install uninstall
 
 all: $(CORE_LIB) $(TARGET) $(BPF_OBJ) plugins
