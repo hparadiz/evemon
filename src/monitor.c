@@ -931,10 +931,23 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state)
     closedir(dp);
 
     /* ── Steam/Proton metadata: second pass ──────────────────── *
+     * Skipped entirely when Steam is not installed on this system *
+     * (saves all per-process /proc/<pid>/environ reads).          *
      * We need parent entries to already exist so that children   *
      * can inherit Steam metadata.  Build a PID→index hash, then *
      * iterate in any order — each entry looks up its parent.     */
     {
+        static int steam_logged = 0;
+        if (!steam_logged) {
+            steam_logged = 1;
+            if (steam_is_available())
+                printf("[evemon] Steam detected — enabling Steam/Proton enrichment pass\n");
+            else
+                printf("[evemon] Steam not found — skipping Steam/Proton enrichment pass\n");
+            fflush(stdout);
+        }
+    }
+    if (steam_is_available()) {
         /* Reuse a simple open-addressing hash: PID → index */
         #define STEAM_HT_SIZE 8192
         typedef struct { pid_t pid; size_t idx; int used; } sht_entry_t;

@@ -120,6 +120,7 @@ TARGET := $(BUILD_DIR)/evemon
 
 DEB_VERSION ?= 0.1.0
 DEB_TARGET  ?= $(if $(target),$(target),debian12)
+DEB_DEBUG   ?= $(if $(filter 1 true yes,$(debug)),1,0)
 
 # Map target name → Dockerfile directory
 DEB_DOCKERFILE_debian12  := packaging/debian12
@@ -234,10 +235,14 @@ deb:
 	echo "==> Running package build for target=$(DEB_TARGET)"; \
 	docker run --rm \
 	    -e VERSION=$(DEB_VERSION) \
+	    -e DEBUG=$(DEB_DEBUG) \
 	    -v "$(CURDIR):/src:ro" \
 	    -v "$(DEB_OUTDIR):/out" \
 	    $(DEB_IMAGE); \
-	echo "==> .deb written to dist/$(DEB_TARGET)/"
+	echo "==> .deb written to dist/$(DEB_TARGET)/"; \
+	if [ "$(DEB_DEBUG)" = "1" ]; then \
+	    echo "==> .ddeb written to dist/$(DEB_TARGET)/"; \
+	fi
 
 clean:
 	rm -rf $(BUILD_DIR)

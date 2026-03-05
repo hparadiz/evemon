@@ -382,6 +382,72 @@ static int is_steam_launcher_process(const char *comm)
 
 /* ── public API ──────────────────────────────────────────────── */
 
+/*
+ * Probe the canonical Linux Steam installation locations to decide
+ * whether Steam is present on this system.  We look for the
+ * ubuntu12_32/steam launcher binary (or its Flatpak equivalent)
+ * as a reliable indicator of an actual Steam install.
+ *
+ * Paths checked (first match wins):
+ *   $HOME/.local/share/Steam/ubuntu12_32/steam   – native / Flatpak
+ *   $HOME/.steam/steam/ubuntu12_32/steam          – legacy symlink tree
+ *   /usr/share/steam/ubuntu12_32/steam            – distro package
+ *   $STEAM_ROOT/ubuntu12_32/steam                 – custom via env var
+ */
+int steam_is_available(void)
+{
+    static int cached = -1;   /* -1 = not yet checked */
+    if (cached != -1)
+        return cached;
+
+    /* Paths that don't depend on $HOME */
+    static const char *fixed_paths[] = {
+        "/usr/share/steam/ubuntu12_32/steam",
+        "/usr/lib/steam/ubuntu12_32/steam",
+        NULL
+    };
+
+    for (int i = 0; fixed_paths[i]; i++) {
+        if (access(fixed_paths[i], F_OK) == 0) {
+            cached = 1;
+            return 1;
+        }
+    }
+
+    /* Check $STEAM_ROOT if set (non-standard installs) */
+    const char *steam_root = getenv("STEAM_ROOT");
+    if (steam_root && steam_root[0]) {
+        char path[STEAM_PATH_MAX];
+        snprintf(path, sizeof(path), "%s/ubuntu12_32/steam", steam_root);
+        if (access(path, F_OK) == 0) {
+            cached = 1;
+            return 1;
+        }
+    }
+
+    /* $HOME-relative paths */
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        static const char *rel_paths[] = {
+            "/.local/share/Steam/ubuntu12_32/steam",
+            "/.steam/steam/ubuntu12_32/steam",
+            "/.var/app/com.valvesoftware.Steam/.local/share/Steam/ubuntu12_32/steam",
+            NULL
+        };
+        for (int i = 0; rel_paths[i]; i++) {
+            char path[STEAM_PATH_MAX];
+            snprintf(path, sizeof(path), "%s%s", home, rel_paths[i]);
+            if (access(path, F_OK) == 0) {
+                cached = 1;
+                return 1;
+            }
+        }
+    }
+
+    cached = 0;
+    return 0;
+}
+
 steam_info_t *steam_detect(pid_t pid, const char *comm, const char *cmdline,
                            const steam_info_t *parent_steam)
 {

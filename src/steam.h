@@ -34,6 +34,22 @@ typedef struct {
 } steam_info_t;
 
 /*
+ * Check once whether Steam is installed on this system.
+ *
+ * Probes the standard Linux Steam locations:
+ *   ~/.local/share/Steam/ubuntu12_32/steam  (native install, Flatpak)
+ *   ~/.steam/steam/ubuntu12_32/steam        (legacy symlink tree)
+ *   /usr/share/steam/ubuntu12_32/steam      (distro package)
+ *
+ * The result is cached after the first call; subsequent calls are O(1).
+ * Returns 1 if Steam appears to be installed, 0 otherwise.
+ *
+ * When this returns 0 the entire Steam detection pass in the monitor
+ * thread is skipped, saving the per-process /proc/<pid>/environ reads.
+ */
+int steam_is_available(void);
+
+/*
  * Probe /proc/<pid>/environ for Steam-related environment variables.
  * Returns a heap-allocated steam_info_t if the process is Steam-related,
  * or NULL if it is not.  Caller takes ownership of the returned pointer.
