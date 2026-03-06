@@ -281,6 +281,8 @@ install: all
 	install -d $(DESTDIR)$(DATADIR)/pixmaps
 	install -m 644 icon.png $(DESTDIR)$(DATADIR)/pixmaps/evemon.png
 	install -d $(DESTDIR)$(LIBDIR)/plugins
+	# Remove all stale .so files before installing so no old-ABI plugins linger
+	rm -f $(DESTDIR)$(LIBDIR)/plugins/*.so
 	install -m 644 $(BPF_OBJ) $(DESTDIR)$(LIBDIR)/
 	install -m 755 $(PLUGIN_SOS) $(DESTDIR)$(LIBDIR)/plugins/
 	update-desktop-database $(DESTDIR)$(DATADIR)/applications
