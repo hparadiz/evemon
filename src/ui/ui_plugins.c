@@ -329,7 +329,7 @@ void on_plugins_menu_map(GtkWidget *menu, gpointer data)
         gtk_widget_destroy(GTK_WIDGET(l->data));
     g_list_free(children);
 
-    if (!preg || ctx->plugin_dir[0] == '\0') {
+    if (ctx->plugin_dir[0] == '\0') {
         GtkWidget *mi = gtk_menu_item_new_with_label("(no plugin directory)");
         gtk_widget_set_sensitive(mi, FALSE);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
