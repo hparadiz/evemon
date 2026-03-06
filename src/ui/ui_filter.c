@@ -51,7 +51,7 @@ void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
-          *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
+          *cwd = NULL, *cmdline = NULL;
     gchar *spark_data = NULL;
     gint spark_peak;
     GdkPixbuf *icon = NULL;
@@ -67,7 +67,6 @@ void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
-        COL_STEAM_LABEL, &steam_label,
         COL_IO_SPARKLINE, &spark_data,
         COL_IO_SPARKLINE_PEAK, &spark_peak,
         COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
@@ -86,7 +85,6 @@ void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
-        COL_STEAM_LABEL, steam_label,
         COL_IO_SPARKLINE, spark_data,
         COL_IO_SPARKLINE_PEAK, spark_peak,
         COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
@@ -99,7 +97,7 @@ void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     g_free(grp_rss_text); g_free(grp_cpu_text);
     g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
-    g_free(steam_label); g_free(spark_data);
+    g_free(spark_data);
 
     GtkTreeIter child;
     gboolean valid = gtk_tree_model_iter_children(src, &child, src_iter);
@@ -141,7 +139,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
-          *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
+          *cwd = NULL, *cmdline = NULL;
     gchar *spark_data = NULL;
     gint spark_peak;
 
@@ -156,7 +154,6 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
-        COL_STEAM_LABEL, &steam_label,
         COL_IO_SPARKLINE, &spark_data,
         COL_IO_SPARKLINE_PEAK, &spark_peak,
         COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
@@ -177,7 +174,6 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
-        COL_STEAM_LABEL, steam_label,
         COL_IO_SPARKLINE, spark_data,
         COL_IO_SPARKLINE_PEAK, spark_peak,
         COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
@@ -188,7 +184,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
     g_free(grp_rss_text); g_free(grp_cpu_text);
     g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
-    g_free(steam_label); g_free(spark_data);
+    g_free(spark_data);
 }
 
 static gboolean sync_filter_rows(GtkTreeStore *fs, GtkTreeIter *fs_parent,
@@ -257,15 +253,35 @@ static int count_store_rows(GtkTreeModel *model, GtkTreeIter *parent)
 static GtkTreeStore *alloc_filter_store(void)
 {
     return gtk_tree_store_new(NUM_COLS,
-        G_TYPE_INT, G_TYPE_INT, G_TYPE_STRING, G_TYPE_STRING,
-        G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
-        G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
-        G_TYPE_INT, G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
-        G_TYPE_INT64, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
-        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
-        G_TYPE_STRING, G_TYPE_INT,
-        G_TYPE_INT64, G_TYPE_INT64, G_TYPE_INT,
-        GDK_TYPE_PIXBUF);
+        G_TYPE_INT,    /* COL_PID               */
+        G_TYPE_INT,    /* COL_PPID              */
+        G_TYPE_STRING, /* COL_USER              */
+        G_TYPE_STRING, /* COL_NAME              */
+        G_TYPE_INT,    /* COL_CPU               */
+        G_TYPE_STRING, /* COL_CPU_TEXT          */
+        G_TYPE_INT,    /* COL_RSS               */
+        G_TYPE_STRING, /* COL_RSS_TEXT          */
+        G_TYPE_INT,    /* COL_GROUP_RSS         */
+        G_TYPE_STRING, /* COL_GROUP_RSS_TEXT    */
+        G_TYPE_INT,    /* COL_GROUP_CPU         */
+        G_TYPE_STRING, /* COL_GROUP_CPU_TEXT    */
+        G_TYPE_INT,    /* COL_IO_READ_RATE      */
+        G_TYPE_STRING, /* COL_IO_READ_RATE_TEXT */
+        G_TYPE_INT,    /* COL_IO_WRITE_RATE     */
+        G_TYPE_STRING, /* COL_IO_WRITE_RATE_TEXT*/
+        G_TYPE_INT64,  /* COL_START_TIME        */
+        G_TYPE_STRING, /* COL_START_TIME_TEXT   */
+        G_TYPE_STRING, /* COL_CONTAINER         */
+        G_TYPE_STRING, /* COL_SERVICE           */
+        G_TYPE_STRING, /* COL_CWD               */
+        G_TYPE_STRING, /* COL_CMDLINE           */
+        G_TYPE_STRING, /* COL_IO_SPARKLINE      */
+        G_TYPE_INT,    /* COL_IO_SPARKLINE_PEAK */
+        G_TYPE_INT64,  /* COL_HIGHLIGHT_BORN    */
+        G_TYPE_INT64,  /* COL_HIGHLIGHT_DIED    */
+        G_TYPE_INT,    /* COL_PINNED_ROOT       */
+        GDK_TYPE_PIXBUF/* COL_ICON              */
+    );
 }
 
 /*

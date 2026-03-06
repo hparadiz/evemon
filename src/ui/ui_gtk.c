@@ -621,8 +621,46 @@ void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
 
 static void on_selection_changed(GtkTreeSelection *sel, gpointer data)
 {
-    (void)sel;
-    proc_detail_update((ui_ctx_t *)data);
+    ui_ctx_t *ctx = (ui_ctx_t *)data;
+
+    proc_detail_update(ctx);
+
+    /* Immediately push the new PID to all follow-selection plugin instances
+     * and kick a broker gather so audio/PipeWire plugins respond without
+     * waiting for the next 1-second on_refresh tick. */
+    plugin_registry_t *preg = ctx->plugin_registry;
+    if (preg && preg->count > 0) {
+        pid_t sel_pid = 0;
+        if (sel) {
+            GList *rows = gtk_tree_selection_get_selected_rows(sel, NULL);
+            if (rows) {
+                GtkTreePath *cpath =
+                    gtk_tree_model_sort_convert_path_to_child_path(
+                        ctx->sort_model, (GtkTreePath *)rows->data);
+                GtkTreeModel *cmodel =
+                    gtk_tree_model_sort_get_model(ctx->sort_model);
+                GtkTreeIter citer;
+                if (cpath && gtk_tree_model_get_iter(cmodel, &citer, cpath)) {
+                    gint v = 0;
+                    gtk_tree_model_get(cmodel, &citer, COL_PID, &v, -1);
+                    sel_pid = (pid_t)v;
+                }
+                if (cpath) gtk_tree_path_free(cpath);
+                g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+            }
+        }
+
+        for (size_t i = 0; i < preg->count; i++) {
+            plugin_instance_t *inst = &preg->instances[i];
+            if (!inst->pinned && inst->is_active)
+                plugin_instance_set_pid(inst, sel_pid, FALSE);
+        }
+
+        if (sel_pid <= 0)
+            plugin_dispatch_clear_all(preg);
+
+        broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
+    }
 }
 
 /* ── Collapsible section constants ────────────────────────────── */
@@ -2141,8 +2179,6 @@ void register_sort_funcs(GtkTreeModelSort *sm)
         sort_string_inverted, GINT_TO_POINTER(COL_CONTAINER), NULL);
     gtk_tree_sortable_set_sort_func(sortable, COL_SERVICE,
         sort_string_inverted, GINT_TO_POINTER(COL_SERVICE), NULL);
-    gtk_tree_sortable_set_sort_func(sortable, COL_STEAM_LABEL,
-        sort_string_inverted, GINT_TO_POINTER(COL_STEAM_LABEL), NULL);
     gtk_tree_sortable_set_sort_func(sortable, COL_CWD,
         sort_string_inverted, GINT_TO_POINTER(COL_CWD), NULL);
 }
@@ -2592,6 +2628,50 @@ static void on_broker_audio_pids(const pid_t *pids, size_t count,
     ctx->audio_pid_count = count;
 }
 
+/*
+ * Resolve the inherited Steam game label for a row that has no own steam
+ * label.  Walks up the tree model's parent chain and returns a pointer
+ * to the first ancestor label found in `ctx->steam_map`, or NULL.
+ * The returned pointer is owned by steam_map and valid until the next
+ * steam_map mutation; the caller must NOT g_free() it.
+ */
+static const char *
+find_ancestor_steam_label(GtkTreeModel *model, GtkTreeIter *iter,
+                          ui_ctx_t *ctx)
+{
+    if (!ctx->steam_map) return NULL;
+
+    GtkTreeIter parent;
+    GtkTreeIter child = *iter;
+
+    while (gtk_tree_model_iter_parent(model, &parent, &child)) {
+        gint ppid = 0;
+        gtk_tree_model_get(model, &parent, COL_PID, &ppid, -1);
+        const char *lbl = steam_map_get(ctx->steam_map, (pid_t)ppid);
+        if (lbl && lbl[0])
+            return lbl;
+        child = parent;
+    }
+    return NULL;
+}
+
+/*
+ * Extract just the game name from a steam display_label.
+ * Labels have the form:  "comm (Steam) · GameName [ProtonVer]"
+ * or just               "comm (Steam) · GameName"
+ * Returns a pointer into `label` past the "· ", or NULL if not found.
+ * The game name ends at " [" or end-of-string; caller is responsible for
+ * limiting the copy.
+ */
+static const char *steam_label_game_name(const char *label)
+{
+    if (!label) return NULL;
+    /* Find " · " separator */
+    const char *sep = strstr(label, " \xC2\xB7 ");  /* UTF-8 middle dot U+00B7 */
+    if (!sep) return NULL;
+    return sep + 4;  /* skip " · " (3 bytes for the middle dot + surrounding spaces) */
+}
+
 static void name_cell_data_func(GtkTreeViewColumn *col,
                                 GtkCellRenderer   *cell,
                                 GtkTreeModel      *model,
@@ -2604,18 +2684,51 @@ static void name_cell_data_func(GtkTreeViewColumn *col,
     highlight_cell_data_func(col, cell, model, iter, NULL);
 
     gchar *name = NULL;
-    gchar *steam_label = NULL;
     gint pid = 0;
     gtk_tree_model_get(model, iter,
                        COL_NAME, &name,
                        COL_PID, &pid,
-                       COL_STEAM_LABEL, &steam_label,
                        -1);
 
-    /* Prefer Steam display label (e.g. "reaper (Steam) · Deadlock [Proton ...]") */
-    const char *display = name;
-    if (steam_label && steam_label[0])
+    /* Prefer Steam display label from the side-table */
+    const char *steam_label = ctx->steam_map
+        ? steam_map_get(ctx->steam_map, (pid_t)pid)
+        : NULL;
+
+    /*
+     * If this row has no own steam label, check whether it lives inside
+     * a Steam game subtree by walking up to the nearest labelled ancestor.
+     * In that case we show:  "procname  [GameName]"
+     */
+    char inherited_buf[512];
+    const char *display;
+    if (steam_label && steam_label[0]) {
         display = steam_label;
+    } else {
+        const char *anc = find_ancestor_steam_label(model, iter, ctx);
+        if (anc) {
+            const char *game = steam_label_game_name(anc);
+            if (game) {
+                /* Trim at " [" (proton version suffix) if present */
+                const char *end = strstr(game, " [");
+                if (end) {
+                    int glen = (int)(end - game);
+                    snprintf(inherited_buf, sizeof(inherited_buf),
+                             "%s  [%.*s]", name ? name : "", glen, game);
+                } else {
+                    snprintf(inherited_buf, sizeof(inherited_buf),
+                             "%s  [%s]", name ? name : "", game);
+                }
+            } else {
+                /* Label exists but has no "· GameName" part – show full label */
+                snprintf(inherited_buf, sizeof(inherited_buf),
+                         "%s  [%s]", name ? name : "", anc);
+            }
+            display = inherited_buf;
+        } else {
+            display = name;
+        }
+    }
 
     gboolean is_pinned = display && pid_is_pinned(ctx, (pid_t)pid);
     gboolean is_audio  = audio_pid_is_active(ctx, (pid_t)pid);
@@ -2631,7 +2744,6 @@ static void name_cell_data_func(GtkTreeViewColumn *col,
         g_object_set(cell, "text", display ? display : "", NULL);
     }
     g_free(name);
-    g_free(steam_label);
 }
 
 /* ── Host service forwarding functions for PipeWire plugins ──── */
@@ -2820,7 +2932,6 @@ void *ui_thread(void *arg)
                                              G_TYPE_STRING,   /* service      */
                                              G_TYPE_STRING,   /* CWD          */
                                              G_TYPE_STRING,   /* CMDLINE      */
-                                             G_TYPE_STRING,   /* STEAM_LABEL  */
                                              G_TYPE_STRING,   /* IO_SPARKLINE */
                                              G_TYPE_INT,      /* IO_SPARKLINE_PEAK */
                                              G_TYPE_INT64,    /* HIGHLIGHT_BORN */
@@ -3732,6 +3843,9 @@ void *ui_thread(void *arg)
     /* Process icon cache — one-time desktop index scan */
     ctx.icon_ctx = proc_icon_ctx_new(ctx.font_size + 4);
 
+    /* Steam display label side-table */
+    ctx.steam_map = steam_map_create();
+
     /* Name filter */
     ctx.filter_store = NULL;
     ctx.sort_model   = GTK_TREE_MODEL_SORT(sort_model);
@@ -4273,6 +4387,12 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     ctx->audio_pids      = NULL;
     ctx->audio_pid_count = 0;
     ctx->audio_pid_cap   = 0;
+
+    /* Free Steam display label side-table */
+    if (ctx->steam_map) {
+        steam_map_destroy(ctx->steam_map);
+        ctx->steam_map = NULL;
+    }
 
     /* Free process icon cache */
     if (ctx->icon_ctx) {

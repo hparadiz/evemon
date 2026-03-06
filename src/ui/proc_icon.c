@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <pwd.h>
 
 /* ── sentinel for negative cache entries ─────────────────────── */
 
@@ -275,51 +276,170 @@ static void on_steam_file_read(GObject *source, GAsyncResult *res,
 }
 
 /*
- * Async-load Steam librarycache art using only GIO (no libsoup needed).
+ * Search candidate home directories for Steam librarycache art.
+ * Tries `home` first, then (if nothing found) every uid≥1000 user
+ * from /etc/passwd — needed when running as root (sudo) where
+ * g_get_home_dir() returns /root instead of the real user's home.
  */
-static void try_steam_art(proc_icon_ctx_t    *ictx,
-                          const char         *app_id,
-                          const char         *key,
-                          proc_icon_cb_t      cb,
-                          void               *userdata)
+/*
+ * Fire an async load for a known art file path.
+ * Returns TRUE and takes ownership of the request if the file exists.
+ */
+static gboolean fire_art_request(proc_icon_ctx_t *ictx,
+                                 const char      *art_path,
+                                 const char      *key,
+                                 proc_icon_cb_t   cb,
+                                 void            *userdata)
 {
-    const char *home = g_get_home_dir();
-    char art_path[PATH_MAX];
+    struct stat st;
+    if (stat(art_path, &st) != 0 || !S_ISREG(st.st_mode))
+        return FALSE;
 
-    static const char *suffixes[] = {
-        "_icon.jpg",
-        "_library_600x900.jpg",
-        "_header.jpg",
-        NULL
-    };
+    steam_art_req_t *req = malloc(sizeof(steam_art_req_t));
+    if (!req) return FALSE;
+    req->ictx     = ictx;
+    req->stream   = NULL;
+    req->cb       = cb;
+    req->userdata = userdata;
+    snprintf(req->key, sizeof(req->key), "%s", key);
+
+    GFile *f = g_file_new_for_path(art_path);
+    g_file_read_async(f, G_PRIORITY_LOW, NULL, on_steam_file_read, req);
+    return TRUE;
+}
+
+static gboolean try_steam_art_from_home(proc_icon_ctx_t *ictx,
+                                        const char      *app_id,
+                                        const char      *key,
+                                        proc_icon_cb_t   cb,
+                                        void            *userdata,
+                                        const char      *home)
+{
     static const char *steam_roots[] = {
         "/.steam/steam",
         "/.local/share/Steam",
         NULL
     };
 
+    char art_path[PATH_MAX];
+
     for (int ri = 0; steam_roots[ri]; ri++) {
-        for (int si = 0; suffixes[si]; si++) {
-            snprintf(art_path, sizeof(art_path),
-                     "%s%s/appcache/librarycache/%s%s",
-                     home, steam_roots[ri], app_id, suffixes[si]);
-            struct stat st;
-            if (stat(art_path, &st) != 0) continue;
+        char cache_dir[PATH_MAX];
+        snprintf(cache_dir, sizeof(cache_dir),
+                 "%s%s/appcache/librarycache", home, steam_roots[ri]);
 
-            steam_art_req_t *req = malloc(sizeof(steam_art_req_t));
-            if (!req) break;
-            req->ictx     = ictx;
-            req->stream   = NULL;
-            req->cb       = cb;
-            req->userdata = userdata;
-            snprintf(req->key, sizeof(req->key), "%s", key);
+        /* ── New layout: librarycache/<appid>/ directory ─────────
+         *
+         * The per-appid directory holds:
+         *   <hash>.jpg          – 32×32 game icon  (only .jpg at top level)
+         *   <hash>/library_capsule.jpg     – 300×450 portrait
+         *   <hash>/library_hero.jpg        – 1920×620 hero
+         *   <hash>/library_header.jpg      – 460×215 header
+         *
+         * We prefer the small icon first, then capsule as fallback.
+         */
+        char appid_dir[PATH_MAX];
+        snprintf(appid_dir, sizeof(appid_dir), "%s/%s", cache_dir, app_id);
 
-            GFile *f = g_file_new_for_path(art_path);
-            g_file_read_async(f, G_PRIORITY_LOW, NULL,
-                              on_steam_file_read, req);
-            /* g_file_read_async keeps its own ref; on_steam_file_read unrefs */
-            return;
+        struct stat dstat;
+        if (stat(appid_dir, &dstat) == 0 && S_ISDIR(dstat.st_mode)) {
+            /* Pass 1: find a .jpg directly in the appid dir (the icon) */
+            DIR *d = opendir(appid_dir);
+            if (d) {
+                struct dirent *de;
+                while ((de = readdir(d)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+                    size_t nl = strlen(de->d_name);
+                    if (nl < 5) continue;
+                    if (strcmp(de->d_name + nl - 4, ".jpg") != 0) continue;
+                    /* Must be a regular file, not a directory */
+                    snprintf(art_path, sizeof(art_path),
+                             "%s/%s", appid_dir, de->d_name);
+                    if (fire_art_request(ictx, art_path, key, cb, userdata)) {
+                        closedir(d);
+                        return TRUE;
+                    }
+                }
+                closedir(d);
+            }
+
+            /* Pass 2: look for named files inside hash subdirs */
+            static const char *subdir_names[] = {
+                "library_capsule.jpg",
+                "library_header.jpg",
+                "library_hero.jpg",
+                NULL
+            };
+            d = opendir(appid_dir);
+            if (d) {
+                struct dirent *de;
+                while ((de = readdir(d)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+                    snprintf(art_path, sizeof(art_path),
+                             "%s/%s", appid_dir, de->d_name);
+                    struct stat sub;
+                    if (stat(art_path, &sub) != 0 || !S_ISDIR(sub.st_mode))
+                        continue;
+                    for (int si = 0; subdir_names[si]; si++) {
+                        char named[PATH_MAX];
+                        snprintf(named, sizeof(named),
+                                 "%s/%s", art_path, subdir_names[si]);
+                        if (fire_art_request(ictx, named, key, cb, userdata)) {
+                            closedir(d);
+                            return TRUE;
+                        }
+                    }
+                }
+                closedir(d);
+            }
         }
+
+        /* ── Legacy flat layout: librarycache/<appid>_icon.jpg etc. ── */
+        static const char *flat_suffixes[] = {
+            "_icon.jpg",
+            "_library_600x900.jpg",
+            "_header.jpg",
+            NULL
+        };
+        for (int si = 0; flat_suffixes[si]; si++) {
+            char *p = g_strconcat(cache_dir, "/", app_id, flat_suffixes[si], NULL);
+            gboolean hit = fire_art_request(ictx, p, key, cb, userdata);
+            g_free(p);
+            if (hit) return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static void try_steam_art(proc_icon_ctx_t    *ictx,
+                          const char         *app_id,
+                          const char         *key,
+                          proc_icon_cb_t      cb,
+                          void               *userdata)
+{
+    /* Try the process-owner's home first */
+    const char *home = g_get_home_dir();
+    if (home && try_steam_art_from_home(ictx, app_id, key, cb, userdata, home))
+        return;
+
+    /*
+     * Fallback: when running as root (sudo), g_get_home_dir() returns /root
+     * but Steam lives under a real user's home.  Scan /etc/passwd for all
+     * users with uid >= 1000.
+     */
+    {
+        struct passwd *pw;
+        setpwent();
+        while ((pw = getpwent()) != NULL) {
+            if (!pw->pw_dir || !pw->pw_dir[0]) continue;
+            if (pw->pw_uid < 1000) continue;
+            if (home && strcmp(pw->pw_dir, home) == 0) continue; /* already tried */
+            if (try_steam_art_from_home(ictx, app_id, key, cb, userdata, pw->pw_dir)) {
+                endpwent();
+                return;
+            }
+        }
+        endpwent();
     }
 
     /* No art file found */

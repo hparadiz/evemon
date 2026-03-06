@@ -224,7 +224,7 @@ static int resolve_game_name(const char *app_id, const char *compat_data_path,
         return 0;
 
     /* Build list of steamapps directories to search */
-    const char *search_dirs[8];
+    const char *search_dirs[12];
     int ndirs = 0;
 
     /* Derive steamapps dir from STEAM_COMPAT_DATA_PATH if available.
@@ -240,7 +240,7 @@ static int resolve_game_name(const char *app_id, const char *compat_data_path,
         search_dirs[ndirs++] = derived_dir;
     }
 
-    /* Standard paths */
+    /* Standard paths under $HOME */
     static char std1[STEAM_PATH_MAX], std2[STEAM_PATH_MAX];
     const char *home = getenv("HOME");
     if (home) {
@@ -248,6 +248,32 @@ static int resolve_game_name(const char *app_id, const char *compat_data_path,
         snprintf(std2, sizeof(std2), "%s/.steam/steam/steamapps", home);
         search_dirs[ndirs++] = std1;
         search_dirs[ndirs++] = std2;
+    }
+
+    /*
+     * When running as root, $HOME is /root but the actual Steam library
+     * lives under a regular user's home.  If we haven't found anything
+     * from the derived path yet and HOME looks like a root/system dir,
+     * scan /etc/passwd for user home directories.
+     * We add at most 2 extra paths to stay within search_dirs[8].
+     */
+    static char pw1[STEAM_PATH_MAX], pw2[STEAM_PATH_MAX];
+    if (ndirs < 4 || (derived_dir[0] == '\0')) {
+        struct passwd *pw;
+        setpwent();
+        int added = 0;
+        while ((pw = getpwent()) != NULL && added < 2) {
+            if (!pw->pw_dir || !pw->pw_dir[0]) continue;
+            if (pw->pw_uid < 1000) continue;
+            /* Skip if this home is already covered by $HOME */
+            if (home && strcmp(pw->pw_dir, home) == 0) continue;
+            char *dst = (added == 0) ? pw1 : pw2;
+            snprintf(dst, STEAM_PATH_MAX,
+                     "%s/.local/share/Steam/steamapps", pw->pw_dir);
+            search_dirs[ndirs++] = dst;
+            added++;
+        }
+        endpwent();
     }
 
     /* Try each directory */
@@ -325,30 +351,46 @@ static void detect_runtime_layer(const char *tool_paths,
 /*
  * Build a human-friendly display label for the process tree.
  * e.g. "reaper (Steam Runtime) Running Deadlock [Proton Exp 9.0]"
+ *      "wineserver (Wine)"
+ *      "game.exe (Wine) [prefix: ~/.wine]"
  */
 static void build_display_label(const char *comm, const steam_info_t *info,
                                 char *label, size_t labelsz)
 {
-    /* Start with the process name */
     int off = 0;
 
-    if (info->game_name[0]) {
-        off += snprintf(label + off, labelsz - off,
-                        "%s (Steam)", comm);
-        off += snprintf(label + off, labelsz - off,
-                        " · %s", info->game_name);
-    } else if (info->app_id[0]) {
-        off += snprintf(label + off, labelsz - off,
-                        "%s (Steam AppID %s)", comm, info->app_id);
-    } else {
-        off += snprintf(label + off, labelsz - off,
-                        "%s (Steam)", comm);
-    }
+    if (info->is_steam) {
+        if (info->game_name[0]) {
+            off += snprintf(label + off, labelsz - off,
+                            "%s (Steam)", comm);
+            off += snprintf(label + off, labelsz - off,
+                            " · %s", info->game_name);
+        } else if (info->app_id[0]) {
+            off += snprintf(label + off, labelsz - off,
+                            "%s (Steam AppID %s)", comm, info->app_id);
+        } else {
+            off += snprintf(label + off, labelsz - off,
+                            "%s (Steam)", comm);
+        }
 
-    if (info->proton_version[0]) {
-        /* Shorten the version for display */
-        off += snprintf(label + off, labelsz - off,
-                        " [%s]", info->proton_version);
+        if (info->proton_version[0]) {
+            off += snprintf(label + off, labelsz - off,
+                            " [%s]", info->proton_version);
+        }
+    } else if (info->is_wine) {
+        off += snprintf(label + off, labelsz - off, "%s (Wine)", comm);
+        if (info->compat_data[0]) {
+            /* Shorten prefix path for display: show last two path components */
+            const char *p = info->compat_data;
+            const char *s1 = strrchr(p, '/');
+            if (s1 && s1 > p) {
+                const char *s2 = s1 - 1;
+                while (s2 > p && *s2 != '/') s2--;
+                if (*s2 == '/') s2++;
+                off += snprintf(label + off, labelsz - off,
+                                " [%s]", s2);
+            }
+        }
     }
 
     (void)off;
@@ -374,6 +416,64 @@ static int is_steam_launcher_process(const char *comm)
     for (int i = 0; names[i]; i++) {
         if (strcmp(comm, names[i]) == 0 ||
             strncmp(comm, names[i], strlen(names[i])) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * Cheap Wine process detection: checks comm and cmdline for well-known
+ * Wine binary names and Windows .exe suffixes without any I/O.
+ *
+ * Returns 1 if the process is clearly a Wine/Proton process, 0 otherwise.
+ *
+ * This covers:
+ *   - wine, wine64, wine32, wineserver, winedevice.exe, wineboot.exe,
+ *     wineloader, wine-preloader, explorer.exe (Wine shell), start.exe,
+ *     plugplay.exe, services.exe, svchost.exe, rpcss.exe (Wine internals)
+ *   - Any process whose comm ends in ".exe" (Windows executable under Wine)
+ *   - Any cmdline starting with a known wine binary path
+ */
+static int is_wine_process(const char *comm, const char *cmdline)
+{
+    if (!comm) return 0;
+
+    /* Exact Wine infrastructure binary names */
+    static const char *wine_exact[] = {
+        "wineserver",
+        "winedevice.exe",
+        "wineboot.exe",
+        "wineloader",
+        "wine-preloader",
+        "winedbg",
+        "plugplay.exe",
+        "rpcss.exe",
+        "tabtip.exe",
+        NULL
+    };
+
+    for (int i = 0; wine_exact[i]; i++) {
+        if (strcasecmp(comm, wine_exact[i]) == 0)
+            return 1;
+    }
+
+    /* "wine" prefix: matches wine, wine64, wine32 but not unrelated names */
+    if (strncmp(comm, "wine", 4) == 0 &&
+        (comm[4] == '\0' || comm[4] == '6' || comm[4] == '3' || comm[4] == '-'))
+        return 1;
+
+    /* Comm ends in ".exe" → Windows executable running under Wine/Proton */
+    {
+        size_t len = strlen(comm);
+        if (len > 4 && strcasecmp(comm + len - 4, ".exe") == 0)
+            return 1;
+    }
+
+    /* Cmdline explicitly invokes a wine binary */
+    if (cmdline) {
+        if (strstr(cmdline, "wine-preloader") ||
+            strstr(cmdline, "wineserver "))
             return 1;
     }
 
@@ -425,15 +525,16 @@ int steam_is_available(void)
         }
     }
 
+    static const char *rel_paths[] = {
+        "/.local/share/Steam/ubuntu12_32/steam",
+        "/.steam/steam/ubuntu12_32/steam",
+        "/.var/app/com.valvesoftware.Steam/.local/share/Steam/ubuntu12_32/steam",
+        NULL
+    };
+
     /* $HOME-relative paths */
     const char *home = getenv("HOME");
     if (home && home[0]) {
-        static const char *rel_paths[] = {
-            "/.local/share/Steam/ubuntu12_32/steam",
-            "/.steam/steam/ubuntu12_32/steam",
-            "/.var/app/com.valvesoftware.Steam/.local/share/Steam/ubuntu12_32/steam",
-            NULL
-        };
         for (int i = 0; rel_paths[i]; i++) {
             char path[STEAM_PATH_MAX];
             snprintf(path, sizeof(path), "%s%s", home, rel_paths[i]);
@@ -444,6 +545,30 @@ int steam_is_available(void)
         }
     }
 
+    /*
+     * When running as root (e.g. sudo), $HOME is /root but Steam is
+     * installed under a regular user's home.  Scan all home directories
+     * from /etc/passwd to find a Steam installation.
+     */
+    {
+        struct passwd *pw;
+        setpwent();
+        while ((pw = getpwent()) != NULL) {
+            if (!pw->pw_dir || !pw->pw_dir[0]) continue;
+            if (pw->pw_uid < 1000) continue;   /* skip system accounts */
+            for (int i = 0; rel_paths[i]; i++) {
+                char path[STEAM_PATH_MAX];
+                snprintf(path, sizeof(path), "%s%s", pw->pw_dir, rel_paths[i]);
+                if (access(path, F_OK) == 0) {
+                    endpwent();
+                    cached = 1;
+                    return 1;
+                }
+            }
+        }
+        endpwent();
+    }
+
     cached = 0;
     return 0;
 }
@@ -452,31 +577,105 @@ steam_info_t *steam_detect(pid_t pid, const char *comm, const char *cmdline,
                            const steam_info_t *parent_steam)
 {
     /*
-     * Fast-reject: if Steam is not installed on this system there is
-     * nothing to detect and we must not allocate anything.
-     */
-    if (!steam_is_available())
-        return NULL;
-
-    /*
      * Fast-reject: kernel threads and early system processes (PID ≤ 10)
-     * are never Steam processes.  Avoid opening /proc/<pid>/environ for
-     * them at all — this is the most common case during the ancestor walk
-     * for ordinary (non-Steam) processes selected in the tree.
+     * are never Steam/Wine processes.
      */
     if (pid <= 10)
         return NULL;
 
     /*
-     * Strategy:
-     *   1. If the process is a known Steam launcher name → probe its environ.
-     *   2. If the parent was already identified as Steam → inherit metadata.
-     *   3. Wine/Proton child processes inherit from parent too.
+     * ── Tier 0: parent inheritance ────────────────────────────────────
+     * If the parent is already identified as Steam or Wine, children
+     * inherit without any I/O.  Rebuild the display label with this
+     * process's own comm so the tree shows the right name.
      */
+    if (parent_steam && (parent_steam->is_steam || parent_steam->is_wine)) {
+        steam_info_t *out = malloc(sizeof(*out));
+        if (!out) return NULL;
+        memcpy(out, parent_steam, sizeof(*out));
+        build_display_label(comm, out, out->display_label,
+                            sizeof(out->display_label));
+        return out;
+    }
+
+    /*
+     * ── Tier 1: cheap Wine heuristics (no I/O) ────────────────────────
+     * Check comm and cmdline before touching any files.  This catches
+     * wineserver, wine64, *.exe etc. in microseconds.
+     *
+     * IMPORTANT: a process that matches the Wine heuristic may still be
+     * a Proton-launched game with full Steam metadata.  We must probe
+     * /proc/<pid>/environ for Steam vars first.  Only if no Steam vars
+     * are present do we return a Wine-only result.
+     */
+    int wine_heuristic = is_wine_process(comm, cmdline);
+
+    if (wine_heuristic && steam_is_available()) {
+        /* Do the full Steam env probe — Proton games pass this test */
+        char app_id[32] = "";
+        char compat_data[STEAM_PATH_MAX] = "";
+        char tool_paths[STEAM_PATH_MAX] = "";
+        char library_paths[STEAM_PATH_MAX] = "";
+
+        env_query_t queries[] = {
+            { "SteamAppId",                 app_id,        sizeof(app_id),        0 },
+            { "STEAM_COMPAT_APP_ID",        app_id,        sizeof(app_id),        0 },
+            { "STEAM_COMPAT_DATA_PATH",     compat_data,   sizeof(compat_data),   0 },
+            { "STEAM_COMPAT_TOOL_PATHS",    tool_paths,    sizeof(tool_paths),    0 },
+            { "STEAM_COMPAT_LIBRARY_PATHS", library_paths, sizeof(library_paths), 0 },
+        };
+        int nq = (int)(sizeof(queries) / sizeof(queries[0]));
+        read_env_vars_bulk(pid, queries, nq);
+
+        if (app_id[0] || compat_data[0] || tool_paths[0]) {
+            /* Has Steam vars → full Proton/Steam resolution */
+            steam_info_t *out = calloc(1, sizeof(*out));
+            if (!out) return NULL;
+            out->is_steam = 1;
+            out->is_wine  = 1;
+            snprintf(out->app_id,      sizeof(out->app_id),      "%s", app_id);
+            snprintf(out->compat_data, sizeof(out->compat_data), "%s", compat_data);
+            resolve_proton_info(tool_paths,
+                                out->proton_version, sizeof(out->proton_version),
+                                out->proton_dist,    sizeof(out->proton_dist));
+            resolve_game_name(app_id, compat_data,
+                              out->game_name, sizeof(out->game_name),
+                              out->game_dir,  sizeof(out->game_dir));
+            detect_runtime_layer(tool_paths, compat_data,
+                                 out->runtime_layer, sizeof(out->runtime_layer));
+            build_display_label(comm, out, out->display_label,
+                                sizeof(out->display_label));
+            return out;
+        }
+        /* No Steam vars — fall through to Wine-only result below */
+    }
+
+    if (wine_heuristic) {
+        /* Standalone Wine (Lutris, Bottles, raw wine invocation) */
+        steam_info_t *out = calloc(1, sizeof(*out));
+        if (!out) return NULL;
+        out->is_wine = 1;
+
+        /* Best-effort: read WINEPREFIX */
+        env_query_t q = { "WINEPREFIX", out->compat_data,
+                          sizeof(out->compat_data), 0 };
+        read_env_vars_bulk(pid, &q, 1);
+
+        build_display_label(comm, out, out->display_label,
+                            sizeof(out->display_label));
+        return out;
+    }
+
+    /*
+     * ── Tier 2: Steam launcher detection (non-Wine processes) ────────
+     * Only proceed for known Steam launcher binaries or Steam-related
+     * cmdline patterns.  Skip if Steam is not installed at all.
+     */
+    if (!steam_is_available())
+        return NULL;
 
     int should_probe = is_steam_launcher_process(comm);
 
-    /* Check if cmdline contains steam/proton/pressure-vessel indicators */
     if (!should_probe && cmdline) {
         if (strstr(cmdline, "pressure-vessel") ||
             strstr(cmdline, "proton waitforexitandrun") ||
@@ -484,26 +683,6 @@ steam_info_t *steam_detect(pid_t pid, const char *comm, const char *cmdline,
             strstr(cmdline, "steam-runtime-launcher-interface") ||
             strstr(cmdline, "SteamLinuxRuntime"))
             should_probe = 1;
-    }
-
-    /*
-     * Fast-reject: if there's no parent Steam context AND this process
-     * doesn't look like a Steam launcher, skip the /proc/environ read
-     * entirely.  This avoids expensive I/O for every ancestor in the
-     * tree walk when a non-Steam process is selected.
-     */
-    if (!should_probe && !parent_steam)
-        return NULL;
-
-    /* If we have Steam parent metadata, children inherit it */
-    if (parent_steam && parent_steam->is_steam) {
-        steam_info_t *out = malloc(sizeof(*out));
-        if (!out) return NULL;
-        memcpy(out, parent_steam, sizeof(*out));
-        /* Rebuild the display label with this process's own name */
-        build_display_label(comm, out, out->display_label,
-                            sizeof(out->display_label));
-        return out;
     }
 
     if (!should_probe)

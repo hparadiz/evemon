@@ -14,6 +14,7 @@
 #include "../evemon_plugin.h"
 #include "../settings.h"
 #include "proc_icon.h"
+#include "steam_map.h"
 
 #include <gtk/gtk.h>
 #include <stdio.h>
@@ -51,7 +52,6 @@ enum {
     COL_SERVICE,       /* systemd unit / openrc service name    */
     COL_CWD,
     COL_CMDLINE,
-    COL_STEAM_LABEL,   /* Steam/Proton display label (string) */
     COL_IO_SPARKLINE,  /* packed sparkline data (string of semicolon-sep floats) */
     COL_IO_SPARKLINE_PEAK, /* current I/O peak × 1000 for glow animation (int) */
     COL_HIGHLIGHT_BORN,/* monotonic µs when row first appeared (gint64, 0=none)  */
@@ -337,6 +337,9 @@ typedef struct {
 
     /* process icon cache */
     proc_icon_ctx_t    *icon_ctx;         /* icon resolution context (NULL until init)       */
+
+    /* Steam display label side-table (PID → display label, outside GtkTreeStore) */
+    steam_map_t        *steam_map;
 
     /* plugin system */
     void               *plugin_registry; /* plugin_registry_t* (opaque to avoid header dep) */

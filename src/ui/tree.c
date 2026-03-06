@@ -90,7 +90,7 @@ static void collect_iters(GtkTreeModel *model, GtkTreeIter *parent,
 /* ── set row data from a proc_entry ──────────────────────────── */
 
 static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
-                         const proc_entry_t *e)
+                         const proc_entry_t *e, ui_ctx_t *ctx)
 {
     char rss_text[64];
     format_memory(e->mem_rss_kb, rss_text, sizeof(rss_text));
@@ -181,13 +181,20 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
                        COL_SERVICE,    e->service[0]   ? e->service   : "",
                        COL_CWD,      e->cwd,
                        COL_CMDLINE,  PROC_CMDLINE(e),
-                       COL_STEAM_LABEL, (e->steam && e->steam->is_steam) ? e->steam->display_label : "",
                        COL_IO_SPARKLINE, spark_buf,
                        COL_IO_SPARKLINE_PEAK, spark_peak,
                        COL_HIGHLIGHT_BORN, (gint64)0,
                        COL_HIGHLIGHT_DIED, (gint64)0,
                        COL_PINNED_ROOT, (gint)PTREE_UNPINNED,
                        -1);
+
+    /* Store Steam display label in the side-table, not in the tree store */
+    if (ctx && ctx->steam_map) {
+        if (e->steam && (e->steam->is_steam || e->steam->is_wine))
+            steam_map_set(ctx->steam_map, e->pid, e->steam->display_label);
+        else
+            steam_map_remove(ctx->steam_map, e->pid);
+    }
 }
 
 /* ── find the parent iter for a given ppid ───────────────────── */
@@ -210,7 +217,8 @@ static GtkTreeIter *find_parent_iter(iter_map_t *map, pid_t ppid, pid_t self_pid
  * are already gone, so we never hand GTK a stale child iter.
  */
 static void update_or_remove_rows(GtkTreeStore *store, GtkTreeIter *parent,
-                                  const proc_store_t *pstore)
+                                  const proc_store_t *pstore,
+                                  ui_ctx_t *ctx)
 {
     GtkTreeModel *model = GTK_TREE_MODEL(store);
     GtkTreeIter iter;
@@ -218,7 +226,7 @@ static void update_or_remove_rows(GtkTreeStore *store, GtkTreeIter *parent,
 
     while (valid) {
         /* Recurse first so children are handled before the parent */
-        update_or_remove_rows(store, &iter, pstore);
+        update_or_remove_rows(store, &iter, pstore, ctx);
 
         gint pid_val;
         gtk_tree_model_get(model, &iter, COL_PID, &pid_val, -1);
@@ -242,7 +250,7 @@ static void update_or_remove_rows(GtkTreeStore *store, GtkTreeIter *parent,
         if (rec->status == PROC_DYING) {
             gint64 born = 0;
             gtk_tree_model_get(model, &iter, COL_HIGHLIGHT_BORN, &born, -1);
-            set_row_data(store, &iter, &rec->entry);
+            set_row_data(store, &iter, &rec->entry, ctx);
 
             /* Only start the red animation after the process has been
              * absent for at least HIGHLIGHT_START_DELAY_US.  Before
@@ -265,7 +273,7 @@ static void update_or_remove_rows(GtkTreeStore *store, GtkTreeIter *parent,
             gtk_tree_model_get(model, &iter,
                                COL_HIGHLIGHT_BORN, &born,
                                COL_HIGHLIGHT_DIED, &died, -1);
-            set_row_data(store, &iter, &rec->entry);
+            set_row_data(store, &iter, &rec->entry, ctx);
             gtk_tree_store_set(store, &iter,
                                COL_HIGHLIGHT_BORN, born,
                                COL_HIGHLIGHT_DIED, died, -1);
@@ -284,20 +292,22 @@ static void update_or_remove_rows(GtkTreeStore *store, GtkTreeIter *parent,
  */
 typedef struct {
     GtkTreeStore *store;
+    steam_map_t  *steam_map;  /* borrowed pointer to ctx->steam_map */
     char          key[PROC_NAME_MAX];  /* same key format used by proc_icon_lookup_async */
 } icon_cb_data_t;
 
 static void walk_set_icon(GtkTreeModel *model, GtkTreeIter *parent,
-                          const char *key, GdkPixbuf *pb)
+                          const char *key, GdkPixbuf *pb,
+                          steam_map_t *steam_map)
 {
     GtkTreeIter iter;
     gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
     while (valid) {
         gchar *name = NULL;
-        gchar *steam_label = NULL;
+        gint   pid  = 0;
         gtk_tree_model_get(model, &iter,
                            COL_NAME, &name,
-                           COL_STEAM_LABEL, &steam_label,
+                           COL_PID,  &pid,
                            -1);
 
         /* Match by comm name or steam:<appid> key */
@@ -306,9 +316,9 @@ static void walk_set_icon(GtkTreeModel *model, GtkTreeIter *parent,
             /* direct comm match */
             if (strcmp(name, key) == 0)
                 match = TRUE;
-            /* steam key: "steam:<appid>" — match any steam row */
+            /* steam key: "steam:<appid>" — match any row with a steam label */
             if (!match && strncmp(key, "steam:", 6) == 0 &&
-                steam_label && steam_label[0])
+                steam_map_has_label(steam_map, (pid_t)pid))
                 match = TRUE;
         }
 
@@ -317,9 +327,8 @@ static void walk_set_icon(GtkTreeModel *model, GtkTreeIter *parent,
                                COL_ICON, pb, -1);
 
         g_free(name);
-        g_free(steam_label);
 
-        walk_set_icon(model, &iter, key, pb);
+        walk_set_icon(model, &iter, key, pb, steam_map);
         valid = gtk_tree_model_iter_next(model, &iter);
     }
 }
@@ -328,7 +337,7 @@ static void on_icon_resolved(const char *key, GdkPixbuf *pb, void *userdata)
 {
     icon_cb_data_t *d = userdata;
     if (pb)   /* NULL = miss, no need to walk */
-        walk_set_icon(GTK_TREE_MODEL(d->store), NULL, key, pb);
+        walk_set_icon(GTK_TREE_MODEL(d->store), NULL, key, pb, d->steam_map);
     g_free(d);
 }
 
@@ -353,6 +362,7 @@ static void request_icon(ui_ctx_t *ctx, GtkTreeStore *store,
     /* Async path — allocate callback data */
     icon_cb_data_t *d = g_new(icon_cb_data_t, 1);
     d->store = store;
+    d->steam_map = ctx ? ctx->steam_map : NULL;
     snprintf(d->key, sizeof(d->key), "%s", e->name);
 
     proc_icon_lookup_async(ctx->icon_ctx, e->name,
@@ -378,7 +388,7 @@ void update_store(GtkTreeStore       *store,
     static int first_update = 1;
 
     /* ── Phase 1 & 2: remove dead rows and update surviving rows ── */
-    update_or_remove_rows(store, NULL, pstore);
+    update_or_remove_rows(store, NULL, pstore, ctx);
 
     /* ── Phase 3: collect existing rows after removals ───────── */
     iter_map_t existing = { NULL, 0, 0 };
@@ -467,7 +477,7 @@ void update_store(GtkTreeStore       *store,
 
             GtkTreeIter new_iter;
             gtk_tree_store_append(store, &new_iter, parent_iter);
-            set_row_data(store, &new_iter, e);
+            set_row_data(store, &new_iter, e, ctx);
             request_icon(ctx, store, &new_iter, e);
 
             /* Stamp newly inserted process with a birth highlight */
@@ -668,7 +678,7 @@ void populate_store_initial(GtkTreeStore       *store,
                 parent_iter = &iters[pidx];
 
             gtk_tree_store_append(store, &iters[sidx], parent_iter);
-            set_row_data(store, &iters[sidx], e);
+            set_row_data(store, &iters[sidx], e, ctx);
             request_icon(ctx, store, &iters[sidx], e);
             inserted[sidx] = 1;
 
@@ -765,7 +775,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
-          *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
+          *cwd = NULL, *cmdline = NULL;
     gchar *spark_data = NULL;
     gint spark_peak;
     GdkPixbuf *icon = NULL;
@@ -781,7 +791,6 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
-        COL_STEAM_LABEL, &steam_label,
         COL_IO_SPARKLINE, &spark_data,
         COL_IO_SPARKLINE_PEAK, &spark_peak,
         COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
@@ -799,7 +808,6 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
-        COL_STEAM_LABEL, steam_label,
         COL_IO_SPARKLINE, spark_data,
         COL_IO_SPARKLINE_PEAK, spark_peak,
         COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
@@ -812,7 +820,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     g_free(grp_rss_text); g_free(grp_cpu_text);
     g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
-    g_free(steam_label); g_free(spark_data);
+    g_free(spark_data);
 
     /* Recurse into children */
     GtkTreeIter child;

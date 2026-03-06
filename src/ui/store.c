@@ -203,7 +203,14 @@ void proc_store_update(proc_store_t *s,
                 free(s->records[r].entry.cmdline_long);
                 continue;
             }
-            if (w != r) s->records[w] = s->records[r];
+            if (w != r) {
+                s->records[w] = s->records[r];
+                /* Re-seat the steam pointer: the shallow copy above made
+                 * entry.steam point at records[r].steam_copy (old slot).
+                 * Fix it to point at records[w].steam_copy (new slot). */
+                if (s->records[w].entry.steam)
+                    s->records[w].entry.steam = &s->records[w].steam_copy;
+            }
             w++;
         }
         s->count = w;

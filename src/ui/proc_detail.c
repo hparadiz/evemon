@@ -42,7 +42,6 @@ typedef struct {
     pid_t      pid;
     gchar     *name;
     gchar     *cmdline;
-    gchar     *steam_label;
     guint      generation;   /* ctx->detail_gen snapshot at enqueue time */
 } detail_deferred_t;
 
@@ -58,28 +57,27 @@ static gboolean detail_deferred_cb(gpointer data)
     if (ctx->shutting_down || d->generation != detail_gen) {
         g_free(d->name);
         g_free(d->cmdline);
-        g_free(d->steam_label);
         free(d);
         return G_SOURCE_REMOVE;
     }
 
-    /* ── Steam / Proton metadata ─────────────────────────────── */
+    /* ── Steam / Proton / Wine metadata ─────────────────────────── */
     {
-        gboolean is_steam = steam_is_available() &&
-                            (d->steam_label && d->steam_label[0]);
         steam_info_t *si = NULL;
 
-        if (is_steam && d->pid > 0) {
+        if (d->pid > 0) {
             si = steam_detect(d->pid, d->name, d->cmdline, NULL);
 
             if (!si) {
-                /* Walk ancestors in the tree model to find Steam env vars */
+                /* Walk ancestors in the tree model to propagate Steam/Wine
+                 * context.  Each ancestor is probed with the accumulated
+                 * parent context so metadata flows down the tree correctly. */
                 GtkTreeModel *child_model =
                     gtk_tree_model_sort_get_model(ctx->sort_model);
                 GtkTreeIter ancestor_iter;
-                /* Find the row for d->pid */
                 if (find_iter_by_pid(child_model, NULL,
                                      d->pid, &ancestor_iter)) {
+                    steam_info_t *accumulated = NULL;
                     while (!si) {
                         GtkTreeIter parent_iter;
                         if (!gtk_tree_model_iter_parent(child_model,
@@ -93,25 +91,28 @@ static gboolean detail_deferred_cb(gpointer data)
                                            COL_PID,     &anc_pid,
                                            COL_NAME,    &anc_name,
                                            COL_CMDLINE, &anc_cmd, -1);
-                        steam_info_t *parent_si =
+                        steam_info_t *anc_si =
                             steam_detect((pid_t)anc_pid,
-                                         anc_name, anc_cmd, NULL);
+                                         anc_name, anc_cmd, accumulated);
                         g_free(anc_name);
                         g_free(anc_cmd);
-                        if (parent_si) {
+                        if (anc_si) {
+                            free(accumulated);
+                            accumulated = anc_si;
+                            /* Try to re-detect the target PID with this context */
                             si = steam_detect(d->pid, d->name,
-                                              d->cmdline, parent_si);
-                            if (!si)
-                                si = parent_si;
-                            else
-                                free(parent_si);
+                                              d->cmdline, accumulated);
                         }
                     }
+                    if (!si)
+                        si = accumulated; /* use ancestor's info directly */
+                    else
+                        free(accumulated);
                 }
             }
         }
 
-        if (si) {
+        if (si && (si->is_steam || si->is_wine)) {
             gtk_label_set_text(ctx->sb_steam_game,
                                si->game_name[0]      ? si->game_name      : "–");
             gtk_label_set_text(ctx->sb_steam_appid,
@@ -133,6 +134,7 @@ static gboolean detail_deferred_cb(gpointer data)
             gtk_widget_set_no_show_all(ctx->sb_steam_frame, TRUE);
             free(si);
         } else {
+            free(si);
             gtk_widget_hide(ctx->sb_steam_frame);
         }
     }
@@ -143,12 +145,11 @@ static gboolean detail_deferred_cb(gpointer data)
 
     g_free(d->name);
     g_free(d->cmdline);
-    g_free(d->steam_label);
     free(d);
     return G_SOURCE_REMOVE;
 }
 
-/* ── process detail panel: update from selection ─────────────── */
+/* ── process detail panel: update from selection ─────────────────── */
 
 void proc_detail_update(ui_ctx_t *ctx)
 {
@@ -241,7 +242,7 @@ void proc_detail_update(ui_ctx_t *ctx)
     gchar *rss_text = NULL, *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_time_text = NULL, *container = NULL, *service = NULL,
-          *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
+          *cwd = NULL, *cmdline = NULL;
 
     gtk_tree_model_get(child_model, &iter,
                        COL_PID,            &pid,
@@ -260,7 +261,6 @@ void proc_detail_update(ui_ctx_t *ctx)
                        COL_SERVICE,        &service,
                        COL_CWD,           &cwd,
                        COL_CMDLINE,        &cmdline,
-                       COL_STEAM_LABEL,    &steam_label,
                        -1);
     (void)cpu_raw; (void)rss; (void)grp_rss; (void)grp_cpu;
 
@@ -354,7 +354,6 @@ void proc_detail_update(ui_ctx_t *ctx)
             d->pid        = (pid_t)pid;
             d->name       = g_strdup(name);
             d->cmdline    = g_strdup(cmdline);
-            d->steam_label = g_strdup(steam_label);
             d->generation = detail_gen;
             g_idle_add(detail_deferred_cb, d);
         }
@@ -364,7 +363,7 @@ void proc_detail_update(ui_ctx_t *ctx)
     g_free(rss_text); g_free(grp_rss_text); g_free(grp_cpu_text);
     g_free(io_read_text); g_free(io_write_text);
     g_free(start_time_text); g_free(container); g_free(service);
-    g_free(cwd); g_free(cmdline); g_free(steam_label);
+    g_free(cwd); g_free(cmdline);
 
     g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
 }
@@ -437,7 +436,7 @@ void pinned_panels_update(ui_ctx_t *ctx)
         gchar *rss_text = NULL, *grp_rss_text = NULL, *grp_cpu_text = NULL;
         gchar *io_read_text = NULL, *io_write_text = NULL;
         gchar *start_time_text = NULL, *container = NULL, *service = NULL,
-              *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
+              *cwd = NULL, *cmdline = NULL;
 
         gtk_tree_model_get(model, &found,
                            COL_PID,            &pid,
@@ -456,7 +455,6 @@ void pinned_panels_update(ui_ctx_t *ctx)
                            COL_SERVICE,        &service,
                            COL_CWD,           &cwd,
                            COL_CMDLINE,        &cmdline,
-                           COL_STEAM_LABEL,    &steam_label,
                            -1);
 
         /* PID / PPID */
@@ -541,17 +539,16 @@ void pinned_panels_update(ui_ctx_t *ctx)
         gtk_label_set_text(pp->sb_cwd,     cwd     ? cwd     : "–");
         gtk_label_set_text(pp->sb_cmdline, cmdline ? cmdline : "–");
 
-        /* ── Steam / Proton ────────────────────────────────────── */
+        /* ── Steam / Proton / Wine ─────────────────────────────── */
         {
-            gboolean is_steam = steam_is_available() &&
-                                (steam_label && steam_label[0]);
             steam_info_t *si = NULL;
 
-            if (is_steam && pid > 0) {
+            if (pid > 0) {
                 si = steam_detect((pid_t)pid, name, cmdline, NULL);
                 if (!si) {
-                    /* Walk ancestors to find Steam env vars */
+                    /* Walk ancestors, threading accumulated context down */
                     GtkTreeIter ancestor = found;
+                    steam_info_t *accumulated = NULL;
                     while (!si) {
                         GtkTreeIter parent_iter;
                         if (!gtk_tree_model_iter_parent(model, &parent_iter,
@@ -564,24 +561,26 @@ void pinned_panels_update(ui_ctx_t *ctx)
                                            COL_PID, &anc_pid,
                                            COL_NAME, &anc_name,
                                            COL_CMDLINE, &anc_cmd, -1);
-                        steam_info_t *parent_si =
+                        steam_info_t *anc_si =
                             steam_detect((pid_t)anc_pid, anc_name,
-                                         anc_cmd, NULL);
+                                         anc_cmd, accumulated);
                         g_free(anc_name);
                         g_free(anc_cmd);
-                        if (parent_si) {
+                        if (anc_si) {
+                            free(accumulated);
+                            accumulated = anc_si;
                             si = steam_detect((pid_t)pid, name, cmdline,
-                                              parent_si);
-                            if (!si)
-                                si = parent_si;
-                            else
-                                free(parent_si);
+                                              accumulated);
                         }
                     }
+                    if (!si)
+                        si = accumulated;
+                    else
+                        free(accumulated);
                 }
             }
 
-            if (si) {
+            if (si && (si->is_steam || si->is_wine)) {
                 gtk_label_set_text(pp->sb_steam_game,
                     si->game_name[0]      ? si->game_name      : "–");
                 gtk_label_set_text(pp->sb_steam_appid,
@@ -605,6 +604,7 @@ void pinned_panels_update(ui_ctx_t *ctx)
                 gtk_widget_set_no_show_all(pp->sb_steam_frame, TRUE);
                 free(si);
             } else {
+                free(si);
                 gtk_widget_hide(pp->sb_steam_frame);
             }
         }
@@ -631,6 +631,6 @@ void pinned_panels_update(ui_ctx_t *ctx)
         g_free(rss_text); g_free(grp_rss_text); g_free(grp_cpu_text);
         g_free(io_read_text); g_free(io_write_text);
         g_free(start_time_text); g_free(container); g_free(service);
-        g_free(cwd); g_free(cmdline); g_free(steam_label);
+        g_free(cwd); g_free(cmdline);
     }
 }
