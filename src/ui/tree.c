@@ -242,9 +242,21 @@ static void update_or_remove_rows(GtkTreeStore *store, GtkTreeIter *parent,
             gint64 born = 0;
             gtk_tree_model_get(model, &iter, COL_HIGHLIGHT_BORN, &born, -1);
             set_row_data(store, &iter, &rec->entry);
+
+            /* Only start the red animation after the process has been
+             * absent for at least HIGHLIGHT_START_DELAY_US.  Before
+             * that threshold we keep COL_HIGHLIGHT_DIED = 0 so nothing
+             * is rendered, avoiding flicker on transient absences. */
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC, &_ts);
+            int64_t now_us = (int64_t)_ts.tv_sec * 1000000LL
+                           + _ts.tv_nsec / 1000;
+            gint64 died_stamp = (now_us - rec->died_at_us >= HIGHLIGHT_START_DELAY_US)
+                                ? (gint64)rec->died_at_us
+                                : (gint64)0;
             gtk_tree_store_set(store, &iter,
                                COL_HIGHLIGHT_BORN, born,
-                               COL_HIGHLIGHT_DIED, (gint64)rec->died_at_us,
+                               COL_HIGHLIGHT_DIED, died_stamp,
                                -1);
         } else {
             /* PROC_ALIVE — update in-place, preserve timestamps */

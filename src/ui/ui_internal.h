@@ -63,7 +63,12 @@ enum {
 
 /* Highlight fade duration (microseconds).  New/dying rows are
  * highlighted for this many µs before the colour fades completely. */
-#define HIGHLIGHT_FADE_US  (2 * 1000000LL)   /* 2 seconds */
+#define HIGHLIGHT_FADE_US        (2 * 1000000LL)   /* 2 seconds */
+
+/* How long a process must be continuously absent before the red
+ * fade-out animation begins.  Prevents flicker from transient
+ * absences shorter than one monitor poll cycle. */
+#define HIGHLIGHT_START_DELAY_US (1 * 1000000LL)   /* 1 second  */
 
 /* Node states (stored per-PID in the set) */
 #define PTREE_EXPANDED  0

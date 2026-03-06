@@ -1121,7 +1121,7 @@ static gboolean on_refresh(gpointer data)
         /* Switch from fast startup poll to the normal 1-second interval */
         if (ctx->initial_refresh) {
             ctx->initial_refresh = FALSE;
-            g_timeout_add(1000, on_refresh, ctx);
+            g_timeout_add(500, on_refresh, ctx);
 
             /* Selection and detail panel are now handled inside
              * populate_store_initial as soon as the preselected row
@@ -4163,7 +4163,7 @@ void *ui_thread(void *arg)
     ctx.highlight_timer = 0;
 
     g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), &ctx);
-    g_timeout_add(50, on_refresh, &ctx);
+    g_timeout_add(20, on_refresh, &ctx);
 
     /* ── Apply theme from settings ────────────────────────────── */
     {
