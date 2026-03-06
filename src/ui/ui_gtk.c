@@ -11,6 +11,7 @@
  */
 
 #include "ui_internal.h"
+#include "store.h"
 
 #include "../plugin_loader.h"
 #include "../plugin_broker.h"
@@ -1038,35 +1039,29 @@ static gboolean on_refresh(gpointer data)
         }
     }
 
-    proc_entry_t *local = NULL;
-    if (count > 0) {
-        local = malloc(count * sizeof(proc_entry_t));
-        if (local) {
-            memcpy(local, ctx->mon->snapshot.entries,
-                   count * sizeof(proc_entry_t));
-            /* Deep-copy heap-allocated steam pointers so the UI's copy
-             * is independent of the monitor's snapshot lifecycle. */
-            for (size_t i = 0; i < count; i++) {
-                if (local[i].steam) {
-                    steam_info_t *copy = malloc(sizeof(steam_info_t));
-                    if (copy)
-                        memcpy(copy, local[i].steam, sizeof(steam_info_t));
-                    local[i].steam = copy;
-                }
-            }
-        }
+    /* Feed the raw snapshot into the GTK-free process store.
+     * proc_store_update() deep-copies all proc_entry_t data
+     * (including steam_info_t) so we can release the monitor lock
+     * immediately after.  The store owns its own lifetime-tracked
+     * copies; no manual deep-copy or proc_snapshot_free needed. */
+    {
+        struct timespec _ts;
+        clock_gettime(CLOCK_MONOTONIC, &_ts);
+        int64_t now_us = (int64_t)_ts.tv_sec * 1000000LL
+                       + _ts.tv_nsec / 1000;
+        proc_store_update(&ctx->pstore,
+                          ctx->mon->snapshot.entries, count,
+                          now_us);
     }
     pthread_mutex_unlock(&ctx->mon->lock);
 
     if (!running || ctx->shutting_down) {
         if (!running)
             gtk_main_quit();
-        proc_snapshot_t tmp = { local, count };
-        proc_snapshot_free(&tmp);
         return G_SOURCE_REMOVE;
     }
 
-    if (!local)
+    if (count == 0 && ctx->pstore.count == 0)
         return G_SOURCE_CONTINUE;
 
     /* Block collapse/expand and selection-changed signals during
@@ -1119,7 +1114,7 @@ static gboolean on_refresh(gpointer data)
 
     if (g_first_refresh) {
         /* First time: full populate + expand all */
-        populate_store_initial(ctx->store, ctx->view, local, count,
+        populate_store_initial(ctx->store, ctx->view, &ctx->pstore,
                                settings_get()->preselected_pid, ctx);
         g_first_refresh = 0;
 
@@ -1174,7 +1169,7 @@ static gboolean on_refresh(gpointer data)
          * duplicate PIDs don't confuse the diff algorithm. */
         remove_pinned_rows(ctx->store);
         /* Incremental: update in-place, no clear, no flash */
-        update_store(ctx->store, ctx->view, local, count);
+        update_store(ctx->store, ctx->view, &ctx->pstore);
     }
 
     /* Rebuild pinned subtrees (copies of pinned PIDs at the top) */
@@ -1352,7 +1347,6 @@ static gboolean on_refresh(gpointer data)
 
     update_status_bar(ctx, count);
 
-    { proc_snapshot_t tmp = { local, count }; proc_snapshot_free(&tmp); }
     return G_SOURCE_CONTINUE;
 
 finish:
@@ -1363,7 +1357,6 @@ finish:
 
     /* First refresh done – finish status update, then remove the fast timer */
     update_status_bar(ctx, count);
-    { proc_snapshot_t tmp = { local, count }; proc_snapshot_free(&tmp); }
     return G_SOURCE_REMOVE;
 }
 
@@ -3706,6 +3699,7 @@ void *ui_thread(void *arg)
     ctx.mon          = mon;
     ctx.store        = store;
     ctx.view         = GTK_TREE_VIEW(tree);
+    proc_store_init(&ctx.pstore);
     ctx.scroll       = GTK_SCROLLED_WINDOW(scroll);
     ctx.status_label = GTK_LABEL(status);
     ctx.status_right = GTK_LABEL(status_right);
@@ -4308,4 +4302,7 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
         ctx->plugin_registry = NULL;
     }
     ctx->plugin_notebook = NULL;
+
+    /* Destroy the GTK-free process store */
+    proc_store_destroy(&ctx->pstore);
 }

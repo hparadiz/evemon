@@ -4,37 +4,37 @@
  */
 
 #include "ui_internal.h"
+#include "store.h"
 #include <time.h>
 
-/* ── hash table for PID lookups ──────────────────────────────── */
-
-#define HT_SIZE 8192
-
-typedef struct { pid_t pid; size_t idx; int used; } ht_entry_t;
-
-static void ht_insert(ht_entry_t *ht, pid_t pid, size_t idx)
+/* ── local hash helpers (operate on store_ht_entry_t arrays) ─── */
+/*
+ * tree.c allocates temporary store_ht_entry_t arrays for local
+ * PID→index lookups (old_ht, new_ht inside update_store).
+ * These mirror the static helpers in store.c but operate on
+ * caller-supplied arrays, so they must live here too.
+ */
+static void ht_insert(store_ht_entry_t *ht, pid_t pid, size_t idx)
 {
-    unsigned h = (unsigned)pid % HT_SIZE;
-    for (int k = 0; k < HT_SIZE; k++) {
+    unsigned h = (unsigned)pid % STORE_HT_SIZE;
+    for (int k = 0; k < STORE_HT_SIZE; k++) {
         if (!ht[h].used) {
             ht[h].pid  = pid;
             ht[h].idx  = idx;
             ht[h].used = 1;
             return;
         }
-        h = (h + 1) % HT_SIZE;
+        h = (h + 1) % STORE_HT_SIZE;
     }
-    /* Table full — silently drop.  With 8192 slots this only
-     * happens on systems with >8192 simultaneous processes. */
 }
 
-static size_t ht_find(const ht_entry_t *ht, pid_t pid)
+static size_t ht_find(const store_ht_entry_t *ht, pid_t pid)
 {
-    unsigned h = (unsigned)pid % HT_SIZE;
-    for (int k = 0; k < HT_SIZE; k++) {
+    unsigned h = (unsigned)pid % STORE_HT_SIZE;
+    for (int k = 0; k < STORE_HT_SIZE; k++) {
         if (!ht[h].used) return (size_t)-1;
         if (ht[h].pid == pid) return ht[h].idx;
-        h = (h + 1) % HT_SIZE;
+        h = (h + 1) % STORE_HT_SIZE;
     }
     return (size_t)-1;
 }
@@ -83,65 +83,6 @@ static void collect_iters(GtkTreeModel *model, GtkTreeIter *parent,
         iter_map_add(map, (pid_t)pid, &iter);
         collect_iters(model, &iter, map);
         valid = gtk_tree_model_iter_next(model, &iter);
-    }
-}
-
-/* ── remove dead rows (recursive, bottom-up) ─────────────────── */
-
-/* Helper: current monotonic time in microseconds */
-static gint64 mono_now_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (gint64)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
-}
-
-/*
- * Mark dead rows (process no longer in snapshot) with a death
- * timestamp instead of removing them immediately.  Rows whose
- * death timestamp is older than HIGHLIGHT_FADE_US are removed.
- * This gives the UI time to show a red fade-out highlight.
- */
-static void remove_dead_rows(GtkTreeStore *store, GtkTreeIter *parent,
-                             const ht_entry_t *new_ht)
-{
-    GtkTreeModel *model = GTK_TREE_MODEL(store);
-    GtkTreeIter iter;
-    gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
-    gint64 now = mono_now_us();
-
-    while (valid) {
-        /* Recurse into children first (bottom-up removal) */
-        remove_dead_rows(store, &iter, new_ht);
-
-        gint pid;
-        gint64 died;
-        gtk_tree_model_get(model, &iter,
-                           COL_PID, &pid,
-                           COL_HIGHLIGHT_DIED, &died, -1);
-
-        if (ht_find(new_ht, (pid_t)pid) == (size_t)-1) {
-            /* Process gone */
-            if (died == 0) {
-                /* First time we see it missing – stamp with death time */
-                gtk_tree_store_set(store, &iter,
-                                   COL_HIGHLIGHT_DIED, now, -1);
-                valid = gtk_tree_model_iter_next(model, &iter);
-            } else if (now - died > HIGHLIGHT_FADE_US) {
-                /* Fade period expired – remove the row */
-                valid = gtk_tree_store_remove(store, &iter);
-            } else {
-                /* Still fading – keep it */
-                valid = gtk_tree_model_iter_next(model, &iter);
-            }
-        } else {
-            /* Process is alive – clear any lingering death stamp
-             * (can happen if a PID is rapidly recycled). */
-            if (died != 0)
-                gtk_tree_store_set(store, &iter,
-                                   COL_HIGHLIGHT_DIED, (gint64)0, -1);
-            valid = gtk_tree_model_iter_next(model, &iter);
-        }
     }
 }
 
@@ -257,83 +198,156 @@ static GtkTreeIter *find_parent_iter(iter_map_t *map, pid_t ppid, pid_t self_pid
     return iter_map_find(map, ppid);
 }
 
+/* ── remove / update dead rows (recursive, bottom-up) ────────── */
 /*
- * Incremental update: diff the new snapshot against the existing tree.
- *   1. Remove rows for processes that no longer exist.
- *   2. Update existing rows in-place.
- *   3. Insert new processes under the correct parent.
+ * Walk the GTK tree bottom-up.  For each row:
+ *   - PROC_KILLED (or absent from store): gtk_tree_store_remove.
+ *   - PROC_DYING:  update data + stamp COL_HIGHLIGHT_DIED.
+ *   - PROC_ALIVE:  update data in-place, preserve highlight timestamps.
  *
- * This avoids clearing the store, so there's no visual flash, and
- * scroll position / expand state / selection are all preserved.
+ * Bottom-up ordering ensures that when a parent is removed its children
+ * are already gone, so we never hand GTK a stale child iter.
  */
-void update_store(GtkTreeStore       *store,
-                  GtkTreeView        *view,
-                  const proc_entry_t *entries,
-                  size_t              count)
+static void update_or_remove_rows(GtkTreeStore *store, GtkTreeIter *parent,
+                                  const proc_store_t *pstore)
 {
-    static int first_update = 1;
-    /* Build hash of new snapshot: PID → index */
-    ht_entry_t *new_ht = calloc(HT_SIZE, sizeof(ht_entry_t));
-    if (!new_ht) return;
-    for (size_t i = 0; i < count; i++)
-        ht_insert(new_ht, entries[i].pid, i);
+    GtkTreeModel *model = GTK_TREE_MODEL(store);
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
 
-    /* Phase 1: Remove dead rows */
-    remove_dead_rows(store, NULL, new_ht);
+    while (valid) {
+        /* Recurse first so children are handled before the parent */
+        update_or_remove_rows(store, &iter, pstore);
 
-    /* Phase 2: Collect remaining existing rows */
-    iter_map_t existing = { NULL, 0, 0 };
-    collect_iters(GTK_TREE_MODEL(store), NULL, &existing);
+        gint pid_val;
+        gtk_tree_model_get(model, &iter, COL_PID, &pid_val, -1);
+        pid_t pid = (pid_t)pid_val;
 
-    /* Build a hash of existing PIDs for quick "already exists?" check */
-    ht_entry_t *old_ht = calloc(HT_SIZE, sizeof(ht_entry_t));
-    if (!old_ht) { free(new_ht); free(existing.entries); return; }
-    for (size_t i = 0; i < existing.count; i++)
-        ht_insert(old_ht, existing.entries[i].pid, i);
+        size_t ridx = ht_find(pstore->ht, pid);
 
-    /* Phase 3: Update existing rows in-place */
-    for (size_t i = 0; i < existing.count; i++) {
-        pid_t pid = existing.entries[i].pid;
-        size_t sidx = ht_find(new_ht, pid);
-        if (sidx != (size_t)-1) {
-            /* Preserve highlight timestamps across data refresh */
+        if (ridx == (size_t)-1) {
+            /* Store already compacted this PID — remove immediately */
+            valid = gtk_tree_store_remove(store, &iter);
+            continue;
+        }
+
+        const proc_record_t *rec = &pstore->records[ridx];
+
+        if (rec->status == PROC_KILLED) {
+            valid = gtk_tree_store_remove(store, &iter);
+            continue;
+        }
+
+        if (rec->status == PROC_DYING) {
+            gint64 born = 0;
+            gtk_tree_model_get(model, &iter, COL_HIGHLIGHT_BORN, &born, -1);
+            set_row_data(store, &iter, &rec->entry);
+            gtk_tree_store_set(store, &iter,
+                               COL_HIGHLIGHT_BORN, born,
+                               COL_HIGHLIGHT_DIED, (gint64)rec->died_at_us,
+                               -1);
+        } else {
+            /* PROC_ALIVE — update in-place, preserve timestamps */
             gint64 born = 0, died = 0;
-            gtk_tree_model_get(GTK_TREE_MODEL(store), &existing.entries[i].iter,
+            gtk_tree_model_get(model, &iter,
                                COL_HIGHLIGHT_BORN, &born,
                                COL_HIGHLIGHT_DIED, &died, -1);
-            set_row_data(store, &existing.entries[i].iter, &entries[sidx]);
-            gtk_tree_store_set(store, &existing.entries[i].iter,
+            set_row_data(store, &iter, &rec->entry);
+            gtk_tree_store_set(store, &iter,
                                COL_HIGHLIGHT_BORN, born,
                                COL_HIGHLIGHT_DIED, died, -1);
         }
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+}
+
+/*
+ * Incremental update: diff the store's snapshot against the existing tree.
+ *   1. Remove PROC_KILLED rows and update PROC_ALIVE/PROC_DYING rows
+ *      in-place (bottom-up, via update_or_remove_rows).
+ *   2. Insert new PROC_ALIVE processes (not yet in the tree) under the
+ *      correct parent.
+ *
+ * Lifecycle tracking (DYING / KILLED) is owned by proc_store_t; tree.c
+ * just translates record status into GTK tree operations.
+ */
+void update_store(GtkTreeStore       *store,
+                  GtkTreeView        *view,
+                  const proc_store_t *pstore)
+{
+    static int first_update = 1;
+
+    /* ── Phase 1 & 2: remove dead rows and update surviving rows ── */
+    update_or_remove_rows(store, NULL, pstore);
+
+    /* ── Phase 3: collect existing rows after removals ───────── */
+    iter_map_t existing = { NULL, 0, 0 };
+    collect_iters(GTK_TREE_MODEL(store), NULL, &existing);
+
+    /* Build a quick "already has a GTK row?" lookup */
+    store_ht_entry_t *old_ht = calloc(STORE_HT_SIZE, sizeof(store_ht_entry_t));
+    if (!old_ht) { free(existing.entries); return; }
+    for (size_t i = 0; i < existing.count; i++)
+        ht_insert(old_ht, existing.entries[i].pid, i);
+
+    /* ── Phase 4: insert new ALIVE processes ─────────────────── */
+    /*
+     * Gather the ALIVE records that have no GTK row yet into a
+     * temporary flat list, then use the ancestor-stack approach to
+     * insert parents before children.
+     */
+    size_t new_count = 0;
+    for (size_t i = 0; i < pstore->count; i++) {
+        const proc_record_t *rec = &pstore->records[i];
+        if (rec->status == PROC_ALIVE &&
+            ht_find(old_ht, rec->entry.pid) == (size_t)-1)
+            new_count++;
     }
 
-    /* Phase 4: Insert new processes.
-     * We need to insert parents before children, so we use the same
-     * ancestor-stack approach as before. */
-    int *inserted = calloc(count, sizeof(int));
-    if (!inserted) { free(new_ht); free(old_ht); free(existing.entries); return; }
-
-    /* Mark already-existing entries as inserted */
-    for (size_t i = 0; i < count; i++) {
-        if (ht_find(old_ht, entries[i].pid) != (size_t)-1)
-            inserted[i] = 1;
+    if (new_count == 0) {
+        free(old_ht);
+        free(existing.entries);
+        first_update = 0;
+        return;
     }
+
+    /* Build an index array of new records */
+    size_t *new_idx = calloc(new_count, sizeof(size_t));
+    if (!new_idx) { free(old_ht); free(existing.entries); return; }
+    {
+        size_t j = 0;
+        for (size_t i = 0; i < pstore->count; i++) {
+            const proc_record_t *rec = &pstore->records[i];
+            if (rec->status == PROC_ALIVE &&
+                ht_find(old_ht, rec->entry.pid) == (size_t)-1)
+                new_idx[j++] = i;
+        }
+    }
+
+    int *inserted = calloc(new_count, sizeof(int));
+    if (!inserted) { free(old_ht); free(existing.entries); free(new_idx); return; }
+
+    /* Local PID→new_idx[] lookup for ancestor-stack resolution */
+    store_ht_entry_t *new_ht = calloc(STORE_HT_SIZE, sizeof(store_ht_entry_t));
+    if (!new_ht) { free(old_ht); free(existing.entries); free(new_idx); free(inserted); return; }
+    for (size_t j = 0; j < new_count; j++)
+        ht_insert(new_ht, pstore->records[new_idx[j]].entry.pid, j);
 
     pid_t stack[64];
     int sp;
 
-    for (size_t i = 0; i < count; i++) {
-        if (inserted[i]) continue;
+    for (size_t j = 0; j < new_count; j++) {
+        if (inserted[j]) continue;
 
         /* Build ancestor stack */
         sp = 0;
-        size_t cur = i;
+        size_t cur = j;
         while (!inserted[cur]) {
             if (sp >= 64) break;
-            stack[sp++] = entries[cur].pid;
+            stack[sp++] = pstore->records[new_idx[cur]].entry.pid;
 
-            pid_t pp = entries[cur].ppid;
+            pid_t pp = pstore->records[new_idx[cur]].entry.ppid;
+            /* Check if parent is also a new entry */
             size_t pidx = ht_find(new_ht, pp);
             if (pidx == (size_t)-1 || pidx == cur) break;
             if (inserted[pidx]) break;
@@ -343,13 +357,11 @@ void update_store(GtkTreeStore       *store,
         /* Pop stack: insert outermost ancestor first */
         while (sp > 0) {
             pid_t p = stack[--sp];
-            size_t sidx = ht_find(new_ht, p);
-            if (sidx == (size_t)-1 || inserted[sidx]) continue;
+            size_t jj = ht_find(new_ht, p);
+            if (jj == (size_t)-1 || inserted[jj]) continue;
 
-            const proc_entry_t *e = &entries[sidx];
+            const proc_entry_t *e = &pstore->records[new_idx[jj]].entry;
 
-            /* Find parent iter – check both existing map and freshly
-             * inserted entries (which we add to existing as we go). */
             GtkTreeIter *parent_iter = find_parent_iter(&existing,
                                                          e->ppid, e->pid);
 
@@ -360,7 +372,20 @@ void update_store(GtkTreeStore       *store,
             /* Stamp newly inserted process with a birth highlight */
             if (!first_update)
                 gtk_tree_store_set(store, &new_iter,
-                                   COL_HIGHLIGHT_BORN, mono_now_us(), -1);
+                                   COL_HIGHLIGHT_BORN, (gint64)
+                                   pstore->records[new_idx[jj]].died_at_us
+                                   /* died_at_us == 0 for ALIVE; use
+                                    * a live timestamp for born */,
+                                   -1);
+            /* Overwrite with a real timestamp for birth highlight */
+            if (!first_update) {
+                struct timespec _ts;
+                clock_gettime(CLOCK_MONOTONIC, &_ts);
+                gint64 now_us = (gint64)_ts.tv_sec * 1000000LL
+                              + _ts.tv_nsec / 1000;
+                gtk_tree_store_set(store, &new_iter,
+                                   COL_HIGHLIGHT_BORN, now_us, -1);
+            }
 
             /* Expand PID 1 and PID 2 the moment their first child arrives */
             if ((e->ppid == 1 || e->ppid == 2) && parent_iter) {
@@ -382,13 +407,14 @@ void update_store(GtkTreeStore       *store,
 
             /* Add to existing map so children can find us */
             iter_map_add(&existing, e->pid, &new_iter);
-            inserted[sidx] = 1;
+            inserted[jj] = 1;
         }
     }
 
     free(new_ht);
     free(old_ht);
     free(existing.entries);
+    free(new_idx);
     free(inserted);
     first_update = 0;
 }
@@ -480,21 +506,26 @@ long compute_group_cpu(GtkTreeStore *store, GtkTreeIter *parent)
 
 /*
  * Full populate for the initial load (tree is empty).
- * Uses the same ancestor-stack insertion as before.
+ * Uses the same ancestor-stack insertion as before, driven from the
+ * proc_store_t instead of a raw proc_entry_t array.
  */
 void populate_store_initial(GtkTreeStore       *store,
                             GtkTreeView        *view,
-                            const proc_entry_t *entries,
-                            size_t              count,
+                            const proc_store_t *pstore,
                             pid_t               preselect_pid,
                             ui_ctx_t           *ctx)
 {
-    if (count == 0) return;
+    if (pstore->count == 0) return;
 
-    ht_entry_t *ht = calloc(HT_SIZE, sizeof(ht_entry_t));
+    /* Build a PID → records[] index hash for parent lookups */
+    store_ht_entry_t *ht = calloc(STORE_HT_SIZE, sizeof(store_ht_entry_t));
     if (!ht) return;
-    for (size_t i = 0; i < count; i++)
-        ht_insert(ht, entries[i].pid, i);
+    for (size_t i = 0; i < pstore->count; i++) {
+        if (pstore->records[i].status != PROC_KILLED)
+            ht_insert(ht, pstore->records[i].entry.pid, i);
+    }
+
+    size_t count = pstore->count;
 
     int          *inserted = calloc(count, sizeof(int));
     GtkTreeIter  *iters    = calloc(count, sizeof(GtkTreeIter));
@@ -509,13 +540,15 @@ void populate_store_initial(GtkTreeStore       *store,
 
     for (size_t i = 0; i < count; i++) {
         if (inserted[i]) continue;
+        if (pstore->records[i].status == PROC_KILLED) { inserted[i] = 1; continue; }
 
         sp = 0;
         size_t cur = i;
         while (!inserted[cur]) {
+            if (pstore->records[cur].status == PROC_KILLED) break;
             if (sp >= 64) break;
-            stack[sp++] = entries[cur].pid;
-            pid_t pp = entries[cur].ppid;
+            stack[sp++] = pstore->records[cur].entry.pid;
+            pid_t pp = pstore->records[cur].entry.ppid;
             size_t pidx = ht_find(ht, pp);
             if (pidx == (size_t)-1 || pidx == cur) break;
             if (inserted[pidx]) break;
@@ -527,7 +560,7 @@ void populate_store_initial(GtkTreeStore       *store,
             size_t sidx = ht_find(ht, p);
             if (sidx == (size_t)-1 || inserted[sidx]) continue;
 
-            const proc_entry_t *e = &entries[sidx];
+            const proc_entry_t *e = &pstore->records[sidx].entry;
             GtkTreeIter *parent_iter = NULL;
             size_t pidx = ht_find(ht, e->ppid);
             if (pidx != (size_t)-1 && inserted[pidx] && pidx != sidx)
@@ -560,7 +593,6 @@ void populate_store_initial(GtkTreeStore       *store,
             if (!preselected && preselect_pid > 0 &&
                 e->pid == preselect_pid && ctx) {
                 preselected = TRUE;
-                /* Build the sort-model path and select it */
                 GtkTreeModel *sort = gtk_tree_view_get_model(view);
                 GtkTreePath *child_path = gtk_tree_model_get_path(
                     GTK_TREE_MODEL(store), &iters[sidx]);
@@ -576,7 +608,6 @@ void populate_store_initial(GtkTreeStore       *store,
                     }
                     gtk_tree_path_free(child_path);
                 }
-                /* Open the detail panel immediately */
                 if (gtk_widget_get_visible(ctx->detail_vbox))
                     gtk_widget_show_all(ctx->detail_panel);
                 proc_detail_update(ctx);

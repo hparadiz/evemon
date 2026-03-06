@@ -8,6 +8,7 @@
 #define UI_INTERNAL_H
 
 #include "../proc.h"
+#include "store.h"
 #include "../log.h"
 #include "../profile.h"
 #include "../evemon_plugin.h"
@@ -185,6 +186,7 @@ typedef struct {
     monitor_state_t    *mon;
     GtkTreeStore       *store;
     GtkTreeView        *view;
+    proc_store_t        pstore;   /* GTK-free process lifecycle store */
     GtkLabel           *status_label;
     GtkLabel           *status_right;
     GtkScrolledWindow  *scroll;
@@ -458,10 +460,10 @@ void label_device(const char *path, char *desc, size_t descsz);
 /* ── tree store operations ───────────────────────────────────── */
 
 void update_store(GtkTreeStore *store, GtkTreeView *view,
-                  const proc_entry_t *entries, size_t count);
+                  const proc_store_t *pstore);
 
 void populate_store_initial(GtkTreeStore *store, GtkTreeView *view,
-                            const proc_entry_t *entries, size_t count,
+                            const proc_store_t *pstore,
                             pid_t preselect_pid, ui_ctx_t *ctx);
 
 long compute_group_rss(GtkTreeStore *store, GtkTreeIter *parent);
