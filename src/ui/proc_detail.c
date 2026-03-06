@@ -169,6 +169,8 @@ void proc_detail_update(ui_ctx_t *ctx)
     }
 
     /* Only update if the detail panel area is toggled on by the user */
+    if (!ctx->detail_vbox || !gtk_widget_get_realized(ctx->detail_vbox))
+        return;
     if (!gtk_widget_get_visible(ctx->detail_vbox))
         return;
 
@@ -208,12 +210,14 @@ void proc_detail_update(ui_ctx_t *ctx)
         !gtk_widget_get_visible(ctx->detail_panel)) {
         gtk_widget_show_all(ctx->detail_panel);
         /* Restore proc info tray state after show_all */
-        if (ctx->proc_info_collapsed) {
-            gtk_revealer_set_reveal_child(
-                GTK_REVEALER(ctx->proc_info_revealer), FALSE);
-            gtk_widget_show(GTK_WIDGET(ctx->proc_info_summary));
-        } else {
-            gtk_widget_hide(GTK_WIDGET(ctx->proc_info_summary));
+        if (ctx->proc_info_revealer && ctx->proc_info_summary) {
+            if (ctx->proc_info_collapsed) {
+                gtk_revealer_set_reveal_child(
+                    GTK_REVEALER(ctx->proc_info_revealer), FALSE);
+                gtk_widget_show(GTK_WIDGET(ctx->proc_info_summary));
+            } else {
+                gtk_widget_hide(GTK_WIDGET(ctx->proc_info_summary));
+            }
         }
     }
 

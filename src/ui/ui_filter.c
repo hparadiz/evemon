@@ -54,6 +54,7 @@ void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
           *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
     gchar *spark_data = NULL;
     gint spark_peak;
+    GdkPixbuf *icon = NULL;
 
     gtk_tree_model_get(src, src_iter,
         COL_PID, &pid, COL_PPID, &ppid, COL_USER, &user, COL_NAME, &name,
@@ -71,6 +72,7 @@ void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_IO_SPARKLINE_PEAK, &spark_peak,
         COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
         COL_PINNED_ROOT, &pinned_root,
+        COL_ICON, &icon,
         -1);
 
     gtk_tree_store_set(dst, &dst_iter,
@@ -89,8 +91,10 @@ void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_IO_SPARKLINE_PEAK, spark_peak,
         COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
         COL_PINNED_ROOT, pinned_root,
+        COL_ICON, icon,
         -1);
 
+    if (icon) g_object_unref(icon);   /* gtk_tree_model_get reffed it */
     g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
     g_free(grp_rss_text); g_free(grp_cpu_text);
     g_free(io_read_text); g_free(io_write_text); g_free(start_text);
@@ -260,7 +264,8 @@ static GtkTreeStore *alloc_filter_store(void)
         G_TYPE_INT64, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
         G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
         G_TYPE_STRING, G_TYPE_INT,
-        G_TYPE_INT64, G_TYPE_INT64, G_TYPE_INT);
+        G_TYPE_INT64, G_TYPE_INT64, G_TYPE_INT,
+        GDK_TYPE_PIXBUF);
 }
 
 /*

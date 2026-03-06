@@ -13,6 +13,7 @@
 #include "../profile.h"
 #include "../evemon_plugin.h"
 #include "../settings.h"
+#include "proc_icon.h"
 
 #include <gtk/gtk.h>
 #include <stdio.h>
@@ -56,6 +57,7 @@ enum {
     COL_HIGHLIGHT_BORN,/* monotonic µs when row first appeared (gint64, 0=none)  */
     COL_HIGHLIGHT_DIED,/* monotonic µs when process vanished (gint64, 0=alive)   */
     COL_PINNED_ROOT,   /* pid_t of the pinned root, or -1 for normal tree */
+    COL_ICON,          /* GdkPixbuf* process icon (may be NULL)                  */
     NUM_COLS
 };
 
@@ -333,6 +335,9 @@ typedef struct {
     size_t              pinned_panel_cap;
     GtkWidget          *pinned_box;      /* GtkBox stacking pinned panels */
 
+    /* process icon cache */
+    proc_icon_ctx_t    *icon_ctx;         /* icon resolution context (NULL until init)       */
+
     /* plugin system */
     void               *plugin_registry; /* plugin_registry_t* (opaque to avoid header dep) */
     GtkWidget          *plugin_notebook; /* GtkNotebook holding plugin tabs */
@@ -465,7 +470,7 @@ void label_device(const char *path, char *desc, size_t descsz);
 /* ── tree store operations ───────────────────────────────────── */
 
 void update_store(GtkTreeStore *store, GtkTreeView *view,
-                  const proc_store_t *pstore);
+                  const proc_store_t *pstore, ui_ctx_t *ctx);
 
 void populate_store_initial(GtkTreeStore *store, GtkTreeView *view,
                             const proc_store_t *pstore,

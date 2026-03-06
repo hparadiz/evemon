@@ -4,6 +4,7 @@
  */
 
 #include "ui_internal.h"
+#include "proc_icon.h"
 #include "store.h"
 #include <time.h>
 
@@ -273,6 +274,92 @@ static void update_or_remove_rows(GtkTreeStore *store, GtkTreeIter *parent,
     }
 }
 
+/* ── icon-resolved callback ───────────────────────────────────── */
+
+/*
+ * Called (possibly async) when proc_icon_lookup_async() resolves an icon.
+ * Walks the entire store and stamps every row whose comm matches `key`
+ * with the resolved pixbuf.  O(N) but N is small and this fires at most
+ * once per unique process name (cache hit → synchronous, no store walk).
+ */
+typedef struct {
+    GtkTreeStore *store;
+    char          key[PROC_NAME_MAX];  /* same key format used by proc_icon_lookup_async */
+} icon_cb_data_t;
+
+static void walk_set_icon(GtkTreeModel *model, GtkTreeIter *parent,
+                          const char *key, GdkPixbuf *pb)
+{
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
+    while (valid) {
+        gchar *name = NULL;
+        gchar *steam_label = NULL;
+        gtk_tree_model_get(model, &iter,
+                           COL_NAME, &name,
+                           COL_STEAM_LABEL, &steam_label,
+                           -1);
+
+        /* Match by comm name or steam:<appid> key */
+        gboolean match = FALSE;
+        if (name) {
+            /* direct comm match */
+            if (strcmp(name, key) == 0)
+                match = TRUE;
+            /* steam key: "steam:<appid>" — match any steam row */
+            if (!match && strncmp(key, "steam:", 6) == 0 &&
+                steam_label && steam_label[0])
+                match = TRUE;
+        }
+
+        if (match)
+            gtk_tree_store_set(GTK_TREE_STORE(model), &iter,
+                               COL_ICON, pb, -1);
+
+        g_free(name);
+        g_free(steam_label);
+
+        walk_set_icon(model, &iter, key, pb);
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+}
+
+static void on_icon_resolved(const char *key, GdkPixbuf *pb, void *userdata)
+{
+    icon_cb_data_t *d = userdata;
+    if (pb)   /* NULL = miss, no need to walk */
+        walk_set_icon(GTK_TREE_MODEL(d->store), NULL, key, pb);
+    g_free(d);
+}
+
+/*
+ * Fire a non-blocking icon lookup for a newly inserted row.
+ * If already cached the callback fires synchronously and sets COL_ICON
+ * before returning; otherwise sets it asynchronously.
+ */
+static void request_icon(ui_ctx_t *ctx, GtkTreeStore *store,
+                         GtkTreeIter *iter, const proc_entry_t *e)
+{
+    if (!ctx || !ctx->icon_ctx) return;
+
+    /* Check synchronous cache first — avoids allocating a callback struct
+     * for the common case (same process seen again after first scan). */
+    GdkPixbuf *cached = proc_icon_get_cached(ctx->icon_ctx, e->name);
+    if (cached) {
+        gtk_tree_store_set(store, iter, COL_ICON, cached, -1);
+        return;
+    }
+
+    /* Async path — allocate callback data */
+    icon_cb_data_t *d = g_new(icon_cb_data_t, 1);
+    d->store = store;
+    snprintf(d->key, sizeof(d->key), "%s", e->name);
+
+    proc_icon_lookup_async(ctx->icon_ctx, e->name,
+                           e->steam,
+                           on_icon_resolved, d);
+}
+
 /*
  * Incremental update: diff the store's snapshot against the existing tree.
  *   1. Remove PROC_KILLED rows and update PROC_ALIVE/PROC_DYING rows
@@ -285,7 +372,8 @@ static void update_or_remove_rows(GtkTreeStore *store, GtkTreeIter *parent,
  */
 void update_store(GtkTreeStore       *store,
                   GtkTreeView        *view,
-                  const proc_store_t *pstore)
+                  const proc_store_t *pstore,
+                  ui_ctx_t           *ctx)
 {
     static int first_update = 1;
 
@@ -380,6 +468,7 @@ void update_store(GtkTreeStore       *store,
             GtkTreeIter new_iter;
             gtk_tree_store_append(store, &new_iter, parent_iter);
             set_row_data(store, &new_iter, e);
+            request_icon(ctx, store, &new_iter, e);
 
             /* Stamp newly inserted process with a birth highlight */
             if (!first_update)
@@ -580,6 +669,7 @@ void populate_store_initial(GtkTreeStore       *store,
 
             gtk_tree_store_append(store, &iters[sidx], parent_iter);
             set_row_data(store, &iters[sidx], e);
+            request_icon(ctx, store, &iters[sidx], e);
             inserted[sidx] = 1;
 
             /* As soon as a direct child of PID 1 or 2 is inserted,
@@ -620,9 +710,11 @@ void populate_store_initial(GtkTreeStore       *store,
                     }
                     gtk_tree_path_free(child_path);
                 }
-                if (gtk_widget_get_visible(ctx->detail_vbox))
-                    gtk_widget_show_all(ctx->detail_panel);
-                proc_detail_update(ctx);
+                if (ctx->detail_vbox && gtk_widget_get_realized(ctx->detail_vbox)) {
+                    if (gtk_widget_get_visible(ctx->detail_vbox))
+                        gtk_widget_show_all(ctx->detail_panel);
+                    proc_detail_update(ctx);
+                }
             }
         }
     }
@@ -676,6 +768,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
           *cwd = NULL, *cmdline = NULL, *steam_label = NULL;
     gchar *spark_data = NULL;
     gint spark_peak;
+    GdkPixbuf *icon = NULL;
 
     gtk_tree_model_get(src, src_iter,
         COL_PID, &pid, COL_PPID, &ppid, COL_USER, &user, COL_NAME, &name,
@@ -692,6 +785,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_IO_SPARKLINE, &spark_data,
         COL_IO_SPARKLINE_PEAK, &spark_peak,
         COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
+        COL_ICON, &icon,
         -1);
 
     gtk_tree_store_set(dst, &dst_iter,
@@ -710,8 +804,10 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_IO_SPARKLINE_PEAK, spark_peak,
         COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
         COL_PINNED_ROOT, pinned_root,
+        COL_ICON, icon,
         -1);
 
+    if (icon) g_object_unref(icon);   /* gtk_tree_model_get reffed it */
     g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
     g_free(grp_rss_text); g_free(grp_cpu_text);
     g_free(io_read_text); g_free(io_write_text); g_free(start_text);

@@ -654,12 +654,14 @@ static void on_toggle_detail_panel(GtkCheckMenuItem *item, gpointer data)
         } else {
             g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
             /* Restore proc info tray state after show_all */
-            if (ctx->proc_info_collapsed) {
-                gtk_revealer_set_reveal_child(
-                    GTK_REVEALER(ctx->proc_info_revealer), FALSE);
-                gtk_widget_show(GTK_WIDGET(ctx->proc_info_summary));
-            } else {
-                gtk_widget_hide(GTK_WIDGET(ctx->proc_info_summary));
+            if (ctx->proc_info_revealer && ctx->proc_info_summary) {
+                if (ctx->proc_info_collapsed) {
+                    gtk_revealer_set_reveal_child(
+                        GTK_REVEALER(ctx->proc_info_revealer), FALSE);
+                    gtk_widget_show(GTK_WIDGET(ctx->proc_info_summary));
+                } else {
+                    gtk_widget_hide(GTK_WIDGET(ctx->proc_info_summary));
+                }
             }
         }
     } else {
@@ -828,12 +830,14 @@ static void detail_panel_relayout(ui_ctx_t *ctx)
         } else {
             g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
             /* Restore proc info tray state after show_all */
-            if (ctx->proc_info_collapsed) {
-                gtk_revealer_set_reveal_child(
-                    GTK_REVEALER(ctx->proc_info_revealer), FALSE);
-                gtk_widget_show(GTK_WIDGET(ctx->proc_info_summary));
-            } else {
-                gtk_widget_hide(GTK_WIDGET(ctx->proc_info_summary));
+            if (ctx->proc_info_revealer && ctx->proc_info_summary) {
+                if (ctx->proc_info_collapsed) {
+                    gtk_revealer_set_reveal_child(
+                        GTK_REVEALER(ctx->proc_info_revealer), FALSE);
+                    gtk_widget_show(GTK_WIDGET(ctx->proc_info_summary));
+                } else {
+                    gtk_widget_hide(GTK_WIDGET(ctx->proc_info_summary));
+                }
             }
         }
     }
@@ -1170,7 +1174,7 @@ static gboolean on_refresh(gpointer data)
          * duplicate PIDs don't confuse the diff algorithm. */
         remove_pinned_rows(ctx->store);
         /* Incremental: update in-place, no clear, no flash */
-        update_store(ctx->store, ctx->view, &ctx->pstore);
+        update_store(ctx->store, ctx->view, &ctx->pstore, ctx);
     }
 
     /* Rebuild pinned subtrees (copies of pinned PIDs at the top) */
@@ -2821,7 +2825,8 @@ void *ui_thread(void *arg)
                                              G_TYPE_INT,      /* IO_SPARKLINE_PEAK */
                                              G_TYPE_INT64,    /* HIGHLIGHT_BORN */
                                              G_TYPE_INT64,    /* HIGHLIGHT_DIED */
-                                             G_TYPE_INT);     /* PINNED_ROOT  */
+                                             G_TYPE_INT,      /* PINNED_ROOT  */
+                                             GDK_TYPE_PIXBUF);/* ICON          */
 
     /* Sort model wraps the store directly (no filter model – we use
      * a shadow store approach for filtering instead). */
@@ -2865,8 +2870,18 @@ void *ui_thread(void *arg)
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
 
     r = gtk_cell_renderer_text_new();
-    col = gtk_tree_view_column_new_with_attributes("Name", r,
-                                                   "text", COL_NAME, NULL);
+    GtkCellRenderer *name_text_r = r;   /* saved for cell-data-func wiring below */
+    col = gtk_tree_view_column_new();
+    gtk_tree_view_column_set_title(col, "Name");
+    {
+        /* Icon renderer — packed before the text, bound to COL_ICON */
+        GtkCellRenderer *icon_r = gtk_cell_renderer_pixbuf_new();
+        g_object_set(icon_r, "yalign", 0.5f, NULL);
+        gtk_tree_view_column_pack_start(col, icon_r, FALSE);
+        gtk_tree_view_column_add_attribute(col, icon_r, "pixbuf", COL_ICON);
+    }
+    gtk_tree_view_column_pack_start(col, r, TRUE);
+    gtk_tree_view_column_add_attribute(col, r, "text", COL_NAME);
     gtk_tree_view_column_set_sort_column_id(col, COL_NAME);
     gtk_tree_view_column_set_resizable(col, TRUE);
     gtk_tree_view_column_set_min_width(col, 150);
@@ -3714,6 +3729,9 @@ void *ui_thread(void *arg)
     ctx.ptree_nodes  = (ptree_node_set_t){ NULL, NULL, NULL, 0, 0 };
     ctx.follow_selection = FALSE;
 
+    /* Process icon cache — one-time desktop index scan */
+    ctx.icon_ctx = proc_icon_ctx_new(ctx.font_size + 4);
+
     /* Name filter */
     ctx.filter_store = NULL;
     ctx.sort_model   = GTK_TREE_MODEL_SORT(sort_model);
@@ -4079,17 +4097,10 @@ void *ui_thread(void *arg)
     }
 
     /* Set up the Name column cell data function so pinned processes
-     * get the arrow prefix.  We need ctx to be initialised first. */
-    {
-        GList *renderers = gtk_cell_layout_get_cells(
-            GTK_CELL_LAYOUT(name_col));
-        if (renderers) {
-            GtkCellRenderer *name_r = renderers->data;
-            gtk_tree_view_column_set_cell_data_func(
-                name_col, name_r, name_cell_data_func, &ctx, NULL);
-            g_list_free(renderers);
-        }
-    }
+     * get the arrow prefix.  We use name_text_r directly — the pixbuf
+     * renderer was packed first so renderers->data would be wrong. */
+    gtk_tree_view_column_set_cell_data_func(
+        name_col, name_text_r, name_cell_data_func, &ctx, NULL);
 
     /* Font menu callbacks (need ctx address, so connect after ctx init) */
     g_signal_connect(font_inc,   "activate", G_CALLBACK(on_font_increase),    &ctx);
@@ -4262,6 +4273,12 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     ctx->audio_pids      = NULL;
     ctx->audio_pid_count = 0;
     ctx->audio_pid_cap   = 0;
+
+    /* Free process icon cache */
+    if (ctx->icon_ctx) {
+        proc_icon_ctx_free(ctx->icon_ctx);
+        ctx->icon_ctx = NULL;
+    }
 
     /* Free the pinned PIDs set */
     free(ctx->pinned_pids);
