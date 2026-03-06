@@ -66,7 +66,16 @@ static size_t ht_find(const store_ht_entry_t *ht, pid_t pid)
  */
 static void copy_entry(proc_record_t *rec, const proc_entry_t *src)
 {
-    rec->entry = *src;   /* shallow copy — fixes up steam pointer below */
+    /* Free any existing heap cmdline before overwriting */
+    free(rec->entry.cmdline_long);
+
+    rec->entry = *src;   /* shallow copy — fixes up steam and cmdline_long below */
+
+    /* Deep-copy the optional long cmdline */
+    if (src->cmdline_long)
+        rec->entry.cmdline_long = strdup(src->cmdline_long);
+    else
+        rec->entry.cmdline_long = NULL;
 
     if (src->steam) {
         rec->steam_copy  = *src->steam;          /* inline copy */
@@ -85,6 +94,8 @@ void proc_store_init(proc_store_t *s)
 
 void proc_store_destroy(proc_store_t *s)
 {
+    for (size_t i = 0; i < s->count; i++)
+        free(s->records[i].entry.cmdline_long);
     free(s->records);
     s->records  = NULL;
     s->count    = 0;
@@ -168,6 +179,7 @@ void proc_store_update(proc_store_t *s,
         }
 
         proc_record_t *rec = &s->records[s->count];
+        memset(rec, 0, sizeof(*rec));   /* zero before copy_entry's free() */
         copy_entry(rec, &entries[i]);
         rec->status     = PROC_ALIVE;
         rec->died_at_us = 0;
@@ -187,7 +199,10 @@ void proc_store_update(proc_store_t *s,
     if (need_compact) {
         size_t w = 0;
         for (size_t r = 0; r < s->count; r++) {
-            if (s->records[r].status == PROC_KILLED) continue;
+            if (s->records[r].status == PROC_KILLED) {
+                free(s->records[r].entry.cmdline_long);
+                continue;
+            }
             if (w != r) s->records[w] = s->records[r];
             w++;
         }

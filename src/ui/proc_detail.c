@@ -65,7 +65,8 @@ static gboolean detail_deferred_cb(gpointer data)
 
     /* ── Steam / Proton metadata ─────────────────────────────── */
     {
-        gboolean is_steam = (d->steam_label && d->steam_label[0]);
+        gboolean is_steam = steam_is_available() &&
+                            (d->steam_label && d->steam_label[0]);
         steam_info_t *si = NULL;
 
         if (is_steam && d->pid > 0) {
@@ -538,7 +539,8 @@ void pinned_panels_update(ui_ctx_t *ctx)
 
         /* ── Steam / Proton ────────────────────────────────────── */
         {
-            gboolean is_steam = (steam_label && steam_label[0]);
+            gboolean is_steam = steam_is_available() &&
+                                (steam_label && steam_label[0]);
             steam_info_t *si = NULL;
 
             if (is_steam && pid > 0) {

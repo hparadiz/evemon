@@ -452,6 +452,13 @@ steam_info_t *steam_detect(pid_t pid, const char *comm, const char *cmdline,
                            const steam_info_t *parent_steam)
 {
     /*
+     * Fast-reject: if Steam is not installed on this system there is
+     * nothing to detect and we must not allocate anything.
+     */
+    if (!steam_is_available())
+        return NULL;
+
+    /*
      * Fast-reject: kernel threads and early system processes (PID ≤ 10)
      * are never Steam processes.  Avoid opening /proc/<pid>/environ for
      * them at all — this is the most common case during the ancestor walk

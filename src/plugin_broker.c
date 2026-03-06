@@ -1565,7 +1565,15 @@ void broker_start(plugin_registry_t *reg, void *fdmon)
 
     cycle->reg   = reg;
     cycle->fdmon = fdmon;
-    cycle->needs = reg->combined_needs;
+    /* Narrow the gather to only what currently-active plugins need.
+     * Plugins that implement wants_update() and return 0 are excluded,
+     * so we skip expensive /proc reads for data no visible tab uses.
+     * Falls back to combined_needs when all plugins want data.
+     * The audio-only PipeWire snapshot always uses combined_needs so
+     * the audio-PID callback fires even when no tab is visible. */
+    cycle->needs = need_audio_only
+                 ? reg->combined_needs
+                 : plugin_registry_effective_needs(reg);
 
     if (npids > 0) {
         cycle->pids = calloc(npids, sizeof(pid_t));

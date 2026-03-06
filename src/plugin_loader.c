@@ -687,6 +687,20 @@ void plugin_registry_recalc_needs(plugin_registry_t *reg)
     }
 }
 
+evemon_data_needs_t plugin_registry_effective_needs(const plugin_registry_t *reg)
+{
+    evemon_data_needs_t needs = 0;
+    for (size_t i = 0; i < reg->count; i++) {
+        const plugin_instance_t *inst = &reg->instances[i];
+        if (!inst->plugin) continue;
+        /* No wants_update → always wants data */
+        if (!inst->plugin->wants_update ||
+            inst->plugin->wants_update(inst->plugin->plugin_ctx))
+            needs |= inst->plugin->data_needs;
+    }
+    return needs;
+}
+
 int plugin_reload(plugin_registry_t *reg, const char *so_path)
 {
     if (!reg || !so_path) return 0;
@@ -742,6 +756,10 @@ void plugin_dispatch_update(plugin_registry_t *reg, pid_t pid,
         plugin_instance_t *inst = &reg->instances[i];
         if (!inst->plugin || !inst->plugin->update) continue;
         if (inst->tracked_pid != pid) continue;
+        /* If the plugin opts in to demand-driven updates, ask it first */
+        if (inst->plugin->wants_update &&
+            !inst->plugin->wants_update(inst->plugin->plugin_ctx))
+            continue;
         inst->plugin->update(inst->plugin->plugin_ctx, data);
     }
 }

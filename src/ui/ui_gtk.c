@@ -948,8 +948,9 @@ static void ensure_highlight_timer(ui_ctx_t *ctx)
 static int g_first_refresh = 1;
 
 /* Update both halves of the status bar from current system state. */
-static void update_status_bar(ui_ctx_t *ctx, size_t count)
+static void update_status_bar(ui_ctx_t *ctx)
 {
+    size_t count = ctx->pstore.count;
     /* System info (right side) */
     {
         double uptime_secs = 0;
@@ -1121,7 +1122,7 @@ static gboolean on_refresh(gpointer data)
         /* Switch from fast startup poll to the normal 1-second interval */
         if (ctx->initial_refresh) {
             ctx->initial_refresh = FALSE;
-            g_timeout_add(500, on_refresh, ctx);
+            g_timeout_add(1000, on_refresh, ctx);
 
             /* Selection and detail panel are now handled inside
              * populate_store_initial as soon as the preselected row
@@ -1345,7 +1346,7 @@ static gboolean on_refresh(gpointer data)
         }
     }
 
-    update_status_bar(ctx, count);
+    update_status_bar(ctx);
 
     return G_SOURCE_CONTINUE;
 
@@ -1356,7 +1357,7 @@ finish:
     g_signal_handlers_unblock_by_func(tree_sel, on_selection_changed, ctx);
 
     /* First refresh done – finish status update, then remove the fast timer */
-    update_status_bar(ctx, count);
+    update_status_bar(ctx);
     return G_SOURCE_REMOVE;
 }
 

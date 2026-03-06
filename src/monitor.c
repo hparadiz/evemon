@@ -49,9 +49,16 @@ static int read_comm(pid_t pid, char *buf, size_t bufsz)
     return 0;
 }
 
-/* Read /proc/<pid>/cmdline (NUL-delimited) and join with spaces. */
-static int read_cmdline(pid_t pid, char *buf, size_t bufsz)
+/*
+ * Read /proc/<pid>/cmdline (NUL-delimited) into the inline buf (size bufsz).
+ * If the raw cmdline is longer than bufsz-1 bytes a heap copy of the full
+ * string is returned via *long_out (caller must free); otherwise *long_out
+ * is set to NULL.  NUL separators are replaced with spaces in both copies.
+ */
+static int read_cmdline(pid_t pid, char *buf, size_t bufsz, char **long_out)
 {
+    *long_out = NULL;
+
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
 
@@ -59,7 +66,11 @@ static int read_cmdline(pid_t pid, char *buf, size_t bufsz)
     if (!f)
         return -1;
 
+    /* Read up to the inline capacity first */
     size_t n = fread(buf, 1, bufsz - 1, f);
+
+    /* Peek: is there more? */
+    int overflow = (n == bufsz - 1) && (fgetc(f) != EOF);
     fclose(f);
 
     if (n == 0) {
@@ -67,12 +78,28 @@ static int read_cmdline(pid_t pid, char *buf, size_t bufsz)
         return 0;   /* kernel thread – empty cmdline is fine */
     }
 
-    /* Replace internal NULs with spaces */
-    for (size_t i = 0; i < n - 1; i++) {
-        if (buf[i] == '\0')
-            buf[i] = ' ';
-    }
+    /* NUL → space in the inline copy */
+    for (size_t i = 0; i < n - 1; i++)
+        if (buf[i] == '\0') buf[i] = ' ';
     buf[n] = '\0';
+
+    if (overflow) {
+        /* Re-read the full cmdline into a heap buffer (rare path) */
+        f = fopen(path, "r");
+        if (f) {
+            /* Read up to PROC_CMD_MAX*4 to cap pathological cases */
+            size_t cap = PROC_CMD_MAX * 4;
+            char  *heap = malloc(cap);
+            if (heap) {
+                size_t total = fread(heap, 1, cap - 1, f);
+                for (size_t i = 0; i < total - 1; i++)
+                    if (heap[i] == '\0') heap[i] = ' ';
+                heap[total] = '\0';
+                *long_out = heap;
+            }
+            fclose(f);
+        }
+    }
 
     return 0;
 }
@@ -851,13 +878,15 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
         }
 
         proc_entry_t *e = &snap.entries[snap.count];
-        e->pid  = pid;
-        e->ppid = read_ppid(pid);
+        e->pid          = pid;
+        e->ppid         = read_ppid(pid);
+        e->cmdline_long = NULL;
 
         if (read_comm(pid, e->name, sizeof(e->name)) != 0)
             continue;   /* process vanished, skip */
 
-        if (read_cmdline(pid, e->cmdline, sizeof(e->cmdline)) != 0)
+        if (read_cmdline(pid, e->cmdline, sizeof(e->cmdline),
+                         &e->cmdline_long) != 0)
             snprintf(e->cmdline, sizeof(e->cmdline), "[%s]", e->name);
 
         /* If cmdline was empty (kernel thread), show [name] */
@@ -927,6 +956,11 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
                 if (partial.entries) {
                     memcpy(partial.entries, snap.entries,
                            snap.count * sizeof(proc_entry_t));
+                    /* Null out heap pointers — the copy doesn't own them */
+                    for (size_t _j = 0; _j < partial.count; _j++) {
+                        partial.entries[_j].steam        = NULL;
+                        partial.entries[_j].cmdline_long = NULL;
+                    }
                     pthread_mutex_lock(&state->lock);
                     proc_snapshot_free(&state->snapshot);
                     state->snapshot = partial;
@@ -965,9 +999,12 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
                        snap.count * sizeof(proc_entry_t));
                 /* steam pointers in the copy are all NULL here —
                  * zero them out explicitly so the UI never sees a
-                 * dangling pointer from the memcpy. */
-                for (size_t _i = 0; _i < early.count; _i++)
-                    early.entries[_i].steam = NULL;
+                 * dangling pointer from the memcpy.
+                 * Same for cmdline_long — the copy doesn't own the heap string. */
+                for (size_t _i = 0; _i < early.count; _i++) {
+                    early.entries[_i].steam        = NULL;
+                    early.entries[_i].cmdline_long = NULL;
+                }
 
                 pthread_mutex_lock(&state->lock);
                 proc_snapshot_free(&state->snapshot);
@@ -1053,7 +1090,7 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
                         }
                     }
 
-                    e->steam = steam_detect(e->pid, e->name, e->cmdline,
+                    e->steam = steam_detect(e->pid, e->name, PROC_CMDLINE(e),
                                             parent_si);
                     if (e->steam)
                         new_detections++;
@@ -1075,8 +1112,10 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
 void proc_snapshot_free(proc_snapshot_t *snap)
 {
     if (snap->entries) {
-        for (size_t i = 0; i < snap->count; i++)
-            free(snap->entries[i].steam);   /* NULL-safe */
+        for (size_t i = 0; i < snap->count; i++) {
+            free(snap->entries[i].steam);        /* NULL-safe */
+            free(snap->entries[i].cmdline_long); /* NULL-safe */
+        }
         free(snap->entries);
         snap->entries = NULL;
         snap->count   = 0;

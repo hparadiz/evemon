@@ -640,6 +640,28 @@ typedef struct {
      */
     void (*set_active)(void *ctx, int active);
 
+    /*
+     * (Optional) Called by the broker before each gather cycle to ask
+     * whether this instance currently wants to receive data.
+     *
+     * Return non-zero to receive update() as normal.
+     * Return 0 to be skipped this cycle — the broker will not gather
+     * the data your plugin needs and update() will not be called.
+     *
+     * NULL (not implemented) means “always send me data”, which is the
+     * correct behaviour for plugins that need continuous data (headless
+     * audio service, write monitor, floating windows, etc.).
+     *
+     * A typical implementation checks whether the plugin's widget is
+     * currently mapped / visible:
+     *
+     *   int my_wants_update(void *ctx) {
+     *       my_ctx_t *c = ctx;
+     *       return gtk_widget_get_mapped(c->root_widget);
+     *   }
+     */
+    int (*wants_update)(void *ctx);
+
 } evemon_plugin_t;
 
 /* ── Plugin init function signature ──────────────────────────── */

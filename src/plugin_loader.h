@@ -109,6 +109,20 @@ int plugin_instance_destroy(plugin_registry_t *reg, int instance_id);
 void plugin_registry_recalc_needs(plugin_registry_t *reg);
 
 /*
+ * Compute the effective data-needs for the current broker cycle.
+ *
+ * This is the OR of data_needs for every instance that will actually
+ * consume data this cycle: instances whose wants_update() returns
+ * non-zero (or is NULL, meaning “always”).  Instances that are
+ * paused/hidden and have implemented wants_update() to return 0 are
+ * excluded, so the broker skips gathering their data entirely.
+ *
+ * The result is always >= 0; it equals combined_needs when every
+ * plugin wants an update.
+ */
+evemon_data_needs_t plugin_registry_effective_needs(const plugin_registry_t *reg);
+
+/*
  * Reload a single plugin .so by path: destroys every instance loaded
  * from that path, dlcloses the handle, then re-loads the file.
  * Returns the number of new instances created (1 on success, 0 on

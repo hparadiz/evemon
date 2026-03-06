@@ -11,7 +11,7 @@
 
 /* Maximum lengths for process info strings */
 #define PROC_NAME_MAX  256
-#define PROC_CMD_MAX   4096
+#define PROC_CMD_MAX   1024   /* covers P99; longer cmdlines spill to cmdline_long */
 #define PROC_USER_MAX  64
 #define PROC_CWD_MAX   1024
 #define PROC_CTR_MAX   64
@@ -26,7 +26,9 @@ typedef struct {
     pid_t    pid;
     pid_t    ppid;
     char     name[PROC_NAME_MAX];
-    char     cmdline[PROC_CMD_MAX];
+    char     cmdline[PROC_CMD_MAX];  /* inline storage, always valid    */
+    char    *cmdline_long;             /* heap; non-NULL only when the     *
+                                        * actual cmdline exceeded PROC_CMD_MAX-1 */
     char     user[PROC_USER_MAX];
     char     cwd[PROC_CWD_MAX];
     char     container[PROC_CTR_MAX];   /* container runtime or empty   */
@@ -43,6 +45,14 @@ typedef struct {
     int      io_history_len;        /* number of valid samples in io_history       */
     steam_info_t *steam;            /* Steam/Proton metadata (heap, NULL if not Steam) */
 } proc_entry_t;
+
+/*
+ * PROC_CMDLINE(e) – always returns the full command line for entry *e.
+ * For most processes this is e->cmdline (inline).  For the rare ones
+ * whose cmdline exceeded PROC_CMD_MAX-1 bytes at read time, the full
+ * string is in e->cmdline_long (heap-allocated).
+ */
+#define PROC_CMDLINE(e)  ((e)->cmdline_long ? (e)->cmdline_long : (e)->cmdline)
 
 /* Snapshot of all processes at a point in time */
 typedef struct {
