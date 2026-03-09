@@ -269,6 +269,15 @@ debug: all
 gdb: debug
 	gdb -q -ex run --args ./$(TARGET)
 
+comma := ,
+ASAN_CFLAGS  := $(subst -O2,-Og -g3,$(CFLAGS)) -fsanitize=address -fno-omit-frame-pointer
+ASAN_CFLAGS  := $(filter-out -D_FORTIFY_SOURCE=2 -fstack-protector-strong -pie,$(ASAN_CFLAGS))
+ASAN_LDFLAGS := $(filter-out -pie -Wl$(comma)-z$(comma)relro$(comma)-z$(comma)now,$(LDFLAGS)) -fsanitize=address
+asan: CFLAGS  := $(ASAN_CFLAGS)
+asan: LDFLAGS := $(ASAN_LDFLAGS)
+asan: PLUGIN_CFLAGS := $(subst -O2,-Og -g3,$(PLUGIN_CFLAGS)) -fsanitize=address -fno-omit-frame-pointer
+asan: all
+
 # ── Install ──────────────────────────────────────────────────────
 
 install: all

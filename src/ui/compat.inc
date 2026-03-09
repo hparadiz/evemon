@@ -410,7 +410,81 @@ static int collect_compat_results(compat_result_t *out, int capacity)
         }
     }
 
-    /* ── Container detection ──────────────────────────────────── */
+        /* ── eBPF network throughput ───────────────────────────────────── */
+
+    {
+        /*
+         * Network throughput has two tiers:
+         *
+         *   TCP  — INET_DIAG netlink.  Works as any user for own sockets;
+         *          needs CAP_NET_ADMIN for all processes.
+         *
+         *   UDP/UDP6 — eBPF kprobes on udp_sendmsg / udp_recvmsg /
+         *              udpv6_sendmsg / udpv6_recvmsg.  Requires:
+         *               • root / CAP_BPF + CAP_PERFMON
+         *               • CONFIG_DEBUG_INFO_BTF=y  (for struct offsets)
+         *
+         * Without BTF the UDP inode-matching code reads the wrong struct
+         * offset and always returns inode 0 → all UDP events are silently
+         * dropped and throughput shows 0 B/s.
+         */
+        gboolean ebpf_kernel = kernel_ge(kmaj, kmin, 5, 5);
+        gboolean cap_bpf_ok  = kernel_ge(kmaj, kmin, 5, 8)
+                             ? ((euid == 0) || (probe_cap(39) && probe_cap(38)))
+                             : ((euid == 0) || probe_cap(21));
+        gboolean bpf_syscall_net = FALSE;
+        {
+            long r = syscall(__NR_bpf, 0, NULL, 0);
+            bpf_syscall_net = (r == -1 && (errno == EINVAL || errno == EFAULT));
+        }
+
+        /* /sys/kernel/btf/vmlinux exists iff CONFIG_DEBUG_INFO_BTF=y */
+        gboolean btf_present = (access("/sys/kernel/btf/vmlinux", F_OK) == 0);
+
+        /* INET_DIAG: available to all users for own sockets */
+        gboolean cap_net_admin = (euid == 0) || probe_cap(12 /* CAP_NET_ADMIN */);
+
+        gboolean tcp_full = cap_net_admin;
+        gboolean udp_ok   = ebpf_kernel && cap_bpf_ok && bpf_syscall_net && btf_present;
+
+        if (tcp_full && udp_ok) {
+            PUSH(COMPAT_OK, "Network throughput", "full",
+                 "TCP throughput via INET_DIAG (all processes).  "
+                 "UDP/UDP6 (QUIC, WebRTC) throughput via eBPF kprobes: "
+                 "udp_sendmsg, udp_recvmsg, udpv6_sendmsg, udpv6_recvmsg.  "
+                 "BTF present — struct offsets resolved correctly.");
+        } else if (!ebpf_kernel) {
+            /* Can still do TCP */
+            PUSH(COMPAT_WARN, "Network throughput", "TCP only",
+                 "TCP throughput via INET_DIAG is %s.  "
+                 "UDP/UDP6 eBPF speed requires Linux 5.5+ (running %d.%d).",
+                 tcp_full ? "full (all processes)" : "own sockets only",
+                 kmaj, kmin);
+        } else if (!cap_bpf_ok || !bpf_syscall_net) {
+            PUSH(COMPAT_WARN, "Network throughput", "TCP only",
+                 "TCP throughput via INET_DIAG is %s.  "
+                 "UDP/UDP6 eBPF speed is unavailable: missing CAP_BPF + CAP_PERFMON.  "
+                 "Run as root or grant capabilities to see QUIC/WebRTC rates.",
+                 tcp_full ? "full (all processes)" : "own sockets only");
+        } else if (!btf_present) {
+            PUSH(COMPAT_WARN, "Network throughput", "TCP only",
+                 "TCP throughput via INET_DIAG is %s.  "
+                 "UDP/UDP6 eBPF speed is unavailable: "
+                 "/sys/kernel/btf/vmlinux not found.  "
+                 "CONFIG_DEBUG_INFO_BTF=y is required for the eBPF kprobes "
+                 "to resolve struct sock → sk_socket offsets correctly.  "
+                 "Recompile the kernel with CONFIG_DEBUG_INFO_BTF=y.",
+                 tcp_full ? "full (all processes)" : "own sockets only");
+        } else {
+            /* TCP only (no CAP_NET_ADMIN) */
+            PUSH(COMPAT_WARN, "Network throughput", "own sockets only",
+                 "TCP INET_DIAG and UDP/UDP6 eBPF are constrained to your "
+                 "own process sockets.  Run as root or grant "
+                 "CAP_NET_ADMIN to see all processes' network rates.");
+        }
+    }
+
+    /* ── Container detection ──────────────────────────────────────── */
 
     {
         /* Check /proc/1/cgroup for cgroup presence */
@@ -603,23 +677,35 @@ static int collect_compat_results(compat_result_t *out, int capacity)
             gboolean btf        = kconfig_option_enabled("CONFIG_DEBUG_INFO_BTF");
 
             gboolean all_ok = bpf_ok && bpf_sys && bpf_ev && ftrace && perf;
-            if (all_ok) {
+            if (all_ok && btf) {
                 PUSH(COMPAT_OK, "eBPF kernel config", "complete",
                      "All required kernel options are present "
                      "(BPF, BPF_SYSCALL, BPF_EVENTS, FTRACE_SYSCALLS, "
-                     "PERF_EVENTS).%s",
-                     btf ? "  BTF/CO-RE supported." : "  BTF not compiled in (CO-RE unavailable).");
+                     "PERF_EVENTS, DEBUG_INFO_BTF).  "
+                     "BTF is available — UDP/UDP6 struct offsets are "
+                     "resolved correctly and QUIC/WebRTC throughput is fully "
+                     "functional.");
+            } else if (all_ok) {
+                PUSH(COMPAT_WARN, "eBPF kernel config", "no BTF",
+                     "Core eBPF options are present (BPF, BPF_SYSCALL, "
+                     "BPF_EVENTS, FTRACE_SYSCALLS, PERF_EVENTS) but "
+                     "CONFIG_DEBUG_INFO_BTF is not set.  "
+                     "UDP/UDP6 eBPF kprobes require BTF to read "
+                     "struct sock → sk_socket offsets; without it all "
+                     "UDP throughput shows as 0 B/s.  "
+                     "Recompile the kernel with CONFIG_DEBUG_INFO_BTF=y.");
             } else {
                 PUSH(COMPAT_WARN, "eBPF kernel config", "incomplete",
                      "Some eBPF kernel options may be missing: "
                      "CONFIG_BPF=%s  CONFIG_BPF_SYSCALL=%s  "
                      "CONFIG_BPF_EVENTS=%s  CONFIG_FTRACE_SYSCALLS=%s  "
-                     "CONFIG_PERF_EVENTS=%s",
+                     "CONFIG_PERF_EVENTS=%s  CONFIG_DEBUG_INFO_BTF=%s",
                      bpf_ok ? "y" : "?",
                      bpf_sys ? "y" : "?",
                      bpf_ev  ? "y" : "?",
                      ftrace  ? "y" : "?",
-                     perf    ? "y" : "?");
+                     perf    ? "y" : "?",
+                     btf    ? "y" : "?");
             }
         }
         /* If we can't read the kernel config, skip this row rather

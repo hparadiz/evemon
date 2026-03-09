@@ -1,6 +1,6 @@
 # Linux Kernel Requirements
 
-allmon relies on several kernel subsystems, syscalls, and pseudo-filesystem
+evemon relies on several kernel subsystems, syscalls, and pseudo-filesystem
 interfaces.  This document lists every requirement, grouped by feature tier.
 
 ---
@@ -12,6 +12,9 @@ interfaces.  This document lists every requirement, grouped by feature tier.
 | **Core** | Process tree, CPU%, memory, containers, services | 2.6.24 | `CAP_SYS_PTRACE`, `CAP_DAC_READ_SEARCH` |
 | **FD monitoring — fanotify** | File open/close tracking (mount-wide) | 5.1 | `CAP_SYS_ADMIN` |
 | **FD monitoring — eBPF** | Full fd lifecycle incl. sockets/pipes | 5.5 | `CAP_BPF` + `CAP_PERFMON` (≥ 5.8) or `CAP_SYS_ADMIN` |
+| **Write monitoring — eBPF** | Capture stdout/stderr of selected process tree in real time | 5.5 | `CAP_BPF` + `CAP_PERFMON` (≥ 5.8) or `CAP_SYS_ADMIN` |
+| **Network throughput — TCP** | Per-socket send/recv bytes/s via INET_DIAG + eBPF kprobes | 5.5 | `CAP_BPF` + `CAP_PERFMON` |
+| **Network throughput — UDP/IPv6** | Per-socket send/recv bytes/s for UDP4, UDP6, QUIC, WebRTC | 5.5 | `CAP_BPF` + `CAP_PERFMON` |
 | **Socket resolution** | TCP/UDP/Unix socket detail in sidebar | 2.6+ | — |
 | **Device labelling** | Human-readable names for /dev nodes | 2.6.16 | — |
 
@@ -54,7 +57,8 @@ device labelling, and `/sys` queries are also unaffected.
 | `CONFIG_FTRACE_SYSCALLS` | eBPF fd monitor | `tracepoint/syscalls/*` attachment |
 | `CONFIG_TRACEPOINTS` | eBPF fd monitor | Tracepoint infrastructure |
 | `CONFIG_PERF_EVENTS` | eBPF fd monitor | Perf ring-buffer output to userspace |
-| `CONFIG_DEBUG_INFO_BTF` | eBPF fd monitor | Recommended for CO-RE / libbpf |
+| `CONFIG_DEBUG_INFO_BTF` | eBPF network throughput | **Required** for correct struct offset resolution at load time. Without this, socket inode reading silently returns 0 and UDP/IPv6 throughput will show zero. |
+| `CONFIG_DEBUG_INFO_BTF_MODULES` | eBPF (modules) | Recommended alongside `DEBUG_INFO_BTF` |
 
 ### fanotify backend
 
@@ -87,11 +91,18 @@ device labelling, and `/sys` queries are also unaffected.
 | `/proc/<pid>/cgroup` | Container runtime detection, systemd/OpenRC service unit |
 | `/proc/<pid>/cwd` | Working directory (readlink) |
 | `/proc/<pid>/ns/pid` | PID namespace inode (container heuristic) |
+| `/proc/<pid>/environ` | Environment variables (Steam detection, plugin broker) |
+| `/proc/<pid>/maps` | Memory-mapped regions (mmap plugin, shared-library list) |
+| `/proc/<pid>/task/` | Thread directory enumeration |
+| `/proc/<pid>/task/<tid>/comm` | Per-thread name |
+| `/proc/<pid>/task/<tid>/stat` | Per-thread CPU ticks, state, priority |
+| `/proc/<pid>/task/<tid>/status` | Per-thread voluntary/involuntary context switches |
 | `/proc/<pid>/fd/` | Open file descriptor enumeration |
 | `/proc/<pid>/fd/<n>` | Resolve fd target path (readlink) |
 | `/proc/1/ns/pid` | Init PID namespace reference inode |
 | `/proc/self/exe` | Locate eBPF object file at runtime |
 | `/proc/self/fd/<n>` | Resolve fanotify event metadata fd |
+| `/proc/sys/kernel/pid_max` | Resize `monitored_pids` BPF map to match live kernel limit |
 | `/proc/stat` | System boot time (`btime`) |
 | `/proc/uptime` | System uptime |
 | `/proc/loadavg` | Load averages |
@@ -112,6 +123,7 @@ device labelling, and `/sys` queries are also unaffected.
 | `/sys/class/input/<dev>/device/name` | Input device name |
 | `/sys/block/<dev>/device/model` | Block device model |
 | `/sys/class/video4linux/<dev>/name` | Camera/video device name |
+| `/sys/fs/cgroup/<path>/` | cgroup v2 resource limit files (`memory.max`, `cpu.max`, `pids.max`, etc.) |
 
 ---
 
@@ -122,6 +134,7 @@ device labelling, and `/sys` queries are also unaffected.
 | `/run/systemd/system` | Detect systemd init (stat) |
 | `/run/openrc` | Detect OpenRC init (stat) |
 | `/run/openrc/daemons/<svc>/<inst>` | OpenRC service → PID mapping |
+| `/run/user/<uid>/pipewire-0` | PipeWire socket discovery for per-user sessions |
 
 ---
 
@@ -163,35 +176,110 @@ device labelling, and `/sys` queries are also unaffected.
 
 ### Program type
 
-All three BPF programs are `BPF_PROG_TYPE_TRACEPOINT`:
+All BPF programs are `BPF_PROG_TYPE_TRACEPOINT`.
 
-| SEC annotation | Tracepoint |
-|----------------|------------|
-| `tracepoint/syscalls/sys_enter_openat` | Capture filename on `openat` entry |
-| `tracepoint/syscalls/sys_exit_openat` | Emit open event with resolved path |
-| `tracepoint/syscalls/sys_enter_close` | Emit close event |
+#### FD monitoring programs
+
+| SEC annotation | Tracepoint | Purpose |
+|----------------|------------|---------|
+| `tracepoint/syscalls/sys_enter_openat` | `sys_enter_openat` | Save filename ptr on openat entry |
+| `tracepoint/syscalls/sys_exit_openat` | `sys_exit_openat` | Emit open event with resolved path |
+| `tracepoint/syscalls/sys_enter_close` | `sys_enter_close` | Emit close event |
+
+#### Write monitoring programs
+
+Hook all write-family syscalls for monitored pids. Each program does a
+single hash lookup of the current tgid in `monitored_pids`; if the pid is
+not present it returns 0 immediately (negligible overhead system-wide).
+
+| SEC annotation | Syscall | Notes |
+|----------------|---------|-------|
+| `tracepoint/syscalls/sys_enter_write` | `write` | Copies payload inline into per-CPU scratch |
+| `tracepoint/syscalls/sys_enter_writev` | `writev` | Walks iovec, copies first non-empty segment |
+| `tracepoint/syscalls/sys_enter_pwrite64` | `pwrite64` | Same as write but with offset |
+| `tracepoint/syscalls/sys_enter_sendto` | `sendto` | Socket write treated as fd write |
+| `tracepoint/syscalls/sys_enter_sendmsg` | `sendmsg` | Zero-payload notification |
+| `tracepoint/syscalls/sys_enter_sendmmsg` | `sendmmsg` | Zero-payload notification |
+| `tracepoint/syscalls/sys_enter_splice` | `splice` | Uses `fd_out`; no user buffer to copy |
+| `tracepoint/syscalls/sys_enter_sendfile` | `sendfile` | Uses `out_fd`; no user buffer to copy |
+
+#### Process lifecycle programs
+
+| SEC annotation | Tracepoint | Purpose |
+|----------------|------------|---------|
+| `tracepoint/sched/sched_process_exit` | `sched_process_exit` | Remove exited PID from `monitored_pids` map so dead PIDs never accumulate |
+| `tracepoint/sched/sched_process_exec` | `sched_process_exec` | Emit `FDMON_BPF_EXEC` event so userspace can re-confirm child map entries |
+| `tracepoint/sched/sched_process_fork` | `sched_process_fork` | Propagate parent's `monitored_pids` entry to child — zero latency, in kernel |
+
+The fork program is the key to capturing output from short-lived children
+(lifetime < 10 ms). It runs synchronously with the fork syscall, so the
+child's map entry exists before the child's first `write()` can fire.
+
+#### Network throughput programs (kprobes)
+
+These kprobes fire on every send/recv call and emit byte counts keyed by
+socket inode. Matching is done by inode (read from `sock → sk_socket → file
+→ f_inode → i_ino`) rather than IPv4 4-tuple, so UDP6, QUIC, and any other
+protocol where the IPv4 address fields are zero are handled correctly.
+
+`CONFIG_DEBUG_INFO_BTF=y` is required for the struct offsets to be
+resolved correctly at load time.
+
+| SEC annotation | Kernel function | Direction | Notes |
+|----------------|-----------------|-----------|-------|
+| `kprobe/tcp_sendmsg` | `tcp_sendmsg` | send | IPv4 + v4-mapped IPv6 TCP |
+| `kretprobe/tcp_recvmsg` | `tcp_recvmsg` | recv | Return value = bytes received |
+| `kprobe/udp_sendmsg` | `udp_sendmsg` | send | IPv4 UDP |
+| `kretprobe/udp_recvmsg` | `udp_recvmsg` | recv | IPv4 UDP |
+| `kprobe/udpv6_sendmsg` | `udpv6_sendmsg` | send | IPv6 UDP (separate kernel function from IPv4) |
+| `kretprobe/udpv6_recvmsg` | `udpv6_recvmsg` | recv | IPv6 UDP — covers QUIC, WebRTC, and all other UDP6 traffic |
+
+TCP throughput is additionally cross-checked via INET_DIAG netlink
+(`sock_diag`) as the primary source when available; eBPF serves as
+the fallback and as the sole source for UDP (INET_DIAG has no UDP
+byte counters).
+
+---
 
 ### BPF maps
 
-| Map | Type | Key | Value | Max entries |
-|-----|------|-----|-------|-------------|
-| `events` | `PERF_EVENT_ARRAY` | CPU id | fd | per-CPU (auto) |
-| `open_args` | `HASH` | `__u32` (tid) | `__u64` (filename ptr) | 8192 |
+| Map | Type | Key | Value | Max entries | Purpose |
+|-----|------|-----|-------|-------------|----------|
+| `events` | `PERF_EVENT_ARRAY` | CPU id | fd | per-CPU | Deliver events to userspace perf buffer |
+| `open_args` | `HASH` | `__u32` tid | `__u64` filename ptr | 8192 | Pass filename ptr from enter to exit tracepoint |
+| `monitored_pids` | `HASH` | `__u32` pid (tgid) | `__u8` fd_mask | dynamic (`/proc/sys/kernel/pid_max`, default 32768) | Which pids to capture and which fds (bit0=fd1, bit1=fd2) |
+| `write_event_scratch` | `PERCPU_ARRAY` | `__u32` 0 | `struct fdmon_bpf_event` | 1 | Per-CPU scratch to hold write payload (4096 bytes) — avoids 512-byte BPF stack limit |
+| `recvmsg_args` | `HASH` | `__u32` tid | `__u64` sock ptr | 4096 | Stash `struct sock *` between kprobe entry and kretprobe exit for tcp/udp/udpv6 recvmsg |
+
+#### `monitored_pids` fd_mask encoding
+
+```
+bit 0 = fd 1 (stdout)
+bit 1 = fd 2 (stderr)
+```
+
+Userspace sets the mask for the root process via `fdmon_watch_parent_fds()`.
+The fork tracepoint copies it to every child automatically.
+
+---
 
 ### BPF helpers used
 
-| Helper | Min kernel |
-|--------|------------|
-| `bpf_get_current_pid_tgid` | 4.2 |
-| `bpf_map_update_elem` | 3.19 |
-| `bpf_map_lookup_elem` | 3.19 |
-| `bpf_map_delete_elem` | 3.19 |
-| `bpf_ktime_get_ns` | 4.1 |
-| `bpf_probe_read_user_str` | **5.5** |
-| `bpf_perf_event_output` | 4.4 |
+| Helper | Min kernel | Used by |
+|--------|------------|---------|
+| `bpf_get_current_pid_tgid` | 4.2 | All programs |
+| `bpf_map_update_elem` | 3.19 | All programs |
+| `bpf_map_lookup_elem` | 3.19 | All programs |
+| `bpf_map_delete_elem` | 3.19 | FD monitor |
+| `bpf_ktime_get_ns` | 4.1 | Write + FD programs |
+| `bpf_probe_read_user_str` | **5.5** | FD open (filename) |
+| `bpf_probe_read_user` | 5.5 | Write programs (payload copy) |
+| `bpf_perf_event_output` | 4.4 | All programs |
 
-The highest requirement is `bpf_probe_read_user_str` at **kernel 5.5**, which
-sets the floor for the eBPF backend.
+The highest requirement remains `bpf_probe_read_user_str` / `bpf_probe_read_user`
+at **kernel 5.5**, which sets the floor for the entire eBPF backend.
+
+---
 
 ### Build requirements
 
@@ -230,6 +318,15 @@ Container runtimes detected by cgroup path keywords:
 | Core process monitor | **2.6.24** | `/proc/<pid>/cgroup` |
 | + fanotify fd tracking | **5.1** | `FAN_UNLIMITED_QUEUE` |
 | + eBPF fd tracking | **5.5** | `bpf_probe_read_user_str` |
+| + UDP/IPv6 network throughput | **5.5** + `CONFIG_DEBUG_INFO_BTF=y` | Struct offset resolution for socket inode reading |
 
 **Recommended: Linux 5.8+** for fine-grained capabilities (`CAP_BPF`,
 `CAP_PERFMON`) instead of blanket `CAP_SYS_ADMIN`.
+
+**Recommended kernel config for full functionality:**
+```
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_DEBUG_INFO_BTF_MODULES=y
+```
+Without `CONFIG_DEBUG_INFO_BTF`, socket inode reads in the eBPF programs
+return 0 and UDP/IPv6 throughput will always show zero.

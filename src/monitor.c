@@ -25,6 +25,47 @@
 
 /* ── helpers ─────────────────────────────────────────────────── */
 
+/*
+ * Replace any byte sequences that are not valid UTF-8 with '?' in-place.
+ * This prevents GTK/Pango from crashing on raw binary cmdline arguments
+ * (e.g. Wine, JVM, or processes that embed binary data in argv).
+ */
+static void utf8_sanitize(char *s)
+{
+    unsigned char *p = (unsigned char *)s;
+    while (*p) {
+        if (*p < 0x80) {
+            /* ASCII — always valid */
+            p++;
+        } else if ((*p & 0xE0) == 0xC0) {
+            /* 2-byte sequence: 110xxxxx 10xxxxxx */
+            if ((p[1] & 0xC0) == 0x80 && (*p & 0x1F) >= 0x02) {
+                p += 2;
+            } else {
+                *p++ = '?';
+            }
+        } else if ((*p & 0xF0) == 0xE0) {
+            /* 3-byte sequence */
+            if ((p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+                p += 3;
+            } else {
+                *p++ = '?';
+            }
+        } else if ((*p & 0xF8) == 0xF0) {
+            /* 4-byte sequence */
+            if ((p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 &&
+                (p[3] & 0xC0) == 0x80) {
+                p += 4;
+            } else {
+                *p++ = '?';
+            }
+        } else {
+            /* Invalid lead byte */
+            *p++ = '?';
+        }
+    }
+}
+
 /* Read the first line of /proc/<pid>/comm into buf (strips newline). */
 static int read_comm(pid_t pid, char *buf, size_t bufsz)
 {
@@ -83,6 +124,11 @@ static int read_cmdline(pid_t pid, char *buf, size_t bufsz, char **long_out)
         if (buf[i] == '\0') buf[i] = ' ';
     buf[n] = '\0';
 
+    /* Sanitize: replace invalid UTF-8 bytes with '?' so GTK/Pango never
+     * receives a malformed string.  Some processes embed raw binary data
+     * in argv (e.g. certain JVM args, Wine processes). */
+    utf8_sanitize(buf);
+
     if (overflow) {
         /* Re-read the full cmdline into a heap buffer (rare path) */
         f = fopen(path, "r");
@@ -95,6 +141,8 @@ static int read_cmdline(pid_t pid, char *buf, size_t bufsz, char **long_out)
                 for (size_t i = 0; i < total - 1; i++)
                     if (heap[i] == '\0') heap[i] = ' ';
                 heap[total] = '\0';
+                /* Sanitize heap copy too */
+                utf8_sanitize(heap);
                 *long_out = heap;
             }
             fclose(f);

@@ -35,7 +35,7 @@ Built-in plugins:
 |--------|---------------|
 | **File Descriptors** | Every open fd categorised into files, devices, sockets (TCP/UDP with addr:port), Unix sockets, pipes, eventfd/epoll/signalfd/timerfd/inotify. Device fds get human-readable sysfs labels (GPU, sound card, input device, …). Descendant-tree merging and duplicate grouping. |
 | **Write Monitor** | Live capture of stdout/stderr from the selected process and its entire descendant tree, including processes that live for less than a millisecond. Powered by eBPF syscall tracepoints and an in-kernel fork propagation program — no userspace polling race. |
-| **Network Sockets** | Per-connection throughput (send/recv bytes/s) powered by eBPF `tcp_sendmsg`/`tcp_recvmsg` tracepoints. |
+| **Network Sockets** | Per-connection throughput (send/recv bytes/s) for TCP and UDP (including IPv6/QUIC). Powered by eBPF kprobes on `tcp_sendmsg`/`tcp_recvmsg`, `udp_sendmsg`/`udp_recvmsg`, and `udpv6_sendmsg`/`udpv6_recvmsg`. Sockets matched to `/proc` fd entries by inode number — protocol-agnostic and correct for IPv6, UDP, and QUIC/WebRTC streams. TCP throughput additionally cross-checked via INET_DIAG netlink when running as root. |
 | **Environment** | All variables from `/proc/<pid>/environ` classified into Paths, Display/Session, Locale, XDG, Steam/Proton, and Other. |
 | **Memory Maps** | All regions from `/proc/<pid>/maps` — Code (r-x), Data (rw-), Heap, Stack, vDSO, Anonymous, and more. |
 | **Shared Libraries** | Executable mappings categorised into Runtime, System, Application, Wine Built-in, and Windows DLL groups. Full Wine/Proton prefix awareness. |
@@ -46,7 +46,7 @@ Built-in plugins:
 Plugins can be pinned to a specific PID, docked to any edge of the main tree, or floated as independent windows. Third-party plugins compile against a single public header ([`evemon_plugin.h`](src/evemon_plugin.h)).
 
 ### eBPF & Fanotify
-- **eBPF backend** — attaches to syscall tracepoints for fd lifecycle (`sys_enter_openat`, `sys_exit_openat`, `sys_enter_close`), all write-family syscalls (`write`, `writev`, `pwrite64`, `sendto`, `sendmsg`, `sendmmsg`, `splice`, `sendfile`), and process lifecycle (`sched_process_fork`, `sched_process_exec`). Network throughput via `tcp_sendmsg` / `tcp_recvmsg` kprobes. Events delivered via perf buffer with per-CPU scratch maps to work around the 512-byte BPF stack limit.
+- **eBPF backend** — attaches to syscall tracepoints for fd lifecycle (`sys_enter_openat`, `sys_exit_openat`, `sys_enter_close`), all write-family syscalls (`write`, `writev`, `pwrite64`, `sendto`, `sendmsg`, `sendmmsg`, `splice`, `sendfile`), and process lifecycle (`sched_process_fork`, `sched_process_exec`). Network throughput via kprobes on `tcp_sendmsg`/`tcp_recvmsg` (TCP), `udp_sendmsg`/`udp_recvmsg` (UDP/IPv4), and `udpv6_sendmsg`/`udpv6_recvmsg` (UDP/IPv6 — including QUIC and WebRTC). All net probes emit the socket inode number for protocol-agnostic matching. Events delivered via perf buffer with per-CPU scratch maps to work around the 512-byte BPF stack limit. Requires `CONFIG_DEBUG_INFO_BTF=y` for correct struct offset resolution.
 - **Fanotify fallback** — used for fd monitoring when eBPF isn't available (e.g. no `CAP_BPF`).
 
 ### UI Polish
@@ -158,28 +158,12 @@ Root (or `CAP_BPF` + `CAP_PERFMON`) is required for eBPF tracing and full `/proc
 
 ## Architecture
 
-```
-```
-┌──────────────────┐      mutex       ┌─────────────────────┐
-│  Monitor Thread  │  ─────────────►   │    UI Thread (GTK)    │
-│  (2s /proc scan) │  proc_snapshot_t │    1s tree refresh    │
-└──────────────────┘                  └──────────┬──────────┘
-         │                                       │
-    fdmon (eBPF)                          ┌──────┬──────┐
-    ├─ openat/close tracepoints              │ Data Broker │
-    ├─ write/writev/sendto/... tracepoints   │  (GTask)    │
-    ├─ sched_process_fork (propagate map)    └──────┬──────┘
-    └─ tcp_sendmsg/recvmsg kprobes                    │
-                              ┌──────┬──────┬────┬──────┬──────┬──────┬─────────┐
-                              │  FD  │ Env  │ MMap   │ Libs │ Net  │Write│ PipeWire│
-                              │ .so  │ .so  │  .so   │ .so  │ .so  │ .so │   .so   │
-                              └──────┴──────┴────────┴──────┴──────┴─────┴─────────┘
-```
+![evemon architecture diagram](docs/assets/architecture.jpg)
 
 - **Monitor thread** — scans `/proc` every 2 seconds, builds a `proc_snapshot_t`, computes CPU% and I/O rates via delta ticks with `CLOCK_MONOTONIC`, detects containers/services/Steam metadata, publishes under a mutex.
 - **UI thread** — GTK 3 main loop. Diff-based tree updates (remove dead → update in-place → insert new) preserve scroll, selection, and expand state.
 - **Data broker** — single GTask worker that gathers `/proc` data for all tracked PIDs, deduplicating reads across plugins via an OR'd `data_needs` bitmask. Plugins receive a read-only `evemon_proc_data_t` and render on the main thread.
-- **eBPF backend** — `fdmon_ebpf_kern.c` compiled to BPF bytecode with clang. Tracepoints cover fd lifecycle, all write-family syscalls, and process fork/exec. The `sched_process_fork` program propagates the `monitored_pids` map entry from parent to child in kernel space — enabling zero-latency capture of sub-millisecond worker processes. Events delivered via perf buffer.
+- **eBPF backend** — `fdmon_ebpf_kern.c` compiled to BPF bytecode with clang. Tracepoints cover fd lifecycle, all write-family syscalls, and process fork/exec. The `sched_process_fork` program propagates the `monitored_pids` map entry from parent to child in kernel space — enabling zero-latency capture of sub-millisecond worker processes. Network throughput kprobes cover TCP and UDP (IPv4 + IPv6) with inode-based socket matching. Events delivered via perf buffer.
 - **Fanotify backend** — fallback for fd monitoring when eBPF is unavailable.
 ```
 

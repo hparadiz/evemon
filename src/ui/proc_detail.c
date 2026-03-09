@@ -53,6 +53,9 @@ static gboolean detail_deferred_cb(gpointer data)
     detail_deferred_t *d = data;
     ui_ctx_t *ctx = d->ctx;
 
+    evemon_log(LOG_DEBUG, "[DBG] detail_deferred_cb: pid=%d gen=%u/%u",
+            (int)d->pid, d->generation, detail_gen);
+
     /* Abort if the UI is shutting down or the user selected a different process */
     if (ctx->shutting_down || d->generation != detail_gen) {
         g_free(d->name);
@@ -66,7 +69,10 @@ static gboolean detail_deferred_cb(gpointer data)
         steam_info_t *si = NULL;
 
         if (d->pid > 0) {
+            evemon_log(LOG_DEBUG, "[DBG] steam_detect pass 1: pid=%d name=%s",
+                    (int)d->pid, d->name ? d->name : "(null)");
             si = steam_detect(d->pid, d->name, d->cmdline, NULL);
+            evemon_log(LOG_DEBUG, "[DBG] steam_detect pass 1 done: si=%p", (void*)si);
 
             if (!si) {
                 /* Walk ancestors in the tree model to propagate Steam/Wine
@@ -74,10 +80,15 @@ static gboolean detail_deferred_cb(gpointer data)
                  * parent context so metadata flows down the tree correctly. */
                 GtkTreeModel *child_model =
                     gtk_tree_model_sort_get_model(ctx->sort_model);
+                evemon_log(LOG_DEBUG, "[DBG] ancestor walk: child_model=%p sort_model=%p",
+                        (void*)child_model, (void*)ctx->sort_model);
                 GtkTreeIter ancestor_iter;
                 if (find_iter_by_pid(child_model, NULL,
                                      d->pid, &ancestor_iter)) {
+                    evemon_log(LOG_DEBUG, "[DBG] found pid %d in model, walking ancestors",
+                            (int)d->pid);
                     steam_info_t *accumulated = NULL;
+                    int anc_depth = 0;
                     while (!si) {
                         GtkTreeIter parent_iter;
                         if (!gtk_tree_model_iter_parent(child_model,
@@ -91,9 +102,14 @@ static gboolean detail_deferred_cb(gpointer data)
                                            COL_PID,     &anc_pid,
                                            COL_NAME,    &anc_name,
                                            COL_CMDLINE, &anc_cmd, -1);
+                        evemon_log(LOG_DEBUG, "[DBG] ancestor[%d]: pid=%d name=%s",
+                                anc_depth++, (int)anc_pid,
+                                anc_name ? anc_name : "(null)");
                         steam_info_t *anc_si =
                             steam_detect((pid_t)anc_pid,
                                          anc_name, anc_cmd, accumulated);
+                        evemon_log(LOG_DEBUG, "[DBG] ancestor steam_detect done: anc_si=%p",
+                                (void*)anc_si);
                         g_free(anc_name);
                         g_free(anc_cmd);
                         if (anc_si) {
@@ -102,8 +118,12 @@ static gboolean detail_deferred_cb(gpointer data)
                             /* Try to re-detect the target PID with this context */
                             si = steam_detect(d->pid, d->name,
                                               d->cmdline, accumulated);
+                            evemon_log(LOG_DEBUG, "[DBG] re-detect with context: si=%p",
+                                    (void*)si);
                         }
                     }
+                    evemon_log(LOG_DEBUG, "[DBG] ancestor walk done: si=%p accumulated=%p",
+                            (void*)si, (void*)accumulated);
                     if (!si)
                         si = accumulated; /* use ancestor's info directly */
                     else
@@ -112,6 +132,7 @@ static gboolean detail_deferred_cb(gpointer data)
             }
         }
 
+        evemon_log(LOG_DEBUG, "[DBG] about to update Steam labels: si=%p", (void*)si);
         if (si && (si->is_steam || si->is_wine)) {
             gtk_label_set_text(ctx->sb_steam_game,
                                si->game_name[0]      ? si->game_name      : "–");
@@ -139,9 +160,13 @@ static gboolean detail_deferred_cb(gpointer data)
         }
     }
 
+    evemon_log(LOG_DEBUG, "[DBG] Steam labels done, starting cgroup scan");
+
     /* ── cgroup limits ───────────────────────────────────────── */
     if (d->pid > 0)
         cgroup_scan_start(ctx, d->pid);
+
+    evemon_log(LOG_DEBUG, "[DBG] detail_deferred_cb done");
 
     g_free(d->name);
     g_free(d->cmdline);
@@ -206,10 +231,15 @@ void proc_detail_update(ui_ctx_t *ctx)
 
     /* ── Phase 1: reveal panel and paint all cheap labels ─────── */
 
+    evemon_log(LOG_DEBUG, "[DBG] proc_detail_update phase1: detail_vbox=%p detail_panel=%p",
+            (void*)ctx->detail_vbox, (void*)ctx->detail_panel);
+
     /* A process is selected – ensure the main detail panel is visible */
     if (gtk_widget_get_visible(ctx->detail_vbox) &&
         !gtk_widget_get_visible(ctx->detail_panel)) {
+        evemon_log(LOG_DEBUG, "[DBG] show_all detail_panel");
         gtk_widget_show_all(ctx->detail_panel);
+        evemon_log(LOG_DEBUG, "[DBG] show_all detail_panel done");
         /* Restore proc info tray state after show_all */
         if (ctx->proc_info_revealer && ctx->proc_info_summary) {
             if (ctx->proc_info_collapsed) {
@@ -235,6 +265,8 @@ void proc_detail_update(ui_ctx_t *ctx)
         return;
     }
     gtk_tree_path_free(store_path);
+
+    evemon_log(LOG_DEBUG, "[DBG] gtk_tree_model_get start");
 
     gint pid = 0, ppid = 0, cpu_raw = 0, rss = 0, grp_rss = 0, grp_cpu = 0;
     gint64 start_epoch = 0;
@@ -264,6 +296,9 @@ void proc_detail_update(ui_ctx_t *ctx)
                        -1);
     (void)cpu_raw; (void)rss; (void)grp_rss; (void)grp_cpu;
 
+    evemon_log(LOG_DEBUG, "[DBG] gtk_tree_model_get done: pid=%d name=%s",
+            pid, name ? name : "(null)");
+
     char buf[32];
     snprintf(buf, sizeof(buf), "%d", pid);
     gtk_label_set_text(ctx->sb_pid, buf);
@@ -279,6 +314,8 @@ void proc_detail_update(ui_ctx_t *ctx)
     gtk_label_set_text(ctx->sb_group_cpu, grp_cpu_text ? grp_cpu_text : "–");
     gtk_label_set_text(ctx->sb_io_read,   io_read_text  ? io_read_text  : "–");
     gtk_label_set_text(ctx->sb_io_write,  io_write_text ? io_write_text : "–");
+
+    evemon_log(LOG_DEBUG, "[DBG] basic labels set, doing summary");
 
     /* Update the compact inline summary (shown when tray is collapsed) */
     {
@@ -326,6 +363,8 @@ void proc_detail_update(ui_ctx_t *ctx)
         #undef FMT_NET_RATE
     }
 
+    evemon_log(LOG_DEBUG, "[DBG] net labels set, doing start_time/container/cwd/cmdline");
+
     if (start_time_text && start_epoch > 0) {
         char fuzzy[64];
         format_fuzzy_time((time_t)start_epoch, fuzzy, sizeof(fuzzy));
@@ -340,11 +379,15 @@ void proc_detail_update(ui_ctx_t *ctx)
     gtk_label_set_text(ctx->sb_cwd,       cwd       ? cwd       : "–");
     gtk_label_set_text(ctx->sb_cmdline,   cmdline   ? cmdline   : "–");
 
+    evemon_log(LOG_DEBUG, "[DBG] all phase1 labels set, hiding steam frame");
+
     /* Hide Steam frame immediately; the deferred idle will re-show it.
      * The cgroup frame is left as-is: cgroup_scan_complete will hide or
      * update it once the async read finishes, avoiding a hide→show blink
      * on every refresh tick. */
     gtk_widget_hide(ctx->sb_steam_frame);
+
+    evemon_log(LOG_DEBUG, "[DBG] steam frame hidden, enqueueing deferred idle");
 
     /* ── Phase 2: enqueue deferred Steam + cgroup work ────────── */
     if (pid > 0) {
@@ -365,7 +408,10 @@ void proc_detail_update(ui_ctx_t *ctx)
     g_free(start_time_text); g_free(container); g_free(service);
     g_free(cwd); g_free(cmdline);
 
+    evemon_log(LOG_DEBUG, "[DBG] before g_list_free_full: rows=%p", (void*)rows);
     g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+
+    evemon_log(LOG_DEBUG, "[DBG] proc_detail_update done");
 }
 
 /* ── pinned detail panels: full update ────────────────────────── */

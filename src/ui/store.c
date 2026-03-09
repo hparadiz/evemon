@@ -176,6 +176,13 @@ void proc_store_update(proc_store_t *s,
             if (!tmp) continue;   /* OOM — skip this entry */
             s->records  = tmp;
             s->capacity = newcap;
+            /* realloc may have moved the buffer — re-seat all entry.steam
+             * pointers that point into the inline steam_copy fields, which
+             * moved along with the records array. */
+            for (size_t k = 0; k < s->count; k++) {
+                if (s->records[k].entry.steam)
+                    s->records[k].entry.steam = &s->records[k].steam_copy;
+            }
         }
 
         proc_record_t *rec = &s->records[s->count];

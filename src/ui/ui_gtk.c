@@ -1325,9 +1325,11 @@ static gboolean on_refresh(gpointer data)
 
     /* Update the process detail panel for the selected process */
     proc_detail_update(ctx);
+    evemon_log(LOG_DEBUG, "[DBG] proc_detail_update returned");
 
     /* Update pinned detail panels' header labels */
     pinned_panels_update(ctx);
+    evemon_log(LOG_DEBUG, "[DBG] pinned_panels_update returned");
 
     /* ── Plugin broker dispatch ──────────────────────────────── */
     /* After the detail panel updates, kick off the plugin data broker.
@@ -1384,11 +1386,15 @@ static gboolean on_refresh(gpointer data)
              * still runs with zero tracked PIDs so it can take a
              * PipeWire graph snapshot and deliver system-wide audio
              * PIDs for the tree-view audio icons. */
+            evemon_log(LOG_DEBUG, "[DBG] broker_start: sel_pid=%d", (int)sel_pid);
             broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
+            evemon_log(LOG_DEBUG, "[DBG] broker_start returned");
         }
     }
 
+    evemon_log(LOG_DEBUG, "[DBG] update_status_bar");
     update_status_bar(ctx);
+    evemon_log(LOG_DEBUG, "[DBG] on_refresh done");
 
     return G_SOURCE_CONTINUE;
 
