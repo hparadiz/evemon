@@ -430,11 +430,18 @@ void fdmon_net_io_snapshot(fdmon_ctx_t *ctx)
 static sock_io_entry_t *sock_io_ht_find_or_create(sock_io_entry_t *ht,
                                                     pid_t tgid,
                                                     uint32_t laddr, uint16_t lport,
-                                                    uint32_t raddr, uint16_t rport)
+                                                    uint32_t raddr, uint16_t rport,
+                                                    uint64_t inode)
 {
-    /* Hash by PID + ports for decent distribution */
-    unsigned h = ((unsigned)tgid * 2654435761u)
-               ^ ((unsigned)lport << 16 | (unsigned)rport);
+    /* Primary key: inode (when non-zero) — works for UDP4, UDP6, TCP6.
+     * Fallback: PID + 4-tuple (legacy path when inode is unavailable). */
+    unsigned h;
+    if (inode) {
+        h = (unsigned)((inode * 2654435761ULL) ^ (unsigned)tgid);
+    } else {
+        h = ((unsigned)tgid * 2654435761u)
+          ^ ((unsigned)lport << 16 | (unsigned)rport);
+    }
     h %= SOCK_IO_HT_SIZE;
     for (int k = 0; k < SOCK_IO_HT_SIZE; k++) {
         sock_io_entry_t *e = &ht[h];
@@ -444,11 +451,15 @@ static sock_io_entry_t *sock_io_ht_find_or_create(sock_io_entry_t *ht,
             e->lport = lport;
             e->raddr = raddr;
             e->rport = rport;
+            e->inode = inode;
             e->used  = 1;
             return e;
         }
-        if (e->tgid == tgid && e->laddr == laddr && e->lport == lport &&
-            e->raddr == raddr && e->rport == rport)
+        /* Match on inode if both sides have one; else fall back to 4-tuple */
+        if (inode && e->inode == inode && e->tgid == tgid)
+            return e;
+        if (!inode && e->tgid == tgid && e->laddr == laddr &&
+            e->lport == lport && e->raddr == raddr && e->rport == rport)
             return e;
         h = (h + 1) % SOCK_IO_HT_SIZE;
     }
@@ -458,11 +469,12 @@ static sock_io_entry_t *sock_io_ht_find_or_create(sock_io_entry_t *ht,
 void submit_sock_event(fdmon_ctx_t *ctx, pid_t tgid,
                        uint32_t laddr, uint16_t lport,
                        uint32_t raddr, uint16_t rport,
+                       uint64_t inode,
                        uint32_t bytes, int is_send)
 {
     pthread_mutex_lock(&ctx->net_io_lock);
     sock_io_entry_t *e = sock_io_ht_find_or_create(
-        ctx->sock_io, tgid, laddr, lport, raddr, rport);
+        ctx->sock_io, tgid, laddr, lport, raddr, rport, inode);
     if (e) {
         if (is_send)
             e->send_bytes += bytes;
@@ -489,6 +501,7 @@ int fdmon_sock_io_list(const fdmon_ctx_t *ctx, pid_t tgid,
         o->raddr      = e->raddr;
         o->lport      = e->lport;
         o->rport      = e->rport;
+        o->inode      = e->inode;
         o->delta_send = e->delta_send;
         o->delta_recv = e->delta_recv;
         (*count)++;

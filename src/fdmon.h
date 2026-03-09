@@ -199,6 +199,7 @@ typedef struct {
     uint32_t raddr;      /* remote IPv4 (network order)   */
     uint16_t lport;      /* local  port (host order)      */
     uint16_t rport;      /* remote port (network order)   */
+    uint64_t inode;      /* socket inode — primary key    */
     uint64_t delta_send; /* bytes sent since last snapshot */
     uint64_t delta_recv; /* bytes recv since last snapshot */
 } fdmon_sock_io_t;

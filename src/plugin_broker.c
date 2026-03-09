@@ -30,6 +30,34 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <errno.h>
+#include <sys/syscall.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/inet_diag.h>
+
+#ifndef SOCK_DIAG_BY_FAMILY
+#  define SOCK_DIAG_BY_FAMILY 20
+#endif
+
+#ifndef __NR_pidfd_open
+#  define __NR_pidfd_open 434
+#endif
+#ifndef __NR_pidfd_getfd
+#  define __NR_pidfd_getfd 438
+#endif
+
+static int sys_pidfd_open(pid_t pid, unsigned int flags)
+{
+    return (int)syscall(__NR_pidfd_open, pid, flags);
+}
+
+static int sys_pidfd_getfd(int pidfd, int targetfd, unsigned int flags)
+{
+    return (int)syscall(__NR_pidfd_getfd, pidfd, targetfd, flags);
+}
 
 /* Defined in ui/devices.c — resolves /dev/ paths to hardware names */
 extern void label_device(const char *path, char *desc, size_t descsz);
@@ -941,9 +969,10 @@ static const bsock_entry_t *bsock_find(const bsock_table_t *tbl,
     return NULL;
 }
 
-/* Collect socket inodes from /proc/<pid>/fd, tracking the source PID */
+/* Collect socket inodes from /proc/<pid>/fd, tracking the source PID and fd number */
 static void collect_sock_inodes(pid_t pid,
                                 unsigned long **out, pid_t **out_pids,
+                                int **out_fdnums,
                                 size_t *cnt, size_t *cap)
 {
     char dirpath[64];
@@ -953,6 +982,7 @@ static void collect_sock_inodes(pid_t pid,
     struct dirent *de;
     while ((de = readdir(dp)) != NULL) {
         if (de->d_name[0] == '.') continue;
+        int fdnum = atoi(de->d_name);
         char link[288], target[512];
         snprintf(link, sizeof(link), "/proc/%d/fd/%s", (int)pid, de->d_name);
         ssize_t n = readlink(link, target, sizeof(target) - 1);
@@ -969,38 +999,228 @@ static void collect_sock_inodes(pid_t pid,
             pid_t *tmp2 = realloc(*out_pids, *cap * sizeof(pid_t));
             if (!tmp2) continue;
             *out_pids = tmp2;
+            int *tmp3 = realloc(*out_fdnums, *cap * sizeof(int));
+            if (!tmp3) continue;
+            *out_fdnums = tmp3;
         }
-        (*out)[*cnt] = ino;
+        (*out)[*cnt]    = ino;
         (*out_pids)[*cnt] = pid;
+        (*out_fdnums)[*cnt] = fdnum;
         (*cnt)++;
     }
     closedir(dp);
 }
 
-/* Gather network sockets with eBPF throughput */
+/* ── Per-inode TCP byte-counter cache ───────────────────────── */
+/*
+ * Two-level approach, tried in order each gather cycle:
+ *
+ *  1. INET_DIAG netlink dump (primary)
+ *     One system-wide dump of all TCP/TCP6 sockets via
+ *     SOCK_DIAG_BY_FAMILY returns struct tcp_info per socket, keyed
+ *     by inode.  Available on all standard distro kernels
+ *     (CONFIG_INET_DIAG + CONFIG_INET_TCP_DIAG).  No root required.
+ *
+ *  2. pidfd_open + pidfd_getfd + getsockopt(TCP_INFO) (fallback)
+ *     Used when INET_DIAG is unavailable (custom kernels, containers).
+ *     Probes each socket fd individually.  Works for same-user
+ *     processes without root on kernel >= 5.6.
+ *
+ * Both paths populate the same inode-keyed cache and produce
+ * send_delta / recv_delta by diffing cumulative counters across cycles.
+ */
+
+#define TCPCACHE_SIZE 8192
+
+typedef struct {
+    unsigned long inode;
+    uint64_t      prev_acked;    /* tcpi_bytes_acked from last cycle  */
+    uint64_t      prev_received; /* tcpi_bytes_received from last cycle */
+    uint64_t      delta_send;
+    uint64_t      delta_recv;
+} tcp_cache_entry_t;
+
+static tcp_cache_entry_t g_tcp_cache[TCPCACHE_SIZE];
+static pthread_mutex_t   g_tcp_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* -1 = not yet probed, 0 = unavailable, 1 = available */
+static int g_inet_diag_available = -1;
+
+static tcp_cache_entry_t *tcpcache_get(unsigned long inode)
+{
+    size_t slot = (size_t)(inode * 2654435761UL) % TCPCACHE_SIZE;
+    for (size_t i = 0; i < TCPCACHE_SIZE; i++) {
+        size_t s = (slot + i) % TCPCACHE_SIZE;
+        if (g_tcp_cache[s].inode == inode)
+            return &g_tcp_cache[s];
+        if (g_tcp_cache[s].inode == 0) {
+            g_tcp_cache[s].inode = inode;
+            return &g_tcp_cache[s];
+        }
+    }
+    return NULL;
+}
+
+static void tcpcache_update(unsigned long inode,
+                            uint64_t acked, uint64_t received)
+{
+    tcp_cache_entry_t *ce = tcpcache_get(inode);
+    if (!ce) return;
+    if (ce->prev_acked > 0 || ce->prev_received > 0) {
+        ce->delta_send = (acked    >= ce->prev_acked)
+                       ? acked    - ce->prev_acked    : 0;
+        ce->delta_recv = (received >= ce->prev_received)
+                       ? received - ce->prev_received : 0;
+    }
+    ce->prev_acked    = acked;
+    ce->prev_received = received;
+}
+
+/*
+ * INET_DIAG primary path.
+ * Dumps all TCP sockets for the given address family, updating the
+ * inode cache with fresh byte counters.
+ * Returns 1 on success, 0 if INET_DIAG is unavailable.
+ */
+static int inet_diag_dump(int nlfd, int family)
+{
+    struct {
+        struct nlmsghdr         nlh;
+        struct inet_diag_req_v2 r;
+    } req;
+    memset(&req, 0, sizeof(req));
+    req.nlh.nlmsg_len   = sizeof(req);
+    req.nlh.nlmsg_type  = SOCK_DIAG_BY_FAMILY;
+    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.nlh.nlmsg_seq   = (uint32_t)family;
+    req.r.sdiag_family   = (uint8_t)family;
+    req.r.sdiag_protocol = IPPROTO_TCP;
+    req.r.idiag_ext      = (1 << (INET_DIAG_INFO - 1));
+    req.r.idiag_states   = 0xffffffff;
+
+    struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+    if (sendto(nlfd, &req, sizeof(req), 0,
+               (struct sockaddr *)&sa, sizeof(sa)) < 0)
+        return 0;
+
+    char buf[65536];
+    for (;;) {
+        int n = (int)recv(nlfd, buf, sizeof(buf), 0);
+        if (n <= 0) return 0;
+        struct nlmsghdr *h = (struct nlmsghdr *)buf;
+        for (; NLMSG_OK(h, (unsigned)n); h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type == NLMSG_DONE)  return 1;
+            if (h->nlmsg_type == NLMSG_ERROR) return 0;
+            if (h->nlmsg_type != SOCK_DIAG_BY_FAMILY) continue;
+
+            struct inet_diag_msg *m =
+                (struct inet_diag_msg *)NLMSG_DATA(h);
+            int rta_len = h->nlmsg_len - NLMSG_LENGTH(sizeof(*m));
+            struct rtattr *attr = (struct rtattr *)(m + 1);
+            for (; RTA_OK(attr, rta_len); attr = RTA_NEXT(attr, rta_len)) {
+                if (attr->rta_type != INET_DIAG_INFO) continue;
+                if (RTA_PAYLOAD(attr) < sizeof(struct tcp_info)) continue;
+                struct tcp_info *ti = (struct tcp_info *)RTA_DATA(attr);
+                tcpcache_update(m->idiag_inode,
+                                ti->tcpi_bytes_acked,
+                                ti->tcpi_bytes_received);
+            }
+        }
+    }
+}
+
+/*
+ * Run INET_DIAG for both AF_INET and AF_INET6.
+ * Opens a fresh netlink socket each cycle (cheap; avoids stale state).
+ * Returns 1 if successful, 0 if INET_DIAG is not available.
+ */
+static int inet_diag_refresh_cache(void)
+{
+    int nlfd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC,
+                      NETLINK_INET_DIAG);
+    if (nlfd < 0) {
+        g_inet_diag_available = 0;
+        return 0;
+    }
+    struct sockaddr_nl local = { .nl_family = AF_NETLINK };
+    if (bind(nlfd, (struct sockaddr *)&local, sizeof(local)) < 0) {
+        close(nlfd);
+        g_inet_diag_available = 0;
+        return 0;
+    }
+
+    int ok4 = inet_diag_dump(nlfd, AF_INET);
+    int ok6 = inet_diag_dump(nlfd, AF_INET6);
+    close(nlfd);
+
+    if (!ok4 && !ok6) {
+        g_inet_diag_available = 0;
+        return 0;
+    }
+    g_inet_diag_available = 1;
+    return 1;
+}
+
+/*
+ * pidfd fallback: probe a single socket fd from another process.
+ * Returns 1 and fills *acked/*received on success.
+ */
+static int tcp_info_probe(pid_t pid, int fdnum,
+                          uint64_t *acked, uint64_t *received)
+{
+    int pidfd = sys_pidfd_open(pid, 0);
+    if (pidfd < 0) return 0;
+
+    int sockfd = sys_pidfd_getfd(pidfd, fdnum, 0);
+    close(pidfd);
+    if (sockfd < 0) return 0;
+
+    struct tcp_info ti;
+    socklen_t tilen = sizeof(ti);
+    int rc = getsockopt(sockfd, IPPROTO_TCP, TCP_INFO, &ti, &tilen);
+    close(sockfd);
+    if (rc != 0) return 0;
+
+    *acked    = ti.tcpi_bytes_acked;
+    *received = ti.tcpi_bytes_received;
+    return 1;
+}
+
+/* Gather network sockets with eBPF throughput + pidfd TCP_INFO */
 static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
 {
     /* 1. Collect socket inodes from this PID and descendants */
     unsigned long *inodes = NULL;
     pid_t *inode_pids = NULL;
+    int   *inode_fdnums = NULL;
     size_t inode_count = 0, inode_cap = 0;
 
-    collect_sock_inodes(pid, &inodes, &inode_pids, &inode_count, &inode_cap);
+    collect_sock_inodes(pid, &inodes, &inode_pids, &inode_fdnums,
+                        &inode_count, &inode_cap);
 
     /* Also collect from descendant PIDs */
     for (size_t i = 0; i < d->desc_count; i++)
         collect_sock_inodes(d->data.descendant_pids[i],
-                            &inodes, &inode_pids, &inode_count, &inode_cap);
+                            &inodes, &inode_pids, &inode_fdnums,
+                            &inode_count, &inode_cap);
 
     if (inode_count == 0) {
         free(inodes);
         free(inode_pids);
+        free(inode_fdnums);
         return;
     }
 
     /* 2. Build the system socket table from /proc/net */
     bsock_table_t socktbl;
     bsock_table_build(&socktbl);
+
+    /* 2b. Refresh INET_DIAG cache (primary TCP/TCP6 speed source).
+     *     One netlink round-trip populates g_tcp_cache for all sockets.
+     *     Falls back gracefully if CONFIG_INET_DIAG is not available. */
+    pthread_mutex_lock(&g_tcp_cache_mutex);
+    inet_diag_refresh_cache();
+    pthread_mutex_unlock(&g_tcp_cache_mutex);
 
     /* 3. Get per-socket throughput from eBPF (H5: heap-allocated) */
     size_t sock_io_cap = 1024;
@@ -1035,7 +1255,7 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
     /* 4. Resolve each inode and build the socket list */
     size_t cap = 32, count = 0;
     evemon_socket_t *socks = calloc(cap, sizeof(evemon_socket_t));
-    if (!socks) { free(inodes); free(inode_pids); free(sock_io); bsock_table_free(&socktbl); return; }
+    if (!socks) { free(inodes); free(inode_pids); free(inode_fdnums); free(sock_io); bsock_table_free(&socktbl); return; }
 
     /* Deduplicate inodes (multiple fds can point to same socket) */
     for (size_t i = 0; i < inode_count; i++) {
@@ -1112,37 +1332,84 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
             break;
         }
 
-        /* Match per-socket throughput from eBPF */
-        for (size_t k = 0; k < sock_io_count; k++) {
-            const fdmon_sock_io_t *sio = &sock_io[k];
-            uint16_t bpf_rport_host = ntohs(sio->rport);
-            int matched = 0;
+        /* ── Speed data ──────────────────────────────────────────────
+         *
+         * Priority:
+         *   1. INET_DIAG cache  – populated above the inode loop for all
+         *      TCP/TCP6 sockets in one netlink round-trip (distro kernels).
+         *   2. pidfd fallback   – per-fd getsockopt(TCP_INFO) for custom
+         *      kernels without CONFIG_INET_DIAG (same-user processes only).
+         *   3. eBPF             – covers UDP4 and any socket where both
+         *      methods above failed (different-user, EPERM on pidfd_getfd).
+         * ─────────────────────────────────────────────────────────────── */
 
-            if (si->kind == BSOCK_TCP || si->kind == BSOCK_UDP) {
-                if (si->local_addr == sio->laddr &&
-                    si->local_port == sio->lport &&
-                    si->remote_addr == sio->raddr &&
-                    si->remote_port == bpf_rport_host)
-                    matched = 1;
-            } else if (si->kind == BSOCK_TCP6 || si->kind == BSOCK_UDP6) {
-                /* Check v4-mapped */
-                if (memcmp(si->local_addr6, v4mapped, 12) == 0 &&
-                    memcmp(si->remote_addr6, v4mapped, 12) == 0) {
-                    uint32_t la4, ra4;
-                    memcpy(&la4, si->local_addr6 + 12, 4);
-                    memcpy(&ra4, si->remote_addr6 + 12, 4);
-                    if (la4 == sio->laddr &&
-                        si->local_port6 == sio->lport &&
-                        ra4 == sio->raddr &&
-                        si->remote_port6 == bpf_rport_host)
-                        matched = 1;
+        int speed_found = 0;
+
+        if (si->kind == BSOCK_TCP || si->kind == BSOCK_TCP6) {
+            /* Check INET_DIAG cache first (already refreshed above) */
+            pthread_mutex_lock(&g_tcp_cache_mutex);
+            tcp_cache_entry_t *ce = tcpcache_get(inodes[i]);
+            if (ce && (ce->delta_send || ce->delta_recv)) {
+                s->send_delta = ce->delta_send;
+                s->recv_delta = ce->delta_recv;
+                s->total      = ce->delta_send + ce->delta_recv;
+                speed_found   = 1;
+            }
+            pthread_mutex_unlock(&g_tcp_cache_mutex);
+
+            /* pidfd fallback when INET_DIAG unavailable */
+            if (!speed_found && !g_inet_diag_available) {
+                int is_connected = (si->kind == BSOCK_TCP)
+                    ? (si->remote_addr != 0 || si->remote_port != 0)
+                    : (memcmp(si->remote_addr6, zeroes, 16) != 0 ||
+                       si->remote_port6 != 0);
+                if (is_connected) {
+                    uint64_t acked = 0, received = 0;
+                    if (tcp_info_probe(inode_pids[i], inode_fdnums[i],
+                                       &acked, &received)) {
+                        pthread_mutex_lock(&g_tcp_cache_mutex);
+                        tcpcache_update(inodes[i], acked, received);
+                        tcp_cache_entry_t *ce2 = tcpcache_get(inodes[i]);
+                        if (ce2) {
+                            s->send_delta = ce2->delta_send;
+                            s->recv_delta = ce2->delta_recv;
+                            s->total      = ce2->delta_send + ce2->delta_recv;
+                        }
+                        pthread_mutex_unlock(&g_tcp_cache_mutex);
+                        speed_found = 1;
+                    }
                 }
             }
-            if (matched) {
-                s->send_delta = sio->delta_send;
-                s->recv_delta = sio->delta_recv;
-                s->total = sio->delta_send + sio->delta_recv;
-                break;
+        }
+
+        /* eBPF fallback: UDP4/UDP6 data + any socket missed above.
+         * Match by inode (primary) — works for all protocols/address families.
+         * Fall back to IPv4 4-tuple if the inode is unavailable (old events). */
+        if (!speed_found) {
+            for (size_t k = 0; k < sock_io_count; k++) {
+                const fdmon_sock_io_t *sio = &sock_io[k];
+                int matched = 0;
+
+                if (sio->inode && sio->inode == inodes[i]) {
+                    /* Inode match — works for UDP4, UDP6, TCP6, everything */
+                    matched = 1;
+                } else if (!sio->inode) {
+                    /* Legacy fallback: IPv4 4-tuple */
+                    uint16_t bpf_rport_host = ntohs(sio->rport);
+                    if ((si->kind == BSOCK_TCP || si->kind == BSOCK_UDP) &&
+                        si->local_addr == sio->laddr &&
+                        si->local_port == sio->lport &&
+                        si->remote_addr == sio->raddr &&
+                        si->remote_port == bpf_rport_host)
+                        matched = 1;
+                }
+
+                if (matched) {
+                    s->send_delta = sio->delta_send;
+                    s->recv_delta = sio->delta_recv;
+                    s->total = sio->delta_send + sio->delta_recv;
+                    break;
+                }
             }
         }
 
@@ -1151,6 +1418,7 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
 
     free(inodes);
     free(inode_pids);
+    free(inode_fdnums);
     free(sock_io);
     bsock_table_free(&socktbl);
 

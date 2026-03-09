@@ -479,14 +479,19 @@ void rebuild_audio_filter_store(ui_ctx_t *ctx)
         GtkTreeModel *old_model = NULL;
         GtkTreeIter sel_iter;
         if (sel && gtk_tree_selection_get_selected(sel, &old_model, &sel_iter)) {
-            GtkTreeIter child_iter;
-            gtk_tree_model_sort_convert_iter_to_child_iter(
-                ctx->sort_model, &child_iter, &sel_iter);
-            GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
-                ctx->sort_model);
-            gint pid_val;
-            gtk_tree_model_get(child_model, &child_iter, COL_PID, &pid_val, -1);
-            sel_pid = (pid_t)pid_val;
+            /* old_model is the model the iter belongs to — use it directly
+             * rather than ctx->sort_model, which may differ if the store
+             * was already replaced by a previous rebuild call. */
+            if (GTK_IS_TREE_MODEL_SORT(old_model)) {
+                GtkTreeIter child_iter;
+                gtk_tree_model_sort_convert_iter_to_child_iter(
+                    GTK_TREE_MODEL_SORT(old_model), &child_iter, &sel_iter);
+                GtkTreeModel *child_model = gtk_tree_model_sort_get_model(
+                    GTK_TREE_MODEL_SORT(old_model));
+                gint pid_val;
+                gtk_tree_model_get(child_model, &child_iter, COL_PID, &pid_val, -1);
+                sel_pid = (pid_t)pid_val;
+            }
         }
     }
 

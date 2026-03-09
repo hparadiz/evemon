@@ -65,6 +65,7 @@ struct fdmon_bpf_event {
             uint32_t raddr;
             uint16_t lport;
             uint16_t rport;
+            uint64_t inode;  /* socket inode — primary match key */
         } net;
         struct {
             uint32_t len;
@@ -100,6 +101,14 @@ typedef struct {
     struct bpf_link       *link_tcp_sendmsg;
     struct bpf_link       *link_tcp_recvmsg_entry;
     struct bpf_link       *link_tcp_recvmsg_ret;
+    /* UDP kprobes — same pattern as TCP, no root required */
+    struct bpf_link       *link_udp_sendmsg;
+    struct bpf_link       *link_udp_recvmsg_entry;
+    struct bpf_link       *link_udp_recvmsg_ret;
+    /* udpv6_sendmsg / udpv6_recvmsg — separate kernel functions for IPv6 UDP */
+    struct bpf_link       *link_udpv6_sendmsg;
+    struct bpf_link       *link_udpv6_recvmsg_entry;
+    struct bpf_link       *link_udpv6_recvmsg_ret;
     /* sched_process_exec tracepoint for orphan-stdout detection */
     struct bpf_link       *link_sched_exec;
     /* sched_process_fork: inherit monitored fds into child immediately */
@@ -377,6 +386,7 @@ static void handle_event(void *cookie, int cpu, void *data, __u32 size)
         submit_sock_event(ctx, (pid_t)ev->pid,
                           ev->net.laddr, ev->net.lport,
                           ev->net.raddr, ev->net.rport,
+                          ev->net.inode,
                           ev->net.bytes,
                           ev->type == FDMON_BPF_NET_SEND);
         return;
@@ -595,6 +605,54 @@ int fdmon_ebpf_init(struct fdmon_ctx *ctx)
             st->link_tcp_recvmsg_ret = NULL;
     }
 
+    /* Attach udp_sendmsg kprobe (optional – non-fatal if unavailable) */
+    prog = bpf_object__find_program_by_name(st->obj, "trace_udp_sendmsg");
+    if (prog) {
+        st->link_udp_sendmsg = bpf_program__attach(prog);
+        if (!st->link_udp_sendmsg || libbpf_get_error(st->link_udp_sendmsg))
+            st->link_udp_sendmsg = NULL;
+    }
+
+    /* Attach udp_recvmsg kprobe entry (stashes sock pointer) */
+    prog = bpf_object__find_program_by_name(st->obj, "trace_udp_recvmsg");
+    if (prog) {
+        st->link_udp_recvmsg_entry = bpf_program__attach(prog);
+        if (!st->link_udp_recvmsg_entry || libbpf_get_error(st->link_udp_recvmsg_entry))
+            st->link_udp_recvmsg_entry = NULL;
+    }
+
+    /* Attach udp_recvmsg kretprobe (captures bytes + 4-tuple) */
+    prog = bpf_object__find_program_by_name(st->obj, "trace_udp_recvmsg_ret");
+    if (prog) {
+        st->link_udp_recvmsg_ret = bpf_program__attach(prog);
+        if (!st->link_udp_recvmsg_ret || libbpf_get_error(st->link_udp_recvmsg_ret))
+            st->link_udp_recvmsg_ret = NULL;
+    }
+
+    /* Attach udpv6_sendmsg kprobe (IPv6 UDP send takes a different function) */
+    prog = bpf_object__find_program_by_name(st->obj, "trace_udpv6_sendmsg");
+    if (prog) {
+        st->link_udpv6_sendmsg = bpf_program__attach(prog);
+        if (!st->link_udpv6_sendmsg || libbpf_get_error(st->link_udpv6_sendmsg))
+            st->link_udpv6_sendmsg = NULL;
+    }
+
+    /* Attach udpv6_recvmsg kprobe entry */
+    prog = bpf_object__find_program_by_name(st->obj, "trace_udpv6_recvmsg");
+    if (prog) {
+        st->link_udpv6_recvmsg_entry = bpf_program__attach(prog);
+        if (!st->link_udpv6_recvmsg_entry || libbpf_get_error(st->link_udpv6_recvmsg_entry))
+            st->link_udpv6_recvmsg_entry = NULL;
+    }
+
+    /* Attach udpv6_recvmsg kretprobe */
+    prog = bpf_object__find_program_by_name(st->obj, "trace_udpv6_recvmsg_ret");
+    if (prog) {
+        st->link_udpv6_recvmsg_ret = bpf_program__attach(prog);
+        if (!st->link_udpv6_recvmsg_ret || libbpf_get_error(st->link_udpv6_recvmsg_ret))
+            st->link_udpv6_recvmsg_ret = NULL;
+    }
+
     /* Attach sched_process_exec tracepoint (optional – for orphan-stdout mode).
      * Failure here is non-fatal; orphan_stdout_mode simply won't auto-fire. */
     prog = bpf_object__find_program_by_name(st->obj, "trace_sched_process_exec");
@@ -649,6 +707,12 @@ int fdmon_ebpf_init(struct fdmon_ctx *ctx)
 fail:
     if (st) {
         if (st->pb)               perf_buffer__free(st->pb);
+        if (st->link_udpv6_recvmsg_ret)     bpf_link__destroy(st->link_udpv6_recvmsg_ret);
+        if (st->link_udpv6_recvmsg_entry)   bpf_link__destroy(st->link_udpv6_recvmsg_entry);
+        if (st->link_udpv6_sendmsg)         bpf_link__destroy(st->link_udpv6_sendmsg);
+        if (st->link_udp_recvmsg_ret)   bpf_link__destroy(st->link_udp_recvmsg_ret);
+        if (st->link_udp_recvmsg_entry) bpf_link__destroy(st->link_udp_recvmsg_entry);
+        if (st->link_udp_sendmsg)       bpf_link__destroy(st->link_udp_sendmsg);
         if (st->link_tcp_recvmsg_ret)   bpf_link__destroy(st->link_tcp_recvmsg_ret);
         if (st->link_tcp_recvmsg_entry) bpf_link__destroy(st->link_tcp_recvmsg_entry);
         if (st->link_tcp_sendmsg) bpf_link__destroy(st->link_tcp_sendmsg);
@@ -685,6 +749,12 @@ void fdmon_ebpf_destroy(struct fdmon_ctx *ctx)
     pthread_mutex_destroy(&st->watched_parent_lock);
 
     if (st->pb)                     perf_buffer__free(st->pb);
+    if (st->link_udpv6_recvmsg_ret)    bpf_link__destroy(st->link_udpv6_recvmsg_ret);
+    if (st->link_udpv6_recvmsg_entry)  bpf_link__destroy(st->link_udpv6_recvmsg_entry);
+    if (st->link_udpv6_sendmsg)        bpf_link__destroy(st->link_udpv6_sendmsg);
+    if (st->link_udp_recvmsg_ret)   bpf_link__destroy(st->link_udp_recvmsg_ret);
+    if (st->link_udp_recvmsg_entry) bpf_link__destroy(st->link_udp_recvmsg_entry);
+    if (st->link_udp_sendmsg)       bpf_link__destroy(st->link_udp_sendmsg);
     if (st->link_tcp_recvmsg_ret)   bpf_link__destroy(st->link_tcp_recvmsg_ret);
     if (st->link_tcp_recvmsg_entry) bpf_link__destroy(st->link_tcp_recvmsg_entry);
     if (st->link_tcp_sendmsg)       bpf_link__destroy(st->link_tcp_sendmsg);

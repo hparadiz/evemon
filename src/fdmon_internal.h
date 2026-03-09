@@ -65,6 +65,7 @@ typedef struct {
     uint32_t raddr;          /* remote IPv4 (network order)        */
     uint16_t lport;          /* local  port (host order)           */
     uint16_t rport;          /* remote port (network order)        */
+    uint64_t inode;          /* socket inode — primary match key   */
     uint64_t send_bytes;
     uint64_t recv_bytes;
     uint64_t prev_send;
@@ -122,6 +123,7 @@ void submit_net_event(fdmon_ctx_t *ctx, pid_t tgid, uint32_t bytes,
 void submit_sock_event(fdmon_ctx_t *ctx, pid_t tgid,
                        uint32_t laddr, uint16_t lport,
                        uint32_t raddr, uint16_t rport,
+                       uint64_t inode,
                        uint32_t bytes, int is_send);
 
 /* Dynamic write monitoring helpers (eBPF backend) */

@@ -469,6 +469,28 @@ typedef struct {
                               GtkDrawingArea *draw_area,
                               unsigned theme_index);
 
+    /*
+     * Set the charting (spectrogram) colour theme globally — applies to
+     * all active spectrogram instances, persists the choice in settings,
+     * and syncs the View → Appearance → Charting Theme menu radio items.
+     * theme_index maps to spectro_theme_t (0=Classic … 5=Vaporwave).
+     */
+    void (*set_charting_theme)(void *host_ctx, unsigned theme_index);
+
+    /*
+     * Register a callback to be invoked whenever the charting theme
+     * changes (e.g. from the menu bar).  This lets plugin UIs keep
+     * their own theme selector in sync with the global setting.
+     * Pass NULL to unregister.  Only one callback per plugin instance.
+     *
+     * cb:        called with (plugin_ctx, theme_index) on the GTK main thread.
+     * plugin_ctx: opaque pointer passed back as the first argument to cb.
+     */
+    void (*charting_theme_notify)(void *host_ctx,
+                                  void (*cb)(void *plugin_ctx,
+                                             unsigned theme_index),
+                                  void *plugin_ctx);
+
     /* ── Event bus ─────────────────────────────────────────── */
 
     /*

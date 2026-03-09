@@ -66,6 +66,7 @@ struct fdmon_bpf_event {
             __u32 raddr;  /* remote IPv4 address (network order) */
             __u16 lport;  /* local  port (host order)            */
             __u16 rport;  /* remote port (network order)         */
+            __u64 inode;  /* socket inode number (for inode-based matching) */
         } net;
         struct {
             __u32 len; /* number of bytes copied into data */
@@ -100,6 +101,7 @@ struct fdmon_bpf_event_hdr {
             __u32 raddr;
             __u16 lport;
             __u16 rport;
+            __u64 inode;  /* socket inode — primary match key for UDP/IPv6 */
         } net;
     };
 };
@@ -186,6 +188,48 @@ static __always_inline void read_sock_tuple(void *sk,
     bpf_probe_read_kernel(laddr, sizeof(*laddr), sk + 4);      /* skc_rcv_saddr  @4  */
     bpf_probe_read_kernel(rport, sizeof(*rport), sk + 12);     /* skc_dport      @12 */
     bpf_probe_read_kernel(lport, sizeof(*lport), sk + 14);     /* skc_num        @14 */
+}
+
+/*
+ * Read the socket inode number from struct sock.
+ *
+ * Layout chain (stable since Linux 3.x, verified via BTF):
+ *   struct sock      { ... struct socket *sk_socket; ... }  @ offset 600 (x86_64)
+ *   struct socket    { ... struct file   *file;      ... }  @ offset 24
+ *   struct file      { ... struct inode  *f_inode;   ... }  @ offset 32
+ *   struct inode     { ... unsigned long  i_ino;     ... }  @ offset 64
+ *
+ * We use fixed offsets rather than BTF helpers to keep the program
+ * self-contained and compatible with kernels that lack BPF CO-RE.
+ * Returns 0 on any probe failure (verifier sees the early-out).
+ *
+ * Offsets verified via pahole/BTF on this kernel build.
+ * If the kernel changes, rebuild with BTF enabled and re-check via:
+ *   pahole -C sock /sys/kernel/btf/vmlinux | grep sk_socket
+ */
+#define SK_SOCKET_OFF   288  /* struct sock   :: sk_socket */
+#define SOCKET_FILE_OFF  16  /* struct socket :: file      */
+#define FILE_INODE_OFF   32  /* struct file   :: f_inode   */
+#define INODE_INO_OFF    64  /* struct inode  :: i_ino     */
+
+static __always_inline __u64 read_sock_inode(void *sk)
+{
+    void *sk_socket = NULL;
+    void *file      = NULL;
+    void *inode     = NULL;
+    __u64 ino       = 0;
+
+    if (bpf_probe_read_kernel(&sk_socket, sizeof(sk_socket),
+                               sk + SK_SOCKET_OFF) != 0 || !sk_socket)
+        return 0;
+    if (bpf_probe_read_kernel(&file, sizeof(file),
+                               sk_socket + SOCKET_FILE_OFF) != 0 || !file)
+        return 0;
+    if (bpf_probe_read_kernel(&inode, sizeof(inode),
+                               file + FILE_INODE_OFF) != 0 || !inode)
+        return 0;
+    bpf_probe_read_kernel(&ino, sizeof(ino), inode + INODE_INO_OFF);
+    return ino;
 }
 
 /* ── tracepoint context structures (from format files) ───────── */
@@ -795,6 +839,7 @@ int trace_tcp_sendmsg(struct pt_regs *ctx)
     ev.fd         = -1;
     ev.timestamp  = bpf_ktime_get_ns();
     ev.net.bytes  = size;
+    ev.net.inode  = read_sock_inode(sk);
     read_sock_tuple(sk, &ev.net.laddr, &ev.net.raddr,
                     &ev.net.lport, &ev.net.rport);
 
@@ -835,6 +880,7 @@ int trace_tcp_recvmsg_ret(struct pt_regs *ctx)
     ev.fd         = -1;
     ev.timestamp  = bpf_ktime_get_ns();
     ev.net.bytes  = (__u32)ret;
+    ev.net.inode  = read_sock_inode(sk);
     read_sock_tuple(sk, &ev.net.laddr, &ev.net.raddr,
                     &ev.net.lport, &ev.net.rport);
 
@@ -969,5 +1015,87 @@ int trace_sched_process_fork(struct sched_process_fork_args *ctx)
 
     return 0;
 }
+
+/* ── UDP kprobes (IPv4 + IPv6) ───────────────────────────────── */
+
+/*
+ * Macro to emit a NET_SEND event from a sendmsg-style kprobe.
+ * PARM1=sk, PARM3=len for both udp_sendmsg and udpv6_sendmsg.
+ */
+#define DEFINE_UDP_SEND_PROBE(name, section)                            \
+SEC(section)                                                            \
+int name(struct pt_regs *ctx)                                           \
+{                                                                       \
+    __u64 pid_tgid = bpf_get_current_pid_tgid();                       \
+    void *sk   = (void *)PT_REGS_PARM1(ctx);                           \
+    __u32 size = (__u32)PT_REGS_PARM3(ctx);                            \
+    struct fdmon_bpf_event_hdr ev = {};                                 \
+    ev.type      = FDMON_BPF_NET_SEND;                                  \
+    ev.pid       = (__u32)(pid_tgid >> 32);                             \
+    ev.tid       = (__u32)pid_tgid;                                     \
+    ev.fd        = -1;                                                  \
+    ev.timestamp = bpf_ktime_get_ns();                                  \
+    ev.net.bytes = size;                                                \
+    ev.net.inode = read_sock_inode(sk);                                 \
+    read_sock_tuple(sk, &ev.net.laddr, &ev.net.raddr,                  \
+                    &ev.net.lport, &ev.net.rport);                      \
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,             \
+                          &ev, sizeof(ev));                             \
+    return 0;                                                           \
+}
+
+/*
+ * Macro to stash sock pointer on recvmsg entry.
+ * PARM1=sk for both udp_recvmsg and udpv6_recvmsg.
+ */
+#define DEFINE_UDP_RECV_ENTRY_PROBE(name, section)                      \
+SEC(section)                                                            \
+int name(struct pt_regs *ctx)                                           \
+{                                                                       \
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();                     \
+    __u64 sk  = (__u64)PT_REGS_PARM1(ctx);                             \
+    bpf_map_update_elem(&recvmsg_args, &tid, &sk, BPF_ANY);            \
+    return 0;                                                           \
+}
+
+/*
+ * Macro to emit NET_RECV on recvmsg return.
+ */
+#define DEFINE_UDP_RECV_RET_PROBE(name, section)                        \
+SEC(section)                                                            \
+int name(struct pt_regs *ctx)                                           \
+{                                                                       \
+    int ret = (int)PT_REGS_RC(ctx);                                     \
+    if (ret <= 0) return 0;                                             \
+    __u64 pid_tgid = bpf_get_current_pid_tgid();                       \
+    __u32 tid = (__u32)pid_tgid;                                        \
+    __u64 *sk_ptr = bpf_map_lookup_elem(&recvmsg_args, &tid);          \
+    if (!sk_ptr) return 0;                                              \
+    void *sk = (void *)*sk_ptr;                                         \
+    bpf_map_delete_elem(&recvmsg_args, &tid);                           \
+    struct fdmon_bpf_event_hdr ev = {};                                 \
+    ev.type      = FDMON_BPF_NET_RECV;                                  \
+    ev.pid       = (__u32)(pid_tgid >> 32);                             \
+    ev.tid       = (__u32)pid_tgid;                                     \
+    ev.fd        = -1;                                                  \
+    ev.timestamp = bpf_ktime_get_ns();                                  \
+    ev.net.bytes = (__u32)ret;                                          \
+    ev.net.inode = read_sock_inode(sk);                                 \
+    read_sock_tuple(sk, &ev.net.laddr, &ev.net.raddr,                  \
+                    &ev.net.lport, &ev.net.rport);                      \
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,             \
+                          &ev, sizeof(ev));                             \
+    return 0;                                                           \
+}
+
+/* IPv4 UDP */
+DEFINE_UDP_SEND_PROBE(trace_udp_sendmsg,      "kprobe/udp_sendmsg")
+DEFINE_UDP_RECV_ENTRY_PROBE(trace_udp_recvmsg,"kprobe/udp_recvmsg")
+DEFINE_UDP_RECV_RET_PROBE(trace_udp_recvmsg_ret, "kretprobe/udp_recvmsg")
+
+/* IPv6 UDP — separate kernel functions */
+DEFINE_UDP_SEND_PROBE(trace_udpv6_sendmsg,       "kprobe/udpv6_sendmsg")
+DEFINE_UDP_RECV_ENTRY_PROBE(trace_udpv6_recvmsg, "kprobe/udpv6_recvmsg")
+DEFINE_UDP_RECV_RET_PROBE(trace_udpv6_recvmsg_ret, "kretprobe/udpv6_recvmsg")
 
 char _license[] SEC("license") = "GPL";

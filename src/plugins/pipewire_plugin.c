@@ -670,7 +670,13 @@ static void on_row_activated(GtkTreeView *view, GtkTreePath *path,
                                  (uint32_t)node_id);
         /* Re-apply the currently selected theme so switching sources
          * doesn't silently reset it to the default (Classic). */
-        if (ctx->host->spectro_set_theme && ctx->spectro_theme_combo) {
+        if (ctx->host->set_charting_theme && ctx->spectro_theme_combo) {
+            int active = gtk_combo_box_get_active(
+                GTK_COMBO_BOX(ctx->spectro_theme_combo));
+            if (active >= 0)
+                ctx->host->set_charting_theme(ctx->host->host_ctx,
+                    (unsigned)active);
+        } else if (ctx->host->spectro_set_theme && ctx->spectro_theme_combo) {
             int active = gtk_combo_box_get_active(
                 GTK_COMBO_BOX(ctx->spectro_theme_combo));
             if (active >= 0)
@@ -686,21 +692,123 @@ static void on_row_activated(GtkTreeView *view, GtkTreePath *path,
 
 /* ── spectrogram theme selector callback ─────────────────────── */
 
+static void on_spectro_theme_changed(GtkComboBox *combo, gpointer data);
+
+/* Called by the host when the charting theme changes externally (e.g. menu bar) */
+static void on_charting_theme_notify(void *plugin_ctx, unsigned theme_index)
+{
+    pw_ctx_t *ctx = plugin_ctx;
+    if (!ctx->spectro_theme_combo) return;
+    int current = gtk_combo_box_get_active(GTK_COMBO_BOX(ctx->spectro_theme_combo));
+    if (current == (int)theme_index) return; /* already in sync */
+    g_signal_handlers_block_by_func(
+        ctx->spectro_theme_combo,
+        G_CALLBACK(on_spectro_theme_changed), ctx);
+    gtk_combo_box_set_active(
+        GTK_COMBO_BOX(ctx->spectro_theme_combo), (gint)theme_index);
+    g_signal_handlers_unblock_by_func(
+        ctx->spectro_theme_combo,
+        G_CALLBACK(on_spectro_theme_changed), ctx);
+}
+
 static void on_spectro_theme_changed(GtkComboBox *combo, gpointer data)
 {
     pw_ctx_t *ctx = data;
-    if (!ctx->host || !ctx->host->spectro_set_theme) return;
+    if (!ctx->host) return;
     int active = gtk_combo_box_get_active(combo);
     if (active < 0) return;
-    ctx->host->spectro_set_theme(ctx->host->host_ctx,
-                                  GTK_DRAWING_AREA(ctx->spectro_draw),
-                                  (unsigned)active);
-    /* Persist the selection so it survives a restart */
-    evemon_settings_t *s = settings_get();
-    if (s) {
-        s->spectro_theme = active;
-        settings_save();
+    if (ctx->host->set_charting_theme) {
+        ctx->host->set_charting_theme(ctx->host->host_ctx, (unsigned)active);
+    } else if (ctx->host->spectro_set_theme) {
+        ctx->host->spectro_set_theme(ctx->host->host_ctx,
+                                     GTK_DRAWING_AREA(ctx->spectro_draw),
+                                     (unsigned)active);
+        evemon_settings_t *s = settings_get();
+        if (s) { s->spectro_theme = active; settings_save(); }
     }
+}
+
+static const char *spectro_theme_names[] = {
+    "Classic", "Heat", "Cool", "Greyscale", "Neon", "Vaporwave"
+};
+#define N_SPECTRO_THEMES 6
+
+typedef struct {
+    pw_ctx_t *ctx;
+    int       theme_index;
+} spectro_theme_popup_data_t;
+
+static void on_spectro_theme_popup_selected(GtkCheckMenuItem *item, gpointer data)
+{
+    if (!gtk_check_menu_item_get_active(item))
+        return;
+    spectro_theme_popup_data_t *d = data;
+    pw_ctx_t *ctx = d->ctx;
+
+    /* Apply the theme directly — mirrors on_spectro_theme_changed */
+    if (ctx->host) {
+        if (ctx->host->set_charting_theme)
+            ctx->host->set_charting_theme(ctx->host->host_ctx,
+                                          (unsigned)d->theme_index);
+        else if (ctx->host->spectro_set_theme)
+            ctx->host->spectro_set_theme(ctx->host->host_ctx,
+                                         GTK_DRAWING_AREA(ctx->spectro_draw),
+                                         (unsigned)d->theme_index);
+    }
+
+    /* Sync the combo box without re-firing on_spectro_theme_changed */
+    if (ctx->spectro_theme_combo) {
+        g_signal_handlers_block_by_func(
+            ctx->spectro_theme_combo,
+            G_CALLBACK(on_spectro_theme_changed), ctx);
+        gtk_combo_box_set_active(
+            GTK_COMBO_BOX(ctx->spectro_theme_combo), d->theme_index);
+        g_signal_handlers_unblock_by_func(
+            ctx->spectro_theme_combo,
+            G_CALLBACK(on_spectro_theme_changed), ctx);
+    }
+}
+
+static gboolean on_spectro_button_press(GtkWidget *widget,
+                                        GdkEventButton *ev,
+                                        gpointer data)
+{
+    (void)widget;
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 3)
+        return FALSE;
+
+    pw_ctx_t *ctx = data;
+    int current = ctx->spectro_theme_combo
+                  ? gtk_combo_box_get_active(
+                        GTK_COMBO_BOX(ctx->spectro_theme_combo))
+                  : 0;
+    if (current < 0) current = 0;
+
+    GtkWidget *menu = gtk_menu_new();
+    GtkWidget *header_mi = gtk_menu_item_new_with_label("Charting Theme");
+    gtk_widget_set_sensitive(header_mi, FALSE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), header_mi);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu),
+                          gtk_separator_menu_item_new());
+
+    static spectro_theme_popup_data_t popup_data[N_SPECTRO_THEMES];
+    GSList *group = NULL;
+    for (int i = 0; i < N_SPECTRO_THEMES; i++) {
+        GtkWidget *item = gtk_radio_menu_item_new_with_label(
+            group, spectro_theme_names[i]);
+        group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(item));
+        if (i == current)
+            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item), TRUE);
+        popup_data[i] = (spectro_theme_popup_data_t){ ctx, i };
+        g_signal_connect(item, "toggled",
+                         G_CALLBACK(on_spectro_theme_popup_selected),
+                         &popup_data[i]);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+    return TRUE;
 }
 
 /* ── spectrogram placeholder draw ────────────────────────────── */
@@ -1217,6 +1325,9 @@ static GtkWidget *pw_create_widget(void *opaque)
     gtk_box_pack_start(GTK_BOX(spectro_header), spectro_label,
                        TRUE, TRUE, 2);
 
+    /* Hidden combo: not added to the widget tree; used only as the
+     * backing store for the current theme index so right-click popup
+     * and menubar items stay in sync. */
     ctx->spectro_theme_combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(
         GTK_COMBO_BOX_TEXT(ctx->spectro_theme_combo), "Classic");
@@ -1236,12 +1347,14 @@ static GtkWidget *pw_create_widget(void *opaque)
                     ? s->spectro_theme : 0;
         gtk_combo_box_set_active(GTK_COMBO_BOX(ctx->spectro_theme_combo), saved);
     }
-    gtk_widget_set_tooltip_text(ctx->spectro_theme_combo, "Spectrogram colour theme");
-    gtk_box_pack_end(GTK_BOX(spectro_header), ctx->spectro_theme_combo,
-                     FALSE, FALSE, 0);
-
     g_signal_connect(ctx->spectro_theme_combo, "changed",
                      G_CALLBACK(on_spectro_theme_changed), ctx);
+    g_object_ref_sink(ctx->spectro_theme_combo); /* own the floating widget */
+
+    /* Right-click on the spectrogram to pick a charting theme */
+    gtk_widget_add_events(ctx->spectro_draw, GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(ctx->spectro_draw, "button-press-event",
+                     G_CALLBACK(on_spectro_button_press), ctx);
 
     gtk_box_pack_start(GTK_BOX(spectro_box), spectro_header,
                        FALSE, FALSE, 2);
@@ -1273,6 +1386,10 @@ static void pw_activate(void *opaque,
         ctx->event_sub_id = services->subscribe(services->host_ctx,
                             EVEMON_EVENT_ALBUM_ART_UPDATED,
                             pw_on_album_art_event, ctx);
+    /* Register for external charting-theme changes (e.g. menu bar) */
+    if (services->charting_theme_notify)
+        services->charting_theme_notify(services->host_ctx,
+                                        on_charting_theme_notify, ctx);
 }
 
 static void pw_update(void *opaque, const evemon_proc_data_t *data)
@@ -1601,6 +1718,9 @@ static void pw_destroy(void *opaque)
         ctx->host->unsubscribe(ctx->host->host_ctx, ctx->event_sub_id);
         ctx->event_sub_id = 0;
     }
+    /* Unregister charting-theme notification to avoid dangling callback */
+    if (ctx->host && ctx->host->charting_theme_notify)
+        ctx->host->charting_theme_notify(ctx->host->host_ctx, NULL, ctx);
 
     if (ctx->meter_timer) {
         g_source_remove(ctx->meter_timer);

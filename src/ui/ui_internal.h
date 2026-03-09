@@ -187,6 +187,21 @@ typedef enum {
     PANEL_POS_RIGHT,
 } panel_position_t;
 
+/* Number of spectrogram colour themes — must match spectro_theme_t below */
+#define SPECTRO_THEME_COUNT 6
+
+/* Spectrogram colour theme — declared unconditionally so charting-theme
+ * menu infrastructure works even when PipeWire is not available. */
+typedef enum {
+    SPECTRO_THEME_CLASSIC = 0,
+    SPECTRO_THEME_HEAT,
+    SPECTRO_THEME_COOL,
+    SPECTRO_THEME_GREYSCALE,
+    SPECTRO_THEME_NEON,
+    SPECTRO_THEME_VIRIDIS,      /* vaporwave: navy → purple → pink → cyan → white */
+    SPECTRO_NUM_THEMES
+} spectro_theme_t;
+
 /* ── per-UI state ────────────────────────────────────────────── */
 
 typedef struct {
@@ -287,6 +302,19 @@ typedef struct {
     size_t              spectro_count;
     gboolean            sb_spectro_user_shown; /* user explicitly showed spectrogram */
 #endif
+
+    /* Charting Theme menu radio items — kept so right-click and menubar
+     * stay in sync.  One entry per spectro_theme_t value.
+     * Unconditional: charting themes are not PipeWire-specific. */
+    GtkCheckMenuItem   *charting_theme_items[SPECTRO_THEME_COUNT];
+
+    /* Plugins that registered a charting-theme-change notification callback */
+#define CHARTING_NOTIFY_MAX 16
+    struct {
+        void (*cb)(void *plugin_ctx, unsigned theme_index);
+        void  *plugin_ctx;
+    } charting_notify[CHARTING_NOTIFY_MAX];
+    int charting_notify_count;
 
     /* middle-click autoscroll */
     gboolean            autoscroll;
@@ -397,16 +425,6 @@ void pw_meter_read(ui_ctx_t *ctx, uint32_t node_id, int *level_l, int *level_r);
 GtkCellRenderer *pw_cell_renderer_meter_new(void);
 
 /* spectrogram – real-time audio FFT visualisation */
-typedef enum {
-    SPECTRO_THEME_CLASSIC = 0,
-    SPECTRO_THEME_HEAT,
-    SPECTRO_THEME_COOL,
-    SPECTRO_THEME_GREYSCALE,
-    SPECTRO_THEME_NEON,
-    SPECTRO_THEME_VIRIDIS,      /* vaporwave: navy → purple → pink → cyan → white */
-    SPECTRO_NUM_THEMES
-} spectro_theme_t;
-
 void spectrogram_start_for_node(ui_ctx_t *ctx, GtkDrawingArea *draw_area,
                                 uint32_t node_id);
 void spectrogram_stop(ui_ctx_t *ctx, GtkDrawingArea *draw_area);

@@ -1686,6 +1686,94 @@ static void on_theme_selected(GtkCheckMenuItem *item, gpointer data)
     settings_save();
 }
 
+/* ── spectrogram / charting colour theme ────────────────────── */
+
+static const char *charting_theme_labels[SPECTRO_THEME_COUNT] = {
+    "Classic", "Heat", "Cool", "Greyscale", "Neon", "Vaporwave"
+};
+
+typedef struct {
+    ui_ctx_t       *ctx;
+    spectro_theme_t theme;
+} charting_theme_data_t;
+
+static charting_theme_data_t charting_theme_data[SPECTRO_THEME_COUNT];
+
+/* Forward declaration — defined after apply_charting_theme */
+static void on_charting_theme_selected(GtkCheckMenuItem *item, gpointer data);
+
+static void apply_charting_theme(ui_ctx_t *ctx, spectro_theme_t theme)
+{
+#ifdef HAVE_PIPEWIRE
+    /* Apply to every active spectrogram instance */
+    for (size_t i = 0; i < ctx->spectro_count; i++) {
+        GtkDrawingArea *da = GTK_DRAWING_AREA(ctx->spectro_instances[i].draw_area);
+        spectrogram_set_theme(ctx, da, theme);
+    }
+#endif
+    /* Persist */
+    evemon_settings_t *s = settings_get();
+    if (s) {
+        s->spectro_theme = (int)theme;
+        settings_save();
+    }
+    /* Sync menubar radio buttons — block signals to avoid re-entrant call */
+    if (ctx->charting_theme_items[theme]) {
+        for (int _i = 0; _i < SPECTRO_THEME_COUNT; _i++)
+            if (ctx->charting_theme_items[_i])
+                g_signal_handlers_block_by_func(
+                    ctx->charting_theme_items[_i],
+                    G_CALLBACK(on_charting_theme_selected),
+                    &charting_theme_data[_i]);
+        gtk_check_menu_item_set_active(ctx->charting_theme_items[theme], TRUE);
+        for (int _i = 0; _i < SPECTRO_THEME_COUNT; _i++)
+            if (ctx->charting_theme_items[_i])
+                g_signal_handlers_unblock_by_func(
+                    ctx->charting_theme_items[_i],
+                    G_CALLBACK(on_charting_theme_selected),
+                    &charting_theme_data[_i]);
+    }
+    /* Notify plugins that registered a charting-theme callback */
+    for (int _i = 0; _i < ctx->charting_notify_count; _i++)
+        if (ctx->charting_notify[_i].cb)
+            ctx->charting_notify[_i].cb(ctx->charting_notify[_i].plugin_ctx,
+                                        (unsigned)theme);
+}
+
+static void on_charting_theme_selected(GtkCheckMenuItem *item, gpointer data)
+{
+    if (!gtk_check_menu_item_get_active(item))
+        return;
+    charting_theme_data_t *d = data;
+    apply_charting_theme(d->ctx, d->theme);
+}
+
+/*
+ * Build a "Charting Theme" submenu with radio items for each spectro theme.
+ */
+static GtkWidget *build_charting_theme_submenu(ui_ctx_t *ctx,
+                                               GSList **out_group)
+{
+    GtkWidget *menu = gtk_menu_new();
+    evemon_settings_t *s = settings_get();
+    int saved = (s && s->spectro_theme >= 0 &&
+                 s->spectro_theme < SPECTRO_THEME_COUNT)
+                ? s->spectro_theme : 0;
+
+    GSList *group = NULL;
+    for (int i = 0; i < SPECTRO_THEME_COUNT; i++) {
+        GtkWidget *item = gtk_radio_menu_item_new_with_label(
+            group, charting_theme_labels[i]);
+        group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(item));
+        if (i == saved)
+            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item), TRUE);
+        ctx->charting_theme_items[i] = GTK_CHECK_MENU_ITEM(item);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+    if (out_group) *out_group = group;
+    return menu;
+}
+
 /*
  * Build a "Theme" submenu with radio items for each discovered GTK3 theme.
  * The currently active theme gets the radio bullet.
@@ -1743,8 +1831,10 @@ static char *read_os_release_field(const char *key)
             size_t vlen = strlen(val);
             while (vlen > 0 && (val[vlen - 1] == '\n' || val[vlen - 1] == '\r'))
                 val[--vlen] = '\0';
-            /* Strip surrounding quotes */
-            if (vlen >= 2 && val[0] == '"' && val[vlen - 1] == '"') {
+            /* Strip surrounding quotes (double or single) */
+            if (vlen >= 2 &&
+                ((val[0] == '"'  && val[vlen - 1] == '"') ||
+                 (val[0] == '\'' && val[vlen - 1] == '\''))) {
                 val[vlen - 1] = '\0';
                 val++;
             }
@@ -2807,7 +2897,40 @@ static void host_spectro_set_theme(void *host_ctx,
     ui_ctx_t *c = host_ctx;
     spectrogram_set_theme(c, draw_area, (spectro_theme_t)theme_index);
 }
+
 #endif /* HAVE_PIPEWIRE */
+
+static void host_set_charting_theme(void *host_ctx, unsigned theme_index)
+{
+    ui_ctx_t *c = host_ctx;
+    if (theme_index >= SPECTRO_THEME_COUNT) return;
+    apply_charting_theme(c, (spectro_theme_t)theme_index);
+}
+
+static void host_charting_theme_notify(void *host_ctx,
+                                       void (*cb)(void *plugin_ctx,
+                                                  unsigned theme_index),
+                                       void *plugin_ctx)
+{
+    ui_ctx_t *c = host_ctx;
+    /* Unregister: remove any existing entry for this plugin_ctx */
+    for (int i = 0; i < c->charting_notify_count; i++) {
+        if (c->charting_notify[i].plugin_ctx == plugin_ctx) {
+            /* Shift remaining entries down */
+            for (int j = i; j < c->charting_notify_count - 1; j++)
+                c->charting_notify[j] = c->charting_notify[j + 1];
+            c->charting_notify_count--;
+            break;
+        }
+    }
+    if (!cb) return;
+    /* Register */
+    if (c->charting_notify_count < CHARTING_NOTIFY_MAX) {
+        c->charting_notify[c->charting_notify_count].cb         = cb;
+        c->charting_notify[c->charting_notify_count].plugin_ctx = plugin_ctx;
+        c->charting_notify_count++;
+    }
+}
 
 /* Trampoline: open a plugin in a floating window (callable by plugins) */
 static void host_open_plugin_window(void *host_ctx,
@@ -3690,6 +3813,12 @@ void *ui_thread(void *arg)
                               build_theme_submenu());
     gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), theme_item);
 
+    /* Charting Theme submenu (spectrogram colour) — signals connected
+     * after ctx is initialised below (ctx address is stable: static). */
+    GtkWidget *charting_theme_item = gtk_menu_item_new_with_label("Charting Theme");
+    gtk_menu_shell_append(GTK_MENU_SHELL(appear_menu), charting_theme_item);
+    /* submenu and signal connections deferred until ctx is set up */
+
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), appear_item);
     gtk_menu_shell_append(GTK_MENU_SHELL(menubar), view_item);
 
@@ -3952,6 +4081,8 @@ void *ui_thread(void *arg)
                 hsvc->spectro_get_target = host_spectro_get_target;
                 hsvc->spectro_set_theme  = host_spectro_set_theme;
 #endif
+                hsvc->set_charting_theme     = host_set_charting_theme;
+                hsvc->charting_theme_notify  = host_charting_theme_notify;
                 /* Event bus wiring */
                 hsvc->subscribe         = host_event_subscribe;
                 hsvc->publish           = host_event_publish;
@@ -4220,6 +4351,21 @@ void *ui_thread(void *arg)
     g_signal_connect(font_inc,   "activate", G_CALLBACK(on_font_increase),    &ctx);
     g_signal_connect(font_dec,   "activate", G_CALLBACK(on_font_decrease),    &ctx);
     g_signal_connect(font_reset, "activate", G_CALLBACK(on_font_reset),       &ctx);
+
+    /* Charting Theme submenu — built here so ctx pointer is valid */
+    {
+        GSList *ct_group = NULL;
+        GtkWidget *ct_menu = build_charting_theme_submenu(&ctx, &ct_group);
+        gtk_menu_item_set_submenu(GTK_MENU_ITEM(charting_theme_item), ct_menu);
+        for (int i = 0; i < SPECTRO_THEME_COUNT; i++) {
+            charting_theme_data[i] = (charting_theme_data_t){ &ctx, (spectro_theme_t)i };
+            if (ctx.charting_theme_items[i])
+                g_signal_connect(ctx.charting_theme_items[i], "toggled",
+                                 G_CALLBACK(on_charting_theme_selected),
+                                 &charting_theme_data[i]);
+        }
+        gtk_widget_show_all(ct_menu);
+    }
     g_signal_connect(filter_item,   "activate", G_CALLBACK(on_menu_filter),   &ctx);
     g_signal_connect(goto_pid_item, "activate", G_CALLBACK(on_menu_goto_pid), &ctx);
     g_signal_connect(detail_panel_toggle, "toggled",
