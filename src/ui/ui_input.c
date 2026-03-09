@@ -605,7 +605,10 @@ gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data)
                 filter_cancel_hide_timer(ctx);
                 gtk_entry_set_text(GTK_ENTRY(ctx->filter_entry), "");
                 ctx->filter_text[0] = '\0';
-                switch_to_real_store(ctx);
+                if (ctx->show_audio_only)
+                    rebuild_audio_filter_store(ctx);
+                else
+                    switch_to_real_store(ctx);
                 gtk_widget_hide(ctx->filter_entry);
                 gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
             } else {
