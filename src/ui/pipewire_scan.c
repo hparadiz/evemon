@@ -227,6 +227,7 @@ typedef struct {
     struct pw_proxy *proxy;
     struct spa_hook  listener;
     size_t           node_index;  /* index into watcher->graph.nodes[] */
+    uint32_t         pw_id;       /* PipeWire object ID (stable, for removal) */
     pw_watcher_t    *owner;       /* back-pointer to the watcher */
 } pw_watcher_bound_t;
 
@@ -252,6 +253,12 @@ struct pw_watcher_t {
     pw_watcher_bound_t **bound;
     size_t               bound_count;
     size_t               bound_cap;
+
+    /* When a new node arrives after initial_done, we issue a sync and
+     * defer watcher_publish() until the sync completes.  This mirrors
+     * the startup two-phase approach and guarantees that node_info
+     * (with media_class / pid) has been delivered before we publish. */
+    int                  pending_sync;  /* seq of outstanding post-init sync, or 0 */
 };
 
 /* Forward declarations */
@@ -369,39 +376,46 @@ static void watcher_on_node_info(void *data,
 {
     if (!data || !info) return;
 
-    /* Only process updates that actually carry property data */
-    if (!(info->change_mask & PW_NODE_CHANGE_MASK_PROPS) || !info->props)
-        return;
-
     /* user_data is the stable pw_watcher_bound_t*, not a raw node pointer */
     pw_watcher_bound_t *wb = data;
     if (!wb->owner || wb->node_index >= wb->owner->graph.node_count)
         return;
     pw_snap_node_t *n = &wb->owner->graph.nodes[wb->node_index];
-    const struct spa_dict *props = info->props;
 
-    const char *pid_str = dict_get(props, PW_KEY_APP_PROCESS_ID);
-    if (!pid_str) pid_str = dict_get(props, "pipewire.sec.pid");
-    if (pid_str && n->pid == 0) n->pid = parse_pid(pid_str);
+    /*
+     * Extract properties whenever info->props is non-NULL, regardless of
+     * change_mask.  The old guard `!(change_mask & PW_NODE_CHANGE_MASK_PROPS)`
+     * caused new runtime nodes to be permanently missed: PipeWire sometimes
+     * delivers the first node_info for a newly-bound proxy without setting
+     * PW_NODE_CHANGE_MASK_PROPS even though info->props carries the full
+     * property set (media.class, application.process.id, etc.).
+     * DICT_COPY_IF_PRESENT only overwrites fields with non-empty values so
+     * it is always safe to call — it never clobbers good data with empty strings.
+     */
+    if (info->props) {
+        const struct spa_dict *props = info->props;
 
-    /* Only overwrite a field if the new value is non-empty,
-     * so incremental updates don't clobber previously-captured data. */
+        const char *pid_str = dict_get(props, PW_KEY_APP_PROCESS_ID);
+        if (!pid_str) pid_str = dict_get(props, "pipewire.sec.pid");
+        if (pid_str && n->pid == 0) n->pid = parse_pid(pid_str);
+
 #define DICT_COPY_IF_PRESENT(key, field) \
-    do { \
-        const char *_v = dict_get(props, key); \
-        if (_v && _v[0]) { \
-            snprintf(n->field, sizeof(n->field), "%s", _v); \
-            utf8_safe_truncate(n->field, sizeof(n->field)); \
-        } \
-    } while (0)
+        do { \
+            const char *_v = dict_get(props, key); \
+            if (_v && _v[0]) { \
+                snprintf(n->field, sizeof(n->field), "%s", _v); \
+                utf8_safe_truncate(n->field, sizeof(n->field)); \
+            } \
+        } while (0)
 
-    DICT_COPY_IF_PRESENT(PW_KEY_APP_NAME,         app_name);
-    DICT_COPY_IF_PRESENT(PW_KEY_NODE_NAME,        node_name);
-    DICT_COPY_IF_PRESENT(PW_KEY_NODE_DESCRIPTION, node_desc);
-    DICT_COPY_IF_PRESENT(PW_KEY_MEDIA_CLASS,      media_class);
-    DICT_COPY_IF_PRESENT(PW_KEY_MEDIA_NAME,       media_name);
+        DICT_COPY_IF_PRESENT(PW_KEY_APP_NAME,         app_name);
+        DICT_COPY_IF_PRESENT(PW_KEY_NODE_NAME,        node_name);
+        DICT_COPY_IF_PRESENT(PW_KEY_NODE_DESCRIPTION, node_desc);
+        DICT_COPY_IF_PRESENT(PW_KEY_MEDIA_CLASS,      media_class);
+        DICT_COPY_IF_PRESENT(PW_KEY_MEDIA_NAME,       media_name);
 
 #undef DICT_COPY_IF_PRESENT
+    }
 
     evemon_log(LOG_AUDIO,
                "[pw_watcher] node_info: id=%u pid=%d app_name='%s' "
@@ -410,10 +424,12 @@ static void watcher_on_node_info(void *data,
                n->app_name, n->node_name, n->node_desc,
                n->media_class, n->media_name);
 
-    /* Publish incrementally after initial enumeration is done,
-     * so the live graph stays fresh on every node update. */
-    /* (We skip publishing during phase 0/1 initial enum to avoid
-     *  partial graphs; watcher_on_core_done does the first publish.) */
+    /*
+     * Don't publish here — the pending_sync path in watcher_on_core_done
+     * will publish once the sync round-trip completes, guaranteeing that
+     * ALL node_info callbacks for this batch have been delivered first.
+     * (watcher_on_global issues pw_core_sync when it binds a new node.)
+     */
 }
 
 static void watcher_on_global(void *data, uint32_t id,
@@ -456,6 +472,7 @@ static void watcher_on_global(void *data, uint32_t id,
         pw_watcher_bound_t *wb = calloc(1, sizeof(*wb));
         if (!wb) return;
         wb->node_index = w->graph.node_count - 1;  /* index of node just pushed */
+        wb->pw_id      = id;                          /* PW object ID for removal */
         wb->owner      = w;
         wb->proxy      = pw_registry_bind(w->registry, id, type, version, 0);
         w->bound[w->bound_count++] = wb;
@@ -465,9 +482,13 @@ static void watcher_on_global(void *data, uint32_t id,
                                          &g_watcher_node_events, wb);
         }
 
-        /* After initial enumeration, publish immediately */
-        if (w->initial_done)
-            watcher_publish(w);
+        /* After initial enumeration, issue a sync so that node_info
+         * (carrying media_class / pid) is guaranteed to arrive before
+         * we publish.  This mirrors the startup two-phase approach.
+         * Coalesce multiple rapid arrivals into a single sync by only
+         * issuing one if none is already pending. */
+        if (w->initial_done && !w->pending_sync)
+            w->pending_sync = pw_core_sync(w->core, PW_ID_CORE, 0);
 
     } else if (strcmp(type, PW_TYPE_INTERFACE_Client) == 0) {
         if (!props) return;
@@ -518,7 +539,41 @@ static void watcher_on_global_remove(void *data, uint32_t id)
     /* Remove from nodes */
     for (size_t i = 0; i < w->graph.node_count; i++) {
         if (w->graph.nodes[i].id == id) {
-            w->graph.nodes[i] = w->graph.nodes[--w->graph.node_count];
+            size_t last = --w->graph.node_count;
+            w->graph.nodes[i] = w->graph.nodes[last];
+            /*
+             * Fix up the bound[] array:
+             *
+             * 1. Remove the entry for the deleted node (identified by pw_id==id).
+             *    Destroy the proxy so PipeWire stops delivering callbacks for it.
+             *
+             * 2. Update the entry for the moved node (it was at node_index==last;
+             *    it now lives at graph index i).
+             *
+             * Doing both in a single pass is safe because pw_id is unique.
+             */
+            int removed = 0, moved = 0;
+            for (size_t b = 0; b < w->bound_count && !(removed && moved); ) {
+                pw_watcher_bound_t *wb = w->bound[b];
+                if (!wb) { b++; continue; }
+
+                if (!removed && wb->pw_id == id) {
+                    /* This is the deleted node's proxy — tear it down */
+                    if (wb->proxy)
+                        pw_proxy_destroy(wb->proxy);
+                    free(wb);
+                    w->bound[b] = w->bound[--w->bound_count];
+                    removed = 1;
+                    /* Don't increment b — the slot now holds a different entry */
+                    continue;
+                }
+                if (!moved && i != last && wb->node_index == last) {
+                    /* This entry tracked the node that was at `last`; it moved to `i` */
+                    wb->node_index = i;
+                    moved = 1;
+                }
+                b++;
+            }
             watcher_publish(w);
             return;
         }
@@ -550,7 +605,16 @@ static void watcher_on_global_remove(void *data, uint32_t id)
 static void watcher_on_core_done(void *data, uint32_t id, int seq)
 {
     pw_watcher_t *w = data;
-    if (id != PW_ID_CORE || seq != w->sync_seq) return;
+    if (id != PW_ID_CORE) return;
+
+    /* Runtime new-node sync: node_info has now been delivered */
+    if (w->initial_done && seq == w->pending_sync) {
+        w->pending_sync = 0;
+        watcher_publish(w);
+        return;
+    }
+
+    if (seq != w->sync_seq) return;
 
     if (w->phase == 0) {
         /* All globals received; do a second sync for node info callbacks */
