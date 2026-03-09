@@ -267,7 +267,7 @@ debug: PLUGIN_CFLAGS := $(DEBUG_PLUGIN_CFLAGS)
 debug: all
 
 gdb: debug
-	gdb -q -ex run ./$(TARGET)
+	gdb -q -ex run --args ./$(TARGET)
 
 # ── Install ──────────────────────────────────────────────────────
 
