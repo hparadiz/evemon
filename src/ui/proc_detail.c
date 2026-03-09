@@ -35,6 +35,33 @@
 
 extern struct timespec evemon_start_time;
 
+/* Generation counter – bumped on every selection change */
+static guint detail_gen = 0;
+
+/* ── icon watermark: async resolve and redraw ─────────────────── */
+
+typedef struct {
+    ui_ctx_t *ctx;
+    guint     generation;
+} detail_icon_cb_t;
+
+static void on_detail_icon_resolved(const char *key, GdkPixbuf *pb,
+                                     void *userdata)
+{
+    (void)key;
+    detail_icon_cb_t *d = userdata;
+    ui_ctx_t *ctx = d->ctx;
+
+    if (!ctx->shutting_down && d->generation == detail_gen) {
+        if (ctx->detail_icon_pb)
+            g_object_unref(ctx->detail_icon_pb);
+        ctx->detail_icon_pb = pb ? g_object_ref(pb) : NULL;
+        if (ctx->detail_icon_da)
+            gtk_widget_queue_draw(ctx->detail_icon_da);
+    }
+    g_free(d);
+}
+
 /* ── deferred Steam/cgroup update context ─────────────────────── */
 
 typedef struct {
@@ -44,9 +71,6 @@ typedef struct {
     gchar     *cmdline;
     guint      generation;   /* ctx->detail_gen snapshot at enqueue time */
 } detail_deferred_t;
-
-/* Generation counter – bumped on every selection change */
-static guint detail_gen = 0;
 
 static gboolean detail_deferred_cb(gpointer data)
 {
@@ -226,6 +250,13 @@ void proc_detail_update(ui_ctx_t *ctx)
         gtk_label_set_text(ctx->sb_cmdline,   "–");
         gtk_widget_hide(ctx->sb_steam_frame);
         gtk_widget_hide(ctx->sb_cgroup_frame);
+        /* Clear the icon watermark */
+        if (ctx->detail_icon_pb) {
+            g_object_unref(ctx->detail_icon_pb);
+            ctx->detail_icon_pb = NULL;
+            if (ctx->detail_icon_da)
+                gtk_widget_queue_draw(ctx->detail_icon_da);
+        }
         return;
     }
 
@@ -388,6 +419,26 @@ void proc_detail_update(ui_ctx_t *ctx)
     gtk_widget_hide(ctx->sb_steam_frame);
 
     evemon_log(LOG_DEBUG, "[DBG] steam frame hidden, enqueueing deferred idle");
+
+    /* ── Icon watermark update ─────────────────────────────────── */
+    if (ctx->icon_ctx_large && name) {
+        GdkPixbuf *cached = proc_icon_get_cached(ctx->icon_ctx_large, name);
+        if (cached) {
+            /* Cache hit: apply immediately */
+            if (ctx->detail_icon_pb)
+                g_object_unref(ctx->detail_icon_pb);
+            ctx->detail_icon_pb = g_object_ref(cached);
+            if (ctx->detail_icon_da)
+                gtk_widget_queue_draw(ctx->detail_icon_da);
+        } else {
+            /* Async path: will redraw when icon resolves */
+            detail_icon_cb_t *ic = g_new(detail_icon_cb_t, 1);
+            ic->ctx        = ctx;
+            ic->generation = detail_gen;
+            proc_icon_lookup_async(ctx->icon_ctx_large, name, NULL,
+                                   on_detail_icon_resolved, ic);
+        }
+    }
 
     /* ── Phase 2: enqueue deferred Steam + cgroup work ────────── */
     if (pid > 0) {

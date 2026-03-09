@@ -669,6 +669,47 @@ static void on_selection_changed(GtkTreeSelection *sel, gpointer data)
 /* Animation duration for section reveal transitions (ms) */
 #define SECTION_TRANSITION_MS  200
 
+/* ── detail panel: process icon watermark ────────────────────── */
+
+/*
+ * Draw a faint, large copy of the process icon in the top-right corner
+ * of the process-info sidebar whenever a process is selected.
+ */
+static gboolean on_detail_icon_draw(GtkWidget *widget, cairo_t *cr,
+                                     gpointer data)
+{
+    ui_ctx_t *ctx = data;
+    if (!ctx->detail_icon_pb)
+        return FALSE;   /* nothing to draw — let GTK paint background normally */
+
+    int widget_w = gtk_widget_get_allocated_width(widget);
+    int widget_h = gtk_widget_get_allocated_height(widget);
+
+    int src_w = gdk_pixbuf_get_width(ctx->detail_icon_pb);
+    int src_h = gdk_pixbuf_get_height(ctx->detail_icon_pb);
+
+    /* Target size: 96 px, or half the widget height, whichever is smaller */
+    int target = MIN(96, widget_h / 2);
+    if (target < 16) return FALSE;
+
+    double scale = (double)target / MAX(src_w, src_h);
+    int draw_w = (int)(src_w * scale);
+    int draw_h = (int)(src_h * scale);
+
+    /* Top-right corner with 8 px margin */
+    int x = widget_w - draw_w - 8;
+    int y = 8;
+
+    cairo_save(cr);
+    cairo_translate(cr, x, y);
+    cairo_scale(cr, scale, scale);
+    gdk_cairo_set_source_pixbuf(cr, ctx->detail_icon_pb, 0, 0);
+    cairo_paint_with_alpha(cr, 1);
+    cairo_restore(cr);
+
+    return FALSE;   /* don't consume the event */
+}
+
 /* ── detail panel: toggle visibility ─────────────────────────── */
 
 static void detail_panel_relayout(ui_ctx_t *ctx);
@@ -3667,6 +3708,17 @@ void *ui_thread(void *arg)
     GtkWidget *sidebar_frame = gtk_frame_new(NULL);
     gtk_container_add(GTK_CONTAINER(sidebar_frame), sidebar_scroll);
 
+    /* Overlay for the icon watermark — sits on top of sidebar_frame */
+    GtkWidget *sidebar_overlay  = gtk_overlay_new();
+    GtkWidget *detail_icon_da   = gtk_drawing_area_new();
+    /* The drawing area must not receive input events */
+    gtk_widget_set_can_focus(detail_icon_da, FALSE);
+    gtk_widget_set_events(detail_icon_da, 0);
+    gtk_overlay_add_overlay(GTK_OVERLAY(sidebar_overlay), detail_icon_da);
+    gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(sidebar_overlay),
+                                         detail_icon_da, TRUE);
+    gtk_container_add(GTK_CONTAINER(sidebar_overlay), sidebar_frame);
+
     /* Live CSS provider for detail panel font size (cascades to all children) */
     GtkCssProvider *sidebar_css = gtk_css_provider_new();
     {
@@ -3887,7 +3939,7 @@ void *ui_thread(void *arg)
                                          SECTION_TRANSITION_MS);
     gtk_revealer_set_reveal_child(GTK_REVEALER(proc_info_revealer), TRUE);
     gtk_widget_set_size_request(sidebar_frame, 280, -1);
-    gtk_container_add(GTK_CONTAINER(proc_info_revealer), sidebar_frame);
+    gtk_container_add(GTK_CONTAINER(proc_info_revealer), sidebar_overlay);
 
     /* Toggle button: thin handle on the LEFT to collapse/expand */
     GtkWidget *proc_info_toggle = gtk_button_new_with_label("◀");
@@ -3976,7 +4028,8 @@ void *ui_thread(void *arg)
     ctx.follow_selection = FALSE;
 
     /* Process icon cache — one-time desktop index scan */
-    ctx.icon_ctx = proc_icon_ctx_new(ctx.font_size + 4);
+    ctx.icon_ctx       = proc_icon_ctx_new(ctx.font_size + 4);
+    ctx.icon_ctx_large = proc_icon_ctx_new(128);
 
     /* Steam display label side-table */
     ctx.steam_map = steam_map_create();
@@ -4336,6 +4389,12 @@ void *ui_thread(void *arg)
     ctx.proc_info_summary   = GTK_LABEL(proc_info_summary_w);
     ctx.proc_info_collapsed = !settings_get()->proc_info_open;
 
+    /* Icon watermark overlay */
+    ctx.detail_icon_da = detail_icon_da;
+    ctx.detail_icon_pb = NULL;
+    g_signal_connect(detail_icon_da, "draw",
+                     G_CALLBACK(on_detail_icon_draw), &ctx);
+
     g_signal_connect(proc_info_toggle, "clicked",
                      G_CALLBACK(on_proc_info_tray_toggle), &ctx);
 
@@ -4550,6 +4609,10 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     if (ctx->icon_ctx) {
         proc_icon_ctx_free(ctx->icon_ctx);
         ctx->icon_ctx = NULL;
+    }
+    if (ctx->icon_ctx_large) {
+        proc_icon_ctx_free(ctx->icon_ctx_large);
+        ctx->icon_ctx_large = NULL;
     }
 
     /* Free the pinned PIDs set */

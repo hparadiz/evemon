@@ -278,6 +278,14 @@ asan: LDFLAGS := $(ASAN_LDFLAGS)
 asan: PLUGIN_CFLAGS := $(subst -O2,-Og -g3,$(PLUGIN_CFLAGS)) -fsanitize=address -fno-omit-frame-pointer
 asan: all
 
+UBSAN_CFLAGS  := $(subst -O2,-Og -g3,$(CFLAGS)) -fsanitize=undefined,address -fno-omit-frame-pointer -fno-sanitize-recover=all
+UBSAN_CFLAGS  := $(filter-out -D_FORTIFY_SOURCE=2 -fstack-protector-strong -pie,$(UBSAN_CFLAGS))
+UBSAN_LDFLAGS := $(filter-out -pie -Wl$(comma)-z$(comma)relro$(comma)-z$(comma)now,$(LDFLAGS)) -fsanitize=undefined,address
+ubsan: CFLAGS  := $(UBSAN_CFLAGS)
+ubsan: LDFLAGS := $(UBSAN_LDFLAGS)
+ubsan: PLUGIN_CFLAGS := $(subst -O2,-Og -g3,$(PLUGIN_CFLAGS)) -fsanitize=undefined,address -fno-omit-frame-pointer
+ubsan: all
+
 # ── Install ──────────────────────────────────────────────────────
 
 install: all

@@ -498,8 +498,11 @@ void update_store(GtkTreeStore       *store,
                                    COL_HIGHLIGHT_BORN, now_us, -1);
             }
 
-            /* Expand PID 1 and PID 2 the moment their first child arrives */
-            if ((e->ppid == 1 || e->ppid == 2) && parent_iter) {
+            /* Expand PID 1 and PID 2 the moment their first child arrives,
+             * but only if the user hasn't manually collapsed that row. */
+            if ((e->ppid == 1 || e->ppid == 2) && parent_iter && ctx &&
+                get_process_tree_node(&ctx->ptree_nodes,
+                                      PTREE_UNPINNED, e->ppid) != PTREE_COLLAPSED) {
                 GtkTreeModel *sort = GTK_TREE_MODEL(
                     gtk_tree_view_get_model(view));
                 GtkTreePath *cp = gtk_tree_model_get_path(
@@ -683,8 +686,11 @@ void populate_store_initial(GtkTreeStore       *store,
             inserted[sidx] = 1;
 
             /* As soon as a direct child of PID 1 or 2 is inserted,
-             * expand that parent so it is open immediately. */
-            if ((e->ppid == 1 || e->ppid == 2) && parent_iter) {
+             * expand that parent so it is open immediately —
+             * unless the user has already collapsed it. */
+            if ((e->ppid == 1 || e->ppid == 2) && parent_iter && ctx &&
+                get_process_tree_node(&ctx->ptree_nodes,
+                                      PTREE_UNPINNED, e->ppid) != PTREE_COLLAPSED) {
                 GtkTreeModel *sort = gtk_tree_view_get_model(view);
                 GtkTreePath *cp = gtk_tree_model_get_path(
                     GTK_TREE_MODEL(store), parent_iter);

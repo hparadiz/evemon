@@ -202,7 +202,8 @@ static GdkPixbuf *theme_load(const char *icon_name, int size)
     GError *err = NULL;
     GdkPixbuf *pb = gtk_icon_theme_load_icon(
         theme, icon_name, size,
-        GTK_ICON_LOOKUP_USE_BUILTIN | GTK_ICON_LOOKUP_FORCE_SIZE,
+        GTK_ICON_LOOKUP_USE_BUILTIN | GTK_ICON_LOOKUP_FORCE_SIZE |
+        GTK_ICON_LOOKUP_GENERIC_FALLBACK,
         &err);
     if (err) {
         g_error_free(err);

@@ -365,6 +365,7 @@ typedef struct {
 
     /* process icon cache */
     proc_icon_ctx_t    *icon_ctx;         /* icon resolution context (NULL until init)       */
+    proc_icon_ctx_t    *icon_ctx_large;   /* 128 px context for detail panel watermark       */
 
     /* Steam display label side-table (PID → display label, outside GtkTreeStore) */
     steam_map_t        *steam_map;
@@ -398,6 +399,10 @@ typedef struct {
     GtkWidget          *proc_info_toggle;     /* toggle button (▶/◀)               */
     GtkLabel           *proc_info_summary;    /* compact summary shown when collapsed */
     gboolean            proc_info_collapsed;  /* TRUE when process info is hidden   */
+
+    /* background icon watermark in the process info panel */
+    GtkWidget          *detail_icon_da;       /* GtkDrawingArea overlay              */
+    GdkPixbuf          *detail_icon_pb;       /* current icon (NULL = none)          */
 } ui_ctx_t;
 
 /* ── PipeWire audio connection scanning & host services ───────── */
