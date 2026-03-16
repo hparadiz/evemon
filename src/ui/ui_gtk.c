@@ -158,6 +158,72 @@ int get_process_tree_node(const ptree_node_set_t *s, pid_t pinned_pid,
     return PTREE_EXPANDED;   /* default */
 }
 
+/*
+ * ptree_nodes_gc – evict entries for PIDs that are no longer alive in
+ * the store.  Called once per refresh tick so the set never accumulates
+ * unbounded state for processes that have come and gone.
+ *
+ * We keep entries whose PID still exists in pstore (any status other
+ * than PROC_KILLED) OR whose pinned_pid is still in pstore (so that
+ * pinned panels keep their expand state while visible).  Everything
+ * else is compacted out.
+ */
+
+/* Local inline PID lookup in a store_ht_entry_t table.
+ * Mirrors the static ht_find() in store.c / tree.c. */
+static size_t ptree_ht_find(const store_ht_entry_t *ht, pid_t pid)
+{
+    unsigned h = (unsigned)pid % STORE_HT_SIZE;
+    for (int k = 0; k < STORE_HT_SIZE; k++) {
+        if (!ht[h].used) return (size_t)-1;
+        if (ht[h].pid == pid) return ht[h].idx;
+        h = (h + 1) % STORE_HT_SIZE;
+    }
+    return (size_t)-1;
+}
+
+static void ptree_nodes_gc(ptree_node_set_t *s, const proc_store_t *pstore)
+{
+    if (s->count == 0) return;
+
+    size_t w = 0;
+    for (size_t i = 0; i < s->count; i++) {
+        pid_t pid        = s->pids[i];
+        pid_t pinned_pid = s->pinned_pids[i];
+
+        /* Keep if the actual process PID is still in the store */
+        size_t pidx = ptree_ht_find(pstore->ht, pid);
+        if (pidx != (size_t)-1 && pstore->records[pidx].status != PROC_KILLED) {
+            if (w != i) {
+                s->pinned_pids[w] = pinned_pid;
+                s->pids       [w] = pid;
+                s->states     [w] = s->states[i];
+            }
+            w++;
+            continue;
+        }
+
+        if (pinned_pid == PTREE_UNPINNED) {
+            /* Entry is for the main tree; PID is gone — drop it */
+            continue;
+        }
+
+        /* Keep if the pinned_pid itself is still alive (the entry
+         * records the expand state of some child in a pinned panel) */
+        size_t ppidx = ptree_ht_find(pstore->ht, pinned_pid);
+        if (ppidx != (size_t)-1 && pstore->records[ppidx].status != PROC_KILLED) {
+            if (w != i) {
+                s->pinned_pids[w] = pinned_pid;
+                s->pids       [w] = pid;
+                s->states     [w] = s->states[i];
+            }
+            w++;
+        }
+        /* otherwise: drop this entry */
+    }
+    s->count = w;
+}
+
 /* ── formatting helpers ──────────────────────────────────────── */
 
 /* Format a KiB value into a human-readable string. */
@@ -364,7 +430,6 @@ static void on_send_signal(GtkMenuItem *item, gpointer data)
     send_signal_data_t *d = data;
     if (d->pid > 1)
         kill(d->pid, d->signo);
-    free(d);
 }
 
 /* Send an arbitrary signal to a process tree (children first). */
@@ -393,7 +458,6 @@ static void on_send_signal_tree(GtkMenuItem *item, gpointer data)
     }
     if (d->pid > 1)
         kill(d->pid, d->signo);
-    free(d);
 }
 
 typedef struct {
@@ -409,7 +473,6 @@ static void on_end_process_tree(GtkMenuItem *item, gpointer data)
 
     GtkTreeIter iter;
     if (!find_iter_by_pid(model, NULL, d->pid, &iter)) {
-        free(d);
         return;
     }
 
@@ -428,8 +491,6 @@ static void on_end_process_tree(GtkMenuItem *item, gpointer data)
     /* Kill the root process last */
     if (d->pid > 1)
         kill(d->pid, SIGTERM);
-
-    free(d);
 }
 
 static void on_copy_command(GtkMenuItem *item, gpointer data)
@@ -482,8 +543,9 @@ void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
         if (pd) {
             pd->ctx = ctx;
             pd->pid = pid;
-            g_signal_connect(mi_pin, "activate",
-                             G_CALLBACK(on_toggle_pin), pd);
+            g_signal_connect_data(mi_pin, "activate",
+                                  G_CALLBACK(on_toggle_pin), pd,
+                                  (GClosureNotify)g_free, 0);
         }
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_pin);
     }
@@ -539,7 +601,9 @@ void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
     if (d) {
         d->ctx = ctx;
         d->pid = pid;
-        g_signal_connect(mi2, "activate", G_CALLBACK(on_end_process_tree), d);
+        g_signal_connect_data(mi2, "activate",
+                              G_CALLBACK(on_end_process_tree), d,
+                              (GClosureNotify)g_free, 0);
     }
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi2);
 
@@ -578,8 +642,9 @@ void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
             if (sd) {
                 sd->pid   = pid;
                 sd->signo = signals[i].signo;
-                g_signal_connect(mi, "activate",
-                                 G_CALLBACK(on_send_signal), sd);
+                g_signal_connect_data(mi, "activate",
+                                      G_CALLBACK(on_send_signal), sd,
+                                      (GClosureNotify)g_free, 0);
             }
             gtk_menu_shell_append(GTK_MENU_SHELL(sig_menu), mi);
         }
@@ -605,8 +670,9 @@ void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
                 sd->ctx   = ctx;
                 sd->pid   = pid;
                 sd->signo = signals[i].signo;
-                g_signal_connect(mi, "activate",
-                                 G_CALLBACK(on_send_signal_tree), sd);
+                g_signal_connect_data(mi, "activate",
+                                      G_CALLBACK(on_send_signal_tree), sd,
+                                      (GClosureNotify)g_free, 0);
             }
             gtk_menu_shell_append(GTK_MENU_SHELL(sig_tree_menu), mi);
         }
@@ -1107,7 +1173,7 @@ static gboolean on_refresh(gpointer data)
 
     pthread_mutex_lock(&ctx->mon->lock);
     int running = ctx->mon->running;
-    size_t count = ctx->mon->snapshot.count;
+    size_t count = ctx->mon->snapshot.len;
 
     /* One-shot: log when we first see a non-empty snapshot */
     {
@@ -1126,18 +1192,21 @@ static gboolean on_refresh(gpointer data)
     /* Feed the raw snapshot into the GTK-free process store.
      * proc_store_update() deep-copies all proc_entry_t data
      * (including steam_info_t) so we can release the monitor lock
-     * immediately after.  The store owns its own lifetime-tracked
-     * copies; no manual deep-copy or proc_snapshot_free needed. */
+     * immediately after. */
     {
         struct timespec _ts;
         clock_gettime(CLOCK_MONOTONIC, &_ts);
         int64_t now_us = (int64_t)_ts.tv_sec * 1000000LL
                        + _ts.tv_nsec / 1000;
         proc_store_update(&ctx->pstore,
-                          ctx->mon->snapshot.entries, count,
+                          &ctx->mon->snapshot,
                           now_us);
     }
     pthread_mutex_unlock(&ctx->mon->lock);
+
+    /* GC stale expand/collapse state for PIDs that are no longer alive.
+     * Prevents ptree_nodes from growing without bound over long sessions. */
+    ptree_nodes_gc(&ctx->ptree_nodes, &ctx->pstore);
 
     if (!running || ctx->shutting_down) {
         if (!running)
@@ -4232,7 +4301,13 @@ void *ui_thread(void *arg)
              * and notebook insertion happen on the GTK main thread as the
              * background thread loads .so files, so the detail panel is
              * never blocked.  on_plugin_scan_done_gtk kicks the first
-             * broker cycle once all plugins are registered. */
+             * broker cycle once all plugins are registered.
+             *
+             * --safe-mode skips this entire block so no plugins are loaded. */
+            if (evemon_safe_mode) {
+                evemon_log(LOG_INFO, "evemon: safe mode — plugin loading skipped");
+            } else
+            {
             plugin_async_ctx_t *ac = malloc(sizeof(*ac));
             if (ac) {
                 ac->ctx = &ctx;
@@ -4347,6 +4422,7 @@ void *ui_thread(void *arg)
                     }
                 }
             }
+            } /* end else(!evemon_safe_mode) */
         } else {
             ctx.plugin_registry = NULL;
             ctx.plugin_notebook = NULL;

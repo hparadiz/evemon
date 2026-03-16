@@ -28,6 +28,7 @@ typedef enum {
 
 extern int evemon_debug;
 extern int evemon_debug_audio;
+extern int evemon_safe_mode;   /* --safe-mode: skip plugin loading on startup */
 
 /*
  * evemon_log(type, fmt, ...)

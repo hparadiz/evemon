@@ -24,6 +24,9 @@
 /* Monotonic timestamp (seconds) recorded at program startup */
 struct timespec evemon_start_time;
 
+/* Set by --safe-mode: blocks plugin loading on startup. */
+int evemon_safe_mode = 0;
+
 /* Global so the signal handler can reach it. */
 static monitor_state_t g_state;
 
@@ -70,13 +73,14 @@ int main(int argc, char *argv[])
         { "debug",       no_argument,       NULL, 'd' },
         { "debug-audio", no_argument,       NULL, 'a' },
         { "pid",         required_argument, NULL, 'p' },
+        { "safe-mode",   no_argument,       NULL, 's' },
         { "help",        no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
 
     pid_t cli_pid = 0;
     int opt;
-    while ((opt = getopt_long(argc, argv, "dap:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "dap:sh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'd':
             evemon_debug = 1;
@@ -91,6 +95,9 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             break;
+        case 's':
+            evemon_safe_mode = 1;
+            break;
         case 'h':
             printf("Usage: evemon [OPTIONS]\n"
                    "\n"
@@ -98,6 +105,7 @@ int main(int argc, char *argv[])
                    "  -d, --debug        Enable verbose debug logging\n"
                    "  -a, --debug-audio  Enable audio/PipeWire debug logging\n"
                    "  -p, --pid <PID>    Pre-select a process by PID on startup\n"
+                   "  -s, --safe-mode    Start without loading any plugins\n"
                    "  -h, --help         Show this help message\n");
             return EXIT_SUCCESS;
         default:

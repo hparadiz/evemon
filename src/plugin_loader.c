@@ -368,6 +368,7 @@ typedef struct {
 static void *async_scan_worker(void *arg)
 {
     async_scan_args_t *a = arg;
+    pthread_setname_np(pthread_self(), "ev-scan");
 
     /* Verify directory permissions (same checks as plugin_loader_scan) */
     struct stat dirstat;

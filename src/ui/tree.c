@@ -90,21 +90,22 @@ static void collect_iters(GtkTreeModel *model, GtkTreeIter *parent,
 /* ── set row data from a proc_entry ──────────────────────────── */
 
 static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
-                         const proc_entry_t *e, ui_ctx_t *ctx)
+                         const proc_entry_t *e,
+                         const proc_store_t *pstore, ui_ctx_t *ctx)
 {
     char rss_text[64];
-    format_memory(e->mem_rss_kb, rss_text, sizeof(rss_text));
+    format_memory((long)e->mem_rss_kb, rss_text, sizeof(rss_text));
 
     char cpu_text[32];
-    if (e->cpu_percent < 0.05)
+    if (e->cpu_percent < 0.05f)
         snprintf(cpu_text, sizeof(cpu_text), "0.0%%");
     else
-        snprintf(cpu_text, sizeof(cpu_text), "%.1f%%", e->cpu_percent);
+        snprintf(cpu_text, sizeof(cpu_text), "%.1f%%", (double)e->cpu_percent);
 
     /* Format I/O rates as human-readable byte/s strings */
     char io_read_text[64], io_write_text[64];
     {
-        double r = e->io_read_rate;
+        double r = (double)e->io_read_rate;
         if (r < 0.5)
             snprintf(io_read_text, sizeof(io_read_text), "0 B/s");
         else if (r < 1024.0)
@@ -117,7 +118,7 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
             snprintf(io_read_text, sizeof(io_read_text), "%.2f GiB/s", r / (1024.0 * 1024.0 * 1024.0));
     }
     {
-        double w = e->io_write_rate;
+        double w = (double)e->io_write_rate;
         if (w < 0.5)
             snprintf(io_write_text, sizeof(io_write_text), "0 B/s");
         else if (w < 1024.0)
@@ -144,7 +145,7 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
     if (e->io_history_len > 0) {
         char *p = spark_buf;
         size_t remaining = sizeof(spark_buf);
-        for (int i = 0; i < e->io_history_len && remaining > 16; i++) {
+        for (int i = 0; i < (int)e->io_history_len && remaining > 16; i++) {
             int n = snprintf(p, remaining, "%.0f;", (double)e->io_history[i]);
             if (n < 0 || (size_t)n >= remaining) break;
             p += n;
@@ -152,18 +153,19 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
         }
     }
 
-    /* Current combined I/O rate as peak for glow animation */
-    double combined_rate = e->io_read_rate + e->io_write_rate;
-    /* Normalise: 10 MiB/s → peak of 1000 */
+    double combined_rate = (double)e->io_read_rate + (double)e->io_write_rate;
     int spark_peak = (int)(combined_rate / (10.0 * 1024.0 * 1024.0) * 1000.0);
     if (spark_peak > 1000) spark_peak = 1000;
+
+    /* Resolve string fields via the store strtab */
+    const proc_strtab_t *strtab = &pstore->strtab;
 
     gtk_tree_store_set(store, iter,
                        COL_PID,      (gint)e->pid,
                        COL_PPID,     (gint)e->ppid,
-                       COL_USER,     e->user,
-                       COL_NAME,     e->name,
-                       COL_CPU,      (gint)(e->cpu_percent * 10000),
+                       COL_USER,     PROC_STR(strtab, e->user_off),
+                       COL_NAME,     PROC_STR(strtab, e->name_off),
+                       COL_CPU,      (gint)((double)e->cpu_percent * 10000),
                        COL_CPU_TEXT, cpu_text,
                        COL_RSS,      (gint)(e->mem_rss_kb),
                        COL_RSS_TEXT, rss_text,
@@ -177,10 +179,10 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
                        COL_IO_WRITE_RATE_TEXT,  io_write_text,
                        COL_START_TIME,      (gint64)e->start_time,
                        COL_START_TIME_TEXT, start_text,
-                       COL_CONTAINER,  e->container[0] ? e->container : "",
-                       COL_SERVICE,    e->service[0]   ? e->service   : "",
-                       COL_CWD,      e->cwd,
-                       COL_CMDLINE,  PROC_CMDLINE(e),
+                       COL_CONTAINER,  PROC_STR(strtab, e->container_off),
+                       COL_SERVICE,    PROC_STR(strtab, e->service_off),
+                       COL_CWD,      PROC_STR(strtab, e->cwd_off),
+                       COL_CMDLINE,  PROC_STR(strtab, e->cmd_off),
                        COL_IO_SPARKLINE, spark_buf,
                        COL_IO_SPARKLINE_PEAK, spark_peak,
                        COL_HIGHLIGHT_BORN, (gint64)0,
@@ -188,10 +190,13 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
                        COL_PINNED_ROOT, (gint)PTREE_UNPINNED,
                        -1);
 
-    /* Store Steam display label in the side-table, not in the tree store */
+    /* Store Steam display label in the side-table */
     if (ctx && ctx->steam_map) {
-        if (e->steam && (e->steam->is_steam || e->steam->is_wine))
-            steam_map_set(ctx->steam_map, e->pid, e->steam->display_label);
+        const steam_info_t *si = (e->extra_idx != UINT32_MAX &&
+                                   e->extra_idx < pstore->extras_len)
+            ? pstore->extras[e->extra_idx].steam : NULL;
+        if (si && (si->is_steam || si->is_wine))
+            steam_map_set(ctx->steam_map, e->pid, si->display_label);
         else
             steam_map_remove(ctx->steam_map, e->pid);
     }
@@ -250,12 +255,10 @@ static void update_or_remove_rows(GtkTreeStore *store, GtkTreeIter *parent,
         if (rec->status == PROC_DYING) {
             gint64 born = 0;
             gtk_tree_model_get(model, &iter, COL_HIGHLIGHT_BORN, &born, -1);
-            set_row_data(store, &iter, &rec->entry, ctx);
+            set_row_data(store, &iter, &rec->entry, pstore, ctx);
 
             /* Only start the red animation after the process has been
-             * absent for at least HIGHLIGHT_START_DELAY_US.  Before
-             * that threshold we keep COL_HIGHLIGHT_DIED = 0 so nothing
-             * is rendered, avoiding flicker on transient absences. */
+             * absent for at least HIGHLIGHT_START_DELAY_US. */
             struct timespec _ts;
             clock_gettime(CLOCK_MONOTONIC, &_ts);
             int64_t now_us = (int64_t)_ts.tv_sec * 1000000LL
@@ -273,7 +276,7 @@ static void update_or_remove_rows(GtkTreeStore *store, GtkTreeIter *parent,
             gtk_tree_model_get(model, &iter,
                                COL_HIGHLIGHT_BORN, &born,
                                COL_HIGHLIGHT_DIED, &died, -1);
-            set_row_data(store, &iter, &rec->entry, ctx);
+            set_row_data(store, &iter, &rec->entry, pstore, ctx);
             gtk_tree_store_set(store, &iter,
                                COL_HIGHLIGHT_BORN, born,
                                COL_HIGHLIGHT_DIED, died, -1);
@@ -347,27 +350,29 @@ static void on_icon_resolved(const char *key, GdkPixbuf *pb, void *userdata)
  * before returning; otherwise sets it asynchronously.
  */
 static void request_icon(ui_ctx_t *ctx, GtkTreeStore *store,
-                         GtkTreeIter *iter, const proc_entry_t *e)
+                         GtkTreeIter *iter, const proc_entry_t *e,
+                         const proc_store_t *pstore)
 {
     if (!ctx || !ctx->icon_ctx) return;
 
-    /* Check synchronous cache first — avoids allocating a callback struct
-     * for the common case (same process seen again after first scan). */
-    GdkPixbuf *cached = proc_icon_get_cached(ctx->icon_ctx, e->name);
+    const char *name = PROC_STR(&pstore->strtab, e->name_off);
+
+    GdkPixbuf *cached = proc_icon_get_cached(ctx->icon_ctx, name);
     if (cached) {
         gtk_tree_store_set(store, iter, COL_ICON, cached, -1);
         return;
     }
 
-    /* Async path — allocate callback data */
     icon_cb_data_t *d = g_new(icon_cb_data_t, 1);
     d->store = store;
     d->steam_map = ctx ? ctx->steam_map : NULL;
-    snprintf(d->key, sizeof(d->key), "%s", e->name);
+    snprintf(d->key, sizeof(d->key), "%s", name);
 
-    proc_icon_lookup_async(ctx->icon_ctx, e->name,
-                           e->steam,
-                           on_icon_resolved, d);
+    const steam_info_t *si = (e->extra_idx != UINT32_MAX &&
+                               e->extra_idx < pstore->extras_len)
+        ? pstore->extras[e->extra_idx].steam : NULL;
+
+    proc_icon_lookup_async(ctx->icon_ctx, name, si, on_icon_resolved, d);
 }
 
 /*
@@ -394,9 +399,12 @@ void update_store(GtkTreeStore       *store,
     iter_map_t existing = { NULL, 0, 0 };
     collect_iters(GTK_TREE_MODEL(store), NULL, &existing);
 
-    /* Build a quick "already has a GTK row?" lookup */
-    store_ht_entry_t *old_ht = calloc(STORE_HT_SIZE, sizeof(store_ht_entry_t));
+    /* Build a quick "already has a GTK row?" lookup.
+     * Allocated once on first call and reused each tick — heap not BSS. */
+    static store_ht_entry_t *old_ht = NULL;
+    if (!old_ht) old_ht = calloc(STORE_HT_SIZE, sizeof(store_ht_entry_t));
     if (!old_ht) { free(existing.entries); return; }
+    memset(old_ht, 0, STORE_HT_SIZE * sizeof(store_ht_entry_t));
     for (size_t i = 0; i < existing.count; i++)
         ht_insert(old_ht, existing.entries[i].pid, i);
 
@@ -415,7 +423,6 @@ void update_store(GtkTreeStore       *store,
     }
 
     if (new_count == 0) {
-        free(old_ht);
         free(existing.entries);
         first_update = 0;
         return;
@@ -423,7 +430,7 @@ void update_store(GtkTreeStore       *store,
 
     /* Build an index array of new records */
     size_t *new_idx = calloc(new_count, sizeof(size_t));
-    if (!new_idx) { free(old_ht); free(existing.entries); return; }
+    if (!new_idx) { free(existing.entries); return; }
     {
         size_t j = 0;
         for (size_t i = 0; i < pstore->count; i++) {
@@ -435,11 +442,14 @@ void update_store(GtkTreeStore       *store,
     }
 
     int *inserted = calloc(new_count, sizeof(int));
-    if (!inserted) { free(old_ht); free(existing.entries); free(new_idx); return; }
+    if (!inserted) { free(existing.entries); free(new_idx); return; }
 
-    /* Local PID→new_idx[] lookup for ancestor-stack resolution */
-    store_ht_entry_t *new_ht = calloc(STORE_HT_SIZE, sizeof(store_ht_entry_t));
-    if (!new_ht) { free(old_ht); free(existing.entries); free(new_idx); free(inserted); return; }
+    /* Local PID→new_idx[] lookup for ancestor-stack resolution.
+     * Allocated once on first call and reused each tick — heap not BSS. */
+    static store_ht_entry_t *new_ht = NULL;
+    if (!new_ht) new_ht = calloc(STORE_HT_SIZE, sizeof(store_ht_entry_t));
+    if (!new_ht) { free(existing.entries); free(new_idx); free(inserted); return; }
+    memset(new_ht, 0, STORE_HT_SIZE * sizeof(store_ht_entry_t));
     for (size_t j = 0; j < new_count; j++)
         ht_insert(new_ht, pstore->records[new_idx[j]].entry.pid, j);
 
@@ -477,8 +487,8 @@ void update_store(GtkTreeStore       *store,
 
             GtkTreeIter new_iter;
             gtk_tree_store_append(store, &new_iter, parent_iter);
-            set_row_data(store, &new_iter, e, ctx);
-            request_icon(ctx, store, &new_iter, e);
+            set_row_data(store, &new_iter, e, pstore, ctx);
+            request_icon(ctx, store, &new_iter, e, pstore);
 
             /* Stamp newly inserted process with a birth highlight */
             if (!first_update)
@@ -525,8 +535,6 @@ void update_store(GtkTreeStore       *store,
         }
     }
 
-    free(new_ht);
-    free(old_ht);
     free(existing.entries);
     free(new_idx);
     free(inserted);
@@ -681,8 +689,8 @@ void populate_store_initial(GtkTreeStore       *store,
                 parent_iter = &iters[pidx];
 
             gtk_tree_store_append(store, &iters[sidx], parent_iter);
-            set_row_data(store, &iters[sidx], e, ctx);
-            request_icon(ctx, store, &iters[sidx], e);
+            set_row_data(store, &iters[sidx], e, pstore, ctx);
+            request_icon(ctx, store, &iters[sidx], e, pstore);
             inserted[sidx] = 1;
 
             /* As soon as a direct child of PID 1 or 2 is inserted,

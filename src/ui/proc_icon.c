@@ -53,6 +53,9 @@ struct proc_icon_ctx {
     int           icon_size;   /* target pixel size for scaling          */
     GHashTable   *cache;       /* comm/key → GdkPixbuf* or MISS          */
     GHashTable   *desk_index;  /* lowercase comm → strdup'd icon name    */
+    GHashTable   *pixbuf_pool; /* icon_name → GdkPixbuf* (intern pool)   */
+                               /* Every unique resolved pixbuf lives here */
+                               /* once; cache entries hold a g_object_ref */
 };
 
 /* ── desktop file index ───────────────────────────────────────── */
@@ -188,11 +191,39 @@ static GHashTable *build_desktop_index(void)
     return idx;
 }
 
+/* ── pixbuf intern pool ──────────────────────────────────────────
+ *
+ * theme_load_interned() resolves an icon name through the GTK theme
+ * exactly once per (name, size) combination.  Subsequent calls for
+ * the same name return the pooled pixbuf with an extra g_object_ref
+ * so every cache slot owns its own reference but the pixel data is
+ * shared — one allocation regardless of how many processes share the
+ * same icon.
+ */
+
+static GdkPixbuf *pixbuf_pool_get(proc_icon_ctx_t *ctx, const char *icon_name)
+{
+    if (!icon_name || !icon_name[0]) return NULL;
+    gpointer val = g_hash_table_lookup(ctx->pixbuf_pool, icon_name);
+    if (!val) return NULL;
+    return g_object_ref((GdkPixbuf *)val);   /* caller owns this ref */
+}
+
+static void pixbuf_pool_put(proc_icon_ctx_t *ctx,
+                             const char *icon_name, GdkPixbuf *pb)
+{
+    /* Pool holds one ref; we take an additional ref for the caller. */
+    g_hash_table_insert(ctx->pixbuf_pool,
+                        g_strdup(icon_name),
+                        g_object_ref(pb));
+}
+
 /* ── GTK theme lookup (synchronous, warm cache) ───────────────── */
 
 /*
  * Try to load an icon by name from the default GTK icon theme.
  * Returns a new GdkPixbuf scaled to `size` (caller owns), or NULL.
+ * Does NOT consult or update the intern pool — use theme_load_interned.
  */
 static GdkPixbuf *theme_load(const char *icon_name, int size)
 {
@@ -210,6 +241,28 @@ static GdkPixbuf *theme_load(const char *icon_name, int size)
         return NULL;
     }
     return pb;   /* already at `size` due to FORCE_SIZE */
+}
+
+/*
+ * Like theme_load but deduplicates through ctx->pixbuf_pool.
+ * If the icon was previously resolved the pooled pixbuf is returned
+ * (with an extra ref) without touching GtkIconTheme at all.
+ * On a fresh hit the pixbuf is interned before returning.
+ */
+static GdkPixbuf *theme_load_interned(proc_icon_ctx_t *ctx,
+                                      const char      *icon_name)
+{
+    if (!icon_name || !icon_name[0]) return NULL;
+
+    GdkPixbuf *pb = pixbuf_pool_get(ctx, icon_name);
+    if (pb) return pb;   /* pool hit — shared pixel data, no I/O */
+
+    pb = theme_load(icon_name, ctx->icon_size);
+    if (!pb) return NULL;
+
+    pixbuf_pool_put(ctx, icon_name, pb);
+    /* pool_put took its own ref; pb already has the caller's ref */
+    return pb;
 }
 
 /* ── Steam art async loading (GIO file:// only) ──────────────── */
@@ -459,6 +512,10 @@ proc_icon_ctx_t *proc_icon_ctx_new(int icon_size)
     ctx->cache      = g_hash_table_new_full(g_str_hash, g_str_equal,
                                              g_free, NULL);
     ctx->desk_index = build_desktop_index();
+    /* Pool key = icon name (strdup'd), value = GdkPixbuf* (one ref). */
+    ctx->pixbuf_pool = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                              g_free,
+                                              (GDestroyNotify)g_object_unref);
 
     if (evemon_debug)
         fprintf(stderr, "[PROC_ICON] desktop index: %u entries\n",
@@ -475,6 +532,7 @@ void proc_icon_ctx_free(proc_icon_ctx_t *ctx)
     proc_icon_invalidate(ctx);
     g_hash_table_destroy(ctx->cache);
     g_hash_table_destroy(ctx->desk_index);
+    g_hash_table_destroy(ctx->pixbuf_pool);
     free(ctx);
 }
 
@@ -482,7 +540,7 @@ void proc_icon_invalidate(proc_icon_ctx_t *ctx)
 {
     if (!ctx) return;
 
-    /* Walk the cache and unref all real pixbufs */
+    /* Walk the cache and unref all real pixbufs (each holds one ref). */
     GHashTableIter it;
     gpointer key, val;
     g_hash_table_iter_init(&it, ctx->cache);
@@ -491,6 +549,9 @@ void proc_icon_invalidate(proc_icon_ctx_t *ctx)
             g_object_unref((GdkPixbuf *)val);
     }
     g_hash_table_remove_all(ctx->cache);
+
+    /* Flush the intern pool — pool's GDestroyNotify unrefs each entry. */
+    g_hash_table_remove_all(ctx->pixbuf_pool);
 }
 
 GdkPixbuf *proc_icon_get_cached(proc_icon_ctx_t *ctx, const char *comm)
@@ -534,9 +595,9 @@ void proc_icon_lookup_async(proc_icon_ctx_t    *ctx,
             lc[ci] = (char)g_ascii_tolower((guchar)comm[ci]);
         lc[ci] = '\0';
 
-        GdkPixbuf *pb = theme_load(lc, ctx->icon_size);
+        GdkPixbuf *pb = theme_load_interned(ctx, lc);
         if (!pb && strcmp(lc, comm) != 0)
-            pb = theme_load(comm, ctx->icon_size);
+            pb = theme_load_interned(ctx, comm);
 
         if (pb) {
             g_hash_table_insert(ctx->cache, g_strdup(key), pb);
@@ -555,7 +616,7 @@ void proc_icon_lookup_async(proc_icon_ctx_t    *ctx,
 
         const char *icon_name = g_hash_table_lookup(ctx->desk_index, lc);
         if (icon_name) {
-            GdkPixbuf *pb = theme_load(icon_name, ctx->icon_size);
+            GdkPixbuf *pb = theme_load_interned(ctx, icon_name);
             if (pb) {
                 g_hash_table_insert(ctx->cache, g_strdup(key), pb);
                 cb(key, pb, userdata);
@@ -564,7 +625,8 @@ void proc_icon_lookup_async(proc_icon_ctx_t    *ctx,
         }
     }
 
-    /* ── Priority 3: Steam librarycache art ──────────────────── */
+    /* ── Priority 3: Steam librarycache art ─────────────────────
+     * Only reached for confirmed Steam games (is_steam && app_id set). */
     if (steam && steam->is_steam && steam->app_id[0]) {
         /* try_steam_art handles async load and calls cb when done */
         try_steam_art(ctx, steam->app_id, key, cb, userdata);

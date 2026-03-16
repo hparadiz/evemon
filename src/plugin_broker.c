@@ -1603,6 +1603,7 @@ static int broker_is_cancelled(void)
 static void *broker_thread_func(void *arg)
 {
     broker_cycle_t *cycle = arg;
+    pthread_setname_np(pthread_self(), "ev-broker");
 
     if (broker_is_cancelled())
         goto cancelled;

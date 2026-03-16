@@ -91,64 +91,66 @@ static int read_comm(pid_t pid, char *buf, size_t bufsz)
 }
 
 /*
- * Read /proc/<pid>/cmdline (NUL-delimited) into the inline buf (size bufsz).
- * If the raw cmdline is longer than bufsz-1 bytes a heap copy of the full
- * string is returned via *long_out (caller must free); otherwise *long_out
- * is set to NULL.  NUL separators are replaced with spaces in both copies.
+ * Read /proc/<pid>/cmdline (NUL-delimited) into the strtab.
+ * NUL separators are replaced with spaces.  Returns the str_off_t of
+ * the stored string, or 0 on failure / empty (kernel thread).
+ * The comm name is passed as a fallback for kernel threads.
  */
-static int read_cmdline(pid_t pid, char *buf, size_t bufsz, char **long_out)
+static str_off_t read_cmdline_to_strtab(pid_t pid, const char *comm,
+                                        proc_strtab_t *strtab)
 {
-    *long_out = NULL;
-
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
 
     FILE *f = fopen(path, "r");
     if (!f)
-        return -1;
+        goto fallback;
 
-    /* Read up to the inline capacity first */
-    size_t n = fread(buf, 1, bufsz - 1, f);
+    /* Read the full cmdline, capped at 4 KiB to handle pathological cases */
+    size_t cap = 4096;
+    char *buf = malloc(cap);
+    if (!buf) { fclose(f); goto fallback; }
 
-    /* Peek: is there more? */
-    int overflow = (n == bufsz - 1) && (fgetc(f) != EOF);
-    fclose(f);
-
-    if (n == 0) {
-        buf[0] = '\0';
-        return 0;   /* kernel thread – empty cmdline is fine */
-    }
-
-    /* NUL → space in the inline copy */
-    for (size_t i = 0; i < n - 1; i++)
-        if (buf[i] == '\0') buf[i] = ' ';
-    buf[n] = '\0';
-
-    /* Sanitize: replace invalid UTF-8 bytes with '?' so GTK/Pango never
-     * receives a malformed string.  Some processes embed raw binary data
-     * in argv (e.g. certain JVM args, Wine processes). */
-    utf8_sanitize(buf);
-
-    if (overflow) {
-        /* Re-read the full cmdline into a heap buffer (rare path) */
-        f = fopen(path, "r");
-        if (f) {
-            /* Read up to PROC_CMD_MAX*4 to cap pathological cases */
-            size_t cap = PROC_CMD_MAX * 4;
-            char  *heap = malloc(cap);
-            if (heap) {
-                size_t total = fread(heap, 1, cap - 1, f);
-                for (size_t i = 0; i < total - 1; i++)
-                    if (heap[i] == '\0') heap[i] = ' ';
-                heap[total] = '\0';
-                /* Sanitize heap copy too */
-                utf8_sanitize(heap);
-                *long_out = heap;
-            }
-            fclose(f);
+    size_t used = 0;
+    for (;;) {
+        size_t n = fread(buf + used, 1, cap - used - 1, f);
+        used += n;
+        if (n == 0) break;
+        if (used >= cap - 1) {
+            /* grow if needed, cap at 16 KiB */
+            if (cap >= 16384) break;
+            size_t newcap = cap * 2;
+            char *nb = realloc(buf, newcap);
+            if (!nb) break;
+            buf = nb;
+            cap = newcap;
         }
     }
+    fclose(f);
 
+    if (used == 0) {
+        free(buf);
+        goto fallback;
+    }
+
+    /* NUL → space */
+    for (size_t i = 0; i < used - 1; i++)
+        if (buf[i] == '\0') buf[i] = ' ';
+    buf[used] = '\0';
+
+    utf8_sanitize(buf);
+
+    str_off_t off = strtab_push(strtab, buf);
+    free(buf);
+    return off;
+
+fallback:
+    /* Kernel thread: show [comm] */
+    if (comm && comm[0]) {
+        char fb[PROC_NAME_MAX + 3];
+        snprintf(fb, sizeof(fb), "[%s]", comm);
+        return strtab_push(strtab, fb);
+    }
     return 0;
 }
 
@@ -174,7 +176,8 @@ static pid_t read_ppid(pid_t pid)
     return ppid;
 }
 
-/* Read the owning user of /proc/<pid> via Uid from status + getpwuid_r. */
+/* Read the owning user of /proc/<pid> via Uid from status + getpwuid_r.
+ * Writes result into buf and returns 0 on success. */
 static int read_user(pid_t pid, char *buf, size_t bufsz)
 {
     char path[64];
@@ -210,19 +213,42 @@ static int read_user(pid_t pid, char *buf, size_t bufsz)
     return 0;
 }
 
-/* Read the current working directory of /proc/<pid>/cwd via readlink. */
-static int read_cwd(pid_t pid, char *buf, size_t bufsz)
+/* Read the current working directory of /proc/<pid>/cwd via readlink
+ * and push it into the strtab.  Returns the str_off_t of the stored
+ * string, or 0 on error.
+ */
+static str_off_t read_cwd_to_strtab(pid_t pid, proc_strtab_t *strtab)
 {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/cwd", pid);
 
-    ssize_t n = readlink(path, buf, bufsz - 1);
-    if (n < 0) {
-        buf[0] = '\0';
-        return -1;
-    }
+    /* Try with a 4 KiB buffer first (PATH_MAX = 4096 on Linux) */
+    char buf[4096];
+    ssize_t n = readlink(path, buf, sizeof(buf) - 1);
+    if (n < 0)
+        return 0;
     buf[n] = '\0';
-    return 0;
+
+    if ((size_t)n < sizeof(buf) - 1) {
+        /* Common case: fits in stack buffer */
+        return strtab_push(strtab, buf);
+    }
+
+    /* Extremely long path — try a heap buffer */
+    size_t cap = 8192;
+    char *heap = malloc(cap);
+    if (!heap)
+        return strtab_push(strtab, buf);  /* use truncated copy */
+    ssize_t hn = readlink(path, heap, cap - 1);
+    str_off_t off;
+    if (hn >= 0) {
+        heap[hn] = '\0';
+        off = strtab_push(strtab, heap);
+    } else {
+        off = strtab_push(strtab, buf);   /* fallback to truncated */
+    }
+    free(heap);
+    return off;
 }
 
 /* Read VmRSS (resident set size in kB) from /proc/<pid>/status. */
@@ -500,10 +526,11 @@ static void read_service_systemd(pid_t pid, char *buf, size_t bufsz)
  */
 
 #define SVC_MAP_SIZE 256
+#define SVC_NAME_MAX 128
 
 typedef struct {
     pid_t pid;
-    char  name[PROC_SVC_MAX];
+    char  name[SVC_NAME_MAX];
 } svc_map_entry_t;
 
 typedef struct {
@@ -589,7 +616,7 @@ static void svc_map_build_openrc(svc_map_t *map)
             if (pid > 0) {
                 svc_map_entry_t *e = &map->entries[map->count++];
                 e->pid = pid;
-                snprintf(e->name, sizeof(e->name), "%s", svc_de->d_name);
+                snprintf(e->name, SVC_NAME_MAX, "%s", svc_de->d_name);
             }
         }
         closedir(sdp);
@@ -608,30 +635,33 @@ static const char *svc_map_lookup(const svc_map_t *map, pid_t pid)
 /*
  * Resolve the service name for a process.
  * Only called for direct children of init (ppid <= 1) for performance.
+ * Writes the result into buf (size SVC_NAME_MAX) and returns a pointer
+ * to buf (empty string if none).
  */
-static void read_service(pid_t pid, pid_t ppid, char *buf, size_t bufsz,
-                         const svc_map_t *openrc_map)
+static const char *read_service(pid_t pid, pid_t ppid, char *buf,
+                                 const svc_map_t *openrc_map)
 {
     buf[0] = '\0';
 
     /* Only resolve for direct children of init */
     if (ppid != 0 && ppid != 1)
-        return;
+        return buf;
 
     switch (g_init_system) {
     case INIT_SYSTEMD:
-        read_service_systemd(pid, buf, bufsz);
+        read_service_systemd(pid, buf, SVC_NAME_MAX);
         break;
     case INIT_OPENRC:
         if (openrc_map) {
             const char *name = svc_map_lookup(openrc_map, pid);
             if (name)
-                snprintf(buf, bufsz, "%s", name);
+                snprintf(buf, SVC_NAME_MAX, "%s", name);
         }
         break;
     default:
         break;
     }
+    return buf;
 }
 
 /*
@@ -875,6 +905,41 @@ static void cpu_ht_set(cpu_prev_entry_t *ht, pid_t pid, unsigned long long ticks
 /* ── snapshot builder ────────────────────────────────────────── */
 
 /*
+ * Copy a proc_snapshot_t by duplicating the strtab buffer and entries.
+ * The extras array is shallow-copied (steam pointers are zeroed; extras
+ * are rebuilt during the Steam pass).
+ * Used for the partial and early pre-Steam publish paths.
+ */
+static proc_snapshot_t snapshot_copy_pre_steam(const proc_snapshot_t *src)
+{
+    proc_snapshot_t dst;
+    memset(&dst, 0, sizeof(dst));
+
+    if (src->len == 0) return dst;
+
+    /* Copy entries array */
+    dst.entries = (proc_entry_t *)malloc(src->len * sizeof(proc_entry_t));
+    if (!dst.entries) return dst;
+    memcpy(dst.entries, src->entries, src->len * sizeof(proc_entry_t));
+    dst.len = src->len;
+    dst.cap = src->len;
+
+    /* Copy strtab buffer */
+    dst.strtab.buf = (char *)malloc(src->strtab.len);
+    if (!dst.strtab.buf) { free(dst.entries); memset(&dst, 0, sizeof(dst)); return dst; }
+    memcpy(dst.strtab.buf, src->strtab.buf, src->strtab.len);
+    dst.strtab.len = src->strtab.len;
+    dst.strtab.cap = src->strtab.len;
+
+    /* Extras: none (steam pointers not yet populated) */
+    dst.extras     = NULL;
+    dst.extras_len = 0;
+    dst.extras_cap = 0;
+
+    return dst;
+}
+
+/*
  * out_published_early: set to 1 if the snapshot was already published
  * inside this function (early partial publish after /proc pass, before
  * the Steam enrichment pass).  The caller should still latch the
@@ -884,7 +949,8 @@ static void cpu_ht_set(cpu_prev_entry_t *ht, pid_t pid, unsigned long long ticks
 static proc_snapshot_t build_snapshot(monitor_state_t *state,
                                       int *out_published_early)
 {
-    proc_snapshot_t snap = { .entries = NULL, .count = 0 };
+    proc_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
     int partial_published = 0;
     if (out_published_early) *out_published_early = 0;
 
@@ -901,12 +967,26 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
     if (!dp)
         return snap;
 
-    size_t capacity = 512;
-    snap.entries = malloc(capacity * sizeof(proc_entry_t));
-    if (!snap.entries) {
+    /* Initialise the strtab (64 KiB initial capacity) */
+    if (strtab_init(&snap.strtab, 65536) != 0) {
         closedir(dp);
         return snap;
     }
+
+    uint32_t capacity = 512;
+    snap.entries = (proc_entry_t *)malloc(capacity * sizeof(proc_entry_t));
+    if (!snap.entries) {
+        strtab_free(&snap.strtab);
+        closedir(dp);
+        memset(&snap, 0, sizeof(snap));
+        return snap;
+    }
+
+    /* Scratch buffers for fields that still go through char[] helpers */
+    char comm_buf[PROC_NAME_MAX];
+    char user_buf[64];
+    char container_buf[64];
+    char svc_buf[SVC_NAME_MAX];
 
     struct dirent *de;
     while ((de = readdir(dp)) != NULL) {
@@ -915,52 +995,61 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
 
         pid_t pid = (pid_t)atoi(de->d_name);
 
-        /* grow buffer if needed */
-        if (snap.count >= capacity) {
+        /* grow entries buffer if needed */
+        if (snap.len >= capacity) {
             capacity *= 2;
-            proc_entry_t *tmp = realloc(snap.entries,
+            proc_entry_t *tmp = (proc_entry_t *)realloc(snap.entries,
                                         capacity * sizeof(proc_entry_t));
             if (!tmp)
                 break;
             snap.entries = tmp;
         }
 
-        proc_entry_t *e = &snap.entries[snap.count];
-        e->pid          = pid;
-        e->ppid         = read_ppid(pid);
-        e->cmdline_long = NULL;
+        proc_entry_t *e = &snap.entries[snap.len];
+        memset(e, 0, sizeof(*e));
+        e->pid        = pid;
+        e->ppid       = read_ppid(pid);
+        e->extra_idx  = UINT32_MAX;
 
-        if (read_comm(pid, e->name, sizeof(e->name)) != 0)
+        if (read_comm(pid, comm_buf, sizeof(comm_buf)) != 0)
             continue;   /* process vanished, skip */
 
-        if (read_cmdline(pid, e->cmdline, sizeof(e->cmdline),
-                         &e->cmdline_long) != 0)
-            snprintf(e->cmdline, sizeof(e->cmdline), "[%s]", e->name);
+        e->name_off = strtab_push(&snap.strtab, comm_buf);
+        e->name_len = (str_len_t)strlen(comm_buf);
 
-        /* If cmdline was empty (kernel thread), show [name] */
-        if (e->cmdline[0] == '\0')
-            snprintf(e->cmdline, sizeof(e->cmdline), "[%s]", e->name);
+        /* cmdline */
+        e->cmd_off = read_cmdline_to_strtab(pid, comm_buf, &snap.strtab);
+        e->cmd_len = e->cmd_off
+            ? (str_len_t)strlen(snap.strtab.buf + e->cmd_off)
+            : 0;
 
-        /* user, cwd, memory */
-        if (read_user(pid, e->user, sizeof(e->user)) != 0)
-            snprintf(e->user, sizeof(e->user), "?");
+        /* user */
+        if (read_user(pid, user_buf, sizeof(user_buf)) != 0)
+            snprintf(user_buf, sizeof(user_buf), "?");
+        e->user_off = strtab_push(&snap.strtab, user_buf);
+        e->user_len = (str_len_t)strlen(user_buf);
 
-        if (read_cwd(pid, e->cwd, sizeof(e->cwd)) != 0)
-            e->cwd[0] = '\0';
+        /* cwd */
+        e->cwd_off = read_cwd_to_strtab(pid, &snap.strtab);
+        e->cwd_len = e->cwd_off
+            ? (str_len_t)strlen(snap.strtab.buf + e->cwd_off)
+            : 0;
 
-        e->mem_rss_kb = read_rss(pid);
+        e->mem_rss_kb = (uint64_t)read_rss(pid);
 
         /* CPU ticks and percentage */
-        e->cpu_ticks = read_cpu_ticks(pid);
-        e->cpu_percent = 0.0;
+        e->cpu_ticks   = read_cpu_ticks(pid);
+        e->cpu_percent = 0.0f;
 
         /* Disk I/O counters (cumulative) */
-        if (read_io_bytes(pid, &e->io_read_bytes, &e->io_write_bytes) != 0) {
-            e->io_read_bytes  = 0;
-            e->io_write_bytes = 0;
+        {
+            unsigned long long rd = 0, wr = 0;
+            if (read_io_bytes(pid, &rd, &wr) != 0) rd = wr = 0;
+            e->io_read_bytes  = rd;
+            e->io_write_bytes = wr;
         }
-        e->io_read_rate  = 0.0;
-        e->io_write_rate = 0.0;
+        e->io_read_rate  = 0.0f;
+        e->io_write_rate = 0.0f;
         e->io_history_len = 0;
         memset(e->io_history, 0, sizeof(e->io_history));
 
@@ -968,47 +1057,33 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
         e->start_time = read_start_time(pid);
 
         /* Container detection */
-        read_container(pid, e->container, sizeof(e->container));
+        read_container(pid, container_buf, sizeof(container_buf));
+        e->container_off = strtab_push(&snap.strtab, container_buf);
+        e->container_len = (str_len_t)strlen(container_buf);
 
         /* Service unit (only for direct children of init) */
-        read_service(pid, e->ppid, e->service, sizeof(e->service),
-                     &openrc_map);
+        read_service(pid, e->ppid, svc_buf, &openrc_map);
+        e->service_off = strtab_push(&snap.strtab, svc_buf);
+        e->service_len = (str_len_t)strlen(svc_buf);
 
-        /* Steam/Proton metadata detection — deferred to second pass
-         * so parent entries are available for inheritance.  Zero-init
-         * for now. */
-        memset(&e->steam, 0, sizeof(e->steam));
-
-        snap.count++;
+        snap.len++;
 
         /* ── Early partial-snapshot publish ─────────────────────
          * If the caller asked for a preselect PID, publish as soon as
-         * we have scanned both PID 1 (init) and the target PID.  The
-         * UI can then open the detail panel without waiting for the
-         * rest of /proc to be read.  We publish by temporarily latching
-         * the partial snap; the final full snap overwrites it later.
-         * Only do this on the very first scan (state != NULL). */
+         * we have scanned both PID 1 (init) and the target PID.
+         * Option C: the partial snapshot owns its own copy of the strtab. */
         if (state && state->preselect_pid > 0 &&
-            !partial_published && snap.count >= 2) {
+            !partial_published && snap.len >= 2) {
             int have_init   = 0;
             int have_target = 0;
-            for (size_t _j = 0; _j < snap.count; _j++) {
+            for (uint32_t _j = 0; _j < snap.len; _j++) {
                 if (snap.entries[_j].pid == 1)                    have_init   = 1;
                 if (snap.entries[_j].pid == state->preselect_pid) have_target = 1;
             }
             if (have_init && have_target) {
                 partial_published = 1;
-                /* Make a shallow copy of the entries seen so far */
-                proc_snapshot_t partial = { .count = snap.count };
-                partial.entries = malloc(snap.count * sizeof(proc_entry_t));
+                proc_snapshot_t partial = snapshot_copy_pre_steam(&snap);
                 if (partial.entries) {
-                    memcpy(partial.entries, snap.entries,
-                           snap.count * sizeof(proc_entry_t));
-                    /* Null out heap pointers — the copy doesn't own them */
-                    for (size_t _j = 0; _j < partial.count; _j++) {
-                        partial.entries[_j].steam        = NULL;
-                        partial.entries[_j].cmdline_long = NULL;
-                    }
                     pthread_mutex_lock(&state->lock);
                     proc_snapshot_free(&state->snapshot);
                     state->snapshot = partial;
@@ -1022,38 +1097,16 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
     closedir(dp);
 
     /* ── Mitigation #2: publish after first /proc pass ───────────
-     * The first /proc traversal is now complete.  All process names,
-     * cmdlines, users, memory, CPU ticks, etc. are populated.  Steam
-     * pointers are still NULL, but that is fine — the UI can render
-     * the full process tree immediately without waiting for the Steam
-     * environ scan (which can be slow on systems with many processes
-     * or Steam libraries on a slow filesystem).
-     *
-     * Only do this on the very first snapshot (state != NULL and the
-     * shared snapshot is still empty) and only when Steam is actually
-     * installed (otherwise there is no second publish and the normal
-     * path at the bottom of monitor_thread handles the single publish).
+     * Option C: early snapshot owns its own strtab copy.
      */
-    if (state && steam_is_available() && snap.count > 0) {
+    if (state && steam_is_available() && snap.len > 0) {
         pthread_mutex_lock(&state->lock);
-        int is_first = (state->snapshot.count == 0);
+        int is_first = (state->snapshot.len == 0);
         pthread_mutex_unlock(&state->lock);
 
         if (is_first) {
-            proc_snapshot_t early = { .count = snap.count };
-            early.entries = malloc(snap.count * sizeof(proc_entry_t));
+            proc_snapshot_t early = snapshot_copy_pre_steam(&snap);
             if (early.entries) {
-                memcpy(early.entries, snap.entries,
-                       snap.count * sizeof(proc_entry_t));
-                /* steam pointers in the copy are all NULL here —
-                 * zero them out explicitly so the UI never sees a
-                 * dangling pointer from the memcpy.
-                 * Same for cmdline_long — the copy doesn't own the heap string. */
-                for (size_t _i = 0; _i < early.count; _i++) {
-                    early.entries[_i].steam        = NULL;
-                    early.entries[_i].cmdline_long = NULL;
-                }
-
                 pthread_mutex_lock(&state->lock);
                 proc_snapshot_free(&state->snapshot);
                 state->snapshot = early;
@@ -1067,19 +1120,14 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
                 double _e = (double)(_now.tv_sec  - evemon_start_time.tv_sec)
                           + (double)(_now.tv_nsec - evemon_start_time.tv_nsec) / 1e9;
                 printf("[evemon] monitor: early snapshot published after /proc pass "
-                       "(%.3f s, %zu procs) — Steam enrichment pass starting\n",
-                       _e, snap.count);
+                       "(%.3f s, %u procs) — Steam enrichment pass starting\n",
+                       _e, snap.len);
                 fflush(stdout);
             }
         }
     }
 
-    /* ── Steam/Proton metadata: second pass ──────────────────── *
-     * Skipped entirely when Steam is not installed on this system *
-     * (saves all per-process /proc/<pid>/environ reads).          *
-     * We need parent entries to already exist so that children   *
-     * can inherit Steam metadata.  Build a PID→index hash, then *
-     * iterate in any order — each entry looks up its parent.     */
+    /* ── Steam/Proton metadata: second pass ──────────────────── */
     {
         static int steam_logged = 0;
         if (!steam_logged) {
@@ -1092,36 +1140,29 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
         }
     }
     if (steam_is_available()) {
-        /* Reuse a simple open-addressing hash: PID → index */
         #define STEAM_HT_SIZE 8192
-        typedef struct { pid_t pid; size_t idx; int used; } sht_entry_t;
-        sht_entry_t *sht = calloc(STEAM_HT_SIZE, sizeof(sht_entry_t));
+        typedef struct { pid_t pid; uint32_t idx; int used; } sht_entry_t;
+        sht_entry_t *sht = (sht_entry_t *)calloc(STEAM_HT_SIZE, sizeof(sht_entry_t));
         if (sht) {
-            for (size_t i = 0; i < snap.count; i++) {
+            for (uint32_t i = 0; i < snap.len; i++) {
                 unsigned h = (unsigned)snap.entries[i].pid % STEAM_HT_SIZE;
-                int inserted = 0;
                 for (int k = 0; k < STEAM_HT_SIZE; k++) {
                     if (!sht[h].used) {
                         sht[h].pid  = snap.entries[i].pid;
                         sht[h].idx  = i;
                         sht[h].used = 1;
-                        inserted = 1;
                         break;
                     }
                     h = (h + 1) % STEAM_HT_SIZE;
                 }
-                if (!inserted) break;  /* table full */
             }
 
-            /* Process entries in ancestor-first order.  A quick way
-             * is to iterate multiple times until no new detections
-             * occur, but in practice a single pass with parent-lookup
-             * handles 99% of cases because Steam trees are shallow. */
             for (int pass = 0; pass < 4; pass++) {
                 int new_detections = 0;
-                for (size_t i = 0; i < snap.count; i++) {
+                for (uint32_t i = 0; i < snap.len; i++) {
                     proc_entry_t *e = &snap.entries[i];
-                    if (e->steam)
+                    if (e->extra_idx != UINT32_MAX &&
+                        snap.extras[e->extra_idx].steam)
                         continue;  /* already detected */
 
                     /* Find parent's steam info (if any) */
@@ -1131,17 +1172,42 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
                         for (int k = 0; k < STEAM_HT_SIZE; k++) {
                             if (!sht[h].used) break;
                             if (sht[h].pid == e->ppid) {
-                                parent_si = snap.entries[sht[h].idx].steam;
+                                uint32_t pidx = sht[h].idx;
+                                if (snap.entries[pidx].extra_idx != UINT32_MAX)
+                                    parent_si = snap.extras[snap.entries[pidx].extra_idx].steam;
                                 break;
                             }
                             h = (h + 1) % STEAM_HT_SIZE;
                         }
                     }
 
-                    e->steam = steam_detect(e->pid, e->name, PROC_CMDLINE(e),
-                                            parent_si);
-                    if (e->steam)
+                    steam_info_t *si = steam_detect(
+                        e->pid,
+                        PROC_NAME(&snap, e),
+                        PROC_CMDLINE(&snap, e),
+                        parent_si);
+
+                    if (si) {
+                        /* Allocate or reuse extras slot */
+                        if (e->extra_idx == UINT32_MAX) {
+                            if (snap.extras_len >= snap.extras_cap) {
+                                uint32_t newcap = snap.extras_cap
+                                    ? snap.extras_cap * 2 : 64;
+                                proc_extra_t *tmp = (proc_extra_t *)realloc(
+                                    snap.extras,
+                                    newcap * sizeof(proc_extra_t));
+                                if (!tmp) { free(si); continue; }
+                                snap.extras     = tmp;
+                                snap.extras_cap = newcap;
+                            }
+                            e->extra_idx = snap.extras_len;
+                            snap.extras[snap.extras_len].steam = NULL;
+                            snap.extras_len++;
+                        }
+                        free(snap.extras[e->extra_idx].steam);
+                        snap.extras[e->extra_idx].steam = si;
                         new_detections++;
+                    }
                 }
                 if (new_detections == 0)
                     break;
@@ -1159,15 +1225,24 @@ static proc_snapshot_t build_snapshot(monitor_state_t *state,
 
 void proc_snapshot_free(proc_snapshot_t *snap)
 {
-    if (snap->entries) {
-        for (size_t i = 0; i < snap->count; i++) {
-            free(snap->entries[i].steam);        /* NULL-safe */
-            free(snap->entries[i].cmdline_long); /* NULL-safe */
-        }
-        free(snap->entries);
-        snap->entries = NULL;
-        snap->count   = 0;
+    /* Free per-entry steam metadata in the extras array */
+    if (snap->extras) {
+        for (uint32_t i = 0; i < snap->extras_len; i++)
+            free(snap->extras[i].steam);   /* NULL-safe */
+        free(snap->extras);
+        snap->extras     = NULL;
+        snap->extras_len = 0;
+        snap->extras_cap = 0;
     }
+
+    /* Free the string blob */
+    strtab_free(&snap->strtab);
+
+    /* Free the entry array */
+    free(snap->entries);
+    snap->entries = NULL;
+    snap->len     = 0;
+    snap->cap     = 0;
 }
 
 int monitor_state_init(monitor_state_t *state)
@@ -1197,6 +1272,7 @@ void monitor_state_destroy(monitor_state_t *state)
 void *monitor_thread(void *arg)
 {
     monitor_state_t *state = (monitor_state_t *)arg;
+    pthread_setname_np(pthread_self(), "ev-monitor");
 
     while (1) {
         /* Check if we should keep running */
@@ -1229,12 +1305,13 @@ void *monitor_thread(void *arg)
                            + (double)(now_ts.tv_nsec - prev_ts.tv_nsec) / 1e9;
             if (elapsed > 0.01) {
                 double total_ticks = elapsed * (double)clk_tck * (double)num_cpus;
-                for (size_t i = 0; i < snap.count; i++) {
+                for (uint32_t i = 0; i < snap.len; i++) {
                     unsigned long long prev = cpu_ht_get(g_prev_ticks,
                                                          snap.entries[i].pid);
                     if (prev > 0 && snap.entries[i].cpu_ticks >= prev) {
                         double delta = (double)(snap.entries[i].cpu_ticks - prev);
-                        snap.entries[i].cpu_percent = (delta / total_ticks) * 100.0;
+                        snap.entries[i].cpu_percent =
+                            (float)((delta / total_ticks) * 100.0);
                     }
 
                     /* I/O rate (bytes/sec) from delta */
@@ -1244,12 +1321,12 @@ void *monitor_thread(void *arg)
                     if (prev_rd > 0 || prev_wr > 0) {
                         if (snap.entries[i].io_read_bytes >= prev_rd)
                             snap.entries[i].io_read_rate =
-                                (double)(snap.entries[i].io_read_bytes - prev_rd)
-                                / elapsed;
+                                (float)((double)(snap.entries[i].io_read_bytes - prev_rd)
+                                / elapsed);
                         if (snap.entries[i].io_write_bytes >= prev_wr)
                             snap.entries[i].io_write_rate =
-                                (double)(snap.entries[i].io_write_bytes - prev_wr)
-                                / elapsed;
+                                (float)((double)(snap.entries[i].io_write_bytes - prev_wr)
+                                / elapsed);
                     }
                 }
             }
@@ -1257,20 +1334,18 @@ void *monitor_thread(void *arg)
 
         /* Store current ticks as the "previous" for next iteration */
         memset(g_prev_ticks, 0, sizeof(g_prev_ticks));
-        for (size_t i = 0; i < snap.count; i++)
+        for (uint32_t i = 0; i < snap.len; i++)
             cpu_ht_set(g_prev_ticks, snap.entries[i].pid,
                        snap.entries[i].cpu_ticks);
 
         /* Store current I/O bytes as "previous" for next iteration */
         memset(g_prev_io, 0, sizeof(g_prev_io));
-        for (size_t i = 0; i < snap.count; i++)
+        for (uint32_t i = 0; i < snap.len; i++)
             io_ht_set(g_prev_io, snap.entries[i].pid,
                       snap.entries[i].io_read_bytes,
                       snap.entries[i].io_write_bytes);
 
-        /* GC stale entries from g_io_history: mark entries whose PID
-         * is not in the current snapshot as unused.  g_prev_ticks was
-         * just rebuilt from this snapshot so we reuse it as a lookup. */
+        /* GC stale entries from g_io_history */
         for (int i = 0; i < CPU_HT_SIZE; i++) {
             if (!g_io_history[i].used) continue;
             if (cpu_ht_get(g_prev_ticks, g_io_history[i].pid) == 0 &&
@@ -1279,15 +1354,14 @@ void *monitor_thread(void *arg)
         }
 
         /* Update per-PID I/O history ring buffers and copy into snapshot */
-        for (size_t i = 0; i < snap.count; i++) {
-            float combined = (float)(snap.entries[i].io_read_rate
-                                   + snap.entries[i].io_write_rate);
+        for (uint32_t i = 0; i < snap.len; i++) {
+            float combined = snap.entries[i].io_read_rate
+                           + snap.entries[i].io_write_rate;
             io_hist_entry_t *hist = io_hist_get_or_create(
                 g_io_history, snap.entries[i].pid);
             if (hist) {
                 io_hist_push(hist, combined);
-                /* Copy the history into the snapshot entry */
-                snap.entries[i].io_history_len = hist->count;
+                snap.entries[i].io_history_len = (uint8_t)hist->count;
                 memcpy(snap.entries[i].io_history, hist->samples,
                        hist->count * sizeof(float));
             } else {
@@ -1304,8 +1378,8 @@ void *monitor_thread(void *arg)
 
         /* Swap it in */
         pthread_mutex_lock(&state->lock);
-        int _first = ((state->snapshot.count == 0 || snap_published_early)
-                      && snap.count > 0);
+        int _first = ((state->snapshot.len == 0 || snap_published_early)
+                      && snap.len > 0);
         proc_snapshot_free(&state->snapshot);
         state->snapshot = snap;
         pthread_cond_signal(&state->updated);
@@ -1318,9 +1392,9 @@ void *monitor_thread(void *arg)
             double _e = (double)(_now.tv_sec  - evemon_start_time.tv_sec)
                       + (double)(_now.tv_nsec - evemon_start_time.tv_nsec) / 1e9;
             const char *_label = snap_published_early
-                ? "[evemon] monitor: Steam-enriched snapshot ready %.3f s after startup (%zu procs)\n"
-                : "[evemon] monitor: first snapshot ready %.3f s after startup (%zu procs)\n";
-            printf(_label, _e, snap.count);
+                ? "[evemon] monitor: Steam-enriched snapshot ready %.3f s after startup (%u procs)\n"
+                : "[evemon] monitor: first snapshot ready %.3f s after startup (%u procs)\n";
+            printf(_label, _e, snap.len);
             fflush(stdout);
         }
 

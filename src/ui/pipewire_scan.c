@@ -640,6 +640,7 @@ static void watcher_on_core_error(void *data, uint32_t id, int seq,
 static void *pw_watcher_thread(void *arg)
 {
     (void)arg;
+    pthread_setname_np(pthread_self(), "ev-pw-watch");
 
     /* PIPEWIRE_REMOTE is resolved in pw_watcher_start() on the main
      * thread before this thread is spawned, so no setenv() here. */

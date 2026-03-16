@@ -532,6 +532,7 @@ int fdmon_sock_io_list(const fdmon_ctx_t *ctx, pid_t tgid,
 static void *fanotify_reader_thread(void *arg)
 {
     fdmon_ctx_t *ctx = arg;
+    pthread_setname_np(pthread_self(), "ev-fanotify");
     char buf[8192] __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
 
     while (atomic_load_explicit(&ctx->fan_running, memory_order_relaxed)) {

@@ -50,14 +50,14 @@ typedef struct {
 /* ── per-process record ──────────────────────────────────────── */
 
 /*
- * proc_record_t embeds a *copy* of proc_entry_t (including a deep-copied
- * steam_info_t) so the store owns all memory and the caller's snapshot
- * can be freed independently after proc_store_update() returns.
+ * proc_record_t embeds a *copy* of proc_entry_t.  String fields are
+ * stored as offsets into proc_store_t::strtab, which is rebuilt each
+ * tick from the incoming snapshot.  Steam info lives in a separately
+ * allocated proc_extra_t array (store owns the steam_info_t heap ptrs).
  */
 typedef struct {
-    proc_entry_t   entry;       /* full copy of the process data            */
-    steam_info_t   steam_copy;  /* inline copy of steam metadata (if any)   */
-    proc_status_t  status;      /* ALIVE / DYING / KILLED                   */
+    proc_entry_t   entry;       /* full copy of the process data (offset-based) */
+    proc_status_t  status;      /* ALIVE / DYING / KILLED                        */
     int64_t        died_at_us;  /* CLOCK_MONOTONIC µs when marked DYING (0 if ALIVE) */
 } proc_record_t;
 
@@ -68,7 +68,16 @@ typedef struct {
     size_t            count;      /* number of live (non-KILLED) records      */
     size_t            capacity;   /* allocated slots in records[]             */
 
-    store_ht_entry_t  ht[STORE_HT_SIZE]; /* PID → records[] index lookup     */
+    store_ht_entry_t *ht;        /* PID → records[] index lookup (heap)      */
+    store_ht_entry_t *snap_ht;   /* scratch buffer for incoming snapshot (heap) */
+
+    /* Per-store string table — rebuilt each tick from the snapshot strtab */
+    proc_strtab_t     strtab;
+
+    /* Per-store extras (steam metadata) — rebuilt each tick */
+    proc_extra_t     *extras;    /* indexed by record's entry.extra_idx      */
+    uint32_t          extras_len;
+    uint32_t          extras_cap;
 } proc_store_t;
 
 /* ── API ─────────────────────────────────────────────────────── */
@@ -100,7 +109,7 @@ void proc_store_destroy(proc_store_t *s);
  * `mono_now_us` must be the current CLOCK_MONOTONIC time in microseconds.
  */
 void proc_store_update(proc_store_t *s,
-                       const proc_entry_t *entries, size_t count,
+                       const proc_snapshot_t *snap,
                        int64_t mono_now_us);
 
 /*

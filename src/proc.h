@@ -2,65 +2,169 @@
 #define evemon_PROC_H
 
 #include <sys/types.h>
+#include <stdint.h>
 #include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "steam.h"
 #include "fdmon.h"
 
 #include "log.h"
 
-/* Maximum lengths for process info strings */
+/* Maximum comm name length (used in a few places that still need it) */
 #define PROC_NAME_MAX  256
-#define PROC_CMD_MAX   1024   /* covers P99; longer cmdlines spill to cmdline_long */
-#define PROC_USER_MAX  64
-#define PROC_CWD_MAX   1024
-#define PROC_CTR_MAX   64
-#define PROC_SVC_MAX   128
 #define PROC_LIST_MAX  2048
 
 /* Number of I/O rate history samples kept per process (sparkline depth) */
 #define IO_HISTORY_LEN 20
 
-/* A single process entry */
-typedef struct {
-    pid_t    pid;
-    pid_t    ppid;
-    char     name[PROC_NAME_MAX];
-    char     cmdline[PROC_CMD_MAX];  /* inline storage, always valid    */
-    char    *cmdline_long;             /* heap; non-NULL only when the     *
-                                        * actual cmdline exceeded PROC_CMD_MAX-1 */
-    char     user[PROC_USER_MAX];
-    char     cwd[PROC_CWD_MAX];
-    char     container[PROC_CTR_MAX];   /* container runtime or empty   */
-    char     service[PROC_SVC_MAX];     /* systemd unit or openrc svc   */
-    long     mem_rss_kb;            /* resident set size in KiB */
-    unsigned long long cpu_ticks;   /* utime + stime (USER_HZ ticks)  */
-    double   cpu_percent;           /* CPU% since last snapshot        */
-    unsigned long long start_time;  /* process start time (epoch secs) */
-    unsigned long long io_read_bytes;  /* cumulative read_bytes from /proc/<pid>/io  */
-    unsigned long long io_write_bytes; /* cumulative write_bytes from /proc/<pid>/io */
-    double   io_read_rate;          /* disk read  bytes/sec since last snapshot    */
-    double   io_write_rate;         /* disk write bytes/sec since last snapshot    */
-    float    io_history[IO_HISTORY_LEN]; /* ring buffer of combined I/O rate samples */
-    int      io_history_len;        /* number of valid samples in io_history       */
-    steam_info_t *steam;            /* Steam/Proton metadata (heap, NULL if not Steam) */
-} proc_entry_t;
+/* ── Variable-length string table ────────────────────────────── */
+
+typedef uint32_t str_off_t;  /* 0 = empty / none (reserved NUL at slot 0) */
+typedef uint16_t str_len_t;
 
 /*
- * PROC_CMDLINE(e) – always returns the full command line for entry *e.
- * For most processes this is e->cmdline (inline).  For the rare ones
- * whose cmdline exceeded PROC_CMD_MAX-1 bytes at read time, the full
- * string is in e->cmdline_long (heap-allocated).
+ * proc_strtab_t – a single flat buffer holding all per-snapshot strings.
+ * Offset 0 is reserved as the empty-string sentinel (a single NUL byte
+ * placed there during init).  Every other string is NUL-terminated and
+ * can be addressed by its offset.
  */
-#define PROC_CMDLINE(e)  ((e)->cmdline_long ? (e)->cmdline_long : (e)->cmdline)
-
-/* Snapshot of all processes at a point in time */
 typedef struct {
-    proc_entry_t *entries;
-    size_t        count;
+    char     *buf;
+    uint32_t  len;   /* bytes used (including the sentinel NUL at [0]) */
+    uint32_t  cap;   /* bytes allocated */
+} proc_strtab_t;
+
+/*
+ * Rare/expensive metadata kept out of the hot row.
+ * Heap-allocated; NULL extras_idx means no extras for this entry.
+ */
+typedef struct {
+    steam_info_t *steam;   /* NULL if not a Steam/Wine process */
+} proc_extra_t;
+
+/* ── Compact process row ─────────────────────────────────────── */
+
+typedef struct {
+    pid_t     pid;
+    pid_t     ppid;
+
+    str_off_t name_off;       str_len_t name_len;
+    str_off_t cmd_off;        str_len_t cmd_len;
+    str_off_t user_off;       str_len_t user_len;
+    str_off_t cwd_off;        str_len_t cwd_len;
+    str_off_t container_off;  str_len_t container_len;
+    str_off_t service_off;    str_len_t service_len;
+
+    uint64_t  mem_rss_kb;
+    uint64_t  cpu_ticks;
+    uint64_t  start_time;
+    uint64_t  io_read_bytes;
+    uint64_t  io_write_bytes;
+
+    float     cpu_percent;
+    float     io_read_rate;
+    float     io_write_rate;
+
+    uint8_t   io_history_len;
+    uint8_t   io_history_head;   /* unused currently; reserved for ring-head */
+    uint16_t  flags;             /* reserved */
+
+    float     io_history[IO_HISTORY_LEN];
+
+    uint32_t  extra_idx;   /* index into proc_snapshot_t::extras[], UINT32_MAX = none */
+} proc_entry_t;
+
+/* ── String-table accessors (two-argument) ───────────────────── */
+
+#define PROC_STR(tab, off)       ((off) ? ((tab)->buf + (off)) : "")
+#define PROC_NAME(s, e)          PROC_STR(&(s)->strtab, (e)->name_off)
+#define PROC_CMDLINE(s, e)       PROC_STR(&(s)->strtab, (e)->cmd_off)
+#define PROC_USER(s, e)          PROC_STR(&(s)->strtab, (e)->user_off)
+#define PROC_CWD(s, e)           PROC_STR(&(s)->strtab, (e)->cwd_off)
+#define PROC_CONTAINER(s, e)     PROC_STR(&(s)->strtab, (e)->container_off)
+#define PROC_SERVICE(s, e)       PROC_STR(&(s)->strtab, (e)->service_off)
+
+/* ── Snapshot ────────────────────────────────────────────────── */
+
+typedef struct {
+    proc_entry_t   *entries;
+    uint32_t        len;
+    uint32_t        cap;
+
+    proc_strtab_t   strtab;
+
+    proc_extra_t   *extras;
+    uint32_t        extras_len;
+    uint32_t        extras_cap;
 } proc_snapshot_t;
 
-/* Free a snapshot and all heap-allocated per-entry data (e.g. steam info) */
+/* ── strtab helper ───────────────────────────────────────────── */
+
+/*
+ * Initialise a strtab: allocate buf, write sentinel NUL at offset 0.
+ * cap: initial buffer capacity in bytes (grows by doubling as needed).
+ */
+static inline int strtab_init(proc_strtab_t *t, uint32_t cap)
+{
+    t->buf = (char *)malloc(cap);
+    if (!t->buf) return -1;
+    t->buf[0] = '\0';
+    t->len = 1;    /* offset 0 = empty sentinel */
+    t->cap = cap;
+    return 0;
+}
+
+static inline void strtab_free(proc_strtab_t *t)
+{
+    free(t->buf);
+    t->buf = NULL;
+    t->len = 0;
+    t->cap = 0;
+}
+
+/*
+ * Append string s (NUL-terminated) to the strtab.
+ * Returns the offset of the stored string, or 0 on OOM/empty.
+ * Offset 0 is the empty sentinel, so callers can use 0 as "none".
+ * Empty strings (s == NULL or s[0] == '\0') return 0.
+ */
+static inline str_off_t strtab_push(proc_strtab_t *t, const char *s)
+{
+    if (!s || s[0] == '\0') return 0;
+
+    uint32_t slen = (uint32_t)strlen(s);
+    uint32_t need = t->len + slen + 1;
+
+    if (need > t->cap) {
+        uint32_t newcap = t->cap * 2;
+        if (newcap < need) newcap = need + 1024;
+        char *nb = (char *)realloc(t->buf, newcap);
+        if (!nb) return 0;
+        t->buf = nb;
+        t->cap = newcap;
+    }
+
+    str_off_t off = t->len;
+    memcpy(t->buf + off, s, slen + 1);
+    t->len += slen + 1;
+    return off;
+}
+
+/*
+ * Reset the strtab to its initial state (len=1, preserving capacity).
+ * Used each tick by the store to repopulate from a fresh snapshot.
+ */
+static inline void strtab_reset(proc_strtab_t *t)
+{
+    if (t->buf) {
+        t->buf[0] = '\0';
+        t->len = 1;
+    }
+}
+
+/* Free a snapshot and all heap-allocated data */
 void proc_snapshot_free(proc_snapshot_t *snap);
 
 /* Thread-safe shared state between the monitor and the UI */

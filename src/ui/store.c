@@ -3,7 +3,7 @@
  *
  * Owns the lifecycle of proc_record_t entries: diff-update against an
  * incoming proc_entry_t snapshot, ALIVE/DYING/KILLED state transitions,
- * deep-copy of steam_info_t, and compaction of expired records.
+ * strtab-based string storage, and compaction of expired records.
  *
  * No GTK headers are included here.
  */
@@ -58,49 +58,103 @@ static size_t ht_find(const store_ht_entry_t *ht, pid_t pid)
     return (size_t)-1;
 }
 
-/* ── deep-copy helpers for proc_entry_t ─────────────────────── */
+/*
+ * re_push_entry_strings – push a record's strings into the store strtab
+ * from a source strtab (may be different from s->strtab).
+ * Used to remap snapshot-strtab offsets into store-strtab offsets.
+ */
+static void re_push_entry_strings(proc_store_t *s, proc_record_t *rec,
+                                   const proc_entry_t *src,
+                                   const proc_strtab_t *src_strtab)
+{
+    rec->entry = *src;
+
+    rec->entry.name_off      = strtab_push(&s->strtab, PROC_STR(src_strtab, src->name_off));
+    rec->entry.cmd_off       = strtab_push(&s->strtab, PROC_STR(src_strtab, src->cmd_off));
+    rec->entry.user_off      = strtab_push(&s->strtab, PROC_STR(src_strtab, src->user_off));
+    rec->entry.cwd_off       = strtab_push(&s->strtab, PROC_STR(src_strtab, src->cwd_off));
+    rec->entry.container_off = strtab_push(&s->strtab, PROC_STR(src_strtab, src->container_off));
+    rec->entry.service_off   = strtab_push(&s->strtab, PROC_STR(src_strtab, src->service_off));
+
+    rec->entry.name_len      = (str_len_t)strlen(PROC_STR(&s->strtab, rec->entry.name_off));
+    rec->entry.cmd_len       = (str_len_t)strlen(PROC_STR(&s->strtab, rec->entry.cmd_off));
+    rec->entry.user_len      = (str_len_t)strlen(PROC_STR(&s->strtab, rec->entry.user_off));
+    rec->entry.cwd_len       = (str_len_t)strlen(PROC_STR(&s->strtab, rec->entry.cwd_off));
+    rec->entry.container_len = (str_len_t)strlen(PROC_STR(&s->strtab, rec->entry.container_off));
+    rec->entry.service_len   = (str_len_t)strlen(PROC_STR(&s->strtab, rec->entry.service_off));
+}
 
 /*
- * Copy src into dst, replacing the steam pointer with an inline copy
- * stored in steam_out (or NULL if src->steam is NULL).
+ * store_copy_entry – copy from a snapshot entry into the store,
+ * remapping string offsets through the snapshot's strtab.
+ * Also deep-copies steam extras into s->extras.
  */
-static void copy_entry(proc_record_t *rec, const proc_entry_t *src)
+static void store_copy_entry(proc_store_t *s, proc_record_t *rec,
+                              const proc_entry_t *src,
+                              const proc_snapshot_t *snap)
 {
-    /* Free any existing heap cmdline before overwriting */
-    free(rec->entry.cmdline_long);
+    re_push_entry_strings(s, rec, src, &snap->strtab);
 
-    rec->entry = *src;   /* shallow copy — fixes up steam and cmdline_long below */
-
-    /* Deep-copy the optional long cmdline */
-    if (src->cmdline_long)
-        rec->entry.cmdline_long = strdup(src->cmdline_long);
-    else
-        rec->entry.cmdline_long = NULL;
-
-    if (src->steam) {
-        rec->steam_copy  = *src->steam;          /* inline copy */
-        rec->entry.steam = &rec->steam_copy;     /* point at our copy */
-    } else {
-        rec->entry.steam = NULL;
+    /* Handle steam extras */
+    rec->entry.extra_idx = UINT32_MAX;
+    if (src->extra_idx != UINT32_MAX && src->extra_idx < snap->extras_len &&
+        snap->extras[src->extra_idx].steam) {
+        if (s->extras_len >= s->extras_cap) {
+            uint32_t newcap = s->extras_cap ? s->extras_cap * 2 : 64;
+            proc_extra_t *tmp = (proc_extra_t *)realloc(
+                s->extras, newcap * sizeof(proc_extra_t));
+            if (tmp) {
+                s->extras     = tmp;
+                s->extras_cap = newcap;
+            }
+        }
+        if (s->extras_len < s->extras_cap) {
+            steam_info_t *si = (steam_info_t *)malloc(sizeof(steam_info_t));
+            if (si) {
+                *si = *snap->extras[src->extra_idx].steam;
+                s->extras[s->extras_len].steam = si;
+                rec->entry.extra_idx = s->extras_len;
+                s->extras_len++;
+            }
+        }
     }
 }
+
 
 /* ── public API ──────────────────────────────────────────────── */
 
 void proc_store_init(proc_store_t *s)
 {
     memset(s, 0, sizeof(*s));
+    s->ht      = calloc(STORE_HT_SIZE, sizeof(store_ht_entry_t));
+    s->snap_ht = calloc(STORE_HT_SIZE, sizeof(store_ht_entry_t));
+    strtab_init(&s->strtab, 65536);
+    s->extras     = NULL;
+    s->extras_len = 0;
+    s->extras_cap = 0;
+    /* OOM on ht/snap_ht is fatal; callers check s->ht != NULL */
 }
 
 void proc_store_destroy(proc_store_t *s)
 {
-    for (size_t i = 0; i < s->count; i++)
-        free(s->records[i].entry.cmdline_long);
+    /* Free steam extras */
+    if (s->extras) {
+        for (uint32_t i = 0; i < s->extras_len; i++)
+            free(s->extras[i].steam);
+        free(s->extras);
+    }
+    strtab_free(&s->strtab);
     free(s->records);
-    s->records  = NULL;
-    s->count    = 0;
-    s->capacity = 0;
-    ht_clear(s->ht);
+    free(s->ht);
+    free(s->snap_ht);
+    s->records    = NULL;
+    s->ht         = NULL;
+    s->snap_ht    = NULL;
+    s->extras     = NULL;
+    s->extras_len = 0;
+    s->extras_cap = 0;
+    s->count      = 0;
+    s->capacity   = 0;
 }
 
 /*
@@ -108,37 +162,63 @@ void proc_store_destroy(proc_store_t *s)
  *
  * Algorithm:
  *
- *  A) Build a temporary hash of the incoming snapshot (snap_ht).
+ *  A) Rebuild the store strtab and extras: reset both, then populate
+ *     from scratch as entries are updated or inserted (clear+repopulate
+ *     strategy avoids fragmentation).
  *
- *  B) Walk the store's current records:
+ *  B) Build a temporary hash of the incoming snapshot (snap_ht).
+ *
+ *  C) Walk the store's current records:
  *     - If a record is ALIVE or DYING and the PID is still in the
  *       snapshot → refresh its data, mark ALIVE.
  *     - If a record is ALIVE and the PID is absent from the snapshot
  *       → mark DYING, stamp died_at_us.
  *     - If a record is DYING and the grace period has expired → mark
- *       KILLED (compacted in step D).
+ *       KILLED (compacted in step E).
  *     - KILLED records are left alone here (already awaiting compaction).
  *
- *  C) Walk the snapshot; any PID not already in the store → append new
+ *  D) Walk the snapshot; any PID not already in the store → append new
  *     ALIVE record.
  *
- *  D) Compact: remove KILLED records from the array and rebuild the ht.
+ *  E) Compact: remove KILLED records from the array and rebuild the ht.
  */
 void proc_store_update(proc_store_t *s,
-                       const proc_entry_t *entries, size_t count,
+                       const proc_snapshot_t *snap,
                        int64_t mono_now_us)
 {
-    /* ── A: build snapshot hash ─────────────────────────────── */
+    if (!s->ht || !s->snap_ht) return;   /* OOM during init – skip */
+    if (!snap) return;
 
-    /* Stack-allocate when count is small, heap otherwise. */
-    store_ht_entry_t *snap_ht = calloc(STORE_HT_SIZE, sizeof(store_ht_entry_t));
-    if (!snap_ht) return;   /* OOM – skip update */
+    const proc_entry_t *entries = snap->entries;
+    uint32_t            count   = snap->len;
 
-    for (size_t i = 0; i < count; i++)
+    /* ── A: save old strtab for DYING record re-push ──────────
+     * We must snapshot the current store strtab *before* the reset
+     * so that DYING records' existing offsets remain readable while
+     * we repopulate this tick. */
+    proc_strtab_t old_strtab = { NULL, 0, 0 };
+    if (s->strtab.len > 1) {
+        old_strtab.buf = (char *)malloc(s->strtab.len);
+        if (old_strtab.buf) {
+            memcpy(old_strtab.buf, s->strtab.buf, s->strtab.len);
+            old_strtab.len = s->strtab.len;
+            old_strtab.cap = s->strtab.len;
+        }
+    }
+
+    /* Reset the store strtab and extras so we can repopulate cleanly */
+    strtab_reset(&s->strtab);
+    for (uint32_t i = 0; i < s->extras_len; i++)
+        free(s->extras[i].steam);
+    s->extras_len = 0;
+
+    /* ── B: build snapshot hash ──────────────────────────────── */
+    store_ht_entry_t *snap_ht = s->snap_ht;
+    memset(snap_ht, 0, STORE_HT_SIZE * sizeof(store_ht_entry_t));
+    for (uint32_t i = 0; i < count; i++)
         ht_insert(snap_ht, entries[i].pid, i);
 
-    /* ── B: update / age existing records ──────────────────── */
-
+    /* ── C: update / age existing records ───────────────────── */
     for (size_t i = 0; i < s->count; i++) {
         proc_record_t *rec = &s->records[i];
         if (rec->status == PROC_KILLED) continue;
@@ -146,12 +226,17 @@ void proc_store_update(proc_store_t *s,
         size_t sidx = ht_find(snap_ht, rec->entry.pid);
 
         if (sidx != (size_t)-1) {
-            /* PID still alive — refresh data */
-            copy_entry(rec, &entries[sidx]);
-            rec->status      = PROC_ALIVE;
-            rec->died_at_us  = 0;
+            /* PID still alive — refresh from snapshot */
+            store_copy_entry(s, rec, &entries[sidx], snap);
+            rec->status     = PROC_ALIVE;
+            rec->died_at_us = 0;
         } else {
-            /* PID gone */
+            /* PID gone — re-push strings from the old strtab so they
+             * stay valid in the freshly-reset store strtab. */
+            proc_strtab_t *src_strtab = old_strtab.buf ? &old_strtab : &s->strtab;
+            re_push_entry_strings(s, rec, &rec->entry, src_strtab);
+            rec->entry.extra_idx = UINT32_MAX;   /* steam not preserved for dying */
+
             if (rec->status == PROC_ALIVE) {
                 rec->status     = PROC_DYING;
                 rec->died_at_us = mono_now_us;
@@ -162,32 +247,26 @@ void proc_store_update(proc_store_t *s,
         }
     }
 
-    /* ── C: append brand-new PIDs ───────────────────────────── */
+    /* Free the old strtab snapshot */
+    free(old_strtab.buf);
 
-    for (size_t i = 0; i < count; i++) {
+    /* ── D: append brand-new PIDs ─────────────────────────── */
+    for (uint32_t i = 0; i < count; i++) {
         if (ht_find(s->ht, entries[i].pid) != (size_t)-1)
-            continue;   /* already in the store */
+            continue;
 
-        /* Grow the records array if needed (doubling strategy) */
         if (s->count >= s->capacity) {
             size_t newcap = s->capacity ? s->capacity * 2 : 256;
             proc_record_t *tmp = realloc(s->records,
                                          newcap * sizeof(proc_record_t));
-            if (!tmp) continue;   /* OOM — skip this entry */
+            if (!tmp) continue;
             s->records  = tmp;
             s->capacity = newcap;
-            /* realloc may have moved the buffer — re-seat all entry.steam
-             * pointers that point into the inline steam_copy fields, which
-             * moved along with the records array. */
-            for (size_t k = 0; k < s->count; k++) {
-                if (s->records[k].entry.steam)
-                    s->records[k].entry.steam = &s->records[k].steam_copy;
-            }
         }
 
         proc_record_t *rec = &s->records[s->count];
-        memset(rec, 0, sizeof(*rec));   /* zero before copy_entry's free() */
-        copy_entry(rec, &entries[i]);
+        memset(rec, 0, sizeof(*rec));
+        store_copy_entry(s, rec, &entries[i], snap);
         rec->status     = PROC_ALIVE;
         rec->died_at_us = 0;
 
@@ -195,9 +274,7 @@ void proc_store_update(proc_store_t *s,
         s->count++;
     }
 
-    /* ── D: compact KILLED records ──────────────────────────── */
-
-    /* Check whether any compaction is needed before touching memory. */
+    /* ── E: compact KILLED records ──────────────────────────── */
     int need_compact = 0;
     for (size_t i = 0; i < s->count; i++) {
         if (s->records[i].status == PROC_KILLED) { need_compact = 1; break; }
@@ -206,32 +283,30 @@ void proc_store_update(proc_store_t *s,
     if (need_compact) {
         size_t w = 0;
         for (size_t r = 0; r < s->count; r++) {
-            if (s->records[r].status == PROC_KILLED) {
-                free(s->records[r].entry.cmdline_long);
+            if (s->records[r].status == PROC_KILLED)
                 continue;
-            }
-            if (w != r) {
+            if (w != r)
                 s->records[w] = s->records[r];
-                /* Re-seat the steam pointer: the shallow copy above made
-                 * entry.steam point at records[r].steam_copy (old slot).
-                 * Fix it to point at records[w].steam_copy (new slot). */
-                if (s->records[w].entry.steam)
-                    s->records[w].entry.steam = &s->records[w].steam_copy;
-            }
             w++;
         }
         s->count = w;
 
-        /* Rebuild hash table from scratch to fix up indices */
         ht_clear(s->ht);
         for (size_t i = 0; i < s->count; i++)
             ht_insert(s->ht, s->records[i].entry.pid, i);
+
+        if (s->capacity > 256 && s->count < s->capacity / 2) {
+            size_t newcap = s->count < 128 ? 256 : s->count * 2;
+            proc_record_t *tmp = realloc(s->records,
+                                          newcap * sizeof(proc_record_t));
+            if (tmp) {
+                s->records  = tmp;
+                s->capacity = newcap;
+            }
+        }
     }
 
-    free(snap_ht);
-
-    (void)store_mono_now_us;   /* suppress unused-function warning if caller
-                                * always passes mono_now_us explicitly */
+    (void)store_mono_now_us;
 }
 
 void proc_store_foreach(const proc_store_t *s,

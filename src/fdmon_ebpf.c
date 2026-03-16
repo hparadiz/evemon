@@ -416,6 +416,7 @@ static void handle_lost(void *cookie, int cpu, __u64 count)
 static void *ebpf_reader_thread(void *arg)
 {
     ebpf_state_t *st = arg;
+    pthread_setname_np(pthread_self(), "ev-ebpf");
     while (atomic_load_explicit(&st->running, memory_order_relaxed)) {
         /* poll for 200ms then check running flag */
         perf_buffer__poll(st->pb, 200);
