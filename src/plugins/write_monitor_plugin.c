@@ -4,6 +4,14 @@
 #include <stdio.h>
 #include <glib.h>
 
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.write_monitor",
+    "Write Monitor",
+    "1.0",
+    EVEMON_ROLE_SERVICE,
+    NULL
+);
+
 typedef struct {
     const evemon_host_services_t *hsvc;
     int sub_pid_select_id;
@@ -115,7 +123,8 @@ evemon_plugin_t *evemon_plugin_init(void)
     p->clear = NULL;
     p->destroy = plugin_destroy;
     p->activate = plugin_activate;
-    p->kind = EVEMON_PLUGIN_HEADLESS;
+    p->role = EVEMON_ROLE_SERVICE;
+    p->dependencies = NULL;
 
     return p;
 }

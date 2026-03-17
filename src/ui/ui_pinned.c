@@ -442,7 +442,7 @@ void pinned_panel_create(ui_ctx_t *ctx, pid_t pid)
         for (size_t i = 0; i < orig_count; i++) {
             plugin_instance_t *orig = &preg->instances[i];
             if (!orig->plugin || !orig->plugin->id) continue;
-            if (orig->plugin->kind == EVEMON_PLUGIN_HEADLESS) continue;
+            if (orig->plugin->role == EVEMON_ROLE_SERVICE) continue;
             if (!orig->widget) continue;
             if (!PLUGIN_IS_AVAILABLE(orig)) continue;
             if (strcmp(orig->plugin->id, tab_order[o]) != 0) continue;
@@ -469,7 +469,7 @@ void pinned_panel_create(ui_ctx_t *ctx, pid_t pid)
         if (pass_added[i]) continue;
         plugin_instance_t *orig = &preg->instances[i];
         if (!orig->plugin || !orig->plugin->id) continue;
-        if (orig->plugin->kind == EVEMON_PLUGIN_HEADLESS) {
+        if (orig->plugin->role == EVEMON_ROLE_SERVICE) {
             /* Clone headless plugins too (e.g. audio_service) */
             if (PP_SEEN(orig->plugin->id)) continue;
             seen_ids[n_seen++] = orig->plugin->id;
@@ -508,7 +508,7 @@ void pinned_panel_create(ui_ctx_t *ctx, pid_t pid)
             if (pass_added[i]) continue;
             plugin_instance_t *orig = &preg->instances[i];
             if (!orig->plugin || !orig->plugin->id) continue;
-            if (orig->plugin->kind == EVEMON_PLUGIN_HEADLESS) continue;
+            if (orig->plugin->role == EVEMON_ROLE_SERVICE) continue;
             if (!PLUGIN_IS_AVAILABLE(orig)) continue;
             if (strcmp(orig->plugin->id, tab_order_last[o]) != 0) continue;
             if (PP_SEEN(orig->plugin->id)) continue;

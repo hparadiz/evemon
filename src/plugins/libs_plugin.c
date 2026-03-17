@@ -15,6 +15,14 @@
 #include <stdio.h>
 #include <strings.h>
 
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.libs",
+    "Libraries",
+    "1.0",
+    EVEMON_ROLE_PROCESS,
+    NULL
+);
+
 /* ── UTF-8 helpers ───────────────────────────────────────────── */
 
 /*
@@ -413,7 +421,7 @@ evemon_plugin_t *evemon_plugin_init(void)
 
     *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
-        .name          = "Shared Libraries",
+        .name          = "Libraries",
         .id            = "org.evemon.libs",
         .version       = "1.0",
         .data_needs    = evemon_NEED_LIBS,
@@ -422,6 +430,8 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = lib_update,
         .clear         = lib_clear,
         .destroy       = lib_destroy,
+        .role          = EVEMON_ROLE_PROCESS,
+        .dependencies  = NULL,
     };
 
     return p;

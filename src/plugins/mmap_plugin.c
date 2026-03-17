@@ -13,6 +13,14 @@
 #include <string.h>
 #include <stdio.h>
 
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.mmap",
+    "Memory Maps",
+    "1.0",
+    EVEMON_ROLE_PROCESS,
+    NULL
+);
+
 /* ── category definitions ────────────────────────────────────── */
 
 enum {
@@ -398,6 +406,8 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = mmap_update,
         .clear         = mmap_clear,
         .destroy       = mmap_destroy,
+        .role          = EVEMON_ROLE_PROCESS,
+        .dependencies  = NULL,
     };
 
     return p;

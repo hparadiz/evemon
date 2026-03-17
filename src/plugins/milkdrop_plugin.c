@@ -32,6 +32,16 @@
 /* from main.c – resolved at dlopen time (-rdynamic) */
 #include "../log.h"
 
+static const char *_md_deps[] = { "org.evemon.audio_service", NULL };
+
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.milkdrop",
+    "MilkDrop",
+    "1.0",
+    EVEMON_ROLE_PROCESS,
+    "org.evemon.audio_service", NULL
+);
+
 /* ── compile-time knobs ──────────────────────────────────────── */
 
 #define MD_FFT_SIZE     1024
@@ -2838,6 +2848,9 @@ static void md_toggle_fullscreen(md_ctx_t *ctx)
         /* Create fullscreen window */
         ctx->fs_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
         gtk_window_set_title(GTK_WINDOW(ctx->fs_window), "MilkDrop");
+        G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+        gtk_window_set_wmclass(GTK_WINDOW(ctx->fs_window), "evemon", "evemon");
+        G_GNUC_END_IGNORE_DEPRECATIONS
         gtk_window_set_decorated(GTK_WINDOW(ctx->fs_window), FALSE);
         gtk_window_set_skip_taskbar_hint(GTK_WINDOW(ctx->fs_window), TRUE);
         gtk_widget_add_events(ctx->fs_window, GDK_KEY_PRESS_MASK);
@@ -4275,7 +4288,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
         .name          = "MilkDrop",
         .id            = "org.evemon.milkdrop",
-        .version       = "3.0",
+        .version       = "1.0",
         .data_needs    = evemon_NEED_PIPEWIRE | evemon_NEED_MPRIS,
         .plugin_ctx    = ctx,
         .create_widget = md_create_widget,
@@ -4284,6 +4297,8 @@ evemon_plugin_t *evemon_plugin_init(void)
         .destroy       = md_destroy,
         .activate      = md_activate,
         .set_active    = md_set_active,
+        .role          = EVEMON_ROLE_PROCESS,
+        .dependencies  = _md_deps,
     };
     return p;
 }

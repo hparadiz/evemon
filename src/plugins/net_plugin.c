@@ -18,6 +18,14 @@
 #include <stdio.h>
 #include <math.h>
 
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.net",
+    "Network",
+    "1.0",
+    EVEMON_ROLE_PROCESS,
+    NULL
+);
+
 /* ── throughput history chart ────────────────────────────────── */
 
 #define NET_HISTORY_LEN   120   /* samples kept (≈2 min at 1 s tick)  */
@@ -1747,15 +1755,17 @@ evemon_plugin_t *evemon_plugin_init(void)
 
     *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
-        .name          = "Network Sockets",
+        .name          = "Network",
         .id            = "org.evemon.net",
-        .version       = "2.0",
+        .version       = "1.0",
         .data_needs    = evemon_NEED_SOCKETS | evemon_NEED_DESCENDANTS,
         .plugin_ctx    = ctx,
         .create_widget = net_create_widget,
         .update        = net_update,
         .clear         = net_clear,
         .destroy       = net_destroy,
+        .role          = EVEMON_ROLE_PROCESS,
+        .dependencies  = NULL,
     };
 
     return p;

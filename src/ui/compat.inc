@@ -734,6 +734,9 @@ static void on_menu_compatibility(GtkMenuItem *item, gpointer data)
     gtk_window_set_title(GTK_WINDOW(dlg), "evemon – System Compatibility");
     gtk_window_set_transient_for(GTK_WINDOW(dlg),
                                  GTK_WINDOW(parent_window));
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    gtk_window_set_wmclass(GTK_WINDOW(dlg), "evemon", "evemon");
+    G_GNUC_END_IGNORE_DEPRECATIONS
     gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
     gtk_window_set_default_size(GTK_WINDOW(dlg), 720, 500);
     gtk_window_set_resizable(GTK_WINDOW(dlg), TRUE);

@@ -14,8 +14,83 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+
+/* libelf — for manifest section inspection without dlopen */
+#include <gelf.h>
+#include <libelf.h>
+
+/* ── Pre-load manifest reader ────────────────────────────────── */
+
+int evemon_manifest_read(const char *so_path, evemon_plugin_manifest_t *out)
+{
+    if (!so_path || !out) return -1;
+
+    /* One-time libelf version initialisation (idempotent) */
+    elf_version(EV_CURRENT);
+
+    int fd = open(so_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+
+    Elf *elf = elf_begin(fd, ELF_C_READ, NULL);
+    if (!elf) { close(fd); return -1; }
+
+    /* Locate the section name string table index */
+    size_t shstrndx = 0;
+    if (elf_getshdrstrndx(elf, &shstrndx) != 0) {
+        elf_end(elf); close(fd); return -1;
+    }
+
+    int found = 0;
+    Elf_Scn *scn = NULL;
+    while ((scn = elf_nextscn(elf, scn)) != NULL) {
+        GElf_Shdr shdr;
+        if (gelf_getshdr(scn, &shdr) != &shdr) continue;
+
+        const char *sname = elf_strptr(elf, shstrndx, shdr.sh_name);
+        if (!sname || strcmp(sname, ".evemon_manifest") != 0) continue;
+
+        /* Found the section — copy raw bytes into *out */
+        Elf_Data *data = elf_getdata(scn, NULL);
+        if (!data || !data->d_buf ||
+            data->d_size < sizeof(evemon_plugin_manifest_t)) {
+            break;  /* section too small */
+        }
+
+        memcpy(out, data->d_buf, sizeof(evemon_plugin_manifest_t));
+        found = 1;
+        break;
+    }
+
+    elf_end(elf);
+    close(fd);
+
+    if (!found) return -1;
+
+    /* Validate magic sentinel */
+    if (out->magic != EVEMON_MANIFEST_MAGIC) return -2;
+
+    /* Ensure all string fields are NUL-terminated (safety) */
+    out->id     [sizeof(out->id)      - 1] = '\0';
+    out->name   [sizeof(out->name)    - 1] = '\0';
+    out->version[sizeof(out->version) - 1] = '\0';
+    out->deps   [sizeof(out->deps)    - 1] = '\0';
+
+    return 0;
+}
+
+const char *evemon_manifest_deps_next(const char **cursor)
+{
+    if (!cursor || !*cursor) return NULL;
+    const char *p = *cursor;
+    if (*p == '\0') return NULL;     /* double-NUL end-of-list */
+    size_t len = strlen(p);
+    *cursor = p + len + 1;           /* advance past this entry's NUL */
+    return p;
+}
 
 /* ── Host-provided utility functions ─────────────────────────── */
 
@@ -183,12 +258,14 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
 
     /* UI plugins must provide create_widget and update.
      * Headless plugins (services) may omit create_widget. */
-    if (plugin->kind == EVEMON_PLUGIN_HEADLESS) {
-        /* Headless plugins need at minimum an activate callback
+    /* SERVICE role plugins need at minimum an activate callback
+     * to receive host services (including the event bus). */
+    if (plugin->role == EVEMON_ROLE_SERVICE) {
+        /* Service plugins need at minimum an activate callback
          * to receive host services (including the event bus). */
         if (!plugin->activate) {
             fprintf(stderr,
-                    "evemon: plugin %s: headless plugin missing activate()\n",
+                    "evemon: plugin %s: service plugin missing activate()\n",
                     path);
             dlclose(handle);
             return -1;
@@ -214,8 +291,8 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
     inst->is_active = 1;  /* default: lives in a notebook tab */
     snprintf(inst->so_path, sizeof(inst->so_path), "%s", path);
 
-    if (plugin->kind == EVEMON_PLUGIN_HEADLESS) {
-        /* Headless plugins have no widget */
+    if (plugin->role == EVEMON_ROLE_SERVICE) {
+        /* Service plugins have no widget */
         inst->widget = NULL;
     } else {
         /* Call create_widget on the GTK main thread (we are on it) */
@@ -238,7 +315,8 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
     reg->combined_needs |= plugin->data_needs;
 
     fprintf(stdout, "evemon: loaded %s plugin \"%s\" (%s) v%s from %s\n",
-            plugin->kind == EVEMON_PLUGIN_HEADLESS ? "headless" : "UI",
+            plugin->role == EVEMON_ROLE_SERVICE ? "service" :
+            plugin->role == EVEMON_ROLE_SYSTEM  ? "system"  : "process",
             plugin->name ? plugin->name : "?",
             plugin->id   ? plugin->id   : "?",
             plugin->version ? plugin->version : "?",
@@ -470,11 +548,11 @@ static void *async_scan_worker(void *arg)
                 continue;
             }
 
-            /* Validate callbacks (headless vs UI) */
-            if (plugin->kind == EVEMON_PLUGIN_HEADLESS) {
+            /* Validate callbacks (service vs UI) */
+            if (plugin->role == EVEMON_ROLE_SERVICE) {
                 if (!plugin->activate) {
                     fprintf(stderr,
-                            "evemon: plugin %s: headless plugin missing "
+                            "evemon: plugin %s: service plugin missing "
                             "activate()\n", path);
                     if (plugin->destroy)
                         plugin->destroy(plugin->plugin_ctx);
@@ -623,7 +701,7 @@ int plugin_instance_create(plugin_registry_t *reg, const char *plugin_id)
     inst->handle    = handle;  /* shared handle — don't dlclose twice */
     inst->is_active = 1;  /* default: lives in a notebook tab */
 
-    if (new_plugin->kind == EVEMON_PLUGIN_HEADLESS) {
+    if (new_plugin->role == EVEMON_ROLE_SERVICE) {
         inst->widget = NULL;
     } else {
         inst->widget = new_plugin->create_widget(new_plugin->plugin_ctx);

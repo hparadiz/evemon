@@ -2541,11 +2541,6 @@ static const char *g_tab_order_last[] = {
     "org.evemon.milkdrop",
     NULL
 };
-static const struct { const char *id; const char *label; } g_tab_label_overrides[] = {
-    { "org.evemon.net", "Network" },
-    { NULL, NULL }
-};
-
 /* Heap-allocated context passed as user_data to the async scan. */
 typedef struct {
     ui_ctx_t *ctx;
@@ -2665,7 +2660,7 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
 
     /* Headless plugins: call activate() now that we're on the GTK main
      * thread (deferred from the async worker which must not touch GTK). */
-    if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS) {
+    if (inst->plugin->role == EVEMON_ROLE_SERVICE) {
         if (inst->plugin->activate && reg->host_services) {
             inst->plugin->activate(inst->plugin->plugin_ctx,
                                    reg->host_services);
@@ -2715,14 +2710,6 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
 
     /* Determine the display label */
     const char *lbl = inst->plugin->name ? inst->plugin->name : "Plugin";
-    if (inst->plugin->id) {
-        for (int k = 0; g_tab_label_overrides[k].id; k++) {
-            if (strcmp(inst->plugin->id, g_tab_label_overrides[k].id) == 0) {
-                lbl = g_tab_label_overrides[k].label;
-                break;
-            }
-        }
-    }
 
     /* Is this a last-order (hidden) plugin? */
     gboolean is_last = FALSE;
@@ -3069,6 +3056,9 @@ void *ui_thread(void *arg)
     /* ── window ──────────────────────────────────────────────── */
     GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window), "ＥＶＥＭＯＮ");
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    gtk_window_set_wmclass(GTK_WINDOW(window), "evemon", "evemon");
+    G_GNUC_END_IGNORE_DEPRECATIONS
     gtk_window_set_default_size(GTK_WINDOW(window), 1100, 700);
 
     /* Accel group for displaying hotkey hints in menus.
@@ -4354,17 +4344,13 @@ void *ui_thread(void *arg)
                             plugin_instance_t *inst = &preg->instances[i];
                             if (!inst->widget || !inst->plugin ||
                                 !inst->plugin->id) continue;
-                            if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS)
+                            if (inst->plugin->role == EVEMON_ROLE_SERVICE)
                                 continue;
                             if (!PLUGIN_IS_AVAILABLE(inst)) continue;
                             if (strcmp(inst->plugin->id, g_tab_order[o]) != 0)
                                 continue;
                             const char *lbl = inst->plugin->name
                                             ? inst->plugin->name : "Plugin";
-                            for (int k = 0; g_tab_label_overrides[k].id; k++)
-                                if (strcmp(inst->plugin->id,
-                                           g_tab_label_overrides[k].id) == 0)
-                                    { lbl = g_tab_label_overrides[k].label; break; }
                             gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
                                 inst->widget, gtk_label_new(lbl));
                             plugin_instance_set_active(inst, TRUE);
@@ -4373,7 +4359,7 @@ void *ui_thread(void *arg)
                     for (size_t i = 0; i < preg->count; i++) {
                         plugin_instance_t *inst = &preg->instances[i];
                         if (!inst->widget || !inst->plugin) continue;
-                        if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS)
+                        if (inst->plugin->role == EVEMON_ROLE_SERVICE)
                             continue;
                         if (!PLUGIN_IS_AVAILABLE(inst)) continue;
                         if (inst->is_active) continue;
@@ -4381,11 +4367,6 @@ void *ui_thread(void *arg)
                             continue;
                         const char *lbl = inst->plugin->name
                                         ? inst->plugin->name : "Plugin";
-                        if (inst->plugin->id)
-                            for (int k = 0; g_tab_label_overrides[k].id; k++)
-                                if (strcmp(inst->plugin->id,
-                                           g_tab_label_overrides[k].id) == 0)
-                                    { lbl = g_tab_label_overrides[k].label; break; }
                         gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
                             inst->widget, gtk_label_new(lbl));
                         plugin_instance_set_active(inst, TRUE);
@@ -4395,7 +4376,7 @@ void *ui_thread(void *arg)
                             plugin_instance_t *inst = &preg->instances[i];
                             if (!inst->widget || !inst->plugin ||
                                 !inst->plugin->id) continue;
-                            if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS)
+                            if (inst->plugin->role == EVEMON_ROLE_SERVICE)
                                 continue;
                             if (!PLUGIN_IS_AVAILABLE(inst)) continue;
                             if (inst->is_active) continue;
@@ -4403,10 +4384,6 @@ void *ui_thread(void *arg)
                                        g_tab_order_last[o]) != 0) continue;
                             const char *lbl = inst->plugin->name
                                             ? inst->plugin->name : "Plugin";
-                            for (int k = 0; g_tab_label_overrides[k].id; k++)
-                                if (strcmp(inst->plugin->id,
-                                           g_tab_label_overrides[k].id) == 0)
-                                    { lbl = g_tab_label_overrides[k].label; break; }
                             gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
                                 inst->widget, gtk_label_new(lbl));
                             plugin_instance_set_active(inst, TRUE);

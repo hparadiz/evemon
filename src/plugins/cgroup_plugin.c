@@ -14,7 +14,15 @@
 #include <stdio.h>
 #include <inttypes.h>
 
-/* ── per-instance state ──────────────────────────────────────── */
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.cgroup",
+    "cgroup Limits",
+    "1.0",
+    EVEMON_ROLE_PROCESS,
+    NULL
+);
+
+/* ── per-instance state ────────────────────────────────────────── */
 
 typedef struct {
     GtkWidget  *box;       /* top-level VBox */
@@ -240,6 +248,8 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = cgroup_update,
         .clear         = cgroup_clear,
         .destroy       = cgroup_destroy,
+        .role          = EVEMON_ROLE_PROCESS,
+        .dependencies  = NULL,
     };
 
     return p;

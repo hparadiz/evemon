@@ -23,7 +23,15 @@
 #include <string.h>
 #include <stdio.h>
 
-/* ── category definitions ────────────────────────────────────── */
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.devices",
+    "Devices",
+    "1.0",
+    EVEMON_ROLE_PROCESS,
+    NULL
+);
+
+/* ── category definitions ────────────────────────────────────────── */
 
 enum {
     DEV_CAT_GPU,
@@ -475,6 +483,8 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = devices_update,
         .clear         = devices_clear,
         .destroy       = devices_destroy,
+        .role          = EVEMON_ROLE_PROCESS,
+        .dependencies  = NULL,
     };
 
     return p;

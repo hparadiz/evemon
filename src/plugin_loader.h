@@ -122,6 +122,45 @@ void plugin_registry_recalc_needs(plugin_registry_t *reg);
  */
 evemon_data_needs_t plugin_registry_effective_needs(const plugin_registry_t *reg);
 
+/* ── Pre-load manifest inspection ───────────────────────────── */
+
+/*
+ * evemon_manifest_read – read a plugin's embedded manifest without
+ * loading the .so.
+ *
+ * Opens `so_path`, parses the ELF, finds the ".evemon_manifest"
+ * section, and copies its contents into `*out`.  No code from the
+ * plugin is executed and no relocations are applied — the section is
+ * read as raw bytes.
+ *
+ * Returns  0 on success (out is populated).
+ * Returns -1 if the file cannot be opened, is not a valid ELF, or
+ *            does not contain a ".evemon_manifest" section.
+ * Returns -2 if the manifest magic sentinel is wrong (section exists
+ *            but was built against an incompatible format).
+ *
+ * Callers can use this to display plugin names, versions, and roles
+ * in a UI before the user decides which plugins to activate, or to
+ * skip plugins whose ABI version does not match.
+ */
+int evemon_manifest_read(const char *so_path,
+                         evemon_plugin_manifest_t *out);
+
+/*
+ * evemon_manifest_deps_next – iterate over packed dependency strings.
+ *
+ * Call with *cursor = manifest.deps to start.  Returns a pointer to
+ * the next dependency ID string and advances *cursor past it, or
+ * returns NULL when the list is exhausted.
+ *
+ * Example:
+ *   const char *cur = manifest.deps;
+ *   const char *dep;
+ *   while ((dep = evemon_manifest_deps_next(&cur)) != NULL)
+ *       printf("  dep: %s\n", dep);
+ */
+const char *evemon_manifest_deps_next(const char **cursor);
+
 /*
  * Reload a single plugin .so by path: destroys every instance loaded
  * from that path, dlcloses the handle, then re-loads the file.

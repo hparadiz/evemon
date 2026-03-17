@@ -27,6 +27,16 @@
 #include <stdio.h>
 #include <math.h>
 
+static const char *_pw_deps[] = { "org.evemon.audio_service", NULL };
+
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.pipewire",
+    "PipeWire",
+    "1.0",
+    EVEMON_ROLE_PROCESS,
+    "org.evemon.audio_service", NULL
+);
+
 /* ── UTF-8 helpers ───────────────────────────────────────────── */
 
 /*
@@ -967,7 +977,7 @@ static void pw_on_art_loaded(GdkPixbuf *pixbuf, void *user_data)
 
 /*
  * Event bus callback: receives album art + metadata from the
- * audio_service headless plugin.
+ * Media Meta service plugin (org.evemon.audio_service).
  */
 static void pw_on_album_art_event(const evemon_event_t *event,
                                   void *user_data)
@@ -1773,7 +1783,7 @@ evemon_plugin_t *evemon_plugin_init(void)
 
     *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
-        .name          = "PipeWire Audio",
+        .name          = "PipeWire",
         .id            = "org.evemon.pipewire",
         .version       = "1.0",
         .data_needs    = evemon_NEED_PIPEWIRE | evemon_NEED_MPRIS,
@@ -1783,6 +1793,8 @@ evemon_plugin_t *evemon_plugin_init(void)
         .clear         = pw_clear,
         .destroy       = pw_destroy,
         .activate      = pw_activate,
+        .role          = EVEMON_ROLE_PROCESS,
+        .dependencies  = _pw_deps,
     };
 
     return p;

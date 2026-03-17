@@ -1015,6 +1015,9 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
     /* ── Create splash-style window (no titlebar) ─────────────── */
     GtkWidget *dlg = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(window));
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    gtk_window_set_wmclass(GTK_WINDOW(dlg), "evemon", "evemon");
+    G_GNUC_END_IGNORE_DEPRECATIONS
     gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
     gtk_window_set_decorated(GTK_WINDOW(dlg), FALSE);
     gtk_window_set_skip_taskbar_hint(GTK_WINDOW(dlg), TRUE);

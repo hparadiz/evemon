@@ -73,20 +73,35 @@ typedef struct {
 typedef void (*evemon_event_cb)(const evemon_event_t *event,
                                 void *user_data);
 
-/* ── Plugin kind ─────────────────────────────────────────────── */
+/* ── Plugin role ─────────────────────────────────────────────── */
 
 /*
- * Distinguishes UI plugins (provide a GtkWidget tab) from headless
- * service plugins (no UI, auto-activated, provide reusable subsystems).
+ * Every plugin declares one of three roles:
  *
- * EVEMON_PLUGIN_UI = 0 so that existing plugins compiled before this
- * enum was added (their `kind` field will be zero-initialized)
- * continue to work as UI plugins without recompilation.
+ *   EVEMON_ROLE_PROCESS  – process-centric UI plugin; provides a
+ *                          GtkWidget tab shown when a process is
+ *                          selected.  This is the default (= 0) so
+ *                          that old plugins compiled before roles
+ *                          were introduced keep working.
+ *
+ *   EVEMON_ROLE_SERVICE  – headless, auto-activated at load time;
+ *                          no UI widget.  Provides reusable host
+ *                          services to other plugins via the event
+ *                          bus (e.g. audio metadata, JSON snapshots).
+ *
+ *   EVEMON_ROLE_SYSTEM   – always-active UI plugin shown in a
+ *                          dedicated system dock area, independent
+ *                          of the selected process.
  */
 typedef enum {
-    EVEMON_PLUGIN_UI       = 0,       /* provides create_widget()       */
-    EVEMON_PLUGIN_HEADLESS = 1        /* no UI, auto-activated service   */
-} evemon_plugin_kind_t;
+    EVEMON_ROLE_PROCESS = 0,          /* per-process tab UI             */
+    EVEMON_ROLE_SERVICE = 1,          /* headless auto-activated service */
+    EVEMON_ROLE_SYSTEM  = 2           /* always-active system dock UI   */
+} evemon_plugin_role_t;
+
+/* Legacy aliases — kept for source compatibility with old plugins */
+#define EVEMON_PLUGIN_UI       EVEMON_ROLE_PROCESS
+#define EVEMON_PLUGIN_HEADLESS EVEMON_ROLE_SERVICE
 
 /* ── Event payloads ──────────────────────────────────────────── */
 
@@ -626,17 +641,31 @@ typedef struct {
     void (*activate)(void *ctx, const evemon_host_services_t *services);
 
     /*
-     * Plugin kind — UI (default, = 0) or headless service.
+     * Plugin role — controls how the host treats this plugin.
      *
-     * Headless plugins do not provide create_widget() and are
-     * auto-activated at load time.  They participate in the event
-     * bus as publishers and/or subscribers.
+     *   EVEMON_ROLE_PROCESS  – per-process tab (default, = 0)
+     *   EVEMON_ROLE_SERVICE  – headless, auto-activated service
+     *   EVEMON_ROLE_SYSTEM   – always-active system dock panel
      *
-     * Appended at end of struct — existing plugins compiled before
-     * this field was added will have it zero-initialized, which
-     * maps to EVEMON_PLUGIN_UI.
+     * Zero-initialised value maps to EVEMON_ROLE_PROCESS so that
+     * plugins compiled against older ABI versions continue to work.
      */
-    evemon_plugin_kind_t kind;
+    evemon_plugin_role_t role;
+
+    /*
+     * (Optional) NULL-terminated array of plugin IDs this plugin
+     * depends on.  The host ensures all listed plugins are activated
+     * before calling this plugin's activate() callback.
+     *
+     * Example:
+     *   static const char *my_deps[] = {
+     *       "org.evemon.audio_service", NULL
+     *   };
+     *   p->dependencies = my_deps;
+     *
+     * Set to NULL if the plugin has no dependencies.
+     */
+    const char **dependencies;
 
     /*
      * (Optional) Returns non-zero if this plugin should be shown as a tab.
@@ -689,6 +718,126 @@ typedef struct {
 /* ── Plugin init function signature ──────────────────────────── */
 
 typedef evemon_plugin_t *(*evemon_plugin_init_fn)(void);
+
+/*
+ * EVEMON_PLUGIN_MANIFEST – embedded flat-bitcode manifest.
+ *
+ * Place this macro once at file scope in your plugin source.
+ *
+ * The struct is stored verbatim in the ".evemon_manifest" ELF section
+ * as a contiguous block of bytes with NO relocations — all fields are
+ * fixed-size value types (char arrays, uint32_t).  This means the host
+ * can read the manifest by mmapping the .so file and finding the
+ * section directly, without dlopen(), without resolving relocations,
+ * and without executing any plugin code.
+ *
+ * Layout (all fields are fixed-size, no pointers):
+ *
+ *   magic        – EVEMON_MANIFEST_MAGIC (0x45564D4E, "EVMN") sentinel
+ *   abi_version  – evemon_PLUGIN_ABI_VERSION at compile time
+ *   role         – evemon_plugin_role_t (uint32_t)
+ *   id[]         – reverse-DNS identifier, NUL-terminated, 128 bytes
+ *   name[]       – human-readable name, NUL-terminated, 128 bytes
+ *   version[]    – version string (e.g. "1.0"), NUL-terminated, 32 bytes
+ *   deps[]       – packed dependency IDs: each entry is a NUL-terminated
+ *                  string; the list ends with an extra NUL byte (i.e.
+ *                  two consecutive NUL bytes mark the end).  512 bytes.
+ *                  Empty (deps[0] == 0) means no dependencies.
+ *
+ * Total struct size: 4+4+4+128+128+32+512 = 812 bytes.
+ *
+ * Usage:
+ *
+ *   EVEMON_PLUGIN_MANIFEST(
+ *       "org.evemon.myplugin",   // id
+ *       "My Plugin",             // name
+ *       "1.0",                   // version
+ *       EVEMON_ROLE_PROCESS,     // role
+ *       "org.evemon.audio_service", NULL  // dependencies (NULL-terminated)
+ *   );
+ *
+ *   // No-dependency form:
+ *   EVEMON_PLUGIN_MANIFEST("org.evemon.env", "Environment Variables",
+ *                          "1.0", EVEMON_ROLE_PROCESS, NULL);
+ */
+
+#define EVEMON_MANIFEST_MAGIC  UINT32_C(0x45564D4E)  /* "EVMN" */
+
+/* Sizes of the fixed string fields in the manifest */
+#define EVEMON_MANIFEST_ID_LEN      128
+#define EVEMON_MANIFEST_NAME_LEN    128
+#define EVEMON_MANIFEST_VER_LEN      32
+#define EVEMON_MANIFEST_DEPS_LEN    512
+
+typedef struct {
+    uint32_t magic;                          /* EVEMON_MANIFEST_MAGIC          */
+    uint32_t abi_version;                    /* evemon_PLUGIN_ABI_VERSION       */
+    uint32_t role;                           /* evemon_plugin_role_t value      */
+    char     id     [EVEMON_MANIFEST_ID_LEN];   /* plugin identifier (NUL-term) */
+    char     name   [EVEMON_MANIFEST_NAME_LEN]; /* human-readable name          */
+    char     version[EVEMON_MANIFEST_VER_LEN];  /* version string               */
+    /*
+     * deps: packed NUL-terminated strings, double-NUL terminated.
+     * e.g. "org.evemon.audio_service\0org.evemon.other\0\0"
+     * An empty deps field has deps[0] == '\0'.
+     */
+    char     deps   [EVEMON_MANIFEST_DEPS_LEN];
+} evemon_plugin_manifest_t;
+
+/*
+ * _evemon_manifest_pack_deps – internal helper used by the macro.
+ * Writes a packed double-NUL-terminated dep list into `buf`.
+ * The varargs must be (const char*) values ending with NULL.
+ * Not for direct use.
+ */
+static inline void _evemon_manifest_pack_deps(char *buf, size_t bufsz, ...)
+    __attribute__((unused));
+static inline void _evemon_manifest_pack_deps(char *buf, size_t bufsz, ...)
+{
+    /* va_list not available without stdarg.h — which is already pulled in
+     * by stddef.h / stdint.h.  We use __builtin_va_* for portability. */
+    __builtin_va_list ap;
+    __builtin_va_start(ap, bufsz);
+    size_t off = 0;
+    const char *dep;
+    while ((dep = __builtin_va_arg(ap, const char *)) != (const char *)0) {
+        size_t dlen = 0;
+        while (dep[dlen]) dlen++;
+        if (off + dlen + 2 >= bufsz) break;  /* +2 for this NUL + terminator */
+        for (size_t i = 0; i < dlen; i++) buf[off++] = dep[i];
+        buf[off++] = '\0';
+    }
+    __builtin_va_end(ap);
+    /* Ensure double-NUL termination (buf was already zero-filled by macro) */
+    if (off < bufsz) buf[off] = '\0';
+}
+
+/*
+ * EVEMON_PLUGIN_MANIFEST(id, name, version, role, dep0, dep1, ..., NULL)
+ *
+ * Emits the flat manifest into ".evemon_manifest".
+ * The constructor__ priority 101 runs before C++ static init (102+) and
+ * before the plugin's own constructors, filling in the deps field at
+ * startup using the pack helper (avoids compound-literal VLA limits).
+ */
+#define EVEMON_PLUGIN_MANIFEST(_id, _name, _ver, _role, ...) \
+    __attribute__((used, section(".evemon_manifest"))) \
+    static evemon_plugin_manifest_t _evemon_manifest = { \
+        .magic       = EVEMON_MANIFEST_MAGIC, \
+        .abi_version = (uint32_t)evemon_PLUGIN_ABI_VERSION, \
+        .role        = (uint32_t)(_role), \
+        .id          = _id, \
+        .name        = _name, \
+        .version     = _ver, \
+        .deps        = { 0 }, \
+    }; \
+    __attribute__((constructor(101), used)) \
+    static void _evemon_manifest_init_deps(void) { \
+        _evemon_manifest_pack_deps( \
+            _evemon_manifest.deps, \
+            sizeof(_evemon_manifest.deps), \
+            __VA_ARGS__); \
+    }
 
 /* ── Host-provided utility functions ─────────────────────────── */
 

@@ -15,6 +15,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.threads",
+    "Threads",
+    "1.0",
+    EVEMON_ROLE_PROCESS,
+    NULL
+);
+
 /* ── thread state definitions ────────────────────────────────── */
 
 enum {
@@ -477,6 +485,8 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = thr_update,
         .clear         = thr_clear,
         .destroy       = thr_destroy,
+        .role          = EVEMON_ROLE_PROCESS,
+        .dependencies  = NULL,
     };
 
     return p;

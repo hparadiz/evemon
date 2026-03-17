@@ -14,6 +14,14 @@
 #include <stdio.h>
 #include <strings.h>
 
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.fd",
+    "File Descriptors",
+    "1.0",
+    EVEMON_ROLE_PROCESS,
+    NULL
+);
+
 /* ── category definitions ────────────────────────────────────── */
 
 enum {
@@ -419,6 +427,8 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = fd_update,
         .clear         = fd_clear,
         .destroy       = fd_destroy,
+        .role          = EVEMON_ROLE_PROCESS,
+        .dependencies  = NULL,
     };
 
     return p;

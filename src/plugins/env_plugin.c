@@ -13,7 +13,15 @@
 #include <string.h>
 #include <stdio.h>
 
-/* ── category definitions ────────────────────────────────────── */
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.env",
+    "Environment Variables",
+    "1.0",
+    EVEMON_ROLE_PROCESS,
+    NULL
+);
+
+/* ── category definitions ────────────────────────────────────────── */
 
 enum {
     ENV_CAT_PATH,
@@ -359,6 +367,8 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = env_update,
         .clear         = env_clear,
         .destroy       = env_destroy,
+        .role          = EVEMON_ROLE_PROCESS,
+        .dependencies  = NULL,
     };
 
     return p;

@@ -1,10 +1,10 @@
 /*
- * audio_service_plugin.c – Headless audio service plugin for evemon.
+ * audio_service_plugin.c – Media Meta service plugin for evemon.
  *
- * This is the first headless (service) plugin.  It owns all album art
- * loading and MPRIS metadata aggregation, publishing results via the
- * event bus so that UI plugins (pipewire_plugin, milkdrop_plugin) can
- * subscribe instead of each maintaining their own art loader.
+ * Headless service plugin that owns album art loading and MPRIS metadata
+ * aggregation, publishing results via the event bus so that UI plugins
+ * (pipewire_plugin, milkdrop_plugin) can subscribe instead of each
+ * maintaining their own art loader.
  *
  * Responsibilities:
  *   - Receive MPRIS metadata via the standard update() callback
@@ -13,10 +13,7 @@
  *   - Publish EVEMON_EVENT_ALBUM_ART_UPDATED with the loaded pixbuf
  *     and metadata to all subscribers
  *
- * This plugin has kind = EVEMON_PLUGIN_HEADLESS, so:
- *   - No create_widget() — no tab in the notebook
- *   - Auto-activated at load time
- *   - Participates in the broker data pipeline (NEED_MPRIS + NEED_PIPEWIRE)
+ * Role: EVEMON_ROLE_SERVICE (headless, auto-activated, no UI tab)
  */
 
 #include "../evemon_plugin.h"
@@ -25,6 +22,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.audio_service",
+    "Media Meta",
+    "1.0",
+    EVEMON_ROLE_SERVICE,
+    NULL
+);
 
 /* ── Guard for async art load callbacks ──────────────────────── */
 
@@ -398,17 +403,36 @@ static void svc_clear(void *opaque)
 static void svc_destroy(void *opaque)
 {
     audio_svc_ctx_t *ctx = opaque;
-    svc_clear(opaque);
-    /* Mark the guard as dead so any in-flight async art load
-     * callbacks will see that the context is gone.  The guard
-     * itself is ref-counted and freed when the last reference
-     * (held by the pending callback) is released. */
+
+    /*
+     * Mark the guard dead FIRST — before cancelling or freeing anything.
+     *
+     * GLib async callbacks (GIO, libsoup) can already be queued in the
+     * main-loop at the point we call g_cancellable_cancel().  Cancellation
+     * sets a flag but does NOT dequeue already-dispatched idle sources, so
+     * on_art_loaded() can fire after we return from svc_clear().
+     *
+     * By marking dead=1 before svc_clear(), any callback that was queued
+     * before this point will see guard->dead == 1, skip accessing ctx,
+     * and simply unref the guard (safe — guard is ref-counted and not
+     * freed until the last reference drops).
+     */
     if (ctx->guard) {
         ctx->guard->dead = 1;
         ctx->guard->ctx  = NULL;
+    }
+
+    /* Now safe to cancel in-flight loads and free GObject refs */
+    svc_clear(opaque);
+
+    /* Release the plugin's own guard ref.  If an async callback still
+     * holds a ref (refcount > 1 before this unref), the guard stays
+     * alive until that callback runs and unrefs it — no use-after-free. */
+    if (ctx->guard) {
         art_load_guard_unref(ctx->guard);
         ctx->guard = NULL;
     }
+
     free(ctx);
 }
 
@@ -426,12 +450,13 @@ evemon_plugin_t *evemon_plugin_init(void)
     if (!p) { art_load_guard_unref(ctx->guard); free(ctx); return NULL; }
 
     p->abi_version   = evemon_PLUGIN_ABI_VERSION;
-    p->name          = "Audio Service";
+    p->name          = "Media Meta";
     p->id            = "org.evemon.audio_service";
     p->version       = "1.0";
     p->data_needs    = evemon_NEED_MPRIS | evemon_NEED_PIPEWIRE;
     p->plugin_ctx    = ctx;
-    p->kind          = EVEMON_PLUGIN_HEADLESS;
+    p->role          = EVEMON_ROLE_SERVICE;
+    p->dependencies  = NULL;
 
     /* Headless plugins have no create_widget */
     p->create_widget = NULL;

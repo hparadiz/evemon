@@ -5,6 +5,16 @@
 #include <stdio.h>
 #include <time.h>
 
+static const char *_wm_ui_deps[] = { "org.evemon.write_monitor", NULL };
+
+EVEMON_PLUGIN_MANIFEST(
+    "org.evemon.write_monitor_ui",
+    "Write Log",
+    "1.0",
+    EVEMON_ROLE_PROCESS,
+    "org.evemon.write_monitor", NULL
+);
+
 /* ── Per-line gutter data ─────────────────────────────────────── */
 
 typedef struct {
@@ -710,7 +720,8 @@ evemon_plugin_t *evemon_plugin_init(void)
     p->clear         = plugin_clear;
     p->destroy       = plugin_destroy;
     p->activate      = plugin_activate;
-    p->kind          = EVEMON_PLUGIN_UI;
+    p->role          = EVEMON_ROLE_PROCESS;
+    p->dependencies  = _wm_ui_deps;
 
     return p;
 }

@@ -103,6 +103,9 @@ void open_plugin_window(ui_ctx_t *ctx, pid_t pid,
 
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(win), title);
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    gtk_window_set_wmclass(GTK_WINDOW(win), "evemon", "evemon");
+    G_GNUC_END_IGNORE_DEPRECATIONS
     gtk_window_set_default_size(GTK_WINDOW(win), 720, 480);
 
     if (ctx->plugin_css)
@@ -370,6 +373,25 @@ void on_plugins_menu_map(GtkWidget *menu, gpointer data)
             }
         }
 
+        /*
+         * For not-yet-loaded plugins read the name directly from the
+         * embedded manifest in the .so — no dlopen, no code execution.
+         * This means the Plugins menu always shows the proper display
+         * name (e.g. "Network Sockets") instead of the raw filename
+         * (e.g. "evemon_net_plugin") for disabled / unloaded plugins.
+         */
+        evemon_plugin_manifest_t manifest;
+        char manifest_name[EVEMON_MANIFEST_NAME_LEN] = { 0 };
+        char manifest_id  [EVEMON_MANIFEST_ID_LEN]   = { 0 };
+        if (is_new && evemon_manifest_read(so_path, &manifest) == 0) {
+            snprintf(manifest_name, sizeof(manifest_name),
+                     "%s", manifest.name);
+            snprintf(manifest_id,   sizeof(manifest_id),
+                     "%s", manifest.id);
+            if (manifest_name[0]) plugin_name = manifest_name;
+            if (manifest_id  [0]) plugin_id   = manifest_id;
+        }
+
         const char *label = plugin_name ? plugin_name
                           : plugin_id   ? plugin_id
                           :               display;
@@ -428,7 +450,7 @@ void show_open_plugin_as_window_menu(ui_ctx_t *ctx, GtkWidget *menu,
     for (size_t i = 0; i < preg->count; i++) {
         plugin_instance_t *inst = &preg->instances[i];
         if (!inst->plugin || !inst->plugin->id) continue;
-        if (inst->plugin->kind == EVEMON_PLUGIN_HEADLESS) continue;
+        if (inst->plugin->role == EVEMON_ROLE_SERVICE) continue;
         if (!inst->widget) continue;
         if (!PLUGIN_IS_AVAILABLE(inst)) continue;
 
