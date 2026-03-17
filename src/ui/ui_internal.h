@@ -95,6 +95,37 @@ void set_process_tree_node(ptree_node_set_t *s, pid_t pinned_pid,
 int  get_process_tree_node(const ptree_node_set_t *s, pid_t pinned_pid,
                            pid_t pid);
 
+/*
+ * collapsed_pid_set_t – flat array of PIDs that are currently collapsed.
+ *
+ * This is a simple set: a PID is either in the array (collapsed) or not
+ * (expanded / never explicitly collapsed).  Use set_node_pid_state() to
+ * add or remove a PID, and node_pid_is_collapsed() to query membership.
+ *
+ * The set is view-agnostic: it does not distinguish between the main
+ * tree and any filtered / pinned view — callers are responsible for
+ * knowing which view they are operating on.
+ */
+typedef struct {
+    pid_t  *pids;      /* dynamic array of collapsed PIDs */
+    size_t  count;     /* number of entries               */
+    size_t  capacity;  /* allocated slots                 */
+} collapsed_pid_set_t;
+
+/*
+ * set_node_pid_state – record the collapsed/expanded state for a PID.
+ *
+ * collapsed = 1  → PID is added to the set (if not already present).
+ * collapsed = 0  → PID is removed from the set (if present).
+ */
+void set_node_pid_state(collapsed_pid_set_t *s, pid_t pid, int collapsed);
+
+/*
+ * node_pid_is_collapsed – returns 1 if the PID is in the collapsed set,
+ * 0 otherwise.
+ */
+int  node_pid_is_collapsed(const collapsed_pid_set_t *s, pid_t pid);
+
 /* ── pinned process detail panel ───────────────────────────────── */
 
 /*
@@ -213,6 +244,7 @@ typedef struct {
     GtkLabel           *status_right;
     GtkScrolledWindow  *scroll;
     ptree_node_set_t    ptree_nodes;
+    collapsed_pid_set_t collapsed_pids; /* PIDs currently collapsed in any view */
     GtkWidget          *menubar;
     GtkWidget          *file_menu_item;
     GtkWidget          *tree;

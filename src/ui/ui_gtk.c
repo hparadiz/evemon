@@ -224,6 +224,52 @@ static void ptree_nodes_gc(ptree_node_set_t *s, const proc_store_t *pstore)
     s->count = w;
 }
 
+/* ── collapsed PID set ───────────────────────────────────────── */
+
+/*
+ * set_node_pid_state – add or remove a PID from the collapsed set.
+ *
+ * collapsed = 1: insert the PID (push) if not already present.
+ * collapsed = 0: remove the PID  (pop)  if present, compacting the
+ *                array in place.
+ */
+void set_node_pid_state(collapsed_pid_set_t *s, pid_t pid, int collapsed)
+{
+    if (collapsed) {
+        /* Check for duplicate before inserting */
+        for (size_t i = 0; i < s->count; i++)
+            if (s->pids[i] == pid) return;   /* already tracked */
+
+        if (s->count >= s->capacity) {
+            size_t newcap = s->capacity ? s->capacity * 2 : 64;
+            pid_t *tmp = realloc(s->pids, newcap * sizeof(pid_t));
+            if (!tmp) return;   /* OOM – silently drop */
+            s->pids     = tmp;
+            s->capacity = newcap;
+        }
+        s->pids[s->count++] = pid;
+    } else {
+        /* Remove by swapping with the last element */
+        for (size_t i = 0; i < s->count; i++) {
+            if (s->pids[i] == pid) {
+                s->pids[i] = s->pids[--s->count];
+                return;
+            }
+        }
+    }
+}
+
+/*
+ * node_pid_is_collapsed – returns 1 if pid is in the collapsed set,
+ * 0 otherwise.
+ */
+int node_pid_is_collapsed(const collapsed_pid_set_t *s, pid_t pid)
+{
+    for (size_t i = 0; i < s->count; i++)
+        if (s->pids[i] == pid) return 1;
+    return 0;
+}
+
 /* ── formatting helpers ──────────────────────────────────────── */
 
 /* Format a KiB value into a human-readable string. */
@@ -2809,6 +2855,32 @@ static void on_broker_audio_pids(const pid_t *pids, size_t count,
     if (ctx->shutting_down)
         return;
 
+    /* When the audio-only filter is active, collapse any PID that is
+     * newly appearing in the audio set (i.e. not already tracked).
+     * This gives new audio processes a collapsed-by-default initial
+     * state so the filtered tree stays tidy. */
+    if (ctx->show_audio_only) {
+        for (size_t i = 0; i < count; i++) {
+            gboolean already_known = FALSE;
+            for (size_t j = 0; j < ctx->audio_pid_count; j++) {
+                if (ctx->audio_pids[j] == pids[i]) {
+                    already_known = TRUE;
+                    break;
+                }
+            }
+            if (!already_known) {
+                /* Only collapse if there is no explicit state recorded yet */
+                if (get_process_tree_node(&ctx->ptree_nodes,
+                                          PTREE_UNPINNED, pids[i])
+                        == PTREE_EXPANDED) {
+                    set_process_tree_node(&ctx->ptree_nodes,
+                                          PTREE_UNPINNED, pids[i],
+                                          PTREE_COLLAPSED);
+                }
+            }
+        }
+    }
+
     /* Grow the audio_pids array if needed */
     if (count > ctx->audio_pid_cap) {
         size_t new_cap = count < 64 ? 64 : count;
@@ -4083,7 +4155,8 @@ void *ui_thread(void *arg)
     ctx.css          = css;
     ctx.sidebar_css  = sidebar_css;
     ctx.font_size    = settings_get()->font_size;
-    ctx.ptree_nodes  = (ptree_node_set_t){ NULL, NULL, NULL, 0, 0 };
+    ctx.ptree_nodes     = (ptree_node_set_t){ NULL, NULL, NULL, 0, 0 };
+    ctx.collapsed_pids  = (collapsed_pid_set_t){ NULL, 0, 0 };
     ctx.follow_selection = FALSE;
 
     /* Process icon cache — one-time desktop index scan */
@@ -4637,6 +4710,12 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     ctx->ptree_nodes.states      = NULL;
     ctx->ptree_nodes.count       = 0;
     ctx->ptree_nodes.capacity    = 0;
+
+    /* Free the collapsed PID set */
+    free(ctx->collapsed_pids.pids);
+    ctx->collapsed_pids.pids     = NULL;
+    ctx->collapsed_pids.count    = 0;
+    ctx->collapsed_pids.capacity = 0;
 
     /* Cancel the broker FIRST — a worker thread may still be running
      * and its completion callback references ctx->audio_pids. */

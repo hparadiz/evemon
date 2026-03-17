@@ -397,6 +397,7 @@ void on_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
     pid_t pinned_root = get_row_pinned_root(child_model, &child_iter);
     set_process_tree_node(&ctx->ptree_nodes, pinned_root, (pid_t)pid,
                           PTREE_COLLAPSED);
+    set_node_pid_state(&ctx->collapsed_pids, (pid_t)pid, 1);
 }
 
 void on_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
@@ -415,6 +416,7 @@ void on_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
     pid_t pinned_root = get_row_pinned_root(child_model, &child_iter);
     set_process_tree_node(&ctx->ptree_nodes, pinned_root, (pid_t)pid,
                           PTREE_EXPANDED);
+    set_node_pid_state(&ctx->collapsed_pids, (pid_t)pid, 0);
 
     GtkTreeModel *sort_model = gtk_tree_view_get_model(view);
     GtkTreeIter sort_child;
