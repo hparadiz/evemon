@@ -30,10 +30,6 @@
 #include <gtk/gtk.h>
 #include "../steam.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /* Pixel size of icons shown in the tree.  Matches a comfortable 16 px
  * default row height; callers may scale this with font size if needed. */
 #define PROC_ICON_SIZE 16
@@ -96,9 +92,5 @@ GdkPixbuf *proc_icon_get_cached(proc_icon_ctx_t *ctx, const char *comm);
  * All previously cached pixbufs are unref'd.  New lookups will re-probe.
  */
 void proc_icon_invalidate(proc_icon_ctx_t *ctx);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* UI_PROC_ICON_H */

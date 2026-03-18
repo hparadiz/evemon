@@ -24,10 +24,6 @@ typedef int gboolean;
 #endif
 #endif
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /* ── Plugin instance ─────────────────────────────────────────── */
 
 /*
@@ -265,9 +261,5 @@ int plugin_loader_scan_async(plugin_registry_t  *reg,
                              plugin_loaded_cb    on_loaded,
                              plugin_scan_done_cb on_done,
                              void               *user_data);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* evemon_PLUGIN_LOADER_H */

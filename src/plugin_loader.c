@@ -291,6 +291,10 @@ static int load_single_plugin(plugin_registry_t *reg, const char *path)
     inst->is_active = 1;  /* default: lives in a notebook tab */
     snprintf(inst->so_path, sizeof(inst->so_path), "%s", path);
 
+    /* SYSTEM role plugins are always-active and track PID 1 (init/systemd) */
+    if (plugin->role == EVEMON_ROLE_SYSTEM)
+        inst->tracked_pid = 1;
+
     if (plugin->role == EVEMON_ROLE_SERVICE) {
         /* Service plugins have no widget */
         inst->widget = NULL;
@@ -595,6 +599,10 @@ static void *async_scan_worker(void *arg)
             inst->widget    = NULL;  /* filled in by on_loaded on main thread */
             snprintf(inst->so_path, sizeof(inst->so_path), "%s", path);
 
+            /* SYSTEM role plugins are always-active and track PID 1 (init/systemd) */
+            if (plugin->role == EVEMON_ROLE_SYSTEM)
+                inst->tracked_pid = 1;
+
             a->reg->combined_needs |= plugin->data_needs;
 
             /* ── Step 3: post to main thread ───────────────────── */
@@ -700,6 +708,10 @@ int plugin_instance_create(plugin_registry_t *reg, const char *plugin_id)
     inst->plugin    = new_plugin;
     inst->handle    = handle;  /* shared handle — don't dlclose twice */
     inst->is_active = 1;  /* default: lives in a notebook tab */
+
+    /* SYSTEM role plugins are always-active and track PID 1 (init/systemd) */
+    if (new_plugin->role == EVEMON_ROLE_SYSTEM)
+        inst->tracked_pid = 1;
 
     if (new_plugin->role == EVEMON_ROLE_SERVICE) {
         inst->widget = NULL;
@@ -865,6 +877,9 @@ void plugin_dispatch_clear_all(plugin_registry_t *reg)
          * independently of the tree selection and must not be cleared
          * when the user deselects a process. */
         if (!inst->is_active) continue;
+        /* Skip SYSTEM role plugins — they always track PID 1 and
+         * must never be cleared due to process selection changes. */
+        if (inst->plugin->role == EVEMON_ROLE_SYSTEM) continue;
         inst->plugin->clear(inst->plugin->plugin_ctx);
     }
 }

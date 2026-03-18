@@ -426,6 +426,15 @@ typedef struct {
     GtkWidget          *hpaned;                /* tree paned (tree | detail panel)  */
     GSList             *panel_pos_group;        /* radio group for position items   */
 
+    /* system plugin panel (EVEMON_ROLE_SYSTEM plugins) */
+    GtkWidget          *system_panel;             /* GtkFrame wrapping system panel notebook   */
+    GtkWidget          *system_panel_notebook;          /* GtkNotebook for system panel plugins   */
+    panel_position_t    system_panel_pos;         /* current dock position            */
+    GtkCheckMenuItem   *system_panel_menu_item;   /* View → System Plugin Panel toggle */
+    GtkWidget          *system_panel_paned;             /* current GtkPaned holding system panel*/
+    GSList             *system_panel_pos_group;         /* radio group for sys pos items    */
+    gboolean            system_panel_has_plugins; /* TRUE once a SYSTEM plugin is added*/
+
     /* collapsible process info tray */
     GtkWidget          *proc_info_revealer;   /* GtkRevealer wrapping sidebar_frame */
     GtkWidget          *proc_info_toggle;     /* toggle button (▶/◀)               */
@@ -591,7 +600,44 @@ void     pin_pid(ui_ctx_t *ctx, pid_t pid);
 void     unpin_pid(ui_ctx_t *ctx, pid_t pid);
 void     on_toggle_pin(GtkMenuItem *item, gpointer data);
 void     pinned_panel_create(ui_ctx_t *ctx, pid_t pid);
-void     pinned_panel_destroy(ui_ctx_t *ctx, pid_t pid);/* ── plugin window management (ui_plugins.c) ─────────────────── */
+void     pinned_panel_destroy(ui_ctx_t *ctx, pid_t pid);
+
+/* ── system plugin panel (system_panel.c) ────────────────────── */
+
+/*
+ * Build the system plugin panel widgets (GtkFrame + GtkNotebook).
+ * Called once during UI initialisation before the first show_all.
+ * Returns the GtkFrame (ctx->system_panel).
+ */
+GtkWidget *system_panel_build(ui_ctx_t *ctx);
+
+/*
+ * Add a SYSTEM-role plugin widget to the system panel notebook.
+ * Creates a tab label with the plugin name and a small ✕ close button.
+ * The close button hides the tab (does not destroy the instance).
+ */
+void system_panel_add_plugin(ui_ctx_t *ctx, GtkWidget *widget,
+                          const char *label, int inst_id);
+
+/*
+ * Relayout the system panel into the correct paned position.
+ * Mirrors detail_panel_relayout() but for the sys panel.
+ */
+void system_panel_relayout(ui_ctx_t *ctx);
+
+/*
+ * Toggle sys panel visibility (called from menu item callback).
+ */
+void on_toggle_system_panel(GtkCheckMenuItem *item, gpointer data);
+
+/*
+ * Panel position changed callback for system panel radio items.
+ */
+typedef struct {
+    ui_ctx_t        *ctx;
+    panel_position_t pos;
+    gboolean         is_sys; /* TRUE = system panel, FALSE = detail panel */
+} panel_pos_data_t;/* ── plugin window management (ui_plugins.c) ─────────────────── */
 
 void     open_plugin_window(ui_ctx_t *ctx, pid_t pid,
                             const char *proc_name, const char *plugin_id);

@@ -38,10 +38,6 @@ typedef void  GtkDrawingArea;
 #include <gtk/gtk.h>
 #endif
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /* ── ABI version ─────────────────────────────────────────────── */
 
 #define evemon_PLUGIN_ABI_VERSION  1
@@ -868,9 +864,5 @@ void evemon_format_fuzzy_time(time_t epoch, char *buf, size_t bufsz);
  */
 void *evemon_settings_get(void);   /* returns evemon_settings_t* */
 int   evemon_settings_save(void);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* evemon_PLUGIN_H */

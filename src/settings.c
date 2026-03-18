@@ -60,6 +60,8 @@ static void settings_set_defaults(evemon_settings_t *s)
     s->detail_panel_position = 0;        /* bottom                      */
     s->preselected_pid       = 1;        /* init                        */
     s->show_audio_only       = false;
+    s->system_panel_open        = false;
+    s->system_panel_position    = 0;        /* bottom                      */
     s->column_count          = 0;        /* empty = show all defaults   */
     s->plugin_count          = 0;        /* empty = load all            */
     s->hotkey_mode           = HOTKEY_MODE_GTK;
@@ -154,6 +156,14 @@ static int settings_load_from_file(evemon_settings_t *s, const char *path)
     if ((v = json_object_get(root, "spectro_theme")) && json_is_integer(v)) {
         int t = (int)json_integer_value(v);
         if (t >= 0 && t < 16) s->spectro_theme = t;
+    }
+
+    if ((v = json_object_get(root, "system_panel_open")) && json_is_boolean(v))
+        s->system_panel_open = json_boolean_value(v);
+
+    if ((v = json_object_get(root, "system_panel_position")) && json_is_integer(v)) {
+        int pos = (int)json_integer_value(v);
+        if (pos >= 0 && pos <= 3) s->system_panel_position = pos;
     }
 
     /* ── Columns ─────────────────────────────────────────────── */
@@ -277,6 +287,10 @@ int settings_save(void)
                         json_boolean(s->show_audio_only));
     json_object_set_new(root, "spectro_theme",
                         json_integer(s->spectro_theme));
+    json_object_set_new(root, "system_panel_open",
+                        json_boolean(s->system_panel_open));
+    json_object_set_new(root, "system_panel_position",
+                        json_integer(s->system_panel_position));
 
     /* ── Columns ─────────────────────────────────────────────── */
 

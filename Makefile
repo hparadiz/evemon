@@ -346,8 +346,8 @@ install: all
 	rm -f $(DESTDIR)$(LIBDIR)/plugins/*.so
 	install -m 644 $(BPF_OBJ) $(DESTDIR)$(LIBDIR)/
 	install -m 755 $(PLUGIN_SOS) $(DESTDIR)$(LIBDIR)/plugins/
-	update-desktop-database $(DESTDIR)$(DATADIR)/applications
-	-gtk-update-icon-cache -f -t $(DESTDIR)$(DATADIR)/icons/hicolor 2>/dev/null || true
+	$(if $(DESTDIR),,update-desktop-database $(DATADIR)/applications)
+	$(if $(DESTDIR),,-gtk-update-icon-cache -f -t $(DATADIR)/icons/hicolor 2>/dev/null || true)
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/evemon

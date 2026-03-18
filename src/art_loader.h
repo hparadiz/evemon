@@ -22,10 +22,6 @@
 
 #include <gtk/gtk.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /*
  * Callback signature.  `pixbuf` is the loaded image (caller takes
  * ownership and must g_object_unref) or NULL on failure.
@@ -43,9 +39,5 @@ typedef void (*art_loaded_cb)(GdkPixbuf *pixbuf, void *user_data);
  */
 void art_load_async(const char *url, art_loaded_cb cb, void *user_data,
                     GCancellable **cancel_out);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* EVEMON_ART_LOADER_H */

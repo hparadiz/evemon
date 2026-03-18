@@ -15,10 +15,6 @@
 #include <sys/types.h>
 #include <stdbool.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /* ── Limits ──────────────────────────────────────────────────── */
 
 #define SETTINGS_MAX_COLUMNS   32
@@ -66,6 +62,10 @@ typedef struct {
     pid_t         preselected_pid;                /* PID to select on startup (0 = none) */
     bool          show_audio_only;               /* filter tree to audio processes */
     int           spectro_theme;                 /* spectrogram colour theme index (0 = Classic) */
+
+    /* System Plugin Panel */
+    bool          system_panel_open;                /* system panel visible             */
+    int           system_panel_position;            /* 0=bottom,1=top,2=left,3=right    */
 
     /* Columns: ordered list of column names; visibility is implicit
      * (present = visible).  Empty array = show all defaults. */
@@ -122,9 +122,5 @@ bool settings_plugin_enabled(const char *plugin_id);
  * If the plugin id is not yet listed, it is added.
  */
 void settings_plugin_set_enabled(const char *plugin_id, bool enabled);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* EVEMON_SETTINGS_H */

@@ -33,7 +33,8 @@
 #include <errno.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
-#include <netinet/tcp.h>
+#include <netinet/in.h>
+#include <linux/tcp.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/inet_diag.h>

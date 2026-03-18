@@ -40,10 +40,6 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /* ── event types ─────────────────────────────────────────────── */
 
 typedef enum {
@@ -251,9 +247,5 @@ int  fdmon_orphan_stdout_enable(fdmon_ctx_t *ctx);
  * process exits or fdmon_remove_pid_fd() is called explicitly.
  */
 void fdmon_orphan_stdout_disable(fdmon_ctx_t *ctx);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* evemon_FDMON_H */

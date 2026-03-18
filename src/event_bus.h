@@ -18,10 +18,6 @@
 
 #include "evemon_plugin.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /*
  * Initialise the global event bus.
  * Must be called once from the GTK main thread before any plugins load.
@@ -79,9 +75,5 @@ void host_event_publish(void *host_ctx,
                         const evemon_event_t *event);
 
 void host_event_unsubscribe(void *host_ctx, int subscription_id);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* EVEMON_EVENT_BUS_H */

@@ -764,6 +764,8 @@ static void on_selection_changed(GtkTreeSelection *sel, gpointer data)
 
         for (size_t i = 0; i < preg->count; i++) {
             plugin_instance_t *inst = &preg->instances[i];
+            /* SYSTEM plugins always track PID 1; never follow selection */
+            if (inst->plugin && inst->plugin->role == EVEMON_ROLE_SYSTEM) continue;
             if (!inst->pinned && inst->is_active)
                 plugin_instance_set_pid(inst, sel_pid, FALSE);
         }
@@ -890,22 +892,32 @@ static void on_proc_info_tray_toggle(GtkButton *btn, gpointer data)
 
 /* ── detail panel: change dock position ──────────────────────── */
 
-typedef struct {
-    ui_ctx_t        *ctx;
-    panel_position_t pos;
-} panel_pos_data_t;
-
 static void on_panel_position_changed(GtkCheckMenuItem *item, gpointer data)
 {
     panel_pos_data_t *d = data;
     if (!gtk_check_menu_item_get_active(item))
         return;   /* ignore radio deactivation */
-    if (d->ctx->detail_panel_pos == d->pos)
-        return;   /* no change */
-    d->ctx->detail_panel_pos = d->pos;
-    detail_panel_relayout(d->ctx);
-    settings_get()->detail_panel_position = (int)d->pos;
-    settings_save();
+
+    if (d->is_sys) {
+        /* System plugin panel */
+        if (d->ctx->system_panel_pos == d->pos)
+            return;
+        d->ctx->system_panel_pos = d->pos;
+        /* Only relayout if the panel is currently visible (has a paned).
+         * If it's hidden, the new position will be applied next time it shows. */
+        if (d->ctx->system_panel_paned)
+            system_panel_relayout(d->ctx);
+        settings_get()->system_panel_position = (int)d->pos;
+        settings_save();
+    } else {
+        /* Detail panel */
+        if (d->ctx->detail_panel_pos == d->pos)
+            return;   /* no change */
+        d->ctx->detail_panel_pos = d->pos;
+        detail_panel_relayout(d->ctx);
+        settings_get()->detail_panel_position = (int)d->pos;
+        settings_save();
+    }
 }
 
 /*
@@ -1353,6 +1365,8 @@ static gboolean on_refresh(gpointer data)
                     pid_t sel_pid = settings_get()->preselected_pid;
                     for (size_t i = 0; i < preg->count; i++) {
                         plugin_instance_t *inst = &preg->instances[i];
+                        /* SYSTEM plugins always track PID 1; never follow selection */
+                        if (inst->plugin && inst->plugin->role == EVEMON_ROLE_SYSTEM) continue;
                         if (!inst->pinned && inst->is_active)
                             plugin_instance_set_pid(inst, sel_pid, 0);
                     }
@@ -1523,9 +1537,11 @@ static gboolean on_refresh(gpointer data)
 
             /* Update follow-selection instances to the selected PID.
              * Skip pinned and floating-window instances — they track
-             * a fixed PID and must not follow the tree selection. */
+             * a fixed PID and must not follow the tree selection.
+             * Skip SYSTEM role plugins — they always track PID 1. */
             for (size_t i = 0; i < preg->count; i++) {
                 plugin_instance_t *inst = &preg->instances[i];
+                if (inst->plugin && inst->plugin->role == EVEMON_ROLE_SYSTEM) continue;
                 if (!inst->pinned && inst->is_active)
                     plugin_instance_set_pid(inst, sel_pid, FALSE);
             }
@@ -2757,6 +2773,35 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
     /* Determine the display label */
     const char *lbl = inst->plugin->name ? inst->plugin->name : "Plugin";
 
+    /* SYSTEM role: add to the system plugin panel notebook */
+    if (inst->plugin->role == EVEMON_ROLE_SYSTEM) {
+        /* SYSTEM plugins always track PID 1 — they are process-independent */
+        plugin_instance_set_pid(inst, 1, FALSE);
+        if (ctx->system_panel_notebook) {
+            system_panel_add_plugin(ctx, inst->widget, lbl, inst->instance_id);
+            plugin_instance_set_active(inst, TRUE);
+            gtk_widget_show_all(inst->widget);
+
+            /* Show the sys panel menu item now that at least one system
+             * plugin is available. */
+            if (ctx->system_panel_menu_item)
+                gtk_widget_set_sensitive(
+                    GTK_WIDGET(ctx->system_panel_menu_item), TRUE);
+
+            /* Auto-show if setting says open */
+            if (settings_get()->system_panel_open &&
+                ctx->system_panel && !gtk_widget_get_visible(ctx->system_panel)) {
+                gtk_check_menu_item_set_active(ctx->system_panel_menu_item, TRUE);
+            }
+        }
+        evemon_log(LOG_INFO,
+                   "evemon: loaded System plugin \"%s\" (%s) v%s — system panel tab added",
+                   inst->plugin->name    ? inst->plugin->name    : "?",
+                   inst->plugin->id      ? inst->plugin->id      : "?",
+                   inst->plugin->version ? inst->plugin->version : "?");
+        return;
+    }
+
     /* Is this a last-order (hidden) plugin? */
     gboolean is_last = FALSE;
     if (inst->plugin->id)
@@ -2833,6 +2878,8 @@ static void on_plugin_scan_done_gtk(int n_loaded, void *user_data)
         pid_t sel_pid = settings_get()->preselected_pid;
         for (size_t i = 0; i < preg->count; i++) {
             plugin_instance_t *inst = &preg->instances[i];
+            /* SYSTEM plugins always track PID 1; never follow selection */
+            if (inst->plugin && inst->plugin->role == EVEMON_ROLE_SYSTEM) continue;
             if (!inst->pinned && inst->is_active)
                 plugin_instance_set_pid(inst, sel_pid, 0);
         }
@@ -3937,6 +3984,53 @@ void *ui_thread(void *arg)
 
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), panel_pos_item);
 
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),
+                          gtk_separator_menu_item_new());
+
+    /* System Plugin Panel toggle */
+    GtkWidget *system_panel_toggle = gtk_check_menu_item_new_with_label(
+        "System Plugin Panel");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(system_panel_toggle), FALSE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), system_panel_toggle);
+
+    /* System Plugin Panel → Position submenu (radio items) */
+    GtkWidget *system_panel_pos_menu = gtk_menu_new();
+    GtkWidget *system_panel_pos_item = gtk_menu_item_new_with_label(
+        "System Panel Position");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(system_panel_pos_item),
+                              system_panel_pos_menu);
+
+    GSList *system_panel_pos_group = NULL;
+    static panel_pos_data_t system_panel_pos_data_bottom, system_panel_pos_data_top,
+                             system_panel_pos_data_left, system_panel_pos_data_right;
+
+    GtkWidget *system_panel_pos_bottom = gtk_radio_menu_item_new_with_label(
+        system_panel_pos_group, "Bottom");
+    system_panel_pos_group = gtk_radio_menu_item_get_group(
+        GTK_RADIO_MENU_ITEM(system_panel_pos_bottom));
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(system_panel_pos_bottom), TRUE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(system_panel_pos_menu), system_panel_pos_bottom);
+
+    GtkWidget *system_panel_pos_top = gtk_radio_menu_item_new_with_label(
+        system_panel_pos_group, "Top");
+    system_panel_pos_group = gtk_radio_menu_item_get_group(
+        GTK_RADIO_MENU_ITEM(system_panel_pos_top));
+    gtk_menu_shell_append(GTK_MENU_SHELL(system_panel_pos_menu), system_panel_pos_top);
+
+    GtkWidget *system_panel_pos_left = gtk_radio_menu_item_new_with_label(
+        system_panel_pos_group, "Left");
+    system_panel_pos_group = gtk_radio_menu_item_get_group(
+        GTK_RADIO_MENU_ITEM(system_panel_pos_left));
+    gtk_menu_shell_append(GTK_MENU_SHELL(system_panel_pos_menu), system_panel_pos_left);
+
+    GtkWidget *system_panel_pos_right = gtk_radio_menu_item_new_with_label(
+        system_panel_pos_group, "Right");
+    system_panel_pos_group = gtk_radio_menu_item_get_group(
+        GTK_RADIO_MENU_ITEM(system_panel_pos_right));
+    gtk_menu_shell_append(GTK_MENU_SHELL(system_panel_pos_menu), system_panel_pos_right);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), system_panel_pos_item);
+
     /* Columns visibility submenu */
     GtkWidget *columns_item = gtk_menu_item_new_with_label("Columns");
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(columns_item),
@@ -4132,6 +4226,10 @@ void *ui_thread(void *arg)
     GtkWidget *outer_paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
     gtk_paned_pack1(GTK_PANED(outer_paned), hpaned, TRUE, FALSE);
     gtk_paned_pack2(GTK_PANED(outer_paned), detail_vbox, FALSE, FALSE);
+
+    /* The system panel paned (wrapping outer_paned + system panel) is created
+     * lazily in system_panel_relayout() only when a SYSTEM plugin is shown.
+     * Until then outer_paned sits directly in vbox with no wasted space. */
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_pack_start(GTK_BOX(vbox), menubar, FALSE, FALSE, 0);
@@ -4509,6 +4607,35 @@ void *ui_thread(void *arg)
     ctx.hpaned                = hpaned;
     ctx.panel_pos_group       = pos_group;
 
+    /* ── System plugin panel setup ───────────────────────────── */
+    ctx.system_panel_pos         = (panel_position_t)settings_get()->system_panel_position;
+    ctx.system_panel_menu_item   = GTK_CHECK_MENU_ITEM(system_panel_toggle);
+    ctx.system_panel_pos_group         = system_panel_pos_group;
+    ctx.system_panel_has_plugins = FALSE;
+    ctx.system_panel_paned             = NULL;  /* created lazily in system_panel_relayout */
+
+    /* Build the system panel widget (frame + notebook, no content yet) */
+    system_panel_build(&ctx);
+
+    /* Set the correct radio button for sys panel position from settings */
+    {
+        GtkWidget *system_panel_pos_items[4] = {
+            system_panel_pos_bottom, system_panel_pos_top, system_panel_pos_left, system_panel_pos_right
+        };
+        int saved_system_panel_pos = settings_get()->system_panel_position;
+        if (saved_system_panel_pos >= 0 && saved_system_panel_pos <= 3) {
+            /* Block signals to avoid triggering relayout before ctx is ready */
+            for (int _i = 0; _i < 4; _i++)
+                g_signal_handlers_block_by_func(system_panel_pos_items[_i],
+                    G_CALLBACK(system_panel_relayout), &ctx);
+            gtk_check_menu_item_set_active(
+                GTK_CHECK_MENU_ITEM(system_panel_pos_items[saved_system_panel_pos]), TRUE);
+            for (int _i = 0; _i < 4; _i++)
+                g_signal_handlers_unblock_by_func(system_panel_pos_items[_i],
+                    G_CALLBACK(system_panel_relayout), &ctx);
+        }
+    }
+
     /* Collapsible process info tray */
     ctx.proc_info_revealer  = proc_info_revealer;
     ctx.proc_info_toggle    = proc_info_toggle;
@@ -4563,10 +4690,10 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_toggle_detail_panel), &ctx);
 
     /* Detail panel position radio items */
-    pos_data_bottom = (panel_pos_data_t){ &ctx, PANEL_POS_BOTTOM };
-    pos_data_top    = (panel_pos_data_t){ &ctx, PANEL_POS_TOP };
-    pos_data_left   = (panel_pos_data_t){ &ctx, PANEL_POS_LEFT };
-    pos_data_right  = (panel_pos_data_t){ &ctx, PANEL_POS_RIGHT };
+    pos_data_bottom = (panel_pos_data_t){ &ctx, PANEL_POS_BOTTOM, FALSE };
+    pos_data_top    = (panel_pos_data_t){ &ctx, PANEL_POS_TOP,    FALSE };
+    pos_data_left   = (panel_pos_data_t){ &ctx, PANEL_POS_LEFT,   FALSE };
+    pos_data_right  = (panel_pos_data_t){ &ctx, PANEL_POS_RIGHT,  FALSE };
     g_signal_connect(pos_bottom, "toggled",
                      G_CALLBACK(on_panel_position_changed), &pos_data_bottom);
     g_signal_connect(pos_top, "toggled",
@@ -4575,6 +4702,23 @@ void *ui_thread(void *arg)
                      G_CALLBACK(on_panel_position_changed), &pos_data_left);
     g_signal_connect(pos_right, "toggled",
                      G_CALLBACK(on_panel_position_changed), &pos_data_right);
+
+    /* System panel toggle and position radio items */
+    g_signal_connect(system_panel_toggle, "toggled",
+                     G_CALLBACK(on_toggle_system_panel), &ctx);
+
+    system_panel_pos_data_bottom = (panel_pos_data_t){ &ctx, PANEL_POS_BOTTOM, TRUE };
+    system_panel_pos_data_top    = (panel_pos_data_t){ &ctx, PANEL_POS_TOP,    TRUE };
+    system_panel_pos_data_left   = (panel_pos_data_t){ &ctx, PANEL_POS_LEFT,   TRUE };
+    system_panel_pos_data_right  = (panel_pos_data_t){ &ctx, PANEL_POS_RIGHT,  TRUE };
+    g_signal_connect(system_panel_pos_bottom, "toggled",
+                     G_CALLBACK(on_panel_position_changed), &system_panel_pos_data_bottom);
+    g_signal_connect(system_panel_pos_top, "toggled",
+                     G_CALLBACK(on_panel_position_changed), &system_panel_pos_data_top);
+    g_signal_connect(system_panel_pos_left, "toggled",
+                     G_CALLBACK(on_panel_position_changed), &system_panel_pos_data_left);
+    g_signal_connect(system_panel_pos_right, "toggled",
+                     G_CALLBACK(on_panel_position_changed), &system_panel_pos_data_right);
 
     g_signal_connect(name_filter_entry, "key-release-event",
                      G_CALLBACK(on_filter_entry_key_release), &ctx);
@@ -4641,6 +4785,14 @@ void *ui_thread(void *arg)
     if (ctx.detail_panel_pos != PANEL_POS_BOTTOM)
         detail_panel_relayout(&ctx);
 
+    /* ── Apply system panel position layout before showing ────── */
+    /* Always call relayout: system_panel_build() only creates the widget,
+     * it does not insert it into the layout hierarchy.  system_panel_relayout()
+     * wraps detail_paned in a new paned and packs the system panel in, which
+     * is required even for the default PANEL_POS_BOTTOM position. */
+    if (ctx.system_panel)
+        system_panel_relayout(&ctx);
+
     /* ── show & run ──────────────────────────────────────────── */
     gtk_widget_show_all(window);
     gtk_widget_hide(menubar);        /* hidden by default; toggle via status-bar right-click */
@@ -4657,6 +4809,15 @@ void *ui_thread(void *arg)
         }
     } else {
         gtk_widget_hide(detail_vbox);
+    }
+
+    /* System panel: honour settings (default = hidden, only if plugins loaded) */
+    if (ctx.system_panel) {
+        if (settings_get()->system_panel_open && ctx.system_panel_has_plugins) {
+            gtk_check_menu_item_set_active(ctx.system_panel_menu_item, TRUE);
+        } else {
+            gtk_widget_hide(ctx.system_panel);
+        }
     }
     gtk_main();
 

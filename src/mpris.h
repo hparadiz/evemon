@@ -29,10 +29,6 @@
  */
 #include "evemon_plugin.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /* Maximum number of MPRIS players we track per PID */
 #define EVEMON_MPRIS_MAX_PLAYERS  8
 
@@ -59,9 +55,5 @@ typedef struct {
 int mpris_scan_for_pid(pid_t pid,
                        const pid_t *desc_pids, size_t desc_count,
                        evemon_mpris_data_t *out);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* EVEMON_MPRIS_H */
