@@ -1,5 +1,11 @@
-# evemon
+<p align="center">
+    <picture>
+        <source srcset="icon.png" media="(max-width: 400px)" />
+        <img src="icon.png" alt="Evemon Logo" width="400"/>
+    </picture>
+</p>
 
+# evemon
 A graphical Linux process monitor focused on deep per-process introspection — built with C11, GTK 3, and eBPF.
 
 > *"What is this process doing and why?"*

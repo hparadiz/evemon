@@ -123,9 +123,18 @@ static void bpm_reset(bpm_state_t *bs)
 /*
  * Feed a new energy sample (0..1 combined L+R peak) into the detector.
  * Called from the meter timer at ~50ms intervals.
+ *
+ * Silent frames (energy below the onset threshold) are skipped entirely:
+ * they cannot contribute an onset, and accumulating them would waste
+ * autocorrelation CPU time and grow vote_count without bound for long
+ * paused/silent tracks.
  */
 static void bpm_feed(bpm_state_t *bs, float energy)
 {
+    /* Gate: ignore silence so we don't process or vote on empty audio */
+    if (energy < BPM_ONSET_THRESH * 0.5f)
+        return;
+
     int prev = (bs->head + BPM_HIST_LEN - 1) % BPM_HIST_LEN;
     float prev_e = (bs->filled > 0) ? bs->energy[prev] : 0.0f;
 
@@ -235,6 +244,23 @@ static void bpm_feed(bpm_state_t *bs, float energy)
                            * bs->histo[best_bin + 1];
             }
             bs->track_bpm = (w_sum > 0.0f) ? bpm_sum / w_sum : 0.0f;
+
+            /*
+             * Normalise the histogram periodically to prevent unbounded
+             * accumulation on long tracks (hours of continuous playback).
+             * Once vote_count reaches the cap, divide all bins by the
+             * peak bin weight so relative proportions are preserved but
+             * magnitudes stay near 1.0.  This keeps float precision
+             * intact and ensures vote_count never overflows an int.
+             */
+#define BPM_HISTO_VOTE_CAP  8000
+            if (bs->vote_count >= BPM_HISTO_VOTE_CAP && best_w > 0.0f) {
+                for (int b = 0; b < BPM_HISTO_BINS; b++)
+                    bs->histo[b] /= best_w;
+                /* Reset vote_count to half the cap so we normalise again
+                 * after another half-cap's worth of new votes, not immediately. */
+                bs->vote_count = BPM_HISTO_VOTE_CAP / 2;
+            }
         }
     }
 }

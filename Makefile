@@ -131,7 +131,24 @@ DEB_DOCKERFILE_ubuntu2404 := packaging/ubuntu2404
 DEB_IMAGE   := evemon-builder-$(DEB_TARGET)
 DEB_OUTDIR  := $(CURDIR)/dist/$(DEB_TARGET)
 
-.PHONY: all clean run debug gdb install uninstall deb _deb_check
+# ── RPM packaging variables ─────────────────────────────────────
+# Usage:  make rpm target=fedora42
+#         make rpm target=fedora41
+# Output: dist/<target>/evemon-<version>-<release>.<arch>.rpm
+
+RPM_VERSION ?= 0.1.0
+RPM_RELEASE ?= 1
+RPM_TARGET  ?= $(if $(target),$(target),fedora42)
+RPM_DEBUG   ?= $(if $(filter 1 true yes,$(debug)),1,0)
+
+# Map target name → Dockerfile directory
+RPM_DOCKERFILE_fedora42 := packaging/fedora42
+RPM_DOCKERFILE_fedora41 := packaging/fedora41
+
+RPM_IMAGE  := evemon-builder-$(RPM_TARGET)
+RPM_OUTDIR := $(CURDIR)/dist/$(RPM_TARGET)
+
+.PHONY: all clean run debug gdb install uninstall deb rpm
 
 all: $(CORE_LIB) $(TARGET) $(BPF_OBJ) plugins
 
@@ -243,6 +260,33 @@ deb:
 	if [ "$(DEB_DEBUG)" = "1" ]; then \
 	    echo "==> .ddeb written to dist/$(DEB_TARGET)/"; \
 	fi
+
+rpm:
+	@if [ -z "$(RPM_TARGET)" ]; then \
+	    echo "Usage: make rpm target=<fedora42|fedora41>"; \
+	    exit 1; \
+	fi
+	@DDIR="$(RPM_DOCKERFILE_$(RPM_TARGET))"; \
+	if [ -z "$$DDIR" ]; then \
+	    echo "Unknown target '$(RPM_TARGET)'. Valid: fedora42 fedora41"; \
+	    exit 1; \
+	fi; \
+	if [ ! -f "$$DDIR/Dockerfile" ]; then \
+	    echo "Dockerfile not found: $$DDIR/Dockerfile"; \
+	    exit 1; \
+	fi; \
+	mkdir -p "$(RPM_OUTDIR)"; \
+	echo "==> Building Docker image $(RPM_IMAGE) from $$DDIR"; \
+	docker build -t $(RPM_IMAGE) -f "$$DDIR/Dockerfile" .; \
+	echo "==> Running package build for target=$(RPM_TARGET)"; \
+	docker run --rm \
+	    -e VERSION=$(RPM_VERSION) \
+	    -e RELEASE=$(RPM_RELEASE) \
+	    -e DEBUG=$(RPM_DEBUG) \
+	    -v "$(CURDIR):/src:ro" \
+	    -v "$(RPM_OUTDIR):/out" \
+	    $(RPM_IMAGE); \
+	echo "==> .rpm written to dist/$(RPM_TARGET)/"
 
 clean:
 	rm -rf $(BUILD_DIR)

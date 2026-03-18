@@ -254,6 +254,20 @@ static void on_process(void *data)
         uint32_t n_samples = n_bytes / sizeof(float);
 
         /*
+         * Skip completely silent buffers — don't waste ring space or
+         * trigger FFT work for tracks that are paused / in silence
+         * sections.  A peak scan is cheap relative to the FFT.
+         * Threshold is well below the noise floor of any real signal.
+         */
+        float peak = 0.0f;
+        for (uint32_t i = 0; i < n_samples; i++) {
+            float a = samples[i] < 0.0f ? -samples[i] : samples[i];
+            if (a > peak) peak = a;
+        }
+        if (peak < 1e-7f)
+            goto done;
+
+        /*
          * Lock-free SPSC write: only the producer updates write_pos.
          * We read read_pos to check for overflow, but never modify it.
          */
@@ -554,13 +568,30 @@ static gboolean spectro_tick(gpointer data)
     int did_fft = 0;
     int fft_count = 0;
     while (avail >= (unsigned)FFT_SIZE && fft_count < MAX_FFTS_PER_TICK) {
-        /* Copy windowed samples (no lock needed — SPSC ring) */
+        /* Peek at the peak magnitude of this window before doing the FFT.
+         * If the window is silent (e.g. paused playback, empty stream),
+         * advance the read pointer but skip the FFT and waterfall write
+         * entirely — no point computing or rendering silence. */
+        float window_peak = 0.0f;
         for (int i = 0; i < FFT_SIZE; i++) {
-            st->fft_re[i] = st->ring.buf[(rp + i) % RING_SIZE] * hann_window[i];
-            st->fft_im[i] = 0.0f;
+            float s = st->ring.buf[(rp + i) % RING_SIZE];
+            if (s < 0.0f) s = -s;
+            if (s > window_peak) window_peak = s;
         }
         rp += FFT_SIZE / 2;    /* 50% overlap */
         avail = wp - rp;
+
+        if (window_peak < 1e-7f) {
+            /* Silent window — skip FFT and waterfall write */
+            fft_count++;
+            continue;
+        }
+
+        /* Copy windowed samples (no lock needed — SPSC ring) */
+        for (int i = 0; i < FFT_SIZE; i++) {
+            st->fft_re[i] = st->ring.buf[(rp - FFT_SIZE / 2 + i) % RING_SIZE] * hann_window[i];
+            st->fft_im[i] = 0.0f;
+        }
 
         fft_dit(st->fft_re, st->fft_im, FFT_SIZE);
 
