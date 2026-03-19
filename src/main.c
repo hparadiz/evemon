@@ -146,15 +146,26 @@ int main(int argc, char *argv[])
         settings_get()->preselected_pid = cli_pid;
     g_state.preselect_pid = settings_get()->preselected_pid;
 
+    /*
+     * Establish signal handlers BEFORE creating any threads.
+     * TLPI §33.2: signal dispositions are process-wide; handlers must
+     * be in place before the first thread is spawned so no thread ever
+     * runs with the default (terminate) disposition for SIGINT/SIGTERM.
+     *
+     * SA_RESTART (TLPI §21.5): restart slow syscalls (poll, read, …)
+     * automatically on EINTR rather than requiring every call site to
+     * wrap in a retry loop.
+     */
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = on_sigint;
+    sa.sa_flags   = SA_RESTART;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
     /* Create the eBPF fd/network monitor (best-effort: NULL on failure) */
     g_state.fdmon = fdmon_create(FDMON_BACKEND_AUTO);
     STARTUP_TS("fdmon_create done");
-
-    /* Handle Ctrl-C gracefully */
-    struct sigaction sa = { .sa_handler = on_sigint };
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
 
     /* Start monitor in a background thread */
     pthread_t mon_tid;
