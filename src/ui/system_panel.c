@@ -106,9 +106,6 @@ GtkWidget *system_panel_build(ui_ctx_t *ctx)
     gtk_widget_set_no_show_all(frame, TRUE);
     gtk_widget_hide(frame);
 
-    if (ctx->system_panel_menu_item)
-        gtk_widget_set_sensitive(GTK_WIDGET(ctx->system_panel_menu_item), FALSE);
-
     return frame;
 }
 

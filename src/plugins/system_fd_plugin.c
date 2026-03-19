@@ -12,7 +12,7 @@
 
 EVEMON_PLUGIN_MANIFEST(
     "org.evemon.system_fd",
-    "System FD",
+    "Files",
     "1.0",
     EVEMON_ROLE_SYSTEM,
     NULL
@@ -44,10 +44,15 @@ static const char *cat_labels[FD_CAT_COUNT] = {
 };
 
 enum {
-    COL_TEXT,
-    COL_MARKUP,
-    COL_CAT,
+    COL_TYPE_MARKUP,
+    COL_NAME_MARKUP,
+    COL_PATH,        /* raw path for detail lookup */
     NUM_COLS
+};
+
+enum {
+    DCOL_MARKUP,
+    DCOL_NUM_COLS
 };
 
 /* ── per-instance state ──────────────────────────────────────── */
@@ -55,14 +60,23 @@ enum {
 typedef struct {
     GtkWidget      *vbox;
     GtkWidget      *scroll;
-    GtkTreeStore   *store;
+    GtkListStore   *store;
     GtkTreeView    *view;
     GtkWidget      *chk_desc;
     GtkWidget      *chk_dedup;
-    unsigned        collapsed;
+    GtkWidget      *search_entry;
+    char            filter_text[256];
     pid_t           last_pid;
     gboolean        include_desc;
     gboolean        merge_dup;
+    /* detail panel */
+    GtkWidget      *detail_scroll;
+    GtkListStore   *detail_store;
+    GtkTreeView    *detail_view;
+    char            selected_path[512];
+    /* snapshot of all raw fds for detail lookup */
+    evemon_fd_t    *snap_fds;
+    size_t          snap_fd_count;
 } fd_ctx_t;
 
 /* ── classification ──────────────────────────────────────────── */
@@ -81,52 +95,66 @@ static int classify_fd(const char *path)
     return FD_CAT_OTHER;
 }
 
-/* ── markup helper ───────────────────────────────────────────── */
-
-static char *fd_to_markup(int fd_num, const char *path, const char *desc)
-{
-    const char *display = (desc && desc[0]) ? desc : path;
-    char *esc = g_markup_escape_text(display, -1);
-    char *markup = g_strdup_printf(
-        "<span foreground=\"#6699cc\">%d</span>  %s", fd_num, esc);
-    g_free(esc);
-    return markup;
-}
-
-static char *fd_to_markup_grouped(const char *path, const char *desc,
-                                  size_t count)
-{
-    const char *display = (desc && desc[0]) ? desc : path;
-    char *esc = g_markup_escape_text(display, -1);
-    char *markup = g_strdup_printf(
-        "%s  <span foreground=\"#888888\">(%zu duplicates)</span>",
-        esc, count);
-    g_free(esc);
-    return markup;
-}
-
 /* ── signal callbacks ────────────────────────────────────────── */
 
-static void on_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
-                             GtkTreePath *path, gpointer data)
+static void populate_detail(fd_ctx_t *ctx, const char *path)
 {
-    (void)view; (void)path;
-    fd_ctx_t *ctx = data;
-    gint cat = -1;
-    gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), iter, COL_CAT, &cat, -1);
-    if (cat >= 0 && cat < FD_CAT_COUNT)
-        ctx->collapsed |= (1u << cat);
+    gtk_list_store_clear(ctx->detail_store);
+    if (!path || !path[0]) return;
+
+    for (size_t i = 0; i < ctx->snap_fd_count; i++) {
+        if (strcmp(ctx->snap_fds[i].path, path) != 0) continue;
+
+        pid_t spid = ctx->snap_fds[i].source_pid;
+        int   fdn  = ctx->snap_fds[i].fd;
+
+        /* read /proc/<pid>/comm for process name */
+        char comm[64] = "";
+        char comm_path[64];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int)spid);
+        FILE *f = fopen(comm_path, "r");
+        if (f) {
+            if (fgets(comm, sizeof(comm), f)) {
+                size_t len = strlen(comm);
+                if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
+            }
+            fclose(f);
+        }
+        if (!comm[0]) snprintf(comm, sizeof(comm), "%d", (int)spid);
+
+        char *fd_esc   = g_markup_escape_text(comm, -1);
+        char *markup = g_strdup_printf(
+            "<span foreground=\"#6699cc\">%d</span>  %s"
+            "  <span foreground=\"#888888\">(%d)</span>",
+            fdn, fd_esc, (int)spid);
+        g_free(fd_esc);
+
+        GtkTreeIter it;
+        gtk_list_store_append(ctx->detail_store, &it);
+        gtk_list_store_set(ctx->detail_store, &it, DCOL_MARKUP, markup, -1);
+        g_free(markup);
+    }
 }
 
-static void on_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
-                            GtkTreePath *path, gpointer data)
+static void on_selection_changed(GtkTreeSelection *sel, gpointer data)
 {
-    (void)view; (void)path;
     fd_ctx_t *ctx = data;
-    gint cat = -1;
-    gtk_tree_model_get(GTK_TREE_MODEL(ctx->store), iter, COL_CAT, &cat, -1);
-    if (cat >= 0 && cat < FD_CAT_COUNT)
-        ctx->collapsed &= ~(1u << cat);
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+
+    if (!gtk_tree_selection_get_selected(sel, &model, &iter)) {
+        gtk_list_store_clear(ctx->detail_store);
+        ctx->selected_path[0] = '\0';
+        return;
+    }
+
+    gchar *path = NULL;
+    gtk_tree_model_get(model, &iter, COL_PATH, &path, -1);
+    if (path) {
+        g_strlcpy(ctx->selected_path, path, sizeof(ctx->selected_path));
+        g_free(path);
+    }
+    populate_detail(ctx, ctx->selected_path);
 }
 
 /* ── plugin callbacks ────────────────────────────────────────── */
@@ -145,37 +173,57 @@ static GtkWidget *fd_create_widget(void *opaque)
     ctx->chk_desc = gtk_check_button_new_with_label("Include Descendants");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->chk_desc),
                                   ctx->include_desc);
+    gtk_widget_set_no_show_all(ctx->chk_desc, TRUE);
     gtk_box_pack_start(GTK_BOX(hbox), ctx->chk_desc, FALSE, FALSE, 0);
 
     ctx->chk_dedup = gtk_check_button_new_with_label("Merge Duplicates");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->chk_dedup),
                                   ctx->merge_dup);
+    gtk_widget_set_no_show_all(ctx->chk_dedup, TRUE);
     gtk_box_pack_start(GTK_BOX(hbox), ctx->chk_dedup, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(ctx->vbox), hbox, FALSE, FALSE, 0);
 
-    ctx->store = gtk_tree_store_new(NUM_COLS,
-                                    G_TYPE_STRING,
-                                    G_TYPE_STRING,
-                                    G_TYPE_INT);
+    ctx->search_entry = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(ctx->search_entry), "Filter\u2026");
+    gtk_widget_set_margin_start(ctx->search_entry, 4);
+    gtk_widget_set_margin_end(ctx->search_entry, 4);
+    gtk_widget_set_margin_bottom(ctx->search_entry, 2);
+    gtk_box_pack_start(GTK_BOX(ctx->vbox), ctx->search_entry, FALSE, FALSE, 0);
+
+    ctx->store = gtk_list_store_new(NUM_COLS,
+                                    G_TYPE_STRING,   /* COL_TYPE_MARKUP */
+                                    G_TYPE_STRING,   /* COL_NAME_MARKUP */
+                                    G_TYPE_STRING);  /* COL_PATH        */
 
     ctx->view = GTK_TREE_VIEW(gtk_tree_view_new_with_model(
         GTK_TREE_MODEL(ctx->store)));
     g_object_unref(ctx->store);
 
-    gtk_tree_view_set_headers_visible(ctx->view, FALSE);
+    gtk_tree_view_set_headers_visible(ctx->view, TRUE);
     gtk_tree_view_set_enable_search(ctx->view, FALSE);
 
-    GtkCellRenderer *cell = gtk_cell_renderer_text_new();
-    g_object_set(cell, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
-    GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(
-        "FD", cell, "markup", COL_MARKUP, NULL);
-    gtk_tree_view_append_column(ctx->view, col);
+    /* Type column */
+    GtkCellRenderer *type_cell = gtk_cell_renderer_text_new();
+    g_object_set(type_cell, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+    GtkTreeViewColumn *type_col = gtk_tree_view_column_new_with_attributes(
+        "Type", type_cell, "markup", COL_TYPE_MARKUP, NULL);
+    gtk_tree_view_column_set_resizable(type_col, TRUE);
+    gtk_tree_view_column_set_min_width(type_col, 80);
+    gtk_tree_view_append_column(ctx->view, type_col);
 
-    g_signal_connect(ctx->view, "row-collapsed",
-                     G_CALLBACK(on_row_collapsed), ctx);
-    g_signal_connect(ctx->view, "row-expanded",
-                     G_CALLBACK(on_row_expanded), ctx);
+    /* Name column */
+    GtkCellRenderer *name_cell = gtk_cell_renderer_text_new();
+    g_object_set(name_cell, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+    GtkTreeViewColumn *name_col = gtk_tree_view_column_new_with_attributes(
+        "Name", name_cell, "markup", COL_NAME_MARKUP, NULL);
+    gtk_tree_view_column_set_resizable(name_col, TRUE);
+    gtk_tree_view_column_set_expand(name_col, TRUE);
+    gtk_tree_view_append_column(ctx->view, name_col);
+
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(ctx->view);
+    gtk_tree_selection_set_mode(sel, GTK_SELECTION_SINGLE);
+    g_signal_connect(sel, "changed", G_CALLBACK(on_selection_changed), ctx);
 
     ctx->scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(ctx->scroll),
@@ -184,7 +232,35 @@ static GtkWidget *fd_create_widget(void *opaque)
     gtk_container_add(GTK_CONTAINER(ctx->scroll), GTK_WIDGET(ctx->view));
     gtk_widget_set_vexpand(ctx->scroll, TRUE);
 
-    gtk_box_pack_start(GTK_BOX(ctx->vbox), ctx->scroll, TRUE, TRUE, 0);
+    /* ── detail list (right pane) ── */
+    ctx->detail_store = gtk_list_store_new(DCOL_NUM_COLS, G_TYPE_STRING);
+    ctx->detail_view  = GTK_TREE_VIEW(
+        gtk_tree_view_new_with_model(GTK_TREE_MODEL(ctx->detail_store)));
+    g_object_unref(ctx->detail_store);
+    gtk_tree_view_set_headers_visible(ctx->detail_view, TRUE);
+    gtk_tree_view_set_enable_search(ctx->detail_view, FALSE);
+
+    GtkCellRenderer *dcell = gtk_cell_renderer_text_new();
+    g_object_set(dcell, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+    GtkTreeViewColumn *dcol = gtk_tree_view_column_new_with_attributes(
+        "FD  Process (PID)", dcell, "markup", DCOL_MARKUP, NULL);
+    gtk_tree_view_append_column(ctx->detail_view, dcol);
+
+    ctx->detail_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(ctx->detail_scroll),
+                                   GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(ctx->detail_scroll),
+                      GTK_WIDGET(ctx->detail_view));
+    gtk_widget_set_vexpand(ctx->detail_scroll, TRUE);
+
+    /* ── hpaned joining both ── */
+    GtkWidget *hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_paned_pack1(GTK_PANED(hpaned), ctx->scroll, TRUE, FALSE);
+    gtk_paned_pack2(GTK_PANED(hpaned), ctx->detail_scroll, TRUE, FALSE);
+    gtk_paned_set_position(GTK_PANED(hpaned), 340);
+
+    gtk_box_pack_start(GTK_BOX(ctx->vbox), hpaned, TRUE, TRUE, 0);
 
     gtk_widget_show_all(ctx->vbox);
 
@@ -195,6 +271,7 @@ static GtkWidget *fd_create_widget(void *opaque)
 
 typedef struct {
     int         fd;
+    pid_t       source_pid;
     const char *path;
     const char *desc;
     int         cat;
@@ -211,15 +288,18 @@ static void fd_update(void *opaque, const evemon_proc_data_t *data)
 {
     fd_ctx_t *ctx = opaque;
 
-    if (data->pid != ctx->last_pid) {
-        ctx->collapsed = 0;
+    if (data->pid != ctx->last_pid)
         ctx->last_pid = data->pid;
-    }
 
     ctx->include_desc = gtk_toggle_button_get_active(
         GTK_TOGGLE_BUTTON(ctx->chk_desc));
     ctx->merge_dup = gtk_toggle_button_get_active(
         GTK_TOGGLE_BUTTON(ctx->chk_dedup));
+
+    const char *filter_raw = gtk_entry_get_text(GTK_ENTRY(ctx->search_entry));
+    g_strlcpy(ctx->filter_text, filter_raw ? filter_raw : "",
+              sizeof(ctx->filter_text));
+    gboolean has_filter = ctx->filter_text[0] != '\0';
 
     size_t raw_total = data->fd_count;
     fd_display_t *raw = g_new0(fd_display_t, raw_total > 0 ? raw_total : 1);
@@ -228,11 +308,23 @@ static void fd_update(void *opaque, const evemon_proc_data_t *data)
     for (size_t i = 0; i < raw_total; i++) {
         if (!ctx->include_desc && data->fds[i].source_pid != data->pid)
             continue;
-        raw[raw_count].fd        = data->fds[i].fd;
-        raw[raw_count].path      = data->fds[i].path;
-        raw[raw_count].desc      = data->fds[i].desc;
-        raw[raw_count].cat       = classify_fd(data->fds[i].path);
-        raw[raw_count].dup_count = 1;
+        /* skip deleted files */
+        const char *p = data->fds[i].path;
+        if (p && (strstr(p, " (deleted)") || strstr(p, "(deleted)")))
+            continue;
+        if (has_filter) {
+            const char *path = data->fds[i].path ? data->fds[i].path : "";
+            const char *desc = data->fds[i].desc ? data->fds[i].desc : "";
+            if (!strcasestr(path, ctx->filter_text) &&
+                !strcasestr(desc, ctx->filter_text))
+                continue;
+        }
+        raw[raw_count].fd         = data->fds[i].fd;
+        raw[raw_count].source_pid  = data->fds[i].source_pid;
+        raw[raw_count].path        = data->fds[i].path;
+        raw[raw_count].desc        = data->fds[i].desc;
+        raw[raw_count].cat         = classify_fd(data->fds[i].path);
+        raw[raw_count].dup_count   = 1;
         raw_count++;
     }
 
@@ -263,123 +355,84 @@ static void fd_update(void *opaque, const evemon_proc_data_t *data)
         display_count = mi;
     }
 
-    size_t cat_count[FD_CAT_COUNT] = {0};
-    for (size_t i = 0; i < display_count; i++)
-        cat_count[display[i].cat]++;
-
     GtkTreeModel *model = GTK_TREE_MODEL(ctx->store);
 
     GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(
         GTK_SCROLLED_WINDOW(ctx->scroll));
     double scroll_pos = gtk_adjustment_get_value(vadj);
 
-    GtkTreeIter cat_iters[FD_CAT_COUNT];
-    gboolean    cat_exists[FD_CAT_COUNT];
-    memset(cat_exists, 0, sizeof(cat_exists));
+    /* Walk existing rows and update or remove them in-place */
+    GtkTreeIter row;
+    gboolean row_valid = gtk_tree_model_get_iter_first(model, &row);
 
-    {
-        GtkTreeIter top;
-        gboolean valid = gtk_tree_model_iter_children(model, &top, NULL);
-        while (valid) {
-            gint cat_id = -1;
-            gtk_tree_model_get(model, &top, COL_CAT, &cat_id, -1);
-            if (cat_id >= 0 && cat_id < FD_CAT_COUNT) {
-                cat_iters[cat_id]  = top;
-                cat_exists[cat_id] = TRUE;
-            }
-            valid = gtk_tree_model_iter_next(model, &top);
-        }
-    }
+    for (size_t i = 0; i < display_count; i++) {
+        const char *type_label = cat_labels[display[i].cat];
+        char *type_esc = g_markup_escape_text(type_label, -1);
 
-    for (int c = 0; c < FD_CAT_COUNT; c++) {
-        if (cat_exists[c] && cat_count[c] == 0) {
-            gtk_tree_store_remove(ctx->store, &cat_iters[c]);
-            cat_exists[c] = FALSE;
-        }
-    }
-
-    for (int c = 0; c < FD_CAT_COUNT; c++) {
-        if (cat_count[c] == 0) continue;
-
-        char hdr[128];
-        snprintf(hdr, sizeof(hdr), "%s (%zu)", cat_labels[c], cat_count[c]);
-        char *hdr_esc = g_markup_escape_text(hdr, -1);
-
-        GtkTreeIter parent;
-        if (!cat_exists[c]) {
-            gtk_tree_store_append(ctx->store, &parent, NULL);
-            gtk_tree_store_set(ctx->store, &parent,
-                               COL_TEXT, hdr,
-                               COL_MARKUP, hdr_esc,
-                               COL_CAT, (gint)c, -1);
-            cat_exists[c] = TRUE;
-            cat_iters[c] = parent;
-        } else {
-            parent = cat_iters[c];
-            gtk_tree_store_set(ctx->store, &parent,
-                               COL_TEXT, hdr,
-                               COL_MARKUP, hdr_esc, -1);
-        }
-        g_free(hdr_esc);
-
-        GtkTreeIter child;
-        gboolean child_valid = gtk_tree_model_iter_children(
-            model, &child, &parent);
-
-        for (size_t i = 0; i < display_count; i++) {
-            if (display[i].cat != c) continue;
-
-            char *markup;
-            if (display[i].dup_count > 1)
-                markup = fd_to_markup_grouped(display[i].path,
-                                              display[i].desc,
-                                              display[i].dup_count);
-            else
-                markup = fd_to_markup(display[i].fd, display[i].path,
-                                      display[i].desc);
-
-            if (child_valid) {
-                gtk_tree_store_set(ctx->store, &child,
-                                   COL_TEXT, display[i].path,
-                                   COL_MARKUP, markup,
-                                   COL_CAT, (gint)-1, -1);
-                child_valid = gtk_tree_model_iter_next(model, &child);
-            } else {
-                GtkTreeIter new_child;
-                gtk_tree_store_append(ctx->store, &new_child, &parent);
-                gtk_tree_store_set(ctx->store, &new_child,
-                                   COL_TEXT, display[i].path,
-                                   COL_MARKUP, markup,
-                                   COL_CAT, (gint)-1, -1);
-            }
-            g_free(markup);
-        }
-
-        while (child_valid)
-            child_valid = gtk_tree_store_remove(ctx->store, &child);
-
-        GtkTreePath *cat_path = gtk_tree_model_get_path(model, &cat_iters[c]);
-        if (ctx->collapsed & (1u << c))
-            gtk_tree_view_collapse_row(ctx->view, cat_path);
+        const char *name_raw = (display[i].desc && display[i].desc[0])
+                               ? display[i].desc : display[i].path;
+        char *name_esc = g_markup_escape_text(name_raw, -1);
+        char *name_markup;
+        if (display[i].dup_count > 1)
+            name_markup = g_strdup_printf(
+                "%s  <span foreground=\"#888888\">(%zu)</span>",
+                name_esc, display[i].dup_count);
         else
-            gtk_tree_view_expand_row(ctx->view, cat_path, FALSE);
-        gtk_tree_path_free(cat_path);
+            name_markup = g_strdup(name_esc);
+        g_free(name_esc);
+
+        if (row_valid) {
+            gtk_list_store_set(ctx->store, &row,
+                               COL_TYPE_MARKUP, type_esc,
+                               COL_NAME_MARKUP, name_markup,
+                               COL_PATH,        display[i].path, -1);
+            row_valid = gtk_tree_model_iter_next(model, &row);
+        } else {
+            GtkTreeIter new_row;
+            gtk_list_store_append(ctx->store, &new_row);
+            gtk_list_store_set(ctx->store, &new_row,
+                               COL_TYPE_MARKUP, type_esc,
+                               COL_NAME_MARKUP, name_markup,
+                               COL_PATH,        display[i].path, -1);
+        }
+        g_free(type_esc);
+        g_free(name_markup);
     }
+
+    /* Remove leftover rows */
+    while (row_valid)
+        row_valid = gtk_list_store_remove(ctx->store, &row);
 
     gtk_adjustment_set_value(vadj, scroll_pos);
     g_free(display);
+
+    /* ── snapshot all raw fds for the detail panel ── */
+    g_free(ctx->snap_fds);
+    ctx->snap_fd_count = data->fd_count;
+    ctx->snap_fds = g_new(evemon_fd_t, data->fd_count > 0 ? data->fd_count : 1);
+    memcpy(ctx->snap_fds, data->fds, data->fd_count * sizeof(evemon_fd_t));
+
+    /* refresh detail panel if a path is still selected */
+    if (ctx->selected_path[0])
+        populate_detail(ctx, ctx->selected_path);
 }
 
 static void fd_clear(void *opaque)
 {
     fd_ctx_t *ctx = opaque;
-    gtk_tree_store_clear(ctx->store);
+    gtk_list_store_clear(ctx->store);
+    gtk_list_store_clear(ctx->detail_store);
+    ctx->selected_path[0] = '\0';
+    g_free(ctx->snap_fds);
+    ctx->snap_fds = NULL;
+    ctx->snap_fd_count = 0;
     ctx->last_pid = 0;
 }
 
 static void fd_destroy(void *opaque)
 {
     fd_ctx_t *ctx = opaque;
+    g_free(ctx->snap_fds);
     free(ctx);
 }
 
@@ -392,7 +445,7 @@ evemon_plugin_t *evemon_plugin_init(void)
     if (!ctx) return NULL;
 
     ctx->include_desc = TRUE;
-    ctx->merge_dup    = FALSE;
+    ctx->merge_dup    = TRUE;
     ctx->last_pid     = 1;   /* hardcoded to PID 1 */
 
     evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
@@ -400,7 +453,7 @@ evemon_plugin_t *evemon_plugin_init(void)
 
     *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
-        .name          = "System FD",
+        .name          = "Files",
         .id            = "org.evemon.system_fd",
         .version       = "1.0",
         .data_needs    = evemon_NEED_FDS | evemon_NEED_DESCENDANTS,

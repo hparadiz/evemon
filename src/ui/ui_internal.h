@@ -637,7 +637,9 @@ typedef struct {
     ui_ctx_t        *ctx;
     panel_position_t pos;
     gboolean         is_sys; /* TRUE = system panel, FALSE = detail panel */
-} panel_pos_data_t;/* ── plugin window management (ui_plugins.c) ─────────────────── */
+} panel_pos_data_t;
+
+/* ── plugin window management (ui_plugins.c) ─────────────────────────────── */
 
 void     open_plugin_window(ui_ctx_t *ctx, pid_t pid,
                             const char *proc_name, const char *plugin_id);

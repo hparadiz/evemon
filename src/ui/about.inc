@@ -119,6 +119,45 @@ static void on_glyph_dialog_destroy(GtkWidget *w, gpointer data)
     glyph_anim_free((glyph_anim_t *)data);
 }
 
+static const char *ABOUT_DIALOG_DATA_KEY = "evemon-about-dialog";
+
+static GtkWidget *get_open_about_dialog(GtkWidget *window)
+{
+    gpointer dlg = g_object_get_data(G_OBJECT(window), ABOUT_DIALOG_DATA_KEY);
+    return GTK_IS_WIDGET(dlg) ? GTK_WIDGET(dlg) : NULL;
+}
+
+static void on_about_dialog_destroy(GtkWidget *dlg, gpointer data)
+{
+    GtkWidget *window = data;
+    GtkWidget *open_dlg = get_open_about_dialog(window);
+
+    if (open_dlg == dlg)
+        g_object_set_data(G_OBJECT(window), ABOUT_DIALOG_DATA_KEY, NULL);
+}
+
+static void close_open_about_dialog(GtkWidget *window)
+{
+    GtkWidget *dlg = get_open_about_dialog(window);
+
+    if (dlg)
+        gtk_widget_destroy(dlg);
+}
+
+static gboolean on_main_client_button_press(GtkWidget *widget,
+                                            GdkEventButton *event,
+                                            gpointer data)
+{
+    GtkWidget *window = data;
+
+    (void)widget;
+
+    if (event->type == GDK_BUTTON_PRESS)
+        close_open_about_dialog(window);
+
+    return FALSE;
+}
+
 /*
  * Rasterize the font-logos glyph into an alpha mask and return a
  * GtkDrawingArea that animates a gradient shimmer across it.
@@ -566,6 +605,12 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
 {
     (void)item;
     GtkWidget *window = data;
+    GtkWidget *open_dlg = get_open_about_dialog(window);
+
+    if (open_dlg) {
+        gtk_window_present(GTK_WINDOW(open_dlg));
+        return;
+    }
 
     /* ── Load the font-logos font ─────────────────────────────── */
     ensure_font_logos_loaded();
@@ -1012,19 +1057,22 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
         g_string_free(gpus, TRUE);
     }
 
-    /* ── Create splash-style window (no titlebar) ─────────────── */
+    /* ── Create About window (no titlebar) ────────────────────── */
     GtkWidget *dlg = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(window));
-    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
-    gtk_window_set_wmclass(GTK_WINDOW(dlg), "evemon", "evemon");
-    G_GNUC_END_IGNORE_DEPRECATIONS
-    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_modal(GTK_WINDOW(dlg), FALSE);
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(dlg), TRUE);
     gtk_window_set_decorated(GTK_WINDOW(dlg), FALSE);
     gtk_window_set_skip_taskbar_hint(GTK_WINDOW(dlg), TRUE);
     gtk_window_set_skip_pager_hint(GTK_WINDOW(dlg), TRUE);
     gtk_window_set_position(GTK_WINDOW(dlg), GTK_WIN_POS_CENTER_ON_PARENT);
     gtk_window_set_resizable(GTK_WINDOW(dlg), FALSE);
-    gtk_window_set_type_hint(GTK_WINDOW(dlg), GDK_WINDOW_TYPE_HINT_SPLASHSCREEN);
+    gtk_window_set_accept_focus(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_type_hint(GTK_WINDOW(dlg), GDK_WINDOW_TYPE_HINT_DIALOG);
+    gtk_window_set_role(GTK_WINDOW(dlg), "about");
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    gtk_window_set_wmclass(GTK_WINDOW(dlg), "evemon", "evemon");
+    G_GNUC_END_IGNORE_DEPRECATIONS
 
     /* Force CSD mode with an invisible header bar.  On KDE Wayland,
      * set_decorated(FALSE) alone doesn't prevent KWin from adding
@@ -1039,35 +1087,38 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
         gtk_window_set_titlebar(GTK_WINDOW(dlg), fake_hdr);
     }
 
-    /* Override WM_CLASS so compositors that apply title-bar rules
-     * based on class name treat this as a true splash, not a
-     * regular "evemon" window that should get decorations.         */
-    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
-    gtk_window_set_wmclass(GTK_WINDOW(dlg), "evemon_splash", "evemon_splash");
-    G_GNUC_END_IGNORE_DEPRECATIONS
-
     /* Force-strip SSD on X11: set _MOTIF_WM_HINTS with decorations=0.
-     * KDE/KWin on X11 sometimes ignores gtk_window_set_decorated(FALSE)
-     * and the SPLASHSCREEN type hint, but respects _MOTIF_WM_HINTS.  */
+     * KDE/KWin on X11 sometimes ignores gtk_window_set_decorated(FALSE),
+     * but respects _MOTIF_WM_HINTS. */
     g_signal_connect(dlg, "realize", G_CALLBACK(splash_force_no_decorations), NULL);
 
     /* Rounded-corner frame + border via CSS */
     {
-        char splash_css_str[256];
+        char splash_css_str[384];
+        GtkStyleContext *sc = gtk_widget_get_style_context(dlg);
+
+        gtk_style_context_add_class(sc, "evemon-about-window");
         snprintf(splash_css_str, sizeof(splash_css_str),
-                 "window { border-radius: 12px;"
+                 ".evemon-about-window { border-radius: 12px;"
                  " border: 1px solid %s;"
-                 " padding: 4px; }",
+                 " padding: 4px;"
+                 " background-image: none;"
+                 " background-color: rgb(18, 18, 22);"
+                 " opacity: 1.0; }"
+                 ".evemon-about-window:backdrop { opacity: 1.0;"
+                 " background-image: none;"
+                 " background-color: rgb(18, 18, 22); }",
                  glyph.color);
         GtkCssProvider *splash_css = gtk_css_provider_new();
         gtk_css_provider_load_from_data(splash_css,
             splash_css_str, -1, NULL);
-        GtkStyleContext *sc = gtk_widget_get_style_context(dlg);
         gtk_style_context_add_provider(sc,
             GTK_STYLE_PROVIDER(splash_css),
             GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
         g_object_unref(splash_css);
     }
+
+    g_object_set_data(G_OBJECT(window), ABOUT_DIALOG_DATA_KEY, dlg);
 
     /* Wrap everything in an event box so clicks anywhere dismiss it */
     GtkWidget *evbox = gtk_event_box_new();
@@ -1347,11 +1398,9 @@ static void on_menu_about(GtkMenuItem *item, gpointer data)
     g_signal_connect_swapped(dlg, "key-press-event",
                              G_CALLBACK(gtk_widget_destroy), dlg);
 
-    /* Dismiss on focus loss */
-    g_signal_connect_swapped(dlg, "focus-out-event",
-                             G_CALLBACK(gtk_widget_destroy), dlg);
-
     /* Clean up animation on destroy */
+    g_signal_connect(dlg, "destroy",
+                     G_CALLBACK(on_about_dialog_destroy), window);
     g_signal_connect(dlg, "destroy",
                      G_CALLBACK(on_glyph_dialog_destroy), glyph_anim);
 

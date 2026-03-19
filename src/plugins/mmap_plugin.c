@@ -278,9 +278,12 @@ static void mmap_update(void *opaque, const evemon_proc_data_t *data)
     ent_t *ents = g_new0(ent_t, total > 0 ? total : 1);
 
     for (size_t i = 0; i < total; i++) {
-        ents[i].text    = data->mmaps[i].text;
+        const char *t = data->mmaps[i].text;
+        if (t && (strstr(t, " (deleted)") || strstr(t, "(deleted)")))
+            continue;
+        ents[i].text    = t;
         ents[i].size_kb = data->mmaps[i].size_kb;
-        ents[i].cat     = classify_mmap(data->mmaps[i].text);
+        ents[i].cat     = classify_mmap(t);
         cat_count[ents[i].cat]++;
         cat_total_kb[ents[i].cat] += ents[i].size_kb;
     }
@@ -340,7 +343,7 @@ static void mmap_update(void *opaque, const evemon_proc_data_t *data)
         gboolean child_v = gtk_tree_model_iter_children(model, &child, &parent);
 
         for (size_t i = 0; i < total; i++) {
-            if (ents[i].cat != c) continue;
+            if (ents[i].cat != c || !ents[i].text) continue;
             char *markup = mmap_to_markup(ents[i].text, ents[i].size_kb);
 
             if (child_v) {

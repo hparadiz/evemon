@@ -2733,25 +2733,8 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
             if (!ctx->has_audio_plugin) {
                 ctx->has_audio_plugin = TRUE;
                 broker_set_audio_callback(on_broker_audio_pids, ctx);
-                evemon_log(LOG_INFO, "evemon: audio plugin detected (%s) – enabling audio PID probing",
-                           inst->plugin->id);
-                /* Enable the View → Show Audio Processes Only menu item now
-                 * that the audio plugin is present. */
-                if (ctx->audio_only_menu_item) {
-                    gtk_widget_set_sensitive(
-                        GTK_WIDGET(ctx->audio_only_menu_item), TRUE);
-                    /* Sync check state in case the setting was loaded before
-                     * we knew whether the audio plugin would be available. */
-                    g_signal_handlers_block_by_func(
-                        ctx->audio_only_menu_item,
-                        on_toggle_audio_only, ctx);
-                    gtk_check_menu_item_set_active(
-                        ctx->audio_only_menu_item,
-                        ctx->show_audio_only);
-                    g_signal_handlers_unblock_by_func(
-                        ctx->audio_only_menu_item,
-                        on_toggle_audio_only, ctx);
-                }
+                evemon_log(LOG_INFO, "evemon: audio plugin detected (%s)",
+                           inst->plugin->id ? inst->plugin->id : "?");
             }
         }
         return;
@@ -2781,12 +2764,6 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
             system_panel_add_plugin(ctx, inst->widget, lbl, inst->instance_id);
             plugin_instance_set_active(inst, TRUE);
             gtk_widget_show_all(inst->widget);
-
-            /* Show the sys panel menu item now that at least one system
-             * plugin is available. */
-            if (ctx->system_panel_menu_item)
-                gtk_widget_set_sensitive(
-                    GTK_WIDGET(ctx->system_panel_menu_item), TRUE);
 
             /* Auto-show if setting says open */
             if (settings_get()->system_panel_open &&
@@ -3175,10 +3152,13 @@ void *ui_thread(void *arg)
     /* ── window ──────────────────────────────────────────────── */
     GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window), "ＥＶＥＭＯＮ");
+    gtk_window_set_role(GTK_WINDOW(window), "main");
     G_GNUC_BEGIN_IGNORE_DEPRECATIONS
     gtk_window_set_wmclass(GTK_WINDOW(window), "evemon", "evemon");
     G_GNUC_END_IGNORE_DEPRECATIONS
     gtk_window_set_default_size(GTK_WINDOW(window), 1100, 700);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(window), "evemon-main-window");
 
     /* Accel group for displaying hotkey hints in menus.
      * The actual key handling is in on_key_press. */
@@ -3241,14 +3221,11 @@ void *ui_thread(void *arg)
     /* NOTE: the "destroy" signal is connected later, after ctx is
      * initialised, so the callback can set ctx.shutting_down. */
 
-    /* Reduce the heavy backdrop dimming that GTK themes apply when a
-     * modal dialog (e.g. the About splash) steals focus.  We override
-     * the :backdrop pseudo-class at the screen level so the main
-     * window stays nearly fully opaque. */
+    /* Match the old binary's main-window backdrop override. */
     {
         GtkCssProvider *bd_css = gtk_css_provider_new();
         gtk_css_provider_load_from_data(bd_css,
-            "window:backdrop { opacity: 0.92; }", -1, NULL);
+            ".evemon-main-window:backdrop { opacity: 1.0; }", -1, NULL);
         gtk_style_context_add_provider_for_screen(
             gdk_screen_get_default(),
             GTK_STYLE_PROVIDER(bd_css),
@@ -4061,7 +4038,6 @@ void *ui_thread(void *arg)
         "Show Audio Processes Only");
     gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(audio_only_item),
                                    settings_get()->show_audio_only);
-    gtk_widget_set_sensitive(audio_only_item, FALSE); /* enabled once audio plugin loads */
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), audio_only_item);
 
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),
@@ -4232,6 +4208,9 @@ void *ui_thread(void *arg)
      * Until then outer_paned sits directly in vbox with no wasted space. */
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_events(vbox, GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(vbox, "button-press-event",
+                     G_CALLBACK(on_main_client_button_press), window);
     gtk_box_pack_start(GTK_BOX(vbox), menubar, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), outer_paned, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), status_ebox, FALSE, FALSE, 4);
@@ -4492,22 +4471,8 @@ void *ui_thread(void *arg)
                              evemon_NEED_PIPEWIRE))
                             ctx.has_audio_plugin = TRUE;
                     }
-                    if (ctx.has_audio_plugin) {
+                    if (ctx.has_audio_plugin)
                         broker_set_audio_callback(on_broker_audio_pids, &ctx);
-                        if (ctx.audio_only_menu_item) {
-                            gtk_widget_set_sensitive(
-                                GTK_WIDGET(ctx.audio_only_menu_item), TRUE);
-                            g_signal_handlers_block_by_func(
-                                ctx.audio_only_menu_item,
-                                on_toggle_audio_only, &ctx);
-                            gtk_check_menu_item_set_active(
-                                ctx.audio_only_menu_item,
-                                ctx.show_audio_only);
-                            g_signal_handlers_unblock_by_func(
-                                ctx.audio_only_menu_item,
-                                on_toggle_audio_only, &ctx);
-                        }
-                    }
 
                     /* Add UI plugin widgets to the notebook in tab order */
                     for (int o = 0; g_tab_order[o]; o++) {
