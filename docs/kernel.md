@@ -13,6 +13,7 @@ interfaces.  This document lists every requirement, grouped by feature tier.
 | **FD monitoring — fanotify** | File open/close tracking (mount-wide) | 5.1 | `CAP_SYS_ADMIN` |
 | **FD monitoring — eBPF** | Full fd lifecycle incl. sockets/pipes | 5.5 | `CAP_BPF` + `CAP_PERFMON` (≥ 5.8) or `CAP_SYS_ADMIN` |
 | **Write monitoring — eBPF** | Capture stdout/stderr of selected process tree in real time | 5.5 | `CAP_BPF` + `CAP_PERFMON` (≥ 5.8) or `CAP_SYS_ADMIN` |
+| **Orphan-stdout capture** | Auto-intercept writes from exec'd processes with non-TTY stdout | 5.5 | `CAP_BPF` + `CAP_PERFMON` |
 | **Network throughput — TCP** | Per-socket send/recv bytes/s via INET_DIAG + eBPF kprobes | 5.5 | `CAP_BPF` + `CAP_PERFMON` |
 | **Network throughput — UDP/IPv6** | Per-socket send/recv bytes/s for UDP4, UDP6, QUIC, WebRTC | 5.5 | `CAP_BPF` + `CAP_PERFMON` |
 | **Socket resolution** | TCP/UDP/Unix socket detail in sidebar | 2.6+ | — |
@@ -95,8 +96,9 @@ device labelling, and `/sys` queries are also unaffected.
 | `/proc/<pid>/maps` | Memory-mapped regions (mmap plugin, shared-library list) |
 | `/proc/<pid>/task/` | Thread directory enumeration |
 | `/proc/<pid>/task/<tid>/comm` | Per-thread name |
-| `/proc/<pid>/task/<tid>/stat` | Per-thread CPU ticks, state, priority |
+| `/proc/<pid>/task/<tid>/stat` | Per-thread CPU ticks, state, priority, nice, last CPU (fields 14–15, 18–19, 39) |
 | `/proc/<pid>/task/<tid>/status` | Per-thread voluntary/involuntary context switches |
+| `/proc/<pid>/io` | Cumulative `read_bytes` / `write_bytes` for disk I/O rate |
 | `/proc/<pid>/fd/` | Open file descriptor enumeration |
 | `/proc/<pid>/fd/<n>` | Resolve fd target path (readlink) |
 | `/proc/1/ns/pid` | Init PID namespace reference inode |
@@ -123,7 +125,7 @@ device labelling, and `/sys` queries are also unaffected.
 | `/sys/class/input/<dev>/device/name` | Input device name |
 | `/sys/block/<dev>/device/model` | Block device model |
 | `/sys/class/video4linux/<dev>/name` | Camera/video device name |
-| `/sys/fs/cgroup/<path>/` | cgroup v2 resource limit files (`memory.max`, `cpu.max`, `pids.max`, etc.) |
+| `/sys/fs/cgroup/<path>/` | cgroup v2 resource limit files: `memory.current`, `memory.max`, `memory.high`, `memory.swap.max`, `cpu.max`, `pids.current`, `pids.max`, `io.max` |
 
 ---
 
@@ -153,9 +155,10 @@ device labelling, and `/sys` queries are also unaffected.
 | `stat` | Namespace inodes, init system detection | Core |
 | `getpwuid_r` | UID → username resolution | Core |
 | `sigaction` | Handle SIGINT / SIGTERM for clean shutdown | Core |
-| `clock_gettime` | Monotonic + realtime clocks for profiling | Core |
+| `clock_gettime` | Monotonic + realtime clocks for profiling and startup timing | Core |
 | `sysconf` | `_SC_CLK_TCK`, `_SC_NPROCESSORS_ONLN` | Core |
 | `kill` | Send SIGTERM / SIGKILL to processes | UI |
+| `getutxent` / `utmpx` | Count logged-in users for the status bar | UI |
 
 ---
 
@@ -176,7 +179,8 @@ device labelling, and `/sys` queries are also unaffected.
 
 ### Program type
 
-All BPF programs are `BPF_PROG_TYPE_TRACEPOINT`.
+FD and write monitoring programs are `BPF_PROG_TYPE_TRACEPOINT`.
+Network throughput programs are `BPF_PROG_TYPE_KPROBE` (kprobe/kretprobe).
 
 #### FD monitoring programs
 
@@ -207,8 +211,8 @@ not present it returns 0 immediately (negligible overhead system-wide).
 
 | SEC annotation | Tracepoint | Purpose |
 |----------------|------------|---------|
-| `tracepoint/sched/sched_process_exit` | `sched_process_exit` | Remove exited PID from `monitored_pids` map so dead PIDs never accumulate |
-| `tracepoint/sched/sched_process_exec` | `sched_process_exec` | Emit `FDMON_BPF_EXEC` event so userspace can re-confirm child map entries |
+| `tracepoint/sched/sched_process_exit` | `sched_process_exit` | Remove exited PID from `monitored_pids` map so dead PIDs never accumulate. Only fires on group-leader exit (pid == tgid) |
+| `tracepoint/sched/sched_process_exec` | `sched_process_exec` | Emit `FDMON_BPF_EXEC` event so userspace can re-confirm child map entries and perform orphan-stdout detection |
 | `tracepoint/sched/sched_process_fork` | `sched_process_fork` | Propagate parent's `monitored_pids` entry to child — zero latency, in kernel |
 
 The fork program is the key to capturing output from short-lived children
@@ -224,6 +228,15 @@ protocol where the IPv4 address fields are zero are handled correctly.
 
 `CONFIG_DEBUG_INFO_BTF=y` is required for the struct offsets to be
 resolved correctly at load time.
+
+The inode read uses fixed kernel struct offsets (verified via pahole/BTF):
+
+| Field | Struct | Offset |
+|-------|--------|--------|
+| `sk_socket` | `struct sock` | 288 |
+| `file` | `struct socket` | 16 |
+| `f_inode` | `struct file` | 32 |
+| `i_ino` | `struct inode` | 64 |
 
 | SEC annotation | Kernel function | Direction | Notes |
 |----------------|-----------------|-----------|-------|
@@ -247,8 +260,8 @@ byte counters).
 |-----|------|-----|-------|-------------|----------|
 | `events` | `PERF_EVENT_ARRAY` | CPU id | fd | per-CPU | Deliver events to userspace perf buffer |
 | `open_args` | `HASH` | `__u32` tid | `__u64` filename ptr | 8192 | Pass filename ptr from enter to exit tracepoint |
-| `monitored_pids` | `HASH` | `__u32` pid (tgid) | `__u8` fd_mask | dynamic (`/proc/sys/kernel/pid_max`, default 32768) | Which pids to capture and which fds (bit0=fd1, bit1=fd2) |
-| `write_event_scratch` | `PERCPU_ARRAY` | `__u32` 0 | `struct fdmon_bpf_event` | 1 | Per-CPU scratch to hold write payload (4096 bytes) — avoids 512-byte BPF stack limit |
+| `monitored_pids` | `HASH` | `__u32` pid (tgid) | `__u8` fd_mask | dynamic (resized from `/proc/sys/kernel/pid_max` at load time; BPF default 32768) | Which pids to capture and which fds (bit0=fd1, bit1=fd2) |
+| `write_event_scratch` | `PERCPU_ARRAY` | `__u32` 0 | `struct fdmon_bpf_event` | 1 | Per-CPU scratch to hold write payload (up to 4096 bytes of `write.data`) — avoids 512-byte BPF stack limit |
 | `recvmsg_args` | `HASH` | `__u32` tid | `__u64` sock ptr | 4096 | Stash `struct sock *` between kprobe entry and kretprobe exit for tcp/udp/udpv6 recvmsg |
 
 #### `monitored_pids` fd_mask encoding
@@ -291,6 +304,12 @@ clang -O2 -target bpf -g -D__TARGET_ARCH_x86
 
 and loaded at runtime from beside the main executable.  Linked against
 `-lbpf -lelf -lz` (libbpf).
+
+The main binary is compiled with gcc (`-std=c11 -O2 -pthread -D_GNU_SOURCE`)
+and linked with GTK 3, GLib/GIO, fontconfig, jansson (JSON settings),
+libepoxy (OpenGL for MilkDrop), and optionally libpipewire-0.3 and
+libsoup-3.0.  The binary is hardened: `-fstack-protector-strong`,
+`-D_FORTIFY_SOURCE=2`, `-fPIE`, `-pie`, `-Wl,-z,relro,-z,now`.
 
 ---
 
