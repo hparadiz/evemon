@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "release/**"]
+    tags-ignore: ["v*"]   # release tags are handled by release.yml
+  pull_request:
+
+jobs:
+  build-deb-debian12:
+    name: Build .deb (Debian 12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t evemon-builder-debian12 -f packaging/debian12/Dockerfile .
+
+      - name: Build .deb package
+        run: |
+          mkdir -p dist/debian12
+          docker run --rm \
+            -e VERSION=0.0.0-ci \
+            -v "${{ github.workspace }}:/src:ro" \
+            -v "${{ github.workspace }}/dist/debian12:/out" \
+            evemon-builder-debian12
+
+      - name: Verify package was produced
+        run: ls -lh dist/debian12/*.deb
+
+      - name: Upload .deb artifact
+        if: startsWith(github.ref, 'refs/heads/release/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: evemon-debian12-deb
+          path: dist/debian12/*.deb
+
+  build-rpm-fedora42:
+    name: Build .rpm (Fedora 42)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t evemon-builder-fedora42 -f packaging/fedora42/Dockerfile .
+
+      - name: Build .rpm package
+        run: |
+          mkdir -p dist/fedora42
+          docker run --rm \
+            -e VERSION=0.0.0 \
+            -e RELEASE=ci \
+            -v "${{ github.workspace }}:/src:ro" \
+            -v "${{ github.workspace }}/dist/fedora42:/out" \
+            evemon-builder-fedora42
+
+      - name: Verify package was produced
+        run: ls -lh dist/fedora42/*.rpm
+
+      - name: Upload .rpm artifact
+        if: startsWith(github.ref, 'refs/heads/release/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: evemon-fedora42-rpm
+          path: dist/fedora42/*.rpm
