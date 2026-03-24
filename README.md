@@ -12,6 +12,17 @@ A graphical Linux process monitor focused on deep per-process introspection — 
 
 evemon drills into individual processes: their file descriptors, network sockets, environment, memory maps, shared libraries, cgroup limits, container context, Steam/Proton metadata, and even live PipeWire audio streams — all in one place.
 
+<video controls width="600">
+    <source src="docs/assets/videos/evemon-viz.mp4" type="video/mp4">
+</video>
+
+
+> an opinionated rethink of what a task manager could be
+
+evemon does the heavy lifting maintaining the kernel event bus providing you an API where you can attach whatever plugin you want
+
+Whether you're drilling into a memory map, hunting which library version a binary is loading, or capturing what those cron jobs are printing to stdout - evemon has you covered.
+
 ---
 
 ## Features
