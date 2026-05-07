@@ -387,6 +387,15 @@ static void mmap_clear(void *opaque)
 
 static void mmap_destroy(void *opaque) { free(opaque); }
 
+static int mmap_wants_update(void *opaque)
+{
+    mmap_ctx_t *ctx = opaque;
+    return ctx->scroll &&
+           GTK_IS_WIDGET(ctx->scroll) &&
+           gtk_widget_get_mapped(ctx->scroll) &&
+           gtk_widget_get_child_visible(ctx->scroll);
+}
+
 /* ── descriptor ──────────────────────────────────────────────── */
 
 __attribute__((visibility("default")))
@@ -409,6 +418,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = mmap_update,
         .clear         = mmap_clear,
         .destroy       = mmap_destroy,
+        .wants_update  = mmap_wants_update,
         .role          = EVEMON_ROLE_PROCESS,
         .dependencies  = NULL,
     };

@@ -14,7 +14,7 @@
 
 EVEMON_PLUGIN_MANIFEST(
     "org.evemon.system_libs",
-    "Libraries",
+    "System Libraries",
     "1.0",
     EVEMON_ROLE_SYSTEM,
     NULL
@@ -876,6 +876,15 @@ static void slib_destroy(void *opaque)
     free(ctx);
 }
 
+static int slib_wants_update(void *opaque)
+{
+    slib_ctx_t *ctx = opaque;
+    return ctx->vbox &&
+           GTK_IS_WIDGET(ctx->vbox) &&
+           gtk_widget_get_mapped(ctx->vbox) &&
+           gtk_widget_get_child_visible(ctx->vbox);
+}
+
 /* ── plugin descriptor ───────────────────────────────────────── */
 
 __attribute__((visibility("default")))
@@ -889,7 +898,7 @@ evemon_plugin_t *evemon_plugin_init(void)
 
     *p = (evemon_plugin_t){
         .abi_version   = evemon_PLUGIN_ABI_VERSION,
-        .name          = "Libraries",
+        .name          = "System Libraries",
         .id            = "org.evemon.system_libs",
         .version       = "1.0",
         .data_needs    = evemon_NEED_LIBS | evemon_NEED_DESCENDANTS,
@@ -898,6 +907,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = slib_update,
         .clear         = slib_clear,
         .destroy       = slib_destroy,
+        .wants_update  = slib_wants_update,
         .role          = EVEMON_ROLE_SYSTEM,
         .dependencies  = NULL,
     };

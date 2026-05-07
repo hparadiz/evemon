@@ -57,18 +57,25 @@ EVEMON_PLUGIN_MANIFEST(
 #define EXPR_MAX_TOKENS 2048
 #define EXPR_MAX_VARS   192
 #define MAX_EXPR_LINES  64
-#define MAX_LINE_LEN    1024
+/* MilkDrop expression lines in real presets are rarely > 200 chars; 512 is
+ * a safe upper bound and halves the per-preset expression-array footprint
+ * compared to the previous 1024 (23 arrays × 32 KB saved = ~736 KB per
+ * md_preset_t → ~2.1 MB for the three inline preset copies in md_ctx_t). */
+#define MAX_LINE_LEN    512
 
 #define MAX_CUSTOM_WAVES  4
 #define MAX_CUSTOM_SHAPES 4
 #define NUM_Q_VAR  32
 #define NUM_T_VAR  8
 
-#define PRESET_DIR \
-    "/home/akujin/.local/share/Steam/steamapps/common/projectM/presets"
+#ifndef EVEMON_DATADIR
+#define EVEMON_DATADIR "/usr/local/share/evemon"
+#endif
+
+#define PRESET_DIR      EVEMON_DATADIR "/milkdrop/presets"
+#define MD_FAV_BASENAME "milkdrop_favorites.ini"
 
 #define MD_FAV_SLOTS   16
-#define MD_FAV_FILE    "/home/akujin/.config/evemon/milkdrop_favorites.ini"
 
 /* max vertices for wave/shape drawing */
 #define MAX_WAVE_VERTS  2048
@@ -491,11 +498,43 @@ typedef struct {
 
 /* ── favorites slot ──────────────────────────────────────────── */
 
+/*
+ * Compact scalar-only snapshot for a saved favorite.  md_preset_t carries
+ * ~1.44 MB of expression-code arrays (per_frame[64][1024], per_pixel,
+ * custom wave/shape code…) that the favorites system never serialises to
+ * disk.  Embedding a full md_preset_t in every slot was therefore wasting
+ * 16 × 1.44 MB ≈ 23 MB inside md_ctx_t's calloc'd block.
+ *
+ * Only the parametric scalar fields are stored here.  Expression code is
+ * always (re)loaded from the .milk file on recall, which is also what
+ * fixes cross-session restore: after a restart the expressions were
+ * previously empty because they were never written to the INI file.
+ */
 typedef struct {
-    int         used;                  /* 1 if this slot has data */
-    char        name[256];             /* display name (preset name) */
-    md_preset_t preset;                /* full preset snapshot       */
-    float       q_vars[NUM_Q_VAR];     /* q-var state at save time   */
+    char   filepath[1024];
+    /* all scalar fields serialised by md_favorites_save / load */
+    float  fGammaAdj, fDecay, fVideoEchoZoom, fVideoEchoAlpha;
+    int    nVideoEchoOrientation, nWaveMode;
+    int    bAdditiveWaves, bWaveDots, bWaveThick;
+    int    bModWaveAlphaByVolume, bMaximizeWaveColor;
+    int    bTexWrap, bDarkenCenter;
+    int    bBrighten, bDarken, bSolarize, bInvert;
+    float  fWaveAlpha, fWaveScale, fWaveSmoothing, fWaveParam;
+    float  fModWaveAlphaStart, fModWaveAlphaEnd;
+    float  fWarpAnimSpeed, fWarpScale, fZoomExponent, fShader;
+    float  zoom, rot, cx, cy, dx, dy, warp, sx, sy;
+    float  wave_r, wave_g, wave_b, wave_x, wave_y;
+    float  ob_size, ob_r, ob_g, ob_b, ob_a;
+    float  ib_size, ib_r, ib_g, ib_b, ib_a;
+    float  nMotionVectorsX, nMotionVectorsY;
+    float  mv_dx, mv_dy, mv_l, mv_r, mv_g, mv_b, mv_a;
+} md_fav_snapshot_t;
+
+typedef struct {
+    int               used;            /* 1 if this slot has data       */
+    char              name[256];       /* display name (preset name)    */
+    md_fav_snapshot_t snap;            /* scalar-only parameter snapshot */
+    float             q_vars[NUM_Q_VAR]; /* q-var state at save time    */
 } md_fav_slot_t;
 
 /* ── .milk parser ────────────────────────────────────────────── */
@@ -1036,7 +1075,7 @@ typedef struct {
     float     fps_accum;         /* for FPS calculation */
     int       fps_frames;
     float     fps_display;       /* last computed FPS value */
-    md_preset_t saved_preset;    /* for undo mashup */
+    md_preset_t *saved_preset;   /* for undo mashup — heap-allocated on demand */
     int       has_saved_preset;  /* whether saved_preset is valid */
 
     /* fullscreen */
@@ -1322,15 +1361,25 @@ static void md_readback_pf_vars(md_ctx_t *ctx)
 /* forward declaration – defined below */
 static void show_info(md_ctx_t *ctx, const char *fmt, ...);
 
+static char *md_favorites_path(void)
+{
+    return g_build_filename(g_get_user_config_dir(), "evemon",
+                            MD_FAV_BASENAME, NULL);
+}
+
 static void md_favorites_save(md_ctx_t *ctx)
 {
-    char dir[512];
-    strncpy(dir, MD_FAV_FILE, sizeof(dir)-1); dir[sizeof(dir)-1] = 0;
-    char *slash = strrchr(dir, '/');
-    if (slash) { *slash = 0; g_mkdir_with_parents(dir, 0755); }
+    char *path = md_favorites_path();
+    if (!path) return;
 
-    FILE *f = fopen(MD_FAV_FILE, "w");
-    if (!f) return;
+    char *dir = g_path_get_dirname(path);
+    if (dir) {
+        g_mkdir_with_parents(dir, 0755);
+        g_free(dir);
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) { g_free(path); return; }
     fprintf(f, "; MilkDrop favorites – managed by evemon\n\n");
 
     for (int i = 0; i < MD_FAV_SLOTS; i++) {
@@ -1338,79 +1387,84 @@ static void md_favorites_save(md_ctx_t *ctx)
         if (!s->used) continue;
         fprintf(f, "[slot%d]\n", i);
         fprintf(f, "name=%s\n",     s->name);
-        fprintf(f, "filepath=%s\n", s->preset.filepath);
+        fprintf(f, "filepath=%s\n", s->snap.filepath);
         /* scalar fields */
-        fprintf(f, "fGammaAdj=%.6g\n",        s->preset.fGammaAdj);
-        fprintf(f, "fDecay=%.6g\n",            s->preset.fDecay);
-        fprintf(f, "fVideoEchoZoom=%.6g\n",    s->preset.fVideoEchoZoom);
-        fprintf(f, "fVideoEchoAlpha=%.6g\n",   s->preset.fVideoEchoAlpha);
-        fprintf(f, "nVideoEchoOrientation=%d\n",s->preset.nVideoEchoOrientation);
-        fprintf(f, "nWaveMode=%d\n",           s->preset.nWaveMode);
-        fprintf(f, "bAdditiveWaves=%d\n",      s->preset.bAdditiveWaves);
-        fprintf(f, "bWaveDots=%d\n",           s->preset.bWaveDots);
-        fprintf(f, "bWaveThick=%d\n",          s->preset.bWaveThick);
-        fprintf(f, "bModWaveAlphaByVolume=%d\n",s->preset.bModWaveAlphaByVolume);
-        fprintf(f, "bMaximizeWaveColor=%d\n",  s->preset.bMaximizeWaveColor);
-        fprintf(f, "bTexWrap=%d\n",            s->preset.bTexWrap);
-        fprintf(f, "bDarkenCenter=%d\n",       s->preset.bDarkenCenter);
-        fprintf(f, "bBrighten=%d\n",           s->preset.bBrighten);
-        fprintf(f, "bDarken=%d\n",             s->preset.bDarken);
-        fprintf(f, "bSolarize=%d\n",           s->preset.bSolarize);
-        fprintf(f, "bInvert=%d\n",             s->preset.bInvert);
-        fprintf(f, "fWaveAlpha=%.6g\n",        s->preset.fWaveAlpha);
-        fprintf(f, "fWaveScale=%.6g\n",        s->preset.fWaveScale);
-        fprintf(f, "fWaveSmoothing=%.6g\n",    s->preset.fWaveSmoothing);
-        fprintf(f, "fWaveParam=%.6g\n",        s->preset.fWaveParam);
-        fprintf(f, "fModWaveAlphaStart=%.6g\n",s->preset.fModWaveAlphaStart);
-        fprintf(f, "fModWaveAlphaEnd=%.6g\n",  s->preset.fModWaveAlphaEnd);
-        fprintf(f, "fWarpAnimSpeed=%.6g\n",    s->preset.fWarpAnimSpeed);
-        fprintf(f, "fWarpScale=%.6g\n",        s->preset.fWarpScale);
-        fprintf(f, "fZoomExponent=%.6g\n",     s->preset.fZoomExponent);
-        fprintf(f, "fShader=%.6g\n",           s->preset.fShader);
-        fprintf(f, "zoom=%.6g\n",              s->preset.zoom);
-        fprintf(f, "rot=%.6g\n",               s->preset.rot);
-        fprintf(f, "cx=%.6g\n",                s->preset.cx);
-        fprintf(f, "cy=%.6g\n",                s->preset.cy);
-        fprintf(f, "dx=%.6g\n",                s->preset.dx);
-        fprintf(f, "dy=%.6g\n",                s->preset.dy);
-        fprintf(f, "warp=%.6g\n",              s->preset.warp);
-        fprintf(f, "sx=%.6g\n",                s->preset.sx);
-        fprintf(f, "sy=%.6g\n",                s->preset.sy);
-        fprintf(f, "wave_r=%.6g\n",            s->preset.wave_r);
-        fprintf(f, "wave_g=%.6g\n",            s->preset.wave_g);
-        fprintf(f, "wave_b=%.6g\n",            s->preset.wave_b);
-        fprintf(f, "wave_x=%.6g\n",            s->preset.wave_x);
-        fprintf(f, "wave_y=%.6g\n",            s->preset.wave_y);
-        fprintf(f, "ob_size=%.6g\n",           s->preset.ob_size);
-        fprintf(f, "ob_r=%.6g\n",              s->preset.ob_r);
-        fprintf(f, "ob_g=%.6g\n",              s->preset.ob_g);
-        fprintf(f, "ob_b=%.6g\n",              s->preset.ob_b);
-        fprintf(f, "ob_a=%.6g\n",              s->preset.ob_a);
-        fprintf(f, "ib_size=%.6g\n",           s->preset.ib_size);
-        fprintf(f, "ib_r=%.6g\n",              s->preset.ib_r);
-        fprintf(f, "ib_g=%.6g\n",              s->preset.ib_g);
-        fprintf(f, "ib_b=%.6g\n",              s->preset.ib_b);
-        fprintf(f, "ib_a=%.6g\n",              s->preset.ib_a);
-        fprintf(f, "nMotionVectorsX=%.6g\n",   s->preset.nMotionVectorsX);
-        fprintf(f, "nMotionVectorsY=%.6g\n",   s->preset.nMotionVectorsY);
-        fprintf(f, "mv_dx=%.6g\n",             s->preset.mv_dx);
-        fprintf(f, "mv_dy=%.6g\n",             s->preset.mv_dy);
-        fprintf(f, "mv_l=%.6g\n",              s->preset.mv_l);
-        fprintf(f, "mv_r=%.6g\n",              s->preset.mv_r);
-        fprintf(f, "mv_g=%.6g\n",              s->preset.mv_g);
-        fprintf(f, "mv_b=%.6g\n",              s->preset.mv_b);
-        fprintf(f, "mv_a=%.6g\n",              s->preset.mv_a);
+        fprintf(f, "fGammaAdj=%.6g\n",        s->snap.fGammaAdj);
+        fprintf(f, "fDecay=%.6g\n",            s->snap.fDecay);
+        fprintf(f, "fVideoEchoZoom=%.6g\n",    s->snap.fVideoEchoZoom);
+        fprintf(f, "fVideoEchoAlpha=%.6g\n",   s->snap.fVideoEchoAlpha);
+        fprintf(f, "nVideoEchoOrientation=%d\n",s->snap.nVideoEchoOrientation);
+        fprintf(f, "nWaveMode=%d\n",           s->snap.nWaveMode);
+        fprintf(f, "bAdditiveWaves=%d\n",      s->snap.bAdditiveWaves);
+        fprintf(f, "bWaveDots=%d\n",           s->snap.bWaveDots);
+        fprintf(f, "bWaveThick=%d\n",          s->snap.bWaveThick);
+        fprintf(f, "bModWaveAlphaByVolume=%d\n",s->snap.bModWaveAlphaByVolume);
+        fprintf(f, "bMaximizeWaveColor=%d\n",  s->snap.bMaximizeWaveColor);
+        fprintf(f, "bTexWrap=%d\n",            s->snap.bTexWrap);
+        fprintf(f, "bDarkenCenter=%d\n",       s->snap.bDarkenCenter);
+        fprintf(f, "bBrighten=%d\n",           s->snap.bBrighten);
+        fprintf(f, "bDarken=%d\n",             s->snap.bDarken);
+        fprintf(f, "bSolarize=%d\n",           s->snap.bSolarize);
+        fprintf(f, "bInvert=%d\n",             s->snap.bInvert);
+        fprintf(f, "fWaveAlpha=%.6g\n",        s->snap.fWaveAlpha);
+        fprintf(f, "fWaveScale=%.6g\n",        s->snap.fWaveScale);
+        fprintf(f, "fWaveSmoothing=%.6g\n",    s->snap.fWaveSmoothing);
+        fprintf(f, "fWaveParam=%.6g\n",        s->snap.fWaveParam);
+        fprintf(f, "fModWaveAlphaStart=%.6g\n",s->snap.fModWaveAlphaStart);
+        fprintf(f, "fModWaveAlphaEnd=%.6g\n",  s->snap.fModWaveAlphaEnd);
+        fprintf(f, "fWarpAnimSpeed=%.6g\n",    s->snap.fWarpAnimSpeed);
+        fprintf(f, "fWarpScale=%.6g\n",        s->snap.fWarpScale);
+        fprintf(f, "fZoomExponent=%.6g\n",     s->snap.fZoomExponent);
+        fprintf(f, "fShader=%.6g\n",           s->snap.fShader);
+        fprintf(f, "zoom=%.6g\n",              s->snap.zoom);
+        fprintf(f, "rot=%.6g\n",               s->snap.rot);
+        fprintf(f, "cx=%.6g\n",                s->snap.cx);
+        fprintf(f, "cy=%.6g\n",                s->snap.cy);
+        fprintf(f, "dx=%.6g\n",                s->snap.dx);
+        fprintf(f, "dy=%.6g\n",                s->snap.dy);
+        fprintf(f, "warp=%.6g\n",              s->snap.warp);
+        fprintf(f, "sx=%.6g\n",                s->snap.sx);
+        fprintf(f, "sy=%.6g\n",                s->snap.sy);
+        fprintf(f, "wave_r=%.6g\n",            s->snap.wave_r);
+        fprintf(f, "wave_g=%.6g\n",            s->snap.wave_g);
+        fprintf(f, "wave_b=%.6g\n",            s->snap.wave_b);
+        fprintf(f, "wave_x=%.6g\n",            s->snap.wave_x);
+        fprintf(f, "wave_y=%.6g\n",            s->snap.wave_y);
+        fprintf(f, "ob_size=%.6g\n",           s->snap.ob_size);
+        fprintf(f, "ob_r=%.6g\n",              s->snap.ob_r);
+        fprintf(f, "ob_g=%.6g\n",              s->snap.ob_g);
+        fprintf(f, "ob_b=%.6g\n",              s->snap.ob_b);
+        fprintf(f, "ob_a=%.6g\n",              s->snap.ob_a);
+        fprintf(f, "ib_size=%.6g\n",           s->snap.ib_size);
+        fprintf(f, "ib_r=%.6g\n",              s->snap.ib_r);
+        fprintf(f, "ib_g=%.6g\n",              s->snap.ib_g);
+        fprintf(f, "ib_b=%.6g\n",              s->snap.ib_b);
+        fprintf(f, "ib_a=%.6g\n",              s->snap.ib_a);
+        fprintf(f, "nMotionVectorsX=%.6g\n",   s->snap.nMotionVectorsX);
+        fprintf(f, "nMotionVectorsY=%.6g\n",   s->snap.nMotionVectorsY);
+        fprintf(f, "mv_dx=%.6g\n",             s->snap.mv_dx);
+        fprintf(f, "mv_dy=%.6g\n",             s->snap.mv_dy);
+        fprintf(f, "mv_l=%.6g\n",              s->snap.mv_l);
+        fprintf(f, "mv_r=%.6g\n",              s->snap.mv_r);
+        fprintf(f, "mv_g=%.6g\n",              s->snap.mv_g);
+        fprintf(f, "mv_b=%.6g\n",              s->snap.mv_b);
+        fprintf(f, "mv_a=%.6g\n",              s->snap.mv_a);
         for (int q = 0; q < NUM_Q_VAR; q++)
             fprintf(f, "q%d=%.8g\n", q+1, s->q_vars[q]);
         fprintf(f, "\n");
     }
     fclose(f);
+    g_free(path);
 }
 
 static void md_favorites_load(md_ctx_t *ctx)
 {
     memset(ctx->favorites, 0, sizeof(ctx->favorites));
-    FILE *f = fopen(MD_FAV_FILE, "r");
+    char *path = md_favorites_path();
+    if (!path) return;
+
+    FILE *f = fopen(path, "r");
+    g_free(path);
     if (!f) return;
 
     char line[1024];
@@ -1439,10 +1493,10 @@ static void md_favorites_load(md_ctx_t *ctx)
         *eq = 0;
         const char *key = line, *val = eq+1;
 
-#define SF(field) if (!strcmp(key,#field)) sv->preset.field = (float)atof(val)
-#define SI(field) if (!strcmp(key,#field)) sv->preset.field = atoi(val)
-        if (!strcmp(key,"name"))     { strncpy(sv->name,          val, 255); sv->name[255]=0; }
-        if (!strcmp(key,"filepath")) { strncpy(sv->preset.filepath,val,1023); sv->preset.filepath[1023]=0; }
+        if (!strcmp(key,"name"))     { strncpy(sv->name,           val, 255); sv->name[255]=0; }
+        if (!strcmp(key,"filepath")) { strncpy(sv->snap.filepath, val,1023); sv->snap.filepath[1023]=0; }
+#define SF(field) if (!strcmp(key,#field)) sv->snap.field = (float)atof(val)
+#define SI(field) if (!strcmp(key,#field)) sv->snap.field = atoi(val)
         SF(fGammaAdj); SF(fDecay); SF(fVideoEchoZoom); SF(fVideoEchoAlpha);
         SI(nVideoEchoOrientation); SI(nWaveMode);
         SI(bAdditiveWaves); SI(bWaveDots); SI(bWaveThick);
@@ -1485,13 +1539,64 @@ static void md_fav_preset_label(md_ctx_t *ctx, char *out, int outsz)
         strncpy(out, ctx->preset.name, outsz-1);
 }
 
+/* Copy all parametric scalars from a preset into a snapshot. */
+static void md_fav_snapshot_from_preset(md_fav_snapshot_t *dst,
+                                        const md_preset_t  *src)
+{
+#define CP(f) dst->f = src->f
+    {   /* avoid gcc -Wrestrict false positive from inlining into on_key_press */
+        size_t n = strnlen(src->filepath, sizeof(dst->filepath) - 1);
+        memcpy(dst->filepath, src->filepath, n);
+        dst->filepath[n] = '\0';
+    }
+    CP(fGammaAdj); CP(fDecay); CP(fVideoEchoZoom); CP(fVideoEchoAlpha);
+    CP(nVideoEchoOrientation); CP(nWaveMode);
+    CP(bAdditiveWaves); CP(bWaveDots); CP(bWaveThick);
+    CP(bModWaveAlphaByVolume); CP(bMaximizeWaveColor);
+    CP(bTexWrap); CP(bDarkenCenter);
+    CP(bBrighten); CP(bDarken); CP(bSolarize); CP(bInvert);
+    CP(fWaveAlpha); CP(fWaveScale); CP(fWaveSmoothing); CP(fWaveParam);
+    CP(fModWaveAlphaStart); CP(fModWaveAlphaEnd);
+    CP(fWarpAnimSpeed); CP(fWarpScale); CP(fZoomExponent); CP(fShader);
+    CP(zoom); CP(rot); CP(cx); CP(cy); CP(dx); CP(dy); CP(warp); CP(sx); CP(sy);
+    CP(wave_r); CP(wave_g); CP(wave_b); CP(wave_x); CP(wave_y);
+    CP(ob_size); CP(ob_r); CP(ob_g); CP(ob_b); CP(ob_a);
+    CP(ib_size); CP(ib_r); CP(ib_g); CP(ib_b); CP(ib_a);
+    CP(nMotionVectorsX); CP(nMotionVectorsY);
+    CP(mv_dx); CP(mv_dy); CP(mv_l); CP(mv_r); CP(mv_g); CP(mv_b); CP(mv_a);
+#undef CP
+}
+
+/* Overlay all parametric scalars from a snapshot onto an already-loaded preset
+ * (which has its expression arrays populated from the .milk file). */
+static void md_fav_overlay_scalars(md_preset_t *dst, const md_fav_snapshot_t *src)
+{
+#define OV(f) dst->f = src->f
+    OV(fGammaAdj); OV(fDecay); OV(fVideoEchoZoom); OV(fVideoEchoAlpha);
+    OV(nVideoEchoOrientation); OV(nWaveMode);
+    OV(bAdditiveWaves); OV(bWaveDots); OV(bWaveThick);
+    OV(bModWaveAlphaByVolume); OV(bMaximizeWaveColor);
+    OV(bTexWrap); OV(bDarkenCenter);
+    OV(bBrighten); OV(bDarken); OV(bSolarize); OV(bInvert);
+    OV(fWaveAlpha); OV(fWaveScale); OV(fWaveSmoothing); OV(fWaveParam);
+    OV(fModWaveAlphaStart); OV(fModWaveAlphaEnd);
+    OV(fWarpAnimSpeed); OV(fWarpScale); OV(fZoomExponent); OV(fShader);
+    OV(zoom); OV(rot); OV(cx); OV(cy); OV(dx); OV(dy); OV(warp); OV(sx); OV(sy);
+    OV(wave_r); OV(wave_g); OV(wave_b); OV(wave_x); OV(wave_y);
+    OV(ob_size); OV(ob_r); OV(ob_g); OV(ob_b); OV(ob_a);
+    OV(ib_size); OV(ib_r); OV(ib_g); OV(ib_b); OV(ib_a);
+    OV(nMotionVectorsX); OV(nMotionVectorsY);
+    OV(mv_dx); OV(mv_dy); OV(mv_l); OV(mv_r); OV(mv_g); OV(mv_b); OV(mv_a);
+#undef OV
+}
+
 static void md_fav_save_current(md_ctx_t *ctx)
 {
     /* Check if already saved (same filepath → update in place) */
     int target = -1;
     for (int i = 0; i < MD_FAV_SLOTS; i++) {
         if (ctx->favorites[i].used &&
-            strcmp(ctx->favorites[i].preset.filepath,
+            strcmp(ctx->favorites[i].snap.filepath,
                    ctx->preset.filepath) == 0) {
             target = i;
             break;
@@ -1512,8 +1617,8 @@ static void md_fav_save_current(md_ctx_t *ctx)
     }
 
     md_fav_slot_t *sv = &ctx->favorites[target];
-    sv->used   = 1;
-    sv->preset = ctx->preset;
+    sv->used = 1;
+    md_fav_snapshot_from_preset(&sv->snap, &ctx->preset);
     memcpy(sv->q_vars, ctx->q_vars, sizeof(ctx->q_vars));
     md_fav_preset_label(ctx, sv->name, sizeof(sv->name));
     md_favorites_save(ctx);
@@ -1526,12 +1631,28 @@ static int md_fav_recall(md_ctx_t *ctx, int slot)
     if (slot < 0 || slot >= MD_FAV_SLOTS) return 0;
     md_fav_slot_t *sv = &ctx->favorites[slot];
     if (!sv->used) return 0;
-    ctx->preset     = sv->preset;
+
+    /* Reload expression code from the .milk file, then layer the saved
+     * parametric overrides on top.  This is correct both in-session and
+     * after a restart (previously the expression arrays were never
+     * serialised to the INI file, so cross-session restore produced a
+     * blank/broken visual). */
+    if (sv->snap.filepath[0] &&
+        md_load_preset(&ctx->preset, sv->snap.filepath) == 0) {
+        md_fav_overlay_scalars(&ctx->preset, &sv->snap);
+    } else {
+        /* .milk file missing — at least apply the saved scalars over defaults */
+        md_preset_defaults(&ctx->preset);
+        strncpy(ctx->preset.filepath, sv->snap.filepath,
+                sizeof(ctx->preset.filepath) - 1);
+        md_fav_overlay_scalars(&ctx->preset, &sv->snap);
+    }
+
     memcpy(ctx->q_vars, sv->q_vars, sizeof(ctx->q_vars));
     ctx->preset_loaded = 1;
-    ctx->pf_init_done  = 1;   /* q_vars already seeded – skip zero-init */
+    ctx->pf_init_done  = 0;   /* let per_frame_init run with restored q_vars */
     ctx->blending      = 0;
-    ctx->preset_serial++; /* invalidate pre-lexed cache */
+    ctx->preset_serial++;
     show_info(ctx, "\xe2\x98\x85 Recalled: %s", sv->name);
     return 1;
 }
@@ -2693,6 +2814,21 @@ static void on_unrealize(GtkGLArea *area, gpointer data)
     free(g->mesh_verts);    g->mesh_verts    = NULL;
     free(g->shape_scratch); g->shape_scratch = NULL;
     free(g->wave_verts);    g->wave_verts    = NULL;
+    /* Release GDK's thread-local "current context" reference.
+     *
+     * gtk_gl_area_make_current() (above) causes GDK to store the
+     * GdkGLContext in a thread-local slot and increment its refcount.
+     * GtkGLArea's own unrealize handler (which runs after this signal
+     * handler) drops GtkGLArea's reference via g_clear_object().  But
+     * if GDK's thread-local ref is still held, the GdkGLContext refcount
+     * never reaches zero — Mesa does NOT destroy its driver context, and
+     * the ~100-180 MB of anonymous mmaps used by the LLVM JIT, gallium
+     * state tracker, and shader compiler are never munmap'd.
+     *
+     * Clearing the current context here makes g_clear_object() in
+     * GtkGLArea::unrealize the last reference drop, which triggers
+     * GdkGLContext finalization → Mesa context teardown → munmap. */
+    gdk_gl_context_clear_current();
     g->gl_ready = 0;
 }
 
@@ -2703,8 +2839,12 @@ static void md_mini_mashup(md_ctx_t *ctx, int save)
 {
     if (ctx->lib.count < 2) return;
     if (save && !ctx->has_saved_preset) {
-        ctx->saved_preset = ctx->preset;
-        ctx->has_saved_preset = 1;
+        if (!ctx->saved_preset)
+            ctx->saved_preset = malloc(sizeof(md_preset_t));
+        if (ctx->saved_preset) {
+            *ctx->saved_preset = ctx->preset;
+            ctx->has_saved_preset = 1;
+        }
     }
     int donor = g_random_int_range(0, ctx->lib.count);
     md_preset_t tmp; memset(&tmp, 0, sizeof(tmp));
@@ -2737,8 +2877,12 @@ static void md_deep_mashup(md_ctx_t *ctx, int save)
 {
     if (ctx->lib.count < 2) return;
     if (save && !ctx->has_saved_preset) {
-        ctx->saved_preset = ctx->preset;
-        ctx->has_saved_preset = 1;
+        if (!ctx->saved_preset)
+            ctx->saved_preset = malloc(sizeof(md_preset_t));
+        if (ctx->saved_preset) {
+            *ctx->saved_preset = ctx->preset;
+            ctx->has_saved_preset = 1;
+        }
     }
     int donor = g_random_int_range(0, ctx->lib.count);
     md_preset_t tmp; memset(&tmp, 0, sizeof(tmp));
@@ -2764,9 +2908,12 @@ static void md_deep_mashup(md_ctx_t *ctx, int save)
 
 static void md_undo_mashup(md_ctx_t *ctx)
 {
-    if (!ctx->has_saved_preset) { show_info(ctx, "No mashup to undo"); return; }
-    ctx->preset = ctx->saved_preset;
+    if (!ctx->has_saved_preset || !ctx->saved_preset)
+        { show_info(ctx, "No mashup to undo"); return; }
+    ctx->preset = *ctx->saved_preset;
+    free(ctx->saved_preset); ctx->saved_preset = NULL;
     ctx->has_saved_preset = 0;
+    ctx->preset_serial++;
     show_info(ctx, "Mashup undone");
 }
 
@@ -3042,8 +3189,12 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
     /* ── C: randomize wave color / Shift+C: undo ─────────────── */
     case GDK_KEY_c:
         if (!ctx->has_saved_preset) {
-            ctx->saved_preset = ctx->preset;
-            ctx->has_saved_preset = 1;
+            if (!ctx->saved_preset)
+                ctx->saved_preset = malloc(sizeof(md_preset_t));
+            if (ctx->saved_preset) {
+                *ctx->saved_preset = ctx->preset;
+                ctx->has_saved_preset = 1;
+            }
         }
         /* Use HSV-based generation: saturation ≥ 0.55, value in [0.45, 0.95]
          * so we always get a vivid, legible color instead of lucky gray/white/black. */
@@ -3166,7 +3317,7 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
                 /* pre-select the currently-playing favorite if any */
                 for (int i = 0; i < MD_FAV_SLOTS; i++) {
                     if (ctx->favorites[i].used &&
-                        strcmp(ctx->favorites[i].preset.filepath,
+                        strcmp(ctx->favorites[i].snap.filepath,
                                ctx->preset.filepath) == 0)
                         { ctx->fav_menu_sel = i; break; }
                 }
@@ -3709,7 +3860,7 @@ static gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         int is_fav = 0;
         for (int i = 0; i < MD_FAV_SLOTS; i++) {
             if (ctx->favorites[i].used &&
-                strcmp(ctx->favorites[i].preset.filepath,
+                strcmp(ctx->favorites[i].snap.filepath,
                        ctx->preset.filepath) == 0)
                 { is_fav = 1; break; }
         }
@@ -4254,6 +4405,33 @@ static void md_destroy(void *opaque)
         g_object_unref(ctx->mpris_art_pixbuf);
         ctx->mpris_art_pixbuf = NULL;
     }
+
+    /* Force GL cleanup while ctx is still valid and the GL context is
+     * accessible.  plugin_registry_destroy() calls md_destroy() before the
+     * GTK window hierarchy is torn down, so on_unrealize() has not fired
+     * yet but ctx is about to be freed.  Without this:
+     *   • glDeleteTextures() is never called → the two 1024×768 FBO
+     *     textures (~6 MB of Mesa anonymous mmaps) are never munmap'd.
+     *   • glDeleteFramebuffers/Programs/Buffers/VertexArrays are skipped,
+     *     leaking GPU objects.
+     *   • mesh_verts / shape_scratch / wave_verts (CPU scratch) leak.
+     * If on_unrealize() already ran (gl_ready==0) this block is skipped
+     * and the subsequent g_signal_handlers_disconnect_by_data() is still
+     * needed to prevent the pending GTK unrealize from reading freed ctx. */
+    if (ctx->gl_area && GTK_IS_WIDGET(ctx->gl_area) && ctx->gl.gl_ready)
+        on_unrealize(GTK_GL_AREA(ctx->gl_area), ctx); /* sets gl_ready = 0 */
+
+    /* Disconnect every widget signal that carries ctx as user_data.
+     * After free(ctx) below, any GTK signal (unrealize, render, draw,
+     * key-press …) would call its handler with a dangling pointer.
+     * g_signal_handlers_disconnect_by_data() is O(#signals) and safe to
+     * call even if the widget has already been finalized. */
+    if (ctx->gl_area && GTK_IS_WIDGET(ctx->gl_area))
+        g_signal_handlers_disconnect_by_data(ctx->gl_area, ctx);
+    if (ctx->fs_info_area && GTK_IS_WIDGET(ctx->fs_info_area))
+        g_signal_handlers_disconnect_by_data(ctx->fs_info_area, ctx);
+
+    free(ctx->saved_preset);
     md_lex_cache_free(ctx);
     md_lib_free(&ctx->lib);
     free(ctx);

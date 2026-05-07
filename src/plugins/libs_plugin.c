@@ -408,6 +408,15 @@ static void lib_clear(void *opaque)
 
 static void lib_destroy(void *opaque) { free(opaque); }
 
+static int lib_wants_update(void *opaque)
+{
+    lib_ctx_t *ctx = opaque;
+    return ctx->scroll &&
+           GTK_IS_WIDGET(ctx->scroll) &&
+           gtk_widget_get_mapped(ctx->scroll) &&
+           gtk_widget_get_child_visible(ctx->scroll);
+}
+
 /* ── descriptor ──────────────────────────────────────────────── */
 
 __attribute__((visibility("default")))
@@ -430,6 +439,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = lib_update,
         .clear         = lib_clear,
         .destroy       = lib_destroy,
+        .wants_update  = lib_wants_update,
         .role          = EVEMON_ROLE_PROCESS,
         .dependencies  = NULL,
     };

@@ -52,6 +52,7 @@ Requires: libbpf
 Requires: elfutils-libelf
 Requires: zlib
 Requires: jansson
+Requires: sqlite-libs
 Requires: pipewire-libs
 Requires: libsoup3
 Requires: gtksourceview4
@@ -72,6 +73,10 @@ cp -a ${DESTDIR}/. %{buildroot}/
 %{_datadir}/applications/evemon.desktop
 %{_datadir}/icons/hicolor/256x256/apps/evemon.png
 %{_datadir}/pixmaps/evemon.png
+%dir %{_datadir}/evemon
+%{_datadir}/evemon/software-directory.sqlite
+%dir %{_datadir}/evemon/milkdrop
+%{_datadir}/evemon/milkdrop/presets
 %dir %{_libdir}/evemon
 %dir %{_libdir}/evemon/plugins
 %{_libdir}/evemon/*.o

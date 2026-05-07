@@ -786,42 +786,93 @@ static void on_selection_changed(GtkTreeSelection *sel, gpointer data)
 /* ── detail panel: process icon watermark ────────────────────── */
 
 /*
- * Draw a faint, large copy of the process icon in the top-right corner
- * of the process-info sidebar whenever a process is selected.
+ * Draw the Steam game logo (if any) as a wide, faint watermark across
+ * the top of the panel, then draw the process icon in the top-right corner.
  */
 static gboolean on_detail_icon_draw(GtkWidget *widget, cairo_t *cr,
                                      gpointer data)
 {
     ui_ctx_t *ctx = data;
-    if (!ctx->detail_icon_pb)
-        return FALSE;   /* nothing to draw — let GTK paint background normally */
 
     int widget_w = gtk_widget_get_allocated_width(widget);
     int widget_h = gtk_widget_get_allocated_height(widget);
 
-    int src_w = gdk_pixbuf_get_width(ctx->detail_icon_pb);
-    int src_h = gdk_pixbuf_get_height(ctx->detail_icon_pb);
+    /* ── Steam game logo: wide banner, top of panel ─────────── */
+    if (ctx->detail_steam_icon_pb) {
+        int src_w = gdk_pixbuf_get_width(ctx->detail_steam_icon_pb);
+        int src_h = gdk_pixbuf_get_height(ctx->detail_steam_icon_pb);
 
-    /* Target size: 96 px, or half the widget height, whichever is smaller */
-    int target = MIN(96, widget_h / 2);
-    if (target < 16) return FALSE;
+        /* Scale to fill ~70 % of the panel width, max 320 px tall */
+        int target_w = (int)(widget_w * 0.70);
+        double scale  = (double)target_w / src_w;
+        int draw_h    = (int)(src_h * scale);
+        if (draw_h > 320) { scale = 320.0 / src_h; }
+        int draw_w    = (int)(src_w * scale);
+        draw_h        = (int)(src_h * scale);
 
-    double scale = (double)target / MAX(src_w, src_h);
-    int draw_w = (int)(src_w * scale);
-    int draw_h = (int)(src_h * scale);
+        /* Right-align with 8 px margin, top 8 px */
+        int x = widget_w - draw_w - 8;
+        int y = 8;
 
-    /* Top-right corner with 8 px margin */
-    int x = widget_w - draw_w - 8;
-    int y = 8;
+        cairo_save(cr);
+        cairo_translate(cr, x, y);
+        cairo_scale(cr, scale, scale);
+        gdk_cairo_set_source_pixbuf(cr, ctx->detail_steam_icon_pb, 0, 0);
+        cairo_paint_with_alpha(cr, 0.18);
+        cairo_restore(cr);
+    }
 
-    cairo_save(cr);
-    cairo_translate(cr, x, y);
-    cairo_scale(cr, scale, scale);
-    gdk_cairo_set_source_pixbuf(cr, ctx->detail_icon_pb, 0, 0);
-    cairo_paint_with_alpha(cr, 1);
-    cairo_restore(cr);
+    /* ── Process icon: small, top-right corner ───────────────── */
+    if (ctx->detail_icon_pb) {
+        int src_w = gdk_pixbuf_get_width(ctx->detail_icon_pb);
+        int src_h = gdk_pixbuf_get_height(ctx->detail_icon_pb);
+
+        /* Target size: 96 px, or half the widget height, whichever is smaller */
+        int target = MIN(96, widget_h / 2);
+        if (target < 16) return FALSE;
+
+        double scale = (double)target / MAX(src_w, src_h);
+        int draw_w = (int)(src_w * scale);
+        int draw_h = (int)(src_h * scale);
+        (void)draw_h;
+
+        /* Top-right corner with 8 px margin */
+        int x = widget_w - draw_w - 8;
+        int y = 8;
+
+        cairo_save(cr);
+        cairo_translate(cr, x, y);
+        cairo_scale(cr, scale, scale);
+        gdk_cairo_set_source_pixbuf(cr, ctx->detail_icon_pb, 0, 0);
+        cairo_paint_with_alpha(cr, 1);
+        cairo_restore(cr);
+    }
 
     return FALSE;   /* don't consume the event */
+}
+
+/* ── proc_meta event callback: update the Software section ────── */
+
+static void on_proc_meta(const evemon_event_t *ev, void *ud)
+{
+    ui_ctx_t *ctx = ud;
+    const evemon_proc_meta_t *m = ev->payload;
+    if (!m || !ctx->sb_meta_frame) return;
+    if (!m->matched) {
+        gtk_widget_hide(ctx->sb_meta_frame);
+        return;
+    }
+#define LBL(field, src) gtk_label_set_text(ctx->field, (src)[0] ? (src) : "–")
+    LBL(sb_meta_organization, m->organization);
+    LBL(sb_meta_homepage,     m->homepage);
+    LBL(sb_meta_source_url,   m->source_url);
+    LBL(sb_meta_funding_url,  m->funding_url);
+    LBL(sb_meta_license,      m->primary_license);
+    LBL(sb_meta_summary,      m->summary);
+#undef LBL
+    gtk_widget_set_no_show_all(ctx->sb_meta_frame, FALSE);
+    gtk_widget_show_all(ctx->sb_meta_frame);
+    gtk_widget_set_no_show_all(ctx->sb_meta_frame, TRUE);
 }
 
 /* ── detail panel: toggle visibility ─────────────────────────── */
@@ -981,11 +1032,11 @@ static void detail_panel_relayout(ui_ctx_t *ctx)
     GtkWidget *new_paned = gtk_paned_new(orient);
 
     if (panel_is_child1) {
-        gtk_paned_pack1(GTK_PANED(new_paned), ctx->detail_vbox, FALSE, FALSE);
+        gtk_paned_pack1(GTK_PANED(new_paned), ctx->detail_vbox, TRUE, FALSE);
         gtk_paned_pack2(GTK_PANED(new_paned), ctx->hpaned, TRUE, FALSE);
     } else {
         gtk_paned_pack1(GTK_PANED(new_paned), ctx->hpaned, TRUE, FALSE);
-        gtk_paned_pack2(GTK_PANED(new_paned), ctx->detail_vbox, FALSE, FALSE);
+        gtk_paned_pack2(GTK_PANED(new_paned), ctx->detail_vbox, TRUE, FALSE);
     }
 
     /* Set a reasonable default position for the divider */
@@ -2758,10 +2809,15 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
 
     /* SYSTEM role: add to the system plugin panel notebook */
     if (inst->plugin->role == EVEMON_ROLE_SYSTEM) {
+        const char *system_tab_lbl = lbl;
+        if (inst->plugin->id &&
+            strcmp(inst->plugin->id, "org.evemon.system_libs") == 0)
+            system_tab_lbl = "Library";
+
         /* SYSTEM plugins always track PID 1 — they are process-independent */
         plugin_instance_set_pid(inst, 1, FALSE);
         if (ctx->system_panel_notebook) {
-            system_panel_add_plugin(ctx, inst->widget, lbl, inst->instance_id);
+            system_panel_add_plugin(ctx, inst->widget, system_tab_lbl, inst->instance_id);
             plugin_instance_set_active(inst, TRUE);
             gtk_widget_show_all(inst->widget);
 
@@ -3825,10 +3881,65 @@ void *ui_thread(void *arg)
     /* Info section is special: always expanded, content = info_grid + steam_box
      * wrapped together in a vertical box.  We still use a revealer for
      * visual consistency when collapsing. */
+    /* ── Process Metadata section (shown when proc_meta service plugin fires) ─ */
+    GtkWidget *meta_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    GtkWidget *meta_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(meta_box), meta_sep, FALSE, FALSE, 4);
+
+    GtkWidget *meta_header = gtk_label_new("Software");
+    gtk_label_set_xalign(GTK_LABEL(meta_header), 0.0f);
+    {
+        PangoAttrList *a = pango_attr_list_new();
+        pango_attr_list_insert(a, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(meta_header), a);
+        pango_attr_list_unref(a);
+    }
+    gtk_box_pack_start(GTK_BOX(meta_box), meta_header, FALSE, FALSE, 0);
+
+    GtkWidget *meta_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(meta_grid), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(meta_grid), 8);
+    gtk_box_pack_start(GTK_BOX(meta_box), meta_grid, FALSE, FALSE, 0);
+
+    #define META_ROW(row, key_str, label_var) do { \
+        GtkWidget *_k = gtk_label_new(key_str);                          \
+        gtk_label_set_xalign(GTK_LABEL(_k), 0.0f);                      \
+        gtk_widget_set_halign(_k, GTK_ALIGN_START);                      \
+        PangoAttrList *_a = pango_attr_list_new();                       \
+        pango_attr_list_insert(_a, pango_attr_weight_new(PANGO_WEIGHT_BOLD)); \
+        gtk_label_set_attributes(GTK_LABEL(_k), _a);                     \
+        pango_attr_list_unref(_a);                                       \
+        GtkWidget *_v = gtk_label_new("–");                              \
+        gtk_label_set_xalign(GTK_LABEL(_v), 0.0f);                      \
+        gtk_label_set_selectable(GTK_LABEL(_v), TRUE);                   \
+        gtk_label_set_ellipsize(GTK_LABEL(_v), PANGO_ELLIPSIZE_END);     \
+        gtk_widget_set_halign(_v, GTK_ALIGN_START);                      \
+        gtk_widget_set_hexpand(_v, TRUE);                                \
+        gtk_grid_attach(GTK_GRID(meta_grid), _k, 0, row, 1, 1);         \
+        gtk_grid_attach(GTK_GRID(meta_grid), _v, 1, row, 1, 1);         \
+        label_var = GTK_LABEL(_v);                                       \
+    } while (0)
+
+    GtkLabel *sb_meta_organization;
+    GtkLabel *sb_meta_homepage, *sb_meta_source_url;
+    GtkLabel *sb_meta_funding_url, *sb_meta_license, *sb_meta_summary;
+
+    META_ROW(0, "Organisation", sb_meta_organization);
+    META_ROW(1, "Homepage",    sb_meta_homepage);
+    META_ROW(2, "Source",      sb_meta_source_url);
+    META_ROW(3, "Funding",     sb_meta_funding_url);
+    META_ROW(4, "Licence",     sb_meta_license);
+    META_ROW(5, "Summary",     sb_meta_summary);
+    #undef META_ROW
+
+    gtk_widget_set_no_show_all(meta_box, TRUE);
+
     GtkWidget *info_content_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_pack_start(GTK_BOX(info_content_box), info_grid, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(info_content_box), steam_box, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(info_content_box), cgroup_box, FALSE, FALSE, 0);
+    gtk_box_pack_end  (GTK_BOX(info_content_box), meta_box,   FALSE, FALSE, 0);
 
     GtkWidget *info_section, *info_header_eb, *info_revealer, *info_arrow;
     MAKE_SECTION(info_section, info_header_eb, info_revealer,
@@ -4180,7 +4291,7 @@ void *ui_thread(void *arg)
     GtkWidget *tray_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_box_pack_start(GTK_BOX(tray_box), proc_info_toggle, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(tray_box), proc_info_summary_w, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(tray_box), proc_info_revealer, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(tray_box), proc_info_revealer, TRUE, TRUE, 0);
 
     /* Inner horizontal paned: tray (process info) | notebook */
     GtkWidget *detail_hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
@@ -4201,7 +4312,7 @@ void *ui_thread(void *arg)
      * outer_paned (vertical): pack1 = hpaned, pack2 = detail_vbox */
     GtkWidget *outer_paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
     gtk_paned_pack1(GTK_PANED(outer_paned), hpaned, TRUE, FALSE);
-    gtk_paned_pack2(GTK_PANED(outer_paned), detail_vbox, FALSE, FALSE);
+    gtk_paned_pack2(GTK_PANED(outer_paned), detail_vbox, TRUE, FALSE);
 
     /* The system panel paned (wrapping outer_paned + system panel) is created
      * lazily in system_panel_relayout() only when a SYSTEM plugin is shown.
@@ -4306,6 +4417,15 @@ void *ui_thread(void *arg)
     ctx.sb_cgroup_io_key       = sb_cgroup_io_key;
     ctx.sb_cgroup_frame        = cgroup_box;
 
+    /* Process metadata (proc_meta service plugin) */
+    ctx.sb_meta_organization = sb_meta_organization;
+    ctx.sb_meta_homepage     = sb_meta_homepage;
+    ctx.sb_meta_source_url   = sb_meta_source_url;
+    ctx.sb_meta_funding_url  = sb_meta_funding_url;
+    ctx.sb_meta_license      = sb_meta_license;
+    ctx.sb_meta_summary      = sb_meta_summary;
+    ctx.sb_meta_frame        = meta_box;
+
 #ifdef HAVE_PIPEWIRE
     /* Meter and spectrogram state are still used by host services */
     ctx.pw_meter       = NULL;
@@ -4334,6 +4454,10 @@ void *ui_thread(void *arg)
 
             /* Initialise the event bus before loading any plugins */
             evemon_event_bus_init();
+
+            /* Subscribe to proc_meta events to populate the Software section */
+            evemon_event_bus_subscribe(EVEMON_EVENT_PROC_META,
+                                       on_proc_meta, &ctx);
 
             /* Build host services table on the heap so it outlives this block */
             evemon_host_services_t *hsvc = calloc(1, sizeof(evemon_host_services_t));

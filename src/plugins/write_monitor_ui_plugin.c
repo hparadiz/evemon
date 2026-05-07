@@ -699,6 +699,15 @@ static void plugin_clear(void *ctx)
             GTK_SOURCE_GUTTER_RENDERER(c->gutter_renderer));
 }
 
+static int plugin_wants_update(void *ctx)
+{
+    wm_ui_ctx_t *c = ctx;
+    return c && c->root &&
+           GTK_IS_WIDGET(c->root) &&
+           gtk_widget_get_mapped(c->root) &&
+           gtk_widget_get_child_visible(c->root);
+}
+
 /* ── Entry point ──────────────────────────────────────────────── */
 
 evemon_plugin_t *evemon_plugin_init(void)
@@ -720,6 +729,7 @@ evemon_plugin_t *evemon_plugin_init(void)
     p->clear         = plugin_clear;
     p->destroy       = plugin_destroy;
     p->activate      = plugin_activate;
+    p->wants_update  = plugin_wants_update;
     p->role          = EVEMON_ROLE_PROCESS;
     p->dependencies  = _wm_ui_deps;
 

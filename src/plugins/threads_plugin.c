@@ -463,6 +463,15 @@ static void thr_destroy(void *opaque)
     free(ctx);
 }
 
+static int thr_wants_update(void *opaque)
+{
+    thr_ctx_t *ctx = opaque;
+    return ctx->scroll &&
+           GTK_IS_WIDGET(ctx->scroll) &&
+           gtk_widget_get_mapped(ctx->scroll) &&
+           gtk_widget_get_child_visible(ctx->scroll);
+}
+
 /* ── plugin descriptor ───────────────────────────────────────── */
 
 __attribute__((visibility("default")))
@@ -485,6 +494,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = thr_update,
         .clear         = thr_clear,
         .destroy       = thr_destroy,
+        .wants_update  = thr_wants_update,
         .role          = EVEMON_ROLE_PROCESS,
         .dependencies  = NULL,
     };

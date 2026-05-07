@@ -54,9 +54,10 @@ typedef enum {
     EVEMON_EVENT_AUDIO_STATE_CHANGED,  /* payload: reserved (NULL)       */
     EVEMON_EVENT_PID_EXITED,           /* payload: pid_t*                */
     EVEMON_EVENT_JSON_SNAPSHOT,        /* payload: evemon_json_payload_t**/
-    EVEMON_EVENT_FD_WRITE,            /* payload: evemon_fd_write_payload_t* */
-    EVEMON_EVENT_CHILD_EXEC,           /* payload: evemon_exec_payload_t*    */
-    EVEMON_EVENT_CUSTOM                /* payload: user-defined          */
+    EVEMON_EVENT_FD_WRITE,            /* payload: evemon_fd_write_payload_t*  */
+    EVEMON_EVENT_CHILD_EXEC,           /* payload: evemon_exec_payload_t*      */
+    EVEMON_EVENT_PROC_META,            /* payload: evemon_proc_meta_t*         */
+    EVEMON_EVENT_CUSTOM                /* payload: user-defined                */
 } evemon_event_type_t;
 
 /* Event structure passed to subscribers */
@@ -100,6 +101,29 @@ typedef enum {
 #define EVEMON_PLUGIN_HEADLESS EVEMON_ROLE_SERVICE
 
 /* ── Event payloads ──────────────────────────────────────────── */
+
+/*
+ * Payload for EVEMON_EVENT_PROC_META.
+ * Published by the proc_meta service plugin when a new process is selected.
+ * Flat fixed-size struct — safe to copy by value in subscriber callbacks.
+ * matched=0 means the process was not found in the software directory DB.
+ */
+typedef struct {
+    pid_t  pid;
+    int    matched;               /* 0 = not found in DB                   */
+    int    confidence;            /* 0–100                                 */
+    char   display_name[256];     /* human-readable name                   */
+    char   organization[256];     /* owning organisation                   */
+    char   homepage[512];         /* project homepage                      */
+    char   source_url[512];       /* source code repository URL            */
+    char   source_host[64];       /* hosting service (e.g. "github.com")  */
+    char   funding_url[512];      /* donation / sponsorship page URL       */
+    char   funding_provider[128]; /* platform (e.g. "Liberapay")          */
+    char   summary[512];          /* one-line description                  */
+    char   primary_license[64];   /* SPDX licence identifier               */
+    char   package_name[128];     /* distro package name                   */
+    char   project_family[128];   /* project family key                    */
+} evemon_proc_meta_t;
 
 /*
  * Payload for EVEMON_EVENT_ALBUM_ART_UPDATED.

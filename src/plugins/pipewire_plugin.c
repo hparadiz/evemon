@@ -515,6 +515,13 @@ typedef struct {
 
     /* Event bus subscription ID (for cleanup in destroy) */
     int             event_sub_id;
+
+    /* Spectrogram node tracking */
+    uint32_t        spectro_target_node;  /* user-selected PW node id (0 = none) */
+    int             spectro_miss_count;   /* consecutive updates target was absent */
+
+    /* Per-node PID, parallel to audio_node_ids */
+    pid_t           audio_node_pids[64];
 } pw_ctx_t;
 
 /* ── classification ──────────────────────────────────────────── */
@@ -616,6 +623,7 @@ static char *pw_build_markup(const char *left_raw,
 typedef struct {
     pw_ctx_t *ctx;
     guint     node_id;
+    pid_t     node_pid;   /* PID of the owning process for this node */
 } pw_popup_data_t;
 
 static void on_pw_open_milkdrop(GtkMenuItem *item, gpointer data)
@@ -623,12 +631,16 @@ static void on_pw_open_milkdrop(GtkMenuItem *item, gpointer data)
     (void)item;
     pw_popup_data_t *d = data;
     pw_ctx_t *ctx = d->ctx;
+    /* Use the owning process PID when available (e.g. when init/PID 1 is
+     * selected and all streams are shown).  Falls back to last_pid for
+     * ordinary single-process selections. */
+    pid_t open_pid = (d->node_pid > 0) ? d->node_pid : ctx->last_pid;
     g_free(d);
 
     if (!ctx->host || !ctx->host->open_plugin_window) return;
     ctx->host->open_plugin_window(ctx->host->host_ctx,
                                   "org.evemon.milkdrop",
-                                  ctx->last_pid,
+                                  open_pid,
                                   ctx->last_proc_name[0]
                                       ? ctx->last_proc_name : "audio");
 }
@@ -672,6 +684,14 @@ static gboolean on_pw_button_press(GtkWidget *widget, GdkEventButton *ev,
     pw_popup_data_t *pd = g_new0(pw_popup_data_t, 1);
     pd->ctx     = ctx;
     pd->node_id = node_id;
+    /* Look up the owning process PID for this node from our tracked list */
+    pd->node_pid = 0;
+    for (size_t _i = 0; _i < ctx->audio_node_count; _i++) {
+        if (ctx->audio_node_ids[_i] == node_id) {
+            pd->node_pid = ctx->audio_node_pids[_i];
+            break;
+        }
+    }
     g_signal_connect(mi_md, "activate",
                      G_CALLBACK(on_pw_open_milkdrop), pd);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_md);
@@ -699,6 +719,8 @@ static void on_row_activated(GtkTreeView *view, GtkTreePath *path,
     if (node_id == 0) return;
 
     ctx->spectro_shown = TRUE;
+    ctx->spectro_target_node = (uint32_t)node_id;
+    ctx->spectro_miss_count = 0;
 
     if (ctx->host && ctx->host->spectro_start) {
         ctx->host->spectro_start(ctx->host->host_ctx,
@@ -1437,6 +1459,8 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
         snprintf(ctx->last_proc_name, sizeof(ctx->last_proc_name),
                  "%s", data->name ? data->name : "");
         ctx->spectro_shown = FALSE;
+        ctx->spectro_target_node = 0;
+        ctx->spectro_miss_count = 0;
         gtk_list_store_clear(ctx->store);
         ctx->audio_node_count = 0;
     }
@@ -1497,8 +1521,10 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
         if (strstr(node->media_class, "Stream") &&
             strstr(node->media_class, "Output") &&
             strstr(node->media_class, "Audio")) {
-            if (ctx->audio_node_count < 64)
+            if (ctx->audio_node_count < 64) {
+                ctx->audio_node_pids[ctx->audio_node_count] = node->pid;
                 ctx->audio_node_ids[ctx->audio_node_count++] = node->id;
+            }
         }
 
         /* Find linked peers */
@@ -1672,20 +1698,28 @@ static void pw_update(void *opaque, const evemon_proc_data_t *data)
             if (!ctx->meter_timer)
                 ctx->meter_timer = g_timeout_add(50, meter_tick, ctx);
 
-            if (ctx->spectro_shown && ctx->host->spectro_start) {
-                uint32_t current = 0;
-                if (ctx->host->spectro_get_target)
-                    current = ctx->host->spectro_get_target(
-                        ctx->host->host_ctx,
-                        GTK_DRAWING_AREA(ctx->spectro_draw));
-                int found = 0;
-                for (size_t i = 0; i < ctx->audio_node_count; i++)
-                    if (ctx->audio_node_ids[i] == current)
-                        { found = 1; break; }
-                if (!found) {
+            if (ctx->spectro_shown && ctx->spectro_target_node != 0
+                && ctx->host->spectro_start) {
+                /* Verify the user-selected node is still in the PipeWire
+                 * graph.  We check the full pw_nodes list — not just the
+                 * audio_node_ids subset — so any node class can be tracked.
+                 * A 3-update debounce absorbs transient PipeWire snapshot
+                 * gaps and prevents spurious restarts (visible pauses). */
+                int still_there = 0;
+                for (size_t i = 0; i < data->pw_node_count; i++) {
+                    if (data->pw_nodes[i].id == ctx->spectro_target_node) {
+                        still_there = 1; break;
+                    }
+                }
+                if (still_there) {
+                    ctx->spectro_miss_count = 0;
+                } else if (++ctx->spectro_miss_count >= 3) {
+                    /* Node truly gone — fall back to first audio output stream */
+                    ctx->spectro_target_node = ctx->audio_node_ids[0];
+                    ctx->spectro_miss_count = 0;
                     ctx->host->spectro_start(ctx->host->host_ctx,
                         GTK_DRAWING_AREA(ctx->spectro_draw),
-                        ctx->audio_node_ids[0]);
+                        ctx->spectro_target_node);
                     /* Re-apply the selected theme after auto-switching nodes */
                     if (ctx->host->spectro_set_theme && ctx->spectro_theme_combo) {
                         int active = gtk_combo_box_get_active(
@@ -1740,6 +1774,9 @@ static void pw_clear(void *opaque)
         gtk_label_set_text(GTK_LABEL(ctx->bpm_label), "");
     if (ctx->bpm_track_label && GTK_IS_LABEL(ctx->bpm_track_label))
         gtk_label_set_text(GTK_LABEL(ctx->bpm_track_label), "");
+    /* Reset spectrogram tracking */
+    ctx->spectro_target_node = 0;
+    ctx->spectro_miss_count = 0;
     /* Don't call pw_meter_stop here — the meter is shared. */
 }
 
@@ -1796,6 +1833,15 @@ static void pw_destroy(void *opaque)
     free(ctx);
 }
 
+static int pw_wants_update(void *opaque)
+{
+    pw_ctx_t *ctx = opaque;
+    return ctx->main_box &&
+           GTK_IS_WIDGET(ctx->main_box) &&
+           gtk_widget_get_mapped(ctx->main_box) &&
+           gtk_widget_get_child_visible(ctx->main_box);
+}
+
 /* ── descriptor ──────────────────────────────────────────────── */
 
 __attribute__((visibility("default")))
@@ -1819,6 +1865,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .clear         = pw_clear,
         .destroy       = pw_destroy,
         .activate      = pw_activate,
+        .wants_update  = pw_wants_update,
         .role          = EVEMON_ROLE_PROCESS,
         .dependencies  = _pw_deps,
     };

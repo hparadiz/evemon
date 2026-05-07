@@ -5,6 +5,31 @@
 #include "ui_internal.h"
 #include "../settings.h"
 #include "../plugin_loader.h"
+#include "../plugin_broker.h"
+#include <malloc.h>
+
+static void system_panel_release_plugins(ui_ctx_t *ctx)
+{
+    plugin_registry_t *preg = ctx ? ctx->plugin_registry : NULL;
+    if (!preg) return;
+
+    for (size_t i = 0; i < preg->count; i++) {
+        plugin_instance_t *inst = &preg->instances[i];
+        if (!inst->plugin || inst->plugin->role != EVEMON_ROLE_SYSTEM)
+            continue;
+        if (inst->plugin->clear)
+            inst->plugin->clear(inst->plugin->plugin_ctx);
+    }
+
+    malloc_trim(0);
+}
+
+static void system_panel_restart_broker(ui_ctx_t *ctx)
+{
+    plugin_registry_t *preg = ctx ? ctx->plugin_registry : NULL;
+    if (!preg) return;
+    broker_start(preg, ctx->mon ? ctx->mon->fdmon : NULL);
+}
 
 /* ── panel-level close button callback ─────────────────────────── */
 
@@ -29,8 +54,11 @@ static void on_system_panel_close(GtkButton *btn, gpointer data)
                                        G_CALLBACK(on_toggle_system_panel),
                                        ctx);
 
-    if (ctx->system_panel)
+    if (ctx->system_panel) {
         gtk_widget_hide(ctx->system_panel);
+        system_panel_release_plugins(ctx);
+        system_panel_restart_broker(ctx);
+    }
 
     settings_get()->system_panel_open = false;
     settings_save();
@@ -125,8 +153,11 @@ void on_toggle_system_panel(GtkCheckMenuItem *item, gpointer data)
         gtk_widget_set_no_show_all(ctx->system_panel, FALSE);
         gtk_widget_show_all(ctx->system_panel);
         gtk_widget_set_no_show_all(ctx->system_panel, TRUE);
+        system_panel_restart_broker(ctx);
     } else {
         gtk_widget_hide(ctx->system_panel);
+        system_panel_release_plugins(ctx);
+        system_panel_restart_broker(ctx);
     }
 }
 

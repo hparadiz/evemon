@@ -4,12 +4,16 @@ PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 LIBDIR = $(PREFIX)/lib/evemon
 DATADIR = $(PREFIX)/share
+EVEMON_DATADIR = $(DATADIR)/evemon
+MILKDROP_PRESETDIR = $(EVEMON_DATADIR)/milkdrop/presets
+SOFTWARE_DIRECTORY_DB = data/software-directory.sqlite
 
 CC      := gcc
 CFLAGS  := -Wall -Wextra -std=c11 -O2 -pthread -D_GNU_SOURCE \
            -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
            -Wformat -Wformat-security -fPIE \
-           -DEVEMON_LIBDIR='"$(LIBDIR)"'
+           -DEVEMON_LIBDIR='"$(LIBDIR)"' \
+           -DEVEMON_DATADIR='"$(EVEMON_DATADIR)"'
 LDFLAGS := -pthread -lm -pie -Wl,-z,relro,-z,now \
            -rdynamic -ldl
 
@@ -194,10 +198,13 @@ SOUP_LDFLAGS   := $(shell pkg-config --libs   libsoup-3.0 2>/dev/null)
 PLUGIN_CFLAGS  := -Wall -Wextra -std=c11 -O2 -D_GNU_SOURCE -fPIC -shared \
                   -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
                   -Wformat -Wformat-security \
+                  -DEVEMON_DATADIR='"$(EVEMON_DATADIR)"' \
                   $(GTK_CFLAGS) $(FC_CFLAGS)
 PLUGIN_LDFLAGS := $(GTK_LDFLAGS) $(FC_LDFLAGS)
 
-PLUGIN_SRCS := $(filter-out $(SRC_DIR)/plugins/json_service_plugin.c, $(wildcard $(SRC_DIR)/plugins/*.c))
+PLUGIN_SRCS := $(filter-out $(SRC_DIR)/plugins/json_service_plugin.c \
+                             $(SRC_DIR)/plugins/proc_meta_service_plugin.c, \
+                             $(wildcard $(SRC_DIR)/plugins/*.c))
 PLUGIN_SOS  := $(patsubst $(SRC_DIR)/plugins/%.c,$(PLUGIN_DIR)/evemon_%.so,$(PLUGIN_SRCS))
 
 $(PLUGIN_DIR):
@@ -223,6 +230,12 @@ $(PLUGIN_DIR)/evemon_milkdrop_plugin.so: $(SRC_DIR)/plugins/milkdrop_plugin.c $(
 # Audio service headless plugin — owns album art loading (art_loader.c + libsoup)
 $(PLUGIN_DIR)/evemon_audio_service_plugin.so: $(SRC_DIR)/plugins/audio_service_plugin.c $(SRC_DIR)/art_loader.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
 	$(CC) $(PLUGIN_CFLAGS) $(SOUP_CFLAGS) -o $@ $(SRC_DIR)/plugins/audio_service_plugin.c $(SRC_DIR)/art_loader.c $(PLUGIN_LDFLAGS) $(SOUP_LDFLAGS)
+
+# Process metadata service plugin — resolves running procs to software directory info
+SQLITE_LDFLAGS := $(shell pkg-config --libs sqlite3 2>/dev/null)
+$(PLUGIN_DIR)/evemon_proc_meta_service_plugin.so: $(SRC_DIR)/plugins/proc_meta_service_plugin.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
+	$(CC) $(PLUGIN_CFLAGS) -o $@ $< $(PLUGIN_LDFLAGS) $(SQLITE_LDFLAGS)
+PLUGIN_SOS += $(PLUGIN_DIR)/evemon_proc_meta_service_plugin.so
 
 # write_monitor_ui plugin needs GtkSourceView-4
 GSV_CFLAGS  := $(shell pkg-config --cflags gtksourceview-4 2>/dev/null)
@@ -346,6 +359,15 @@ install: all
 	rm -f $(DESTDIR)$(LIBDIR)/plugins/*.so
 	install -m 644 $(BPF_OBJ) $(DESTDIR)$(LIBDIR)/
 	install -m 755 $(PLUGIN_SOS) $(DESTDIR)$(LIBDIR)/plugins/
+	install -d $(DESTDIR)$(MILKDROP_PRESETDIR)
+	if [ -d presets ]; then \
+	    cp -a presets/. $(DESTDIR)$(MILKDROP_PRESETDIR)/; \
+	    find $(DESTDIR)$(MILKDROP_PRESETDIR) -type d -exec chmod 755 {} \; ; \
+	    find $(DESTDIR)$(MILKDROP_PRESETDIR) -type f -exec chmod 644 {} \; ; \
+	fi
+	if [ -f $(SOFTWARE_DIRECTORY_DB) ]; then \
+	    install -m 644 $(SOFTWARE_DIRECTORY_DB) $(DESTDIR)$(EVEMON_DATADIR)/software-directory.sqlite; \
+	fi
 	$(if $(DESTDIR),,update-desktop-database $(DATADIR)/applications)
 	$(if $(DESTDIR),,-gtk-update-icon-cache -f -t $(DATADIR)/icons/hicolor 2>/dev/null || true)
 
@@ -355,4 +377,5 @@ uninstall:
 	rm -f $(DESTDIR)$(DATADIR)/icons/hicolor/256x256/apps/evemon.png
 	rm -f $(DESTDIR)$(DATADIR)/pixmaps/evemon.png
 	rm -rf $(DESTDIR)$(LIBDIR)
+	rm -rf $(DESTDIR)$(EVEMON_DATADIR)
 	-gtk-update-icon-cache -f -t $(DESTDIR)$(DATADIR)/icons/hicolor 2>/dev/null || true

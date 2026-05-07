@@ -127,6 +127,7 @@ static void idle_dispatch_free(idle_dispatch_t *d)
             free((void *)jp->json);
             free(jp);
         } else {
+            /* EVEMON_EVENT_PROC_META and EVEMON_EVENT_CUSTOM: flat alloc */
             free(d->owned_payload);
         }
     }
@@ -207,6 +208,15 @@ static idle_dispatch_t *event_to_idle(const evemon_event_t *event)
         pid_t *dst = malloc(sizeof(pid_t));
         if (dst) {
             *dst = *src;
+            d->event.payload = dst;
+            d->owned_payload = dst;
+        }
+    }
+    /* PROC_META: flat fixed-size struct — simple copy */
+    else if (event->type == EVEMON_EVENT_PROC_META && event->payload) {
+        evemon_proc_meta_t *dst = malloc(sizeof(evemon_proc_meta_t));
+        if (dst) {
+            *dst = *(const evemon_proc_meta_t *)event->payload;
             d->event.payload = dst;
             d->owned_payload = dst;
         }

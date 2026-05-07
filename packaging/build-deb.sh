@@ -116,7 +116,7 @@ Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: evemon contributors
 Installed-Size: ${INSTALLED_SIZE}
-Depends: libgtk-3-0, libfontconfig1, libbpf1, libelf1, zlib1g, libjansson4, libpipewire-0.3-0, libsoup-3.0-0, libgtksourceview-4-0, libepoxy0, libx11-6
+Depends: libgtk-3-0, libfontconfig1, libbpf1, libelf1, zlib1g, libjansson4, libsqlite3-0, libpipewire-0.3-0, libsoup-3.0-0, libgtksourceview-4-0, libepoxy0, libx11-6
 Section: utils
 Priority: optional
 Homepage: https://github.com/hparadiz/evemon

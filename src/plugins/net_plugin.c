@@ -1739,6 +1739,15 @@ static void net_destroy(void *opaque)
     free(ctx);
 }
 
+static int net_wants_update(void *opaque)
+{
+    net_ctx_t *ctx = opaque;
+    return ctx->main_box &&
+           GTK_IS_WIDGET(ctx->main_box) &&
+           gtk_widget_get_mapped(ctx->main_box) &&
+           gtk_widget_get_child_visible(ctx->main_box);
+}
+
 /* ── descriptor ──────────────────────────────────────────────── */
 
 __attribute__((visibility("default")))
@@ -1764,6 +1773,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = net_update,
         .clear         = net_clear,
         .destroy       = net_destroy,
+        .wants_update  = net_wants_update,
         .role          = EVEMON_ROLE_PROCESS,
         .dependencies  = NULL,
     };

@@ -402,6 +402,15 @@ static void fd_destroy(void *opaque)
     free(ctx);
 }
 
+static int fd_wants_update(void *opaque)
+{
+    fd_ctx_t *ctx = opaque;
+    return ctx->vbox &&
+           GTK_IS_WIDGET(ctx->vbox) &&
+           gtk_widget_get_mapped(ctx->vbox) &&
+           gtk_widget_get_child_visible(ctx->vbox);
+}
+
 /* ── plugin descriptor ───────────────────────────────────────── */
 
 __attribute__((visibility("default")))
@@ -427,6 +436,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = fd_update,
         .clear         = fd_clear,
         .destroy       = fd_destroy,
+        .wants_update  = fd_wants_update,
         .role          = EVEMON_ROLE_PROCESS,
         .dependencies  = NULL,
     };

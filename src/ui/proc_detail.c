@@ -37,6 +37,7 @@ extern struct timespec evemon_start_time;
 
 /* Generation counter – bumped on every selection change */
 static guint detail_gen = 0;
+static pid_t detail_last_pid = 0;  /* last PID shown – used to suppress hide/show flicker */
 
 /* ── icon watermark: async resolve and redraw ─────────────────── */
 
@@ -174,13 +175,56 @@ static gboolean detail_deferred_cb(gpointer data)
                                         si->game_dir[0] ? si->game_dir : NULL);
             gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sb_steam_compat),
                                         si->compat_data[0] ? si->compat_data : NULL);
-            gtk_widget_set_no_show_all(ctx->sb_steam_frame, FALSE);
-            gtk_widget_show_all(ctx->sb_steam_frame);
-            gtk_widget_set_no_show_all(ctx->sb_steam_frame, TRUE);
+
+            /* Load the Steam game logo for the icon watermark overlay.
+             * Prefer logo.png (transparent), fall back to header.jpg. */
+            if (si->app_id[0]) {
+                const char *home = g_get_home_dir();
+                char icon_path[2048];
+                GdkPixbuf *steam_pb = NULL;
+
+                /* Try standard install location first, then Flatpak */
+                const char *steam_roots[] = {
+                    ".local/share/Steam",
+                    ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+                    NULL
+                };
+                for (int ri = 0; !steam_pb && steam_roots[ri]; ri++) {
+                    const char *candidates[] = { "logo.png", "header.jpg", NULL };
+                    for (int ci = 0; !steam_pb && candidates[ci]; ci++) {
+                        snprintf(icon_path, sizeof(icon_path),
+                                 "%s/%s/appcache/librarycache/%s/%s",
+                                 home, steam_roots[ri], si->app_id, candidates[ci]);
+                        if (g_file_test(icon_path, G_FILE_TEST_EXISTS))
+                            steam_pb = gdk_pixbuf_new_from_file(icon_path, NULL);
+                    }
+                }
+
+                if (steam_pb) {
+                    if (ctx->detail_steam_icon_pb)
+                        g_object_unref(ctx->detail_steam_icon_pb);
+                    ctx->detail_steam_icon_pb = steam_pb;
+                    if (ctx->detail_icon_da)
+                        gtk_widget_queue_draw(ctx->detail_icon_da);
+                }
+            }
+
+            if (!gtk_widget_get_visible(ctx->sb_steam_frame)) {
+                gtk_widget_set_no_show_all(ctx->sb_steam_frame, FALSE);
+                gtk_widget_show_all(ctx->sb_steam_frame);
+                gtk_widget_set_no_show_all(ctx->sb_steam_frame, TRUE);
+            }
             free(si);
         } else {
             free(si);
             gtk_widget_hide(ctx->sb_steam_frame);
+            /* Clear game logo when not a Steam process */
+            if (ctx->detail_steam_icon_pb) {
+                g_object_unref(ctx->detail_steam_icon_pb);
+                ctx->detail_steam_icon_pb = NULL;
+                if (ctx->detail_icon_da)
+                    gtk_widget_queue_draw(ctx->detail_icon_da);
+            }
         }
     }
 
@@ -250,12 +294,17 @@ void proc_detail_update(ui_ctx_t *ctx)
         gtk_label_set_text(ctx->sb_cmdline,   "–");
         gtk_widget_hide(ctx->sb_steam_frame);
         gtk_widget_hide(ctx->sb_cgroup_frame);
+        detail_last_pid = 0;
         /* Clear the icon watermark */
         if (ctx->detail_icon_pb) {
             g_object_unref(ctx->detail_icon_pb);
             ctx->detail_icon_pb = NULL;
             if (ctx->detail_icon_da)
                 gtk_widget_queue_draw(ctx->detail_icon_da);
+        }
+        if (ctx->detail_steam_icon_pb) {
+            g_object_unref(ctx->detail_steam_icon_pb);
+            ctx->detail_steam_icon_pb = NULL;
         }
         return;
     }
@@ -412,11 +461,13 @@ void proc_detail_update(ui_ctx_t *ctx)
 
     evemon_log(LOG_DEBUG, "[DBG] all phase1 labels set, hiding steam frame");
 
-    /* Hide Steam frame immediately; the deferred idle will re-show it.
-     * The cgroup frame is left as-is: cgroup_scan_complete will hide or
-     * update it once the async read finishes, avoiding a hide→show blink
-     * on every refresh tick. */
-    gtk_widget_hide(ctx->sb_steam_frame);
+    /* Hide Steam frame immediately only when the selected PID has changed.
+     * On a same-PID refresh (poll tick) the existing Steam data is still
+     * valid, so leave the frame as-is; Phase 2 will update it silently. */
+    if ((pid_t)pid != detail_last_pid) {
+        gtk_widget_hide(ctx->sb_steam_frame);
+        detail_last_pid = (pid_t)pid;
+    }
 
     evemon_log(LOG_DEBUG, "[DBG] steam frame hidden, enqueueing deferred idle");
 
@@ -696,9 +747,11 @@ void pinned_panels_update(ui_ctx_t *ctx)
                 gtk_widget_set_tooltip_text(
                     GTK_WIDGET(pp->sb_steam_compat),
                     si->compat_data[0] ? si->compat_data : NULL);
-                gtk_widget_set_no_show_all(pp->sb_steam_frame, FALSE);
-                gtk_widget_show_all(pp->sb_steam_frame);
-                gtk_widget_set_no_show_all(pp->sb_steam_frame, TRUE);
+                if (!gtk_widget_get_visible(pp->sb_steam_frame)) {
+                    gtk_widget_set_no_show_all(pp->sb_steam_frame, FALSE);
+                    gtk_widget_show_all(pp->sb_steam_frame);
+                    gtk_widget_set_no_show_all(pp->sb_steam_frame, TRUE);
+                }
                 free(si);
             } else {
                 free(si);

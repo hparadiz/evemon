@@ -307,6 +307,15 @@ typedef struct {
     GtkWidget          *sb_cgroup_io_key;
     GtkWidget          *sb_cgroup_frame;     /* container to show/hide */
     guint               cgroup_generation;
+
+    /* Process metadata (from proc_meta service plugin) */
+    GtkLabel           *sb_meta_organization;
+    GtkLabel           *sb_meta_homepage;
+    GtkLabel           *sb_meta_source_url;
+    GtkLabel           *sb_meta_funding_url;
+    GtkLabel           *sb_meta_license;
+    GtkLabel           *sb_meta_summary;
+    GtkWidget          *sb_meta_frame;       /* container to show/hide */
     GCancellable       *cgroup_cancel;
 
 #ifdef HAVE_PIPEWIRE
@@ -444,6 +453,7 @@ typedef struct {
     /* background icon watermark in the process info panel */
     GtkWidget          *detail_icon_da;       /* GtkDrawingArea overlay              */
     GdkPixbuf          *detail_icon_pb;       /* current icon (NULL = none)          */
+    GdkPixbuf          *detail_steam_icon_pb; /* Steam game logo (NULL = none)       */
 } ui_ctx_t;
 
 /* ── PipeWire audio connection scanning & host services ───────── */

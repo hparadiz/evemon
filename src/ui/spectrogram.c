@@ -107,7 +107,15 @@ static void ensure_hann(void)
 
 /* ── lock-free SPSC ring buffer for PCM samples ──────────────── */
 
-#define RING_SIZE  (FFT_SIZE * 8)   /* ~170 ms at 48 kHz */
+#define RING_SIZE  (FFT_SIZE * 48)  /* ~1 s at 48 kHz — absorbs network burst gaps */
+
+/*
+ * Expected wall-clock time between waterfall columns.
+ * Each column represents one FFT hop: FFT_SIZE/2 samples.
+ * At 48000 Hz: 512 / 48000 ≈ 10.67 ms = 10667 µs.
+ * Used to synthesise silence columns when the ring is empty.
+ */
+#define SPECTRO_COL_PERIOD_US  10667
 
 typedef struct {
     float           buf[RING_SIZE];
@@ -160,12 +168,20 @@ typedef struct {
     /* Signal handler id for the "draw" callback (so we can disconnect) */
     gulong                 draw_handler_id;
 
+    /* Wall-clock timestamp (g_get_monotonic_time µs) of the last waterfall
+     * column write — real or synthesised.  Used to keep the waterfall
+     * scrolling at a constant rate when network audio arrives as bursts. */
+    gint64                 last_col_us;
+
     /* ── frequency cutoff detection ──────────────────────────── */
     float                  cutoff_freq;     /* detected cutoff in Hz    */
     int                    cutoff_bin;      /* FFT bin index of cutoff  */
     char                   cutoff_label[64];/* codec label string       */
     float                  cutoff_ema;      /* EMA-smoothed cutoff bin  */
     int                    detect_counter;  /* frames since last detect */
+    /* Producer idle tracking — avoids false silence on PW quantum gaps */
+    unsigned               last_wp;         /* wp seen in previous tick  */
+    int                    producer_idle;   /* consecutive idle tick count*/
 } spectro_state_t;
 
 /* ── frequency cutoff detection ───────────────────────────────
@@ -541,6 +557,12 @@ static gboolean on_spectro_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 /* ── GTK timer: consume ring buffer → FFT → update waterfall ── */
 
 #define MAX_FFTS_PER_TICK  4   /* cap work per frame to stay responsive */
+/*
+ * Minimum consecutive ticks with wp unchanged before synthesising silence.
+ * 10 ticks × 16 ms ≈ 160 ms — safely exceeds the largest realistic
+ * PipeWire quantum (4096 frames at 48 kHz ≈ 85 ms).
+ */
+#define SILENCE_IDLE_TICKS 10
 
 static gboolean spectro_tick(gpointer data)
 {
@@ -552,6 +574,31 @@ static gboolean spectro_tick(gpointer data)
     unsigned wp = atomic_load_explicit(&st->ring.write_pos, memory_order_acquire);
     unsigned rp = atomic_load_explicit(&st->ring.read_pos, memory_order_relaxed);
     unsigned avail = wp - rp;
+
+    /*
+     * Track how many consecutive ticks the producer hasn't advanced wp.
+     * Short gaps are normal PipeWire quantum delivery; gaps longer than
+     * SILENCE_IDLE_TICKS ticks mean the stream is truly paused/stopped.
+     */
+    if (wp != st->last_wp) {
+        st->last_wp       = wp;
+        st->producer_idle = 0;
+    } else if (st->producer_idle < INT_MAX) {
+        st->producer_idle++;
+    }
+
+    /*
+     * If there is a partial ring fragment (0 < avail < FFT_SIZE) that
+     * the producer hasn't topped up for SILENCE_IDLE_TICKS ticks, the
+     * stream has truly stopped.  Discard it so silence synthesis below
+     * can proceed (otherwise avail never reaches zero).
+     */
+    if (avail > 0 && avail < (unsigned)FFT_SIZE
+                  && st->producer_idle >= SILENCE_IDLE_TICKS) {
+        rp   += avail;
+        avail = 0;
+        atomic_store_explicit(&st->ring.read_pos, rp, memory_order_release);
+    }
 
     /*
      * If we've fallen far behind, skip ahead so we only process
@@ -582,7 +629,13 @@ static gboolean spectro_tick(gpointer data)
         avail = wp - rp;
 
         if (window_peak < 1e-7f) {
-            /* Silent window — skip FFT and waterfall write */
+            /* Silent window — write a zero-magnitude column so the visual
+             * timeline stays uniform (silence gaps in the audio are real
+             * events that should appear as silence in the waterfall). */
+            memset(st->waterfall[st->wf_write_col], 0,
+                   FFT_HALF * sizeof(float));
+            st->wf_write_col = (st->wf_write_col + 1) % WATERFALL_COLS;
+            did_fft = 1;
             fft_count++;
             continue;
         }
@@ -612,7 +665,13 @@ static gboolean spectro_tick(gpointer data)
     }
     atomic_store_explicit(&st->ring.read_pos, rp, memory_order_release);
 
+    gint64 now_us = g_get_monotonic_time();
+
     if (did_fft) {
+        /* Real columns written — record wall-clock time so silence
+         * synthesis knows when to resume from. */
+        st->last_col_us = now_us;
+
         /* Run cutoff detection periodically to avoid wasting cycles */
         st->detect_counter += fft_count;
         if (st->detect_counter >= CUTOFF_DETECT_INTERVAL) {
@@ -621,6 +680,38 @@ static gboolean spectro_tick(gpointer data)
         }
         if (st->draw_area)
             gtk_widget_queue_draw(GTK_WIDGET(st->draw_area));
+    } else if (st->last_col_us > 0
+               && avail == 0
+               && st->producer_idle >= SILENCE_IDLE_TICKS) {
+        /*
+         * Ring is empty and the producer has been idle long enough that
+         * this is a real pause, not a PipeWire inter-quantum gap.
+         * Synthesise silence columns so the waterfall keeps scrolling
+         * instead of freezing.
+         *
+         * We advance last_col_us by exactly SPECTRO_COL_PERIOD_US per
+         * synthesised column (rather than snapping to now_us) so there
+         * is no accumulated drift when bursts resume.
+         */
+        int64_t elapsed_us = now_us - st->last_col_us;
+        int cols_due = (int)(elapsed_us / SPECTRO_COL_PERIOD_US);
+        if (cols_due > MAX_FFTS_PER_TICK)
+            cols_due = MAX_FFTS_PER_TICK;
+        for (int c = 0; c < cols_due; c++) {
+            memset(st->waterfall[st->wf_write_col], 0,
+                   FFT_HALF * sizeof(float));
+            st->wf_write_col = (st->wf_write_col + 1) % WATERFALL_COLS;
+            st->last_col_us += SPECTRO_COL_PERIOD_US;
+        }
+        if (cols_due > 0) {
+            st->detect_counter += cols_due;
+            if (st->detect_counter >= CUTOFF_DETECT_INTERVAL) {
+                st->detect_counter = 0;
+                detect_cutoff(st);
+            }
+            if (st->draw_area)
+                gtk_widget_queue_draw(GTK_WIDGET(st->draw_area));
+        }
     }
 
     return G_SOURCE_CONTINUE;

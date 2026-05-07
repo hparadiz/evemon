@@ -4,3 +4,5 @@ build/
 *.swp
 *~
 dist
+screencap_cache/
+presets.community

@@ -784,6 +784,8 @@ evemon_data_needs_t plugin_registry_effective_needs(const plugin_registry_t *reg
     for (size_t i = 0; i < reg->count; i++) {
         const plugin_instance_t *inst = &reg->instances[i];
         if (!inst->plugin) continue;
+        if (inst->plugin->role != EVEMON_ROLE_SERVICE && !inst->widget)
+            continue;
         /* No wants_update → always wants data */
         if (!inst->plugin->wants_update ||
             inst->plugin->wants_update(inst->plugin->plugin_ctx))
@@ -846,6 +848,8 @@ void plugin_dispatch_update(plugin_registry_t *reg, pid_t pid,
     for (size_t i = 0; i < reg->count; i++) {
         plugin_instance_t *inst = &reg->instances[i];
         if (!inst->plugin || !inst->plugin->update) continue;
+        if (inst->plugin->role != EVEMON_ROLE_SERVICE && !inst->widget)
+            continue;
         if (inst->tracked_pid != pid) continue;
         /* If the plugin opts in to demand-driven updates, ask it first */
         if (inst->plugin->wants_update &&

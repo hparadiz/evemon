@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <strings.h>
+#include <malloc.h>
 
 EVEMON_PLUGIN_MANIFEST(
     "org.evemon.system_fd",
@@ -95,6 +96,28 @@ static int classify_fd(const char *path)
     return FD_CAT_OTHER;
 }
 
+static gboolean fd_should_show(const evemon_fd_t *fd)
+{
+    if (!fd || !fd->path[0])
+        return FALSE;
+    if (strstr(fd->path, " (deleted)") || strstr(fd->path, "(deleted)"))
+        return FALSE;
+
+    int cat = classify_fd(fd->path);
+    return cat == FD_CAT_FILES || cat == FD_CAT_DEVICES;
+}
+
+static void fd_release_data(fd_ctx_t *ctx)
+{
+    gtk_list_store_clear(ctx->store);
+    gtk_list_store_clear(ctx->detail_store);
+    ctx->selected_path[0] = '\0';
+    g_free(ctx->snap_fds);
+    ctx->snap_fds = NULL;
+    ctx->snap_fd_count = 0;
+    malloc_trim(0);
+}
+
 /* ── signal callbacks ────────────────────────────────────────── */
 
 static void populate_detail(fd_ctx_t *ctx, const char *path)
@@ -157,6 +180,16 @@ static void on_selection_changed(GtkTreeSelection *sel, gpointer data)
     populate_detail(ctx, ctx->selected_path);
 }
 
+static void on_child_visible_notify(GObject *obj, GParamSpec *pspec,
+                                    gpointer data)
+{
+    (void)obj;
+    (void)pspec;
+    fd_ctx_t *ctx = data;
+    if (!gtk_widget_get_child_visible(ctx->vbox))
+        fd_release_data(ctx);
+}
+
 /* ── plugin callbacks ────────────────────────────────────────── */
 
 static GtkWidget *fd_create_widget(void *opaque)
@@ -164,6 +197,8 @@ static GtkWidget *fd_create_widget(void *opaque)
     fd_ctx_t *ctx = opaque;
 
     ctx->vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    g_signal_connect(ctx->vbox, "notify::child-visible",
+                     G_CALLBACK(on_child_visible_notify), ctx);
 
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_margin_start(hbox, 4);
@@ -308,13 +343,11 @@ static void fd_update(void *opaque, const evemon_proc_data_t *data)
     for (size_t i = 0; i < raw_total; i++) {
         if (!ctx->include_desc && data->fds[i].source_pid != data->pid)
             continue;
-        /* skip deleted files */
-        const char *p = data->fds[i].path;
-        if (p && (strstr(p, " (deleted)") || strstr(p, "(deleted)")))
+        if (!fd_should_show(&data->fds[i]))
             continue;
         if (has_filter) {
-            const char *path = data->fds[i].path ? data->fds[i].path : "";
-            const char *desc = data->fds[i].desc ? data->fds[i].desc : "";
+            const char *path = data->fds[i].path;
+            const char *desc = data->fds[i].desc;
             if (!strcasestr(path, ctx->filter_text) &&
                 !strcasestr(desc, ctx->filter_text))
                 continue;
@@ -406,11 +439,21 @@ static void fd_update(void *opaque, const evemon_proc_data_t *data)
     gtk_adjustment_set_value(vadj, scroll_pos);
     g_free(display);
 
-    /* ── snapshot all raw fds for the detail panel ── */
+    /* ── snapshot displayed fds for the detail panel ── */
     g_free(ctx->snap_fds);
-    ctx->snap_fd_count = data->fd_count;
+    ctx->snap_fd_count = 0;
     ctx->snap_fds = g_new(evemon_fd_t, data->fd_count > 0 ? data->fd_count : 1);
-    memcpy(ctx->snap_fds, data->fds, data->fd_count * sizeof(evemon_fd_t));
+    for (size_t i = 0; i < data->fd_count; i++) {
+        if (!ctx->include_desc && data->fds[i].source_pid != data->pid)
+            continue;
+        if (!fd_should_show(&data->fds[i]))
+            continue;
+        if (has_filter &&
+            !strcasestr(data->fds[i].path, ctx->filter_text) &&
+            !strcasestr(data->fds[i].desc, ctx->filter_text))
+            continue;
+        ctx->snap_fds[ctx->snap_fd_count++] = data->fds[i];
+    }
 
     /* refresh detail panel if a path is still selected */
     if (ctx->selected_path[0])
@@ -420,12 +463,7 @@ static void fd_update(void *opaque, const evemon_proc_data_t *data)
 static void fd_clear(void *opaque)
 {
     fd_ctx_t *ctx = opaque;
-    gtk_list_store_clear(ctx->store);
-    gtk_list_store_clear(ctx->detail_store);
-    ctx->selected_path[0] = '\0';
-    g_free(ctx->snap_fds);
-    ctx->snap_fds = NULL;
-    ctx->snap_fd_count = 0;
+    fd_release_data(ctx);
     ctx->last_pid = 0;
 }
 
@@ -434,6 +472,15 @@ static void fd_destroy(void *opaque)
     fd_ctx_t *ctx = opaque;
     g_free(ctx->snap_fds);
     free(ctx);
+}
+
+static int fd_wants_update(void *opaque)
+{
+    fd_ctx_t *ctx = opaque;
+    return ctx->vbox &&
+           GTK_IS_WIDGET(ctx->vbox) &&
+           gtk_widget_get_mapped(ctx->vbox) &&
+           gtk_widget_get_child_visible(ctx->vbox);
 }
 
 /* ── plugin descriptor ───────────────────────────────────────── */
@@ -462,6 +509,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = fd_update,
         .clear         = fd_clear,
         .destroy       = fd_destroy,
+        .wants_update  = fd_wants_update,
         .role          = EVEMON_ROLE_SYSTEM,
         .dependencies  = NULL,
     };

@@ -226,6 +226,15 @@ static void cgroup_clear(void *opaque)
 
 static void cgroup_destroy(void *opaque) { free(opaque); }
 
+static int cgroup_wants_update(void *opaque)
+{
+    cgroup_ctx_t *ctx = opaque;
+    return ctx->box &&
+           GTK_IS_WIDGET(ctx->box) &&
+           gtk_widget_get_mapped(ctx->box) &&
+           gtk_widget_get_child_visible(ctx->box);
+}
+
 /* ── descriptor ──────────────────────────────────────────────── */
 
 __attribute__((visibility("default")))
@@ -248,6 +257,7 @@ evemon_plugin_t *evemon_plugin_init(void)
         .update        = cgroup_update,
         .clear         = cgroup_clear,
         .destroy       = cgroup_destroy,
+        .wants_update  = cgroup_wants_update,
         .role          = EVEMON_ROLE_PROCESS,
         .dependencies  = NULL,
     };
