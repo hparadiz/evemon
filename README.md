@@ -10,7 +10,7 @@ A graphical Linux process monitor focused on deep per-process introspection — 
 
 > *"What is this process doing and why?"*
 
-evemon drills into individual processes: their file descriptors, network sockets, environment, memory maps, shared libraries, cgroup limits, container context, Steam/Proton metadata, and even live PipeWire audio streams — all in one place.
+evemon drills into individual processes: their file descriptors, network sockets, environment, memory maps, shared libraries, cgroup limits, container context, software/package metadata, Steam/Proton metadata, and even live PipeWire audio streams — all in one place.
 
 ![evemon demo](docs/assets/videos/evemon-viz.gif)
 
@@ -59,6 +59,7 @@ Built-in process plugins:
 | **cgroup Limits** | `memory.max`, `memory.current`, `memory.high`, `swap.max`, `cpu.max`, `pids.max`, `io.max`, etc. with percentage bars. Hidden when no explicit limits are set. |
 | **PipeWire Audio** | Audio graph connections for the selected process with real-time L/R peak meters and an interactive FFT spectrogram. |
 | **MilkDrop** | GPU-accelerated MilkDrop visualiser driven by the selected process's audio output via PipeWire. Renders in a dockable GTK surface using OpenGL (via libepoxy/GtkGLArea). |
+| **Gentoo / Portage** | On Gentoo systems, resolves the selected process executable back to the owning Portage package and shows atom, repository, SLOT, EAPI, license, homepage, KEYWORDS, installed size, build time, USE flags, and runtime dependencies. Lookups run on a serialized worker and are coalesced across rapid selection changes. |
 
 Built-in headless service plugins:
 
@@ -66,15 +67,16 @@ Built-in headless service plugins:
 |--------|------|
 | **Audio Service** | Headless MPRIS2 + album-art provider. Resolves D-Bus media player metadata (track, artist, album, art URL, playback state) and publishes `EVEMON_EVENT_ALBUM_ART_UPDATED` events on the bus for UI plugins to consume. |
 | **Write Monitor (service)** | Headless backend that subscribes to `EVEMON_EVENT_PROCESS_SELECTED` and registers `(pid, fd 1/2)` pairs in the eBPF `monitored_pids` map. Write events are published as `EVEMON_EVENT_FD_WRITE` for the UI half of the plugin. |
+| **Process Metadata** | Headless software-directory lookup service. Resolves selected process names against the bundled SQLite metadata database and publishes `EVEMON_EVENT_PROC_META` for the sidebar Software section. |
 
 Built-in system panel plugins (always-active, process-independent):
 
 | Plugin | What it shows |
 |--------|---------------|
-| **Files** (`system_fd`) | File descriptors of PID 1 (init/systemd) and its entire descendant tree — same fd categories as the per-process plugin. |
-| **Libraries** (`system_libs`) | All shared libraries loaded across PID 1 and its descendants in a flat two-column list; selecting a row shows every process that has the library mapped. |
+| **Files** (`system_fd`) | Real filesystem paths and device fds from PID 1 (init/systemd) and its descendant tree. Sockets, pipes, eventfds, anon inodes, and other synthetic fd targets are filtered out so the system panel stays focused on files. |
+| **System Libraries** (`system_libs`) | All shared libraries loaded across PID 1 and its descendants in a flat two-column list; selecting a row shows every process that has the library mapped. The system-panel tab is labeled **Library**. |
 
-Plugins can be pinned to a specific PID, docked to any edge of the main tree, or floated as independent windows. Third-party plugins compile against a single public header ([`evemon_plugin.h`](src/evemon_plugin.h)). Plugins embed a flat ELF manifest (`.evemon_manifest` section) so the host can read name, version, role, and dependencies without executing any plugin code.
+Plugins can be pinned to a specific PID, docked to any edge of the main tree, or floated as independent windows. Third-party plugins compile against a single public header ([`evemon_plugin.h`](src/evemon_plugin.h)). Plugins embed a flat ELF manifest (`.evemon_manifest` section) so the host can read name, version, role, and dependencies without executing any plugin code. Hidden plugins can opt out via `wants_update()`, allowing the broker to stop gathering unused `/proc` data; hiding the system panel also clears system-plugin state and trims releasable allocator memory.
 
 Plugin roles:
 - **`EVEMON_ROLE_PROCESS`** — per-process tab in the sidebar.
@@ -116,6 +118,7 @@ Plugin roles:
 | libelf | `libelf-dev` | `libelf` | eBPF ELF loading |
 | zlib | `zlib1g-dev` | `zlib` | eBPF compression |
 | jansson | `libjansson-dev` | `jansson` | JSON settings file |
+| SQLite 3 | `libsqlite3-dev` | `sqlite` | Bundled software metadata database |
 | clang | `clang` | `clang` | BPF kernel program compilation |
 | glib-compile-resources | `libglib2.0-dev-bin` | `glib2` | Embedded resources (icon, font) |
 | libepoxy | `libepoxy-dev` | `libepoxy` | OpenGL (MilkDrop plugin) |
@@ -154,6 +157,15 @@ build/evemon                  # main binary
 build/fdmon_ebpf_kern.o       # eBPF kernel program (loaded at runtime)
 build/plugins/evemon_*.so     # sidebar plugins
 ```
+
+Installed data files:
+
+```
+$(PREFIX)/share/evemon/software-directory.sqlite
+$(PREFIX)/share/evemon/milkdrop/presets/*.milk
+```
+
+The `.deb` and `.rpm` package targets include those data files. The package builds also declare the runtime SQLite dependency required by the process metadata service.
 
 ### Run
 
