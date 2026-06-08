@@ -32,6 +32,9 @@
 #include "../steam.h"
 #include "../fdmon.h"
 #include <time.h>
+#include <dirent.h>
+#include <pwd.h>
+#include <sys/stat.h>
 
 extern struct timespec evemon_start_time;
 
@@ -61,6 +64,168 @@ static void on_detail_icon_resolved(const char *key, GdkPixbuf *pb,
             gtk_widget_queue_draw(ctx->detail_icon_da);
     }
     g_free(d);
+}
+
+static void request_detail_icon(ui_ctx_t *ctx, const char *name,
+                                const steam_info_t *steam, guint generation)
+{
+    if (!ctx || !ctx->icon_ctx_large || !name) return;
+
+    detail_icon_cb_t *ic = g_new(detail_icon_cb_t, 1);
+    ic->ctx        = ctx;
+    ic->generation = generation;
+    proc_icon_lookup_async(ctx->icon_ctx_large, name, steam,
+                           on_detail_icon_resolved, ic);
+}
+
+static GdkPixbuf *load_existing_pixbuf(const char *path)
+{
+    if (!path || !g_file_test(path, G_FILE_TEST_EXISTS))
+        return NULL;
+
+    GError *err = NULL;
+    GdkPixbuf *pb = gdk_pixbuf_new_from_file(path, &err);
+    if (err) {
+        evemon_log(LOG_DEBUG, "[DBG] Steam detail art load failed: %s: %s",
+                   path, err->message);
+        g_error_free(err);
+        return NULL;
+    }
+    return pb;
+}
+
+static GdkPixbuf *load_steam_art_from_home(const char *home, const char *app_id)
+{
+    if (!home || !home[0] || !app_id || !app_id[0])
+        return NULL;
+
+    const char *steam_roots[] = {
+        ".local/share/Steam",
+        ".steam/steam",
+        ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+        NULL
+    };
+
+    for (int ri = 0; steam_roots[ri]; ri++) {
+        char *cache_dir = g_build_filename(home, steam_roots[ri],
+                                           "appcache", "librarycache", NULL);
+        char *path = g_build_filename(cache_dir, app_id, NULL);
+
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            const char *named[] = {
+                "logo.png",
+                "header.jpg",
+                "library_header.jpg",
+                "library_capsule.jpg",
+                "library_hero.jpg",
+                NULL
+            };
+            for (int ni = 0; named[ni]; ni++) {
+                char *candidate = g_build_filename(path, named[ni], NULL);
+                GdkPixbuf *pb = load_existing_pixbuf(candidate);
+                g_free(candidate);
+                if (pb) {
+                    g_free(path);
+                    g_free(cache_dir);
+                    return pb;
+                }
+            }
+
+            DIR *d = opendir(path);
+            if (d) {
+                struct dirent *de;
+                while ((de = readdir(d)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+
+                    char *child = g_build_filename(path, de->d_name, NULL);
+
+                    struct stat child_st;
+                    if (stat(child, &child_st) != 0) {
+                        g_free(child);
+                        continue;
+                    }
+
+                    if (S_ISREG(child_st.st_mode)) {
+                        size_t len = strlen(de->d_name);
+                        if (len > 4 && strcmp(de->d_name + len - 4, ".jpg") == 0) {
+                            GdkPixbuf *pb = load_existing_pixbuf(child);
+                            if (pb) {
+                                g_free(child);
+                                closedir(d);
+                                g_free(path);
+                                g_free(cache_dir);
+                                return pb;
+                            }
+                        }
+                    } else if (S_ISDIR(child_st.st_mode)) {
+                        for (int ni = 2; named[ni]; ni++) {
+                            char *candidate = g_build_filename(child, named[ni], NULL);
+                            GdkPixbuf *pb = load_existing_pixbuf(candidate);
+                            g_free(candidate);
+                            if (pb) {
+                                g_free(child);
+                                closedir(d);
+                                g_free(path);
+                                g_free(cache_dir);
+                                return pb;
+                            }
+                        }
+                    }
+                    g_free(child);
+                }
+                closedir(d);
+            }
+        }
+
+        const char *legacy[] = {
+            "_icon.jpg",
+            "_header.jpg",
+            "_library_600x900.jpg",
+            NULL
+        };
+        for (int li = 0; legacy[li]; li++) {
+            char *filename = g_strconcat(app_id, legacy[li], NULL);
+            char *legacy_path = g_build_filename(cache_dir, filename, NULL);
+            GdkPixbuf *pb = load_existing_pixbuf(legacy_path);
+            g_free(legacy_path);
+            g_free(filename);
+            if (pb) {
+                g_free(path);
+                g_free(cache_dir);
+                return pb;
+            }
+        }
+
+        g_free(path);
+        g_free(cache_dir);
+    }
+
+    return NULL;
+}
+
+static GdkPixbuf *load_steam_detail_art(const char *app_id)
+{
+    const char *home = g_get_home_dir();
+    GdkPixbuf *pb = load_steam_art_from_home(home, app_id);
+    if (pb) return pb;
+
+    struct passwd *pw;
+    setpwent();
+    while ((pw = getpwent()) != NULL) {
+        if (!pw->pw_dir || !pw->pw_dir[0]) continue;
+        if (pw->pw_uid < 1000) continue;
+        if (home && strcmp(pw->pw_dir, home) == 0) continue;
+
+        pb = load_steam_art_from_home(pw->pw_dir, app_id);
+        if (pb) {
+            endpwent();
+            return pb;
+        }
+    }
+    endpwent();
+
+    return NULL;
 }
 
 /* ── deferred Steam/cgroup update context ─────────────────────── */
@@ -176,29 +341,14 @@ static gboolean detail_deferred_cb(gpointer data)
             gtk_widget_set_tooltip_text(GTK_WIDGET(ctx->sb_steam_compat),
                                         si->compat_data[0] ? si->compat_data : NULL);
 
-            /* Load the Steam game logo for the icon watermark overlay.
-             * Prefer logo.png (transparent), fall back to header.jpg. */
-            if (si->app_id[0]) {
-                const char *home = g_get_home_dir();
-                char icon_path[2048];
-                GdkPixbuf *steam_pb = NULL;
+            if (si->app_id[0])
+                request_detail_icon(ctx, d->name, si, d->generation);
 
-                /* Try standard install location first, then Flatpak */
-                const char *steam_roots[] = {
-                    ".local/share/Steam",
-                    ".var/app/com.valvesoftware.Steam/.local/share/Steam",
-                    NULL
-                };
-                for (int ri = 0; !steam_pb && steam_roots[ri]; ri++) {
-                    const char *candidates[] = { "logo.png", "header.jpg", NULL };
-                    for (int ci = 0; !steam_pb && candidates[ci]; ci++) {
-                        snprintf(icon_path, sizeof(icon_path),
-                                 "%s/%s/appcache/librarycache/%s/%s",
-                                 home, steam_roots[ri], si->app_id, candidates[ci]);
-                        if (g_file_test(icon_path, G_FILE_TEST_EXISTS))
-                            steam_pb = gdk_pixbuf_new_from_file(icon_path, NULL);
-                    }
-                }
+            /* Load the Steam game logo for the icon watermark overlay.
+             * Prefer logo.png (transparent), fall back to newer and legacy
+             * Steam librarycache art layouts. */
+            if (si->app_id[0]) {
+                GdkPixbuf *steam_pb = load_steam_detail_art(si->app_id);
 
                 if (steam_pb) {
                     if (ctx->detail_steam_icon_pb)
@@ -482,12 +632,9 @@ void proc_detail_update(ui_ctx_t *ctx)
             if (ctx->detail_icon_da)
                 gtk_widget_queue_draw(ctx->detail_icon_da);
         } else {
-            /* Async path: will redraw when icon resolves */
-            detail_icon_cb_t *ic = g_new(detail_icon_cb_t, 1);
-            ic->ctx        = ctx;
-            ic->generation = detail_gen;
-            proc_icon_lookup_async(ctx->icon_ctx_large, name, NULL,
-                                   on_detail_icon_resolved, ic);
+            /* Async path: will redraw when icon resolves.  Steam-specific
+             * art is requested later, after deferred Steam detection. */
+            request_detail_icon(ctx, name, NULL, detail_gen);
         }
     }
 

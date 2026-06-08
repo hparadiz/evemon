@@ -315,6 +315,9 @@ typedef struct {
     GtkLabel           *sb_meta_funding_url;
     GtkLabel           *sb_meta_license;
     GtkLabel           *sb_meta_summary;
+    GtkWidget          *sb_meta_homepage_button;
+    GtkWidget          *sb_meta_source_url_button;
+    GtkWidget          *sb_meta_funding_url_button;
     GtkWidget          *sb_meta_frame;       /* container to show/hide */
     GCancellable       *cgroup_cancel;
 

@@ -27,6 +27,9 @@ struct timespec evemon_start_time;
 /* Set by --safe-mode: blocks plugin loading on startup. */
 int evemon_safe_mode = 0;
 
+/* Preserved before getopt/gtk_init mutate argc/argv; used by File -> Restart. */
+char **evemon_restart_argv = NULL;
+
 /* Global so the signal handler can reach it. */
 static monitor_state_t g_state;
 
@@ -67,6 +70,10 @@ static gboolean check_shutdown(gpointer data)
 int main(int argc, char *argv[])
 {
     clock_gettime(CLOCK_MONOTONIC, &evemon_start_time);
+
+    evemon_restart_argv = g_new0(char *, (size_t)argc + 1);
+    for (int i = 0; i < argc; i++)
+        evemon_restart_argv[i] = g_strdup(argv[i]);
 
     /* ── CLI argument parsing ──────────────────────────────────── */
     static const struct option long_opts[] = {

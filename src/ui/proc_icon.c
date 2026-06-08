@@ -224,19 +224,29 @@ static void pixbuf_pool_put(proc_icon_ctx_t *ctx,
  * Try to load an icon by name from the default GTK icon theme.
  * Returns a new GdkPixbuf scaled to `size` (caller owns), or NULL.
  * Does NOT consult or update the intern pool — use theme_load_interned.
+ *
+ * Avoid GTK_ICON_LOOKUP_GENERIC_FALLBACK here.  On some GTK/theme/loader
+ * combinations a missing icon falls through to image-missing.svg; if that
+ * fallback SVG loader fails, GTK can abort internally before our GError is
+ * returned.  A process icon miss is non-fatal, so cache it as a miss.
  */
 static GdkPixbuf *theme_load(const char *icon_name, int size)
 {
     if (!icon_name || !icon_name[0]) return NULL;
 
     GtkIconTheme *theme = gtk_icon_theme_get_default();
+    if (!gtk_icon_theme_has_icon(theme, icon_name))
+        return NULL;
+
     GError *err = NULL;
     GdkPixbuf *pb = gtk_icon_theme_load_icon(
         theme, icon_name, size,
-        GTK_ICON_LOOKUP_USE_BUILTIN | GTK_ICON_LOOKUP_FORCE_SIZE |
-        GTK_ICON_LOOKUP_GENERIC_FALLBACK,
+        GTK_ICON_LOOKUP_USE_BUILTIN | GTK_ICON_LOOKUP_FORCE_SIZE,
         &err);
     if (err) {
+        if (evemon_debug)
+            fprintf(stderr, "[PROC_ICON] failed to load icon '%s': %s\n",
+                    icon_name, err->message);
         g_error_free(err);
         return NULL;
     }

@@ -148,11 +148,13 @@ static gboolean on_main_client_button_press(GtkWidget *widget,
                                             GdkEventButton *event,
                                             gpointer data)
 {
-    GtkWidget *window = data;
+    ui_ctx_t *ctx = data;
+    GtkWidget *window = gtk_widget_get_toplevel(widget);
 
-    (void)widget;
+    if (metadata_link_from_main_click(ctx, event))
+        return TRUE;
 
-    if (event->type == GDK_BUTTON_PRESS)
+    if (event->type == GDK_BUTTON_PRESS && GTK_IS_WIDGET(window))
         close_open_about_dialog(window);
 
     return FALSE;
