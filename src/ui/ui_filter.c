@@ -1,9 +1,10 @@
 /*
- * ui_filter.c – Name-filter and audio-only filter shadow stores.
+ * ui_filter.c – Process-list filter shadow stores.
  *
  * The filter is implemented as a shadow GtkTreeStore that mirrors
  * the subset of rows from the real store that match the current
- * filter text (or audio-PID set).  The real store is never modified;
+ * filter text, audio-PID set, or CPU-intensive group tree.  The real
+ * store is never modified;
  * switching between real and filtered view is a matter of swapping
  * the sort model.
  *
@@ -13,10 +14,19 @@
  *   switch_to_real_store()
  *   rebuild_audio_filter_store()
  *   sync_audio_filter_store()
+ *   rebuild_cpu_intensive_filter_store()
+ *   sync_cpu_intensive_filter_store()
  *   copy_subtree()
  */
 
 #include "ui_internal.h"
+
+#include <unistd.h>
+
+/* Half of one logical CPU is considered sustained, CPU-intensive work.
+ * COL_CPU/COL_GROUP_CPU are percentages of the whole machine × 10000. */
+#define CPU_INTENSIVE_CORE_FRACTION_NUM  1
+#define CPU_INTENSIVE_CORE_FRACTION_DEN  2
 
 /* ── row predicate ────────────────────────────────────────────── */
 
@@ -24,11 +34,9 @@
 typedef gboolean (*row_matches_fn)(GtkTreeModel *model, GtkTreeIter *iter,
                                    void *userdata);
 
-/*
- * Deep-copy a subtree from `src` into `dst` under `dst_parent`.
- */
-void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
-                  GtkTreeModel *src, GtkTreeIter *src_iter)
+/* Copy one row and return its newly appended destination iterator. */
+static GtkTreeIter copy_row(GtkTreeStore *dst, GtkTreeIter *dst_parent,
+                            GtkTreeModel *src, GtkTreeIter *src_iter)
 {
     GtkTreeIter dst_iter;
     gtk_tree_store_append(dst, &dst_iter, dst_parent);
@@ -88,6 +96,15 @@ void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
     g_free(spark_data);
 
+    return dst_iter;
+}
+
+/* Deep-copy a subtree from `src` into `dst` under `dst_parent`. */
+void copy_subtree(GtkTreeStore *dst, GtkTreeIter *dst_parent,
+                  GtkTreeModel *src, GtkTreeIter *src_iter)
+{
+    GtkTreeIter dst_iter = copy_row(dst, dst_parent, src, src_iter);
+
     GtkTreeIter child;
     gboolean valid = gtk_tree_model_iter_children(src, &child, src_iter);
     while (valid) {
@@ -120,6 +137,67 @@ static gboolean match_audio(GtkTreeModel *model, GtkTreeIter *iter,
     gtk_tree_model_get(model, iter, COL_PID, &pid, COL_PINNED_ROOT, &pr, -1);
     if (pr != (gint)PTREE_UNPINNED) return FALSE;
     return audio_pid_is_active(ctx, (pid_t)pid) || pid_is_pinned(ctx, (pid_t)pid);
+}
+
+static gint cpu_intensive_threshold(void)
+{
+    long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpu_count < 1)
+        cpu_count = 1;
+
+    return (gint)((100LL * 10000LL * CPU_INTENSIVE_CORE_FRACTION_NUM) /
+                  (cpu_count * CPU_INTENSIVE_CORE_FRACTION_DEN));
+}
+
+/* A row represents both a process and its descendant group.  Filtering on
+ * COL_GROUP_CPU keeps the ancestor chain leading to each busy subprocess. */
+static gboolean match_cpu_intensive_group(GtkTreeModel *model,
+                                           GtkTreeIter *iter,
+                                           gint threshold)
+{
+    gint group_cpu = 0;
+    gint pinned_root = 0;
+    gtk_tree_model_get(model, iter,
+                       COL_GROUP_CPU, &group_cpu,
+                       COL_PINNED_ROOT, &pinned_root,
+                       -1);
+    return pinned_root == (gint)PTREE_UNPINNED && group_cpu >= threshold;
+}
+
+/* Copy only CPU-intensive branches.  Unlike the generic filters, a matching
+ * group does not drag all of its unrelated, idle descendants into the view. */
+static void copy_cpu_intensive_children(GtkTreeStore *dst,
+                                        GtkTreeIter *dst_parent,
+                                        GtkTreeModel *src,
+                                        GtkTreeIter *src_parent,
+                                        gint threshold)
+{
+    GtkTreeIter src_iter;
+    gboolean valid = gtk_tree_model_iter_children(src, &src_iter, src_parent);
+    while (valid) {
+        if (match_cpu_intensive_group(src, &src_iter, threshold)) {
+            GtkTreeIter dst_iter = copy_row(dst, dst_parent, src, &src_iter);
+            copy_cpu_intensive_children(dst, &dst_iter, src, &src_iter,
+                                        threshold);
+        }
+        valid = gtk_tree_model_iter_next(src, &src_iter);
+    }
+}
+
+static int count_cpu_intensive_rows(GtkTreeModel *model, GtkTreeIter *parent,
+                                    gint threshold)
+{
+    int count = 0;
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
+    while (valid) {
+        if (match_cpu_intensive_group(model, &iter, threshold)) {
+            count++;
+            count += count_cpu_intensive_rows(model, &iter, threshold);
+        }
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+    return count;
 }
 
 /* ── generic tree-walking helpers ─────────────────────────────── */
@@ -253,6 +331,83 @@ static int count_store_rows(GtkTreeModel *model, GtkTreeIter *parent)
     return count;
 }
 
+static gboolean find_unpinned_iter_by_pid(GtkTreeModel *model,
+                                           GtkTreeIter *parent,
+                                           pid_t target,
+                                           GtkTreeIter *result)
+{
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
+    while (valid) {
+        gint pid = 0;
+        gint pinned_root = 0;
+        gtk_tree_model_get(model, &iter,
+                           COL_PID, &pid,
+                           COL_PINNED_ROOT, &pinned_root,
+                           -1);
+        if (pinned_root == (gint)PTREE_UNPINNED) {
+            if ((pid_t)pid == target) {
+                *result = iter;
+                return TRUE;
+            }
+            if (find_unpinned_iter_by_pid(model, &iter, target, result))
+                return TRUE;
+        }
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+    return FALSE;
+}
+
+static gboolean cpu_filter_membership_is_current(GtkTreeStore *filter_store,
+                                                  GtkTreeIter *parent,
+                                                  GtkTreeModel *real,
+                                                  gint threshold)
+{
+    GtkTreeModel *filtered = GTK_TREE_MODEL(filter_store);
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(filtered, &iter, parent);
+    while (valid) {
+        gint pid = 0;
+        gtk_tree_model_get(filtered, &iter, COL_PID, &pid, -1);
+
+        GtkTreeIter real_iter;
+        if (!find_unpinned_iter_by_pid(real, NULL, (pid_t)pid, &real_iter) ||
+            !match_cpu_intensive_group(real, &real_iter, threshold))
+            return FALSE;
+
+        if (!cpu_filter_membership_is_current(filter_store, &iter, real,
+                                              threshold))
+            return FALSE;
+
+        valid = gtk_tree_model_iter_next(filtered, &iter);
+    }
+    return TRUE;
+}
+
+static gboolean sync_cpu_filter_rows(GtkTreeStore *filter_store,
+                                     GtkTreeIter *parent,
+                                     GtkTreeModel *real)
+{
+    GtkTreeModel *filtered = GTK_TREE_MODEL(filter_store);
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(filtered, &iter, parent);
+    while (valid) {
+        gint pid = 0;
+        gtk_tree_model_get(filtered, &iter, COL_PID, &pid, -1);
+
+        GtkTreeIter real_iter;
+        if (!find_unpinned_iter_by_pid(real, NULL, (pid_t)pid, &real_iter))
+            return FALSE;
+
+        sync_row_from_real(filter_store, &iter, real, &real_iter);
+        if (!sync_cpu_filter_rows(filter_store, &iter, real))
+            return FALSE;
+
+        valid = gtk_tree_model_iter_next(filtered, &iter);
+    }
+    return TRUE;
+}
+
 /* Helper: allocate a fresh store matching the main store column layout */
 static GtkTreeStore *alloc_filter_store(void)
 {
@@ -326,16 +481,11 @@ static pid_t save_selected_pid(ui_ctx_t *ctx)
  * selected PID is not in the new store and `fallback_first` is TRUE,
  * selects the first row instead.
  */
-static void install_filter_store(ui_ctx_t *ctx,
-                                  row_matches_fn matches, void *userdata,
-                                  void (*expand_fn)(ui_ctx_t *),
-                                  gboolean fallback_first)
+static void install_populated_filter_store(ui_ctx_t *ctx, GtkTreeStore *fs,
+                                            void (*expand_fn)(ui_ctx_t *),
+                                            gboolean fallback_first)
 {
     pid_t sel_pid = save_selected_pid(ctx);
-
-    GtkTreeStore *fs = alloc_filter_store();
-    find_and_copy_matches(fs, GTK_TREE_MODEL(ctx->store), NULL,
-                          matches, userdata, FALSE);
 
     if (ctx->filter_store)
         g_object_unref(ctx->filter_store);
@@ -400,6 +550,17 @@ static void install_filter_store(ui_ctx_t *ctx,
             }
         }
     }
+}
+
+static void install_filter_store(ui_ctx_t *ctx,
+                                 row_matches_fn matches, void *userdata,
+                                 void (*expand_fn)(ui_ctx_t *),
+                                 gboolean fallback_first)
+{
+    GtkTreeStore *fs = alloc_filter_store();
+    find_and_copy_matches(fs, GTK_TREE_MODEL(ctx->store), NULL,
+                          matches, userdata, FALSE);
+    install_populated_filter_store(ctx, fs, expand_fn, fallback_first);
 }
 
 /*
@@ -476,6 +637,56 @@ void sync_audio_filter_store(ui_ctx_t *ctx)
 
     if (expected != current || !sync_filter_rows(ctx->filter_store, NULL, real))
         rebuild_audio_filter_store(ctx);
+}
+
+static void expand_all_filtered_rows(ui_ctx_t *ctx)
+{
+    gtk_tree_view_expand_all(ctx->view);
+}
+
+/* Rebuild the CPU-intensive tree.  Every retained row has a group total of
+ * at least half a logical CPU, so the tree contains the busy subprocess and
+ * the ancestor groups that account for its load, without idle siblings. */
+void rebuild_cpu_intensive_filter_store(ui_ctx_t *ctx)
+{
+    if (ctx->filter_text[0] != '\0') {
+        rebuild_filter_store(ctx);
+        return;
+    }
+
+    gint threshold = cpu_intensive_threshold();
+    GtkTreeStore *fs = alloc_filter_store();
+    copy_cpu_intensive_children(fs, NULL, GTK_TREE_MODEL(ctx->store), NULL,
+                                threshold);
+    install_populated_filter_store(ctx, fs, expand_all_filtered_rows, TRUE);
+}
+
+/* CPU membership is dynamic, so validate both the row count and each PID.
+ * A same-sized swap (one Firefox child cools while another heats up) must
+ * rebuild the hierarchy rather than merely copying new percentages. */
+void sync_cpu_intensive_filter_store(ui_ctx_t *ctx)
+{
+    if (ctx->filter_text[0] != '\0') {
+        sync_filter_store(ctx);
+        return;
+    }
+
+    if (!ctx->filter_store) {
+        rebuild_cpu_intensive_filter_store(ctx);
+        return;
+    }
+
+    GtkTreeModel *real = GTK_TREE_MODEL(ctx->store);
+    gint threshold = cpu_intensive_threshold();
+    int expected = count_cpu_intensive_rows(real, NULL, threshold);
+    int current = count_store_rows(GTK_TREE_MODEL(ctx->filter_store), NULL);
+
+    if (expected != current ||
+        !cpu_filter_membership_is_current(ctx->filter_store, NULL, real,
+                                          threshold) ||
+        !sync_cpu_filter_rows(ctx->filter_store, NULL, real)) {
+        rebuild_cpu_intensive_filter_store(ctx);
+    }
 }
 
 /*

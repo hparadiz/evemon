@@ -149,7 +149,12 @@ static void on_open_plugin_window(GtkMenuItem *item, gpointer data)
     (void)item;
     open_plugin_window_data_t *d = data;
     open_plugin_window(d->ctx, d->pid, d->proc_name, d->plugin_id);
-    free(d);
+}
+
+static void open_plugin_window_data_free(gpointer data, GClosure *closure)
+{
+    (void)closure;
+    free(data);
 }
 
 /* ── Plugins menu helpers ──────────────────────────────────────── */
@@ -438,10 +443,10 @@ int inst_is_last_order(const evemon_plugin_t *p, const char *list[])
 
 /* ── show-process context menu: Open Plugin as Window entry ─── */
 
-void show_open_plugin_as_window_menu(ui_ctx_t *ctx, GtkWidget *menu,
-                                     pid_t pid, const char *name)
+GtkWidget *show_open_plugin_as_window_menu(ui_ctx_t *ctx, GtkWidget *menu,
+                                           pid_t pid, const char *name)
 {
-    if (!ctx->plugin_registry) return;
+    if (!ctx->plugin_registry) return NULL;
 
     plugin_registry_t *preg = ctx->plugin_registry;
     GtkWidget *pw_menu = gtk_menu_new();
@@ -468,7 +473,7 @@ void show_open_plugin_as_window_menu(ui_ctx_t *ctx, GtkWidget *menu,
                      "%s", inst->plugin->id);
             g_signal_connect_data(mi_pw, "activate",
                 G_CALLBACK(on_open_plugin_window), wd,
-                (GClosureNotify)(void(*)(void))free, 0);
+                open_plugin_window_data_free, 0);
         }
         gtk_menu_shell_append(GTK_MENU_SHELL(pw_menu), mi_pw);
         any = TRUE;
@@ -479,7 +484,9 @@ void show_open_plugin_as_window_menu(ui_ctx_t *ctx, GtkWidget *menu,
             gtk_menu_item_new_with_label("Open Plugin as Window");
         gtk_menu_item_set_submenu(GTK_MENU_ITEM(pw_item), pw_menu);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), pw_item);
+        return pw_item;
     } else {
         gtk_widget_destroy(pw_menu);
     }
+    return NULL;
 }

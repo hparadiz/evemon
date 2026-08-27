@@ -23,6 +23,7 @@
 extern void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
                                       pid_t pid, const char *name,
                                       const char *cmdline);
+extern void show_status_context_menu(ui_ctx_t *ctx, GdkEventButton *ev);
 extern void stop_autoscroll(ui_ctx_t *ctx);
 extern gboolean autoscroll_tick(gpointer data);
 extern void reload_font_css(ui_ctx_t *ctx);
@@ -32,6 +33,7 @@ extern void register_sort_funcs(GtkTreeModelSort *sm);
 extern void rebuild_filter_store(ui_ctx_t *ctx);
 extern void switch_to_real_store(ui_ctx_t *ctx);
 extern void rebuild_audio_filter_store(ui_ctx_t *ctx);
+extern void rebuild_cpu_intensive_filter_store(ui_ctx_t *ctx);
 
 /* ── overlay positioning ─────────────────────────────────────── */
 
@@ -136,7 +138,9 @@ gboolean on_filter_entry_key_release(GtkWidget *widget, GdkEventKey *ev,
         filter_cancel_hide_timer(ctx);
         gtk_entry_set_text(GTK_ENTRY(ctx->filter_entry), "");
         ctx->filter_text[0] = '\0';
-        if (ctx->show_audio_only)
+        if (ctx->show_cpu_intensive)
+            rebuild_cpu_intensive_filter_store(ctx);
+        else if (ctx->show_audio_only)
             rebuild_audio_filter_store(ctx);
         else
             switch_to_real_store(ctx);
@@ -160,7 +164,9 @@ gboolean on_filter_entry_key_release(GtkWidget *widget, GdkEventKey *ev,
         filter_cancel_hide_timer(ctx);
         rebuild_filter_store(ctx);
     } else {
-        if (ctx->show_audio_only)
+        if (ctx->show_cpu_intensive)
+            rebuild_cpu_intensive_filter_store(ctx);
+        else if (ctx->show_audio_only)
             rebuild_audio_filter_store(ctx);
         else
             switch_to_real_store(ctx);
@@ -293,6 +299,8 @@ gboolean on_button_press(GtkWidget *widget, GdkEventButton *ev, gpointer data)
                 g_free(cmdline);
             }
             gtk_tree_path_free(path);
+        } else {
+            show_status_context_menu(ctx, ev);
         }
         return TRUE;
     }
@@ -607,7 +615,9 @@ gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data)
                 filter_cancel_hide_timer(ctx);
                 gtk_entry_set_text(GTK_ENTRY(ctx->filter_entry), "");
                 ctx->filter_text[0] = '\0';
-                if (ctx->show_audio_only)
+                if (ctx->show_cpu_intensive)
+                    rebuild_cpu_intensive_filter_store(ctx);
+                else if (ctx->show_audio_only)
                     rebuild_audio_filter_store(ctx);
                 else
                     switch_to_real_store(ctx);

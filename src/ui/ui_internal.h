@@ -391,6 +391,7 @@ typedef struct {
     char                filter_text[256];
     guint               filter_hide_timer; /* auto-hide after idle (0=none) */
     gboolean            show_audio_only;  /* TRUE = show only audio processes */
+    gboolean            show_cpu_intensive; /* TRUE = show CPU-intensive groups */
 
     /* Go-to-PID (Ctrl+G) */
     GtkWidget          *pid_entry;
@@ -432,6 +433,7 @@ typedef struct {
     panel_position_t    detail_panel_pos;      /* current dock position            */
     GtkCheckMenuItem   *detail_panel_menu_item;/* View → Detail Panel toggle       */
     GtkCheckMenuItem   *audio_only_menu_item;  /* View → Show Audio Processes Only  */
+    GtkCheckMenuItem   *cpu_intensive_menu_item; /* View → CPU-intensive only       */
     GtkWidget          *detail_paned;          /* current GtkPaned holding panel   */
     GtkWidget          *main_content;          /* tree_overlay (stable reference)  */
     GtkWidget          *content_box;           /* vbox holding menubar+content+status */
@@ -661,8 +663,8 @@ gboolean on_plugin_window_delete(GtkWidget *window, GdkEvent *ev,
 void     on_plugin_toggled(GtkCheckMenuItem *item, gpointer data);
 void     on_plugins_menu_map(GtkWidget *menu, gpointer data);
 int      inst_is_last_order(const evemon_plugin_t *p, const char *list[]);
-void     show_open_plugin_as_window_menu(ui_ctx_t *ctx, GtkWidget *menu,
-                                         pid_t pid, const char *name);
+GtkWidget *show_open_plugin_as_window_menu(ui_ctx_t *ctx, GtkWidget *menu,
+                                            pid_t pid, const char *name);
 
 /* ── filter store (ui_filter.c) ──────────────────────────────── */
 
@@ -673,6 +675,8 @@ void     sync_filter_store(ui_ctx_t *ctx);
 void     switch_to_real_store(ui_ctx_t *ctx);
 void     rebuild_audio_filter_store(ui_ctx_t *ctx);
 void     sync_audio_filter_store(ui_ctx_t *ctx);
+void     rebuild_cpu_intensive_filter_store(ui_ctx_t *ctx);
+void     sync_cpu_intensive_filter_store(ui_ctx_t *ctx);
 void     expand_respecting_collapsed(ui_ctx_t *ctx);
 void     expand_respecting_collapsed_recurse(ui_ctx_t *ctx,
                                              GtkTreeModel *model,
@@ -682,6 +686,7 @@ void     on_sort_column_changed(GtkTreeSortable *sortable, gpointer data);
 void     show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
                                    pid_t pid, const char *name,
                                    const char *cmdline);
+void     show_status_context_menu(ui_ctx_t *ctx, GdkEventButton *ev);
 void     reload_font_css(ui_ctx_t *ctx);
 
 /* ── input handlers (ui_input.c) ─────────────────────────────── */

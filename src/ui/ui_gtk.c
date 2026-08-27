@@ -590,13 +590,41 @@ static void on_copy_command(GtkMenuItem *item, gpointer data)
 
 /* pin/unpin helpers and pinned_panel_create/destroy → see ui_pinned.c */
 
-/* ── Show Audio Processes Only toggle ──────────────────────────── */
+/* ── Alternate process-list filters ────────────────────────────── */
+
+static void on_toggle_cpu_intensive(GtkCheckMenuItem *item, gpointer data);
 
 static void on_toggle_audio_only(GtkCheckMenuItem *item, gpointer data)
 {
     ui_ctx_t *ctx = data;
     ctx->show_audio_only = gtk_check_menu_item_get_active(item);
     settings_get()->show_audio_only = ctx->show_audio_only;
+
+    if (ctx->show_audio_only && ctx->show_cpu_intensive) {
+        ctx->show_cpu_intensive = FALSE;
+        settings_get()->show_cpu_intensive = false;
+        if (ctx->cpu_intensive_menu_item) {
+            g_signal_handlers_block_by_func(ctx->cpu_intensive_menu_item,
+                                            on_toggle_cpu_intensive, ctx);
+            gtk_check_menu_item_set_active(ctx->cpu_intensive_menu_item,
+                                           FALSE);
+            g_signal_handlers_unblock_by_func(ctx->cpu_intensive_menu_item,
+                                              on_toggle_cpu_intensive, ctx);
+        }
+    }
+
+    if (ctx->audio_only_menu_item &&
+        item != ctx->audio_only_menu_item &&
+        gtk_check_menu_item_get_active(ctx->audio_only_menu_item) !=
+            ctx->show_audio_only) {
+        g_signal_handlers_block_by_func(ctx->audio_only_menu_item,
+                                        on_toggle_audio_only, ctx);
+        gtk_check_menu_item_set_active(ctx->audio_only_menu_item,
+                                       ctx->show_audio_only);
+        g_signal_handlers_unblock_by_func(ctx->audio_only_menu_item,
+                                          on_toggle_audio_only, ctx);
+    }
+
     settings_save();
 
     if (ctx->show_audio_only) {
@@ -607,9 +635,83 @@ static void on_toggle_audio_only(GtkCheckMenuItem *item, gpointer data)
          * back to the unfiltered real store. */
         if (ctx->filter_text[0] != '\0')
             rebuild_filter_store(ctx);
+        else if (ctx->show_cpu_intensive)
+            rebuild_cpu_intensive_filter_store(ctx);
         else
             switch_to_real_store(ctx);
     }
+}
+
+static void on_toggle_cpu_intensive(GtkCheckMenuItem *item, gpointer data)
+{
+    ui_ctx_t *ctx = data;
+    ctx->show_cpu_intensive = gtk_check_menu_item_get_active(item);
+    settings_get()->show_cpu_intensive = ctx->show_cpu_intensive;
+
+    if (ctx->show_cpu_intensive && ctx->show_audio_only) {
+        ctx->show_audio_only = FALSE;
+        settings_get()->show_audio_only = false;
+        if (ctx->audio_only_menu_item) {
+            g_signal_handlers_block_by_func(ctx->audio_only_menu_item,
+                                            on_toggle_audio_only, ctx);
+            gtk_check_menu_item_set_active(ctx->audio_only_menu_item, FALSE);
+            g_signal_handlers_unblock_by_func(ctx->audio_only_menu_item,
+                                              on_toggle_audio_only, ctx);
+        }
+    }
+
+    if (ctx->cpu_intensive_menu_item &&
+        item != ctx->cpu_intensive_menu_item &&
+        gtk_check_menu_item_get_active(ctx->cpu_intensive_menu_item) !=
+            ctx->show_cpu_intensive) {
+        g_signal_handlers_block_by_func(ctx->cpu_intensive_menu_item,
+                                        on_toggle_cpu_intensive, ctx);
+        gtk_check_menu_item_set_active(ctx->cpu_intensive_menu_item,
+                                       ctx->show_cpu_intensive);
+        g_signal_handlers_unblock_by_func(ctx->cpu_intensive_menu_item,
+                                          on_toggle_cpu_intensive, ctx);
+    }
+
+    settings_save();
+
+    if (ctx->show_cpu_intensive) {
+        rebuild_cpu_intensive_filter_store(ctx);
+    } else if (ctx->filter_text[0] != '\0') {
+        rebuild_filter_store(ctx);
+    } else if (ctx->show_audio_only) {
+        rebuild_audio_filter_store(ctx);
+    } else {
+        switch_to_real_store(ctx);
+    }
+}
+
+static GtkWidget *append_audio_only_menu_item(ui_ctx_t *ctx, GtkWidget *menu)
+{
+    if (!ctx->has_audio_plugin)
+        return NULL;
+
+    GtkWidget *item = gtk_check_menu_item_new_with_label(
+        "Show Audio Processes Only");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item),
+                                   ctx->show_audio_only);
+    g_signal_connect(item, "toggled", G_CALLBACK(on_toggle_audio_only), ctx);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    return item;
+}
+
+static GtkWidget *append_cpu_intensive_menu_item(ui_ctx_t *ctx,
+                                                  GtkWidget *menu)
+{
+    GtkWidget *item = gtk_check_menu_item_new_with_label(
+        "Show CPU-Intensive Processes Only");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item),
+                                   ctx->show_cpu_intensive);
+    gtk_widget_set_tooltip_text(
+        item,
+        "Show groups using at least half of one logical CPU and the busy subprocesses within them");
+    g_signal_connect(item, "toggled", G_CALLBACK(on_toggle_cpu_intensive), ctx);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    return item;
 }
 
 
@@ -638,15 +740,10 @@ void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
     }
 
     /* ── Show Audio Processes Only toggle ── */
-    if (ctx->has_audio_plugin) {
-        GtkWidget *mi_audio = gtk_check_menu_item_new_with_label(
-            "Show Audio Processes Only");
-        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(mi_audio),
-                                       ctx->show_audio_only);
-        g_signal_connect(mi_audio, "toggled",
-                         G_CALLBACK(on_toggle_audio_only), ctx);
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_audio);
-    }
+    append_audio_only_menu_item(ctx, menu);
+
+    /* ── Show CPU-Intensive Processes Only toggle ── */
+    append_cpu_intensive_menu_item(ctx, menu);
 
     /* ── Open Plugin as Window submenu ── */
     show_open_plugin_as_window_menu(ctx, menu, pid, name);
@@ -2006,8 +2103,9 @@ static gboolean on_refresh(gpointer data)
                     g_list_free_full(prows, (GDestroyNotify)gtk_tree_path_free);
             }
 
-            /* Honour show_audio_only from settings on first load */
-            if (ctx->show_audio_only)
+            /* Honour the saved alternate view on first load.  The CPU view
+             * is installed below, after group totals have been computed. */
+            if (ctx->show_audio_only && !ctx->show_cpu_intensive)
                 rebuild_audio_filter_store(ctx);
 
             /* Kick the plugin broker immediately on first display so the
@@ -2097,7 +2195,9 @@ static gboolean on_refresh(gpointer data)
      * This updates data in-place, preserving view state (expand,
      * selection, scroll).  A full rebuild only happens if the set
      * of matching processes has structurally changed. */
-    if (ctx->show_audio_only)
+    if (ctx->show_cpu_intensive)
+        sync_cpu_intensive_filter_store(ctx);
+    else if (ctx->show_audio_only)
         sync_audio_filter_store(ctx);
     else if (ctx->filter_text[0] != '\0')
         sync_filter_store(ctx);
@@ -2923,7 +3023,12 @@ static void on_menu_filter(GtkMenuItem *item, gpointer data)
         filter_cancel_hide_timer(ctx);
         gtk_entry_set_text(GTK_ENTRY(ctx->filter_entry), "");
         ctx->filter_text[0] = '\0';
-        switch_to_real_store(ctx);
+        if (ctx->show_cpu_intensive)
+            rebuild_cpu_intensive_filter_store(ctx);
+        else if (ctx->show_audio_only)
+            rebuild_audio_filter_store(ctx);
+        else
+            switch_to_real_store(ctx);
         gtk_widget_hide(ctx->filter_entry);
         gtk_widget_grab_focus(GTK_WIDGET(ctx->view));
     } else {
@@ -3021,6 +3126,66 @@ static void on_toggle_menubar(GtkMenuItem *item, gpointer data)
         gtk_widget_show_all(ctx->menubar);
 }
 
+static gboolean get_selected_process_for_menu(ui_ctx_t *ctx, pid_t *pid,
+                                               gchar **name)
+{
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(ctx->view);
+    GtkTreeModel *model = NULL;
+    GtkTreeIter iter;
+    if (!selection ||
+        !gtk_tree_selection_get_selected(selection, &model, &iter))
+        return FALSE;
+
+    gint value = 0;
+    gtk_tree_model_get(model, &iter,
+                       COL_PID, &value,
+                       COL_NAME, name,
+                       -1);
+    if (value <= 0) {
+        g_clear_pointer(name, g_free);
+        return FALSE;
+    }
+
+    *pid = (pid_t)value;
+    return TRUE;
+}
+
+void show_status_context_menu(ui_ctx_t *ctx, GdkEventButton *ev)
+{
+    GtkWidget *menu = gtk_menu_new();
+    gboolean have_shared_item = FALSE;
+
+    if (append_audio_only_menu_item(ctx, menu))
+        have_shared_item = TRUE;
+    if (append_cpu_intensive_menu_item(ctx, menu))
+        have_shared_item = TRUE;
+
+    pid_t pid = 0;
+    gchar *name = NULL;
+    gboolean have_process = get_selected_process_for_menu(ctx, &pid, &name);
+    GtkWidget *plugin_item = show_open_plugin_as_window_menu(
+        ctx, menu, pid, have_process ? name : "No process selected");
+    if (plugin_item) {
+        gtk_widget_set_sensitive(plugin_item, have_process);
+        have_shared_item = TRUE;
+    }
+    g_free(name);
+
+    if (have_shared_item)
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu),
+                              gtk_separator_menu_item_new());
+
+    gboolean visible = gtk_widget_get_visible(ctx->menubar);
+    const char *label = visible ? "Hide Menubar" : "Show Menubar";
+
+    GtkWidget *mi = gtk_menu_item_new_with_label(label);
+    g_signal_connect(mi, "activate", G_CALLBACK(on_toggle_menubar), ctx);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+}
+
 static gboolean on_status_button_press(GtkWidget *widget, GdkEventButton *ev,
                                        gpointer data)
 {
@@ -3028,17 +3193,7 @@ static gboolean on_status_button_press(GtkWidget *widget, GdkEventButton *ev,
     ui_ctx_t *ctx = data;
 
     if (ev->button == 3) {   /* right-click */
-        GtkWidget *menu = gtk_menu_new();
-
-        gboolean visible = gtk_widget_get_visible(ctx->menubar);
-        const char *label = visible ? "Hide Menubar" : "Show Menubar";
-
-        GtkWidget *mi = gtk_menu_item_new_with_label(label);
-        g_signal_connect(mi, "activate", G_CALLBACK(on_toggle_menubar), ctx);
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
-
-        gtk_widget_show_all(menu);
-        gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+        show_status_context_menu(ctx, ev);
         return TRUE;
     }
     return FALSE;
@@ -3508,6 +3663,9 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
         if (inst->plugin->data_needs & evemon_NEED_PIPEWIRE) {
             if (!ctx->has_audio_plugin) {
                 ctx->has_audio_plugin = TRUE;
+                if (ctx->audio_only_menu_item)
+                    gtk_widget_set_sensitive(
+                        GTK_WIDGET(ctx->audio_only_menu_item), TRUE);
                 broker_set_audio_callback(on_broker_audio_pids, ctx);
                 evemon_log(LOG_INFO, "evemon: audio plugin detected (%s)",
                            inst->plugin->id ? inst->plugin->id : "?");
@@ -4906,7 +5064,17 @@ void *ui_thread(void *arg)
         "Show Audio Processes Only");
     gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(audio_only_item),
                                    settings_get()->show_audio_only);
+    gtk_widget_set_sensitive(audio_only_item, FALSE);
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), audio_only_item);
+
+    GtkWidget *cpu_intensive_item = gtk_check_menu_item_new_with_label(
+        "Show CPU-Intensive Processes Only");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(cpu_intensive_item),
+                                   settings_get()->show_cpu_intensive);
+    gtk_widget_set_tooltip_text(
+        cpu_intensive_item,
+        "Show groups using at least half of one logical CPU and the busy subprocesses within them");
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), cpu_intensive_item);
 
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),
                           gtk_separator_menu_item_new());
@@ -5121,6 +5289,7 @@ void *ui_thread(void *arg)
     ctx.name_col     = name_col;
     ctx.filter_text[0] = '\0';
     ctx.show_audio_only = settings_get()->show_audio_only;
+    ctx.show_cpu_intensive = settings_get()->show_cpu_intensive;
 
     /* Go-to-PID */
     ctx.pid_entry = pid_entry;
@@ -5453,6 +5622,10 @@ void *ui_thread(void *arg)
     ctx.audio_only_menu_item   = GTK_CHECK_MENU_ITEM(audio_only_item);
     g_signal_connect(audio_only_item, "toggled",
                      G_CALLBACK(on_toggle_audio_only), &ctx);
+    gtk_widget_set_sensitive(audio_only_item, ctx.has_audio_plugin);
+    ctx.cpu_intensive_menu_item = GTK_CHECK_MENU_ITEM(cpu_intensive_item);
+    g_signal_connect(cpu_intensive_item, "toggled",
+                     G_CALLBACK(on_toggle_cpu_intensive), &ctx);
     ctx.detail_paned          = outer_paned;
     ctx.content_box           = vbox;
     ctx.hpaned                = hpaned;
