@@ -28,6 +28,9 @@
 #ifdef GDK_WINDOWING_X11
 #include <gdk/gdkx.h>
 #endif
+#ifdef GDK_WINDOWING_WAYLAND
+#include <gdk/gdkwayland.h>
+#endif
 #include <math.h>
 #include <signal.h>
 #include <unistd.h>
@@ -2274,6 +2277,63 @@ static void on_menu_restart(GtkMenuItem *item, gpointer data)
     gtk_widget_destroy(dlg);
 }
 
+static int find_desktop_bin(const char *name, char *out, size_t outsz)
+{
+    const char *dirs[] = {
+        "/usr/bin", "/usr/local/bin",
+        "/usr/libexec/kf6", "/usr/libexec/kf5",
+        "/usr/lib64/libexec/kf6", "/usr/lib64/libexec/kf5",
+        "/usr/local/libexec/kf6", "/usr/local/libexec/kf5",
+        NULL
+    };
+    for (int i = 0; dirs[i]; i++) {
+        snprintf(out, outsz, "%s/%s", dirs[i], name);
+        if (access(out, X_OK) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Plasma can be restarted with stale WAYLAND_DISPLAY/QT_QPA_PLATFORM
+ * values, which its children then inherit.  GTK has already connected to
+ * the display successfully, so use that live connection as the authority
+ * for the elevater and the restarted process.
+ */
+static void repair_elevation_environment(void)
+{
+    if (desktop_open_ctx.usable && desktop_open_ctx.uid == getuid()) {
+        setenv("XDG_RUNTIME_DIR", desktop_open_ctx.runtime_dir, 1);
+        setenv("DBUS_SESSION_BUS_ADDRESS", desktop_open_ctx.bus_addr, 1);
+    }
+
+    GdkDisplay *display = gdk_display_get_default();
+    if (!display)
+        return;
+
+    const char *name = gdk_display_get_name(display);
+    if (!name || !name[0])
+        return;
+
+#ifdef GDK_WINDOWING_WAYLAND
+    if (GDK_IS_WAYLAND_DISPLAY(display)) {
+        setenv("WAYLAND_DISPLAY", name, 1);
+        setenv("GDK_BACKEND", "wayland", 1);
+        setenv("QT_QPA_PLATFORM", "wayland", 1);
+        return;
+    }
+#endif
+#ifdef GDK_WINDOWING_X11
+    if (GDK_IS_X11_DISPLAY(display)) {
+        setenv("DISPLAY", name, 1);
+        setenv("GDK_BACKEND", "x11", 1);
+        setenv("QT_QPA_PLATFORM", "xcb", 1);
+        if (desktop_open_ctx.xauthority)
+            setenv("XAUTHORITY", desktop_open_ctx.xauthority, 1);
+    }
+#endif
+}
+
 static void on_menu_restart_as_admin(GtkMenuItem *item, gpointer data)
 {
     (void)item;
@@ -2284,47 +2344,91 @@ static void on_menu_restart_as_admin(GtkMenuItem *item, gpointer data)
     if (len <= 0) return;
     exe[len] = '\0';
 
-    /* Helper: resolve a binary from /usr/bin or /usr/local/bin */
-    auto int find_bin(const char *name, char *out, size_t outsz);
-    int find_bin(const char *name, char *out, size_t outsz) {
-        snprintf(out, outsz, "/usr/bin/%s", name);
-        if (access(out, X_OK) == 0) return 1;
-        snprintf(out, outsz, "/usr/local/bin/%s", name);
-        if (access(out, X_OK) == 0) return 1;
-        return 0;
+    repair_elevation_environment();
+
+    const char *display       = getenv("DISPLAY");
+    const char *wayland_dpy   = getenv("WAYLAND_DISPLAY");
+    const char *xauthority    = getenv("XAUTHORITY");
+    const char *runtime_dir   = getenv("XDG_RUNTIME_DIR");
+    const char *bus_addr      = getenv("DBUS_SESSION_BUS_ADDRESS");
+    const char *gdk_backend   = getenv("GDK_BACKEND");
+    const char *qt_platform   = getenv("QT_QPA_PLATFORM");
+
+    char disp_str[256]         = "";
+    char wdpy_str[256]         = "";
+    char xaut_str[PATH_MAX]    = "";
+    char runtime_str[PATH_MAX] = "";
+    char bus_str[1024]         = "";
+    char backend_str[64]       = "";
+    char qt_str[64]            = "";
+    if (display)     snprintf(disp_str, sizeof(disp_str),
+                              "DISPLAY=%s", display);
+    if (wayland_dpy) snprintf(wdpy_str, sizeof(wdpy_str),
+                              "WAYLAND_DISPLAY=%s", wayland_dpy);
+    if (xauthority)  snprintf(xaut_str, sizeof(xaut_str),
+                              "XAUTHORITY=%s", xauthority);
+    if (runtime_dir) snprintf(runtime_str, sizeof(runtime_str),
+                              "XDG_RUNTIME_DIR=%s", runtime_dir);
+    if (bus_addr)    snprintf(bus_str, sizeof(bus_str),
+                              "DBUS_SESSION_BUS_ADDRESS=%s", bus_addr);
+    if (gdk_backend) snprintf(backend_str, sizeof(backend_str),
+                              "GDK_BACKEND=%s", gdk_backend);
+    if (qt_platform) snprintf(qt_str, sizeof(qt_str),
+                              "QT_QPA_PLATFORM=%s", qt_platform);
+
+    char env_path[PATH_MAX];
+    int have_env = find_desktop_bin("env", env_path, sizeof(env_path));
+
+    /* 1. Prefer KDE's native elevater whenever it is installed.  Do not
+     * decide from inherited KDE_* / XDG_* variables: those are precisely
+     * the variables that may be stale after a bad plasmashell restart. */
+    char kdesu_path[PATH_MAX];
+    if (have_env &&
+        find_desktop_bin("kdesu", kdesu_path, sizeof(kdesu_path))) {
+        const char *argv[24];
+        int ai = 0;
+        argv[ai++] = kdesu_path;
+        argv[ai++] = "-n";
+        argv[ai++] = "--noignorebutton";
+        argv[ai++] = "-i";
+        argv[ai++] = "evemon";
+        argv[ai++] = "--";
+        argv[ai++] = env_path;
+        if (display)       argv[ai++] = disp_str;
+        if (wayland_dpy)   argv[ai++] = wdpy_str;
+        if (xauthority)    argv[ai++] = xaut_str;
+        if (runtime_dir)   argv[ai++] = runtime_str;
+        if (bus_addr)      argv[ai++] = bus_str;
+        if (gdk_backend)   argv[ai++] = backend_str;
+        if (qt_platform)   argv[ai++] = qt_str;
+        argv[ai++] = exe;
+        argv[ai] = NULL;
+
+        execv(kdesu_path, (char *const *)argv);
+        /* execv only returns on failure — fall through to pkexec. */
     }
 
-    /* 1. Prefer pkexec — always shows a polite graphical auth dialog.
+    /* 2. Prefer pkexec on other desktops.  It shows a graphical auth dialog.
      *    pkexec sanitizes the environment, so DISPLAY/WAYLAND_DISPLAY/
-     *    XAUTHORITY are stripped.  Pass them explicitly via:
-     *      pkexec env DISPLAY=… WAYLAND_DISPLAY=… XAUTHORITY=… evemon
+     *    XAUTHORITY/XDG_RUNTIME_DIR are stripped.  Pass the repaired live
+     *    display context explicitly via pkexec env ... evemon.
      *    pkexec refuses to run if its parent is already dead, so exec
      *    directly (no fork) so the parent process stays alive. */
-    char pkexec_path[256];
-    if (find_bin("pkexec", pkexec_path, sizeof(pkexec_path))) {
-        const char *display     = getenv("DISPLAY");
-        const char *wayland_dpy = getenv("WAYLAND_DISPLAY");
-        const char *xauthority  = getenv("XAUTHORITY");
-
-        /* Build env var strings: "KEY=value" or NULL if unset */
-        char disp_str[256]  = "";
-        char wdpy_str[256]  = "";
-        char xaut_str[256]  = "";
-        if (display)     snprintf(disp_str, sizeof(disp_str),
-                                  "DISPLAY=%s", display);
-        if (wayland_dpy) snprintf(wdpy_str, sizeof(wdpy_str),
-                                  "WAYLAND_DISPLAY=%s", wayland_dpy);
-        if (xauthority)  snprintf(xaut_str, sizeof(xaut_str),
-                                  "XAUTHORITY=%s", xauthority);
-
+    char pkexec_path[PATH_MAX];
+    if (have_env &&
+        find_desktop_bin("pkexec", pkexec_path, sizeof(pkexec_path))) {
         /* Assemble argv: pkexec env [vars…] exe */
-        const char *argv[16];
+        const char *argv[20];
         int ai = 0;
         argv[ai++] = pkexec_path;
-        argv[ai++] = "env";
-        if (display)     argv[ai++] = disp_str;
-        if (wayland_dpy) argv[ai++] = wdpy_str;
-        if (xauthority)  argv[ai++] = xaut_str;
+        argv[ai++] = env_path;
+        if (display)       argv[ai++] = disp_str;
+        if (wayland_dpy)   argv[ai++] = wdpy_str;
+        if (xauthority)    argv[ai++] = xaut_str;
+        if (runtime_dir)   argv[ai++] = runtime_str;
+        if (bus_addr)      argv[ai++] = bus_str;
+        if (gdk_backend)   argv[ai++] = backend_str;
+        if (qt_platform)   argv[ai++] = qt_str;
         argv[ai++] = exe;
         argv[ai]   = NULL;
 
@@ -2332,9 +2436,9 @@ static void on_menu_restart_as_admin(GtkMenuItem *item, gpointer data)
         /* execv only returns on failure — fall through to sudo */
     }
 
-    /* 2. Fall back to sudo with a GTK password dialog. */
-    char sudo_path[256];
-    if (find_bin("sudo", sudo_path, sizeof(sudo_path))) {
+    /* 3. Fall back to sudo with a GTK password dialog. */
+    char sudo_path[PATH_MAX];
+    if (find_desktop_bin("sudo", sudo_path, sizeof(sudo_path))) {
         GtkWidget *dlg = gtk_dialog_new_with_buttons(
             "Authentication required",
             NULL, GTK_DIALOG_MODAL,
@@ -2367,11 +2471,15 @@ static void on_menu_restart_as_admin(GtkMenuItem *item, gpointer data)
             return;
         }
 
-        const char *pw = gtk_entry_get_text(GTK_ENTRY(entry));
+        char *pw = g_strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
 
         /* Write the password to a pipe that sudo -S reads from stdin. */
         int pipefd[2];
-        if (pipe(pipefd) != 0) { gtk_widget_destroy(dlg); return; }
+        if (pipe(pipefd) != 0) {
+            g_free(pw);
+            gtk_widget_destroy(dlg);
+            return;
+        }
 
         pid_t pid = fork();
         if (pid == 0) {
@@ -2396,14 +2504,15 @@ static void on_menu_restart_as_admin(GtkMenuItem *item, gpointer data)
             close(pipefd[0]);
             close(pipefd[1]);
         }
+        g_free(pw);
         return;
     }
 
-    /* 3. No launcher found — show an error. */
+    /* 4. No launcher found — show an error. */
     GtkWidget *dlg = gtk_message_dialog_new(
         NULL, GTK_DIALOG_MODAL,
         GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
-        "Could not find pkexec or sudo.\n"
+        "Could not find kdesu, pkexec, or sudo.\n"
         "Run evemon as root manually.");
     gtk_dialog_run(GTK_DIALOG(dlg));
     gtk_widget_destroy(dlg);
