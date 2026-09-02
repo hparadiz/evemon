@@ -13,6 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch pinned nvtop sources
+        run: make nvtop
+
       - name: Build Docker image
         run: docker build -t evemon-builder-debian12 -f packaging/debian12/Dockerfile .
 
@@ -40,6 +43,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch pinned nvtop sources
+        run: make nvtop
 
       - name: Build Docker image
         run: docker build -t evemon-builder-fedora42 -f packaging/fedora42/Dockerfile .

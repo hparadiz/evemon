@@ -69,12 +69,16 @@ static void on_system_panel_close(GtkButton *btn, gpointer data)
 void system_panel_add_plugin(ui_ctx_t *ctx, GtkWidget *widget,
                              const char *label, int inst_id)
 {
-    (void)inst_id;   /* no per-tab close button; inst_id is unused here */
     if (!ctx->system_panel_notebook || !widget) return;
 
     GtkWidget *tab_lbl = gtk_label_new(label);
-    gtk_notebook_append_page(GTK_NOTEBOOK(ctx->system_panel_notebook),
-                             widget, tab_lbl);
+    plugin_registry_t *preg = ctx->plugin_registry;
+    int idx = preg ? plugin_registry_find_by_id(preg, inst_id) : -1;
+    gboolean is_gpu = idx >= 0 && preg->instances[idx].plugin &&
+        g_strcmp0(preg->instances[idx].plugin->id, "org.evemon.gpu") == 0;
+
+    gtk_notebook_insert_page(GTK_NOTEBOOK(ctx->system_panel_notebook),
+                             widget, tab_lbl, is_gpu ? 0 : -1);
     ctx->system_panel_has_plugins = TRUE;
 }
 
@@ -209,11 +213,11 @@ void system_panel_relayout(ui_ctx_t *ctx)
     GtkWidget *new_paned = gtk_paned_new(orient);
 
     if (panel_is_child1) {
-        gtk_paned_pack1(GTK_PANED(new_paned), ctx->system_panel, FALSE, FALSE);
-        gtk_paned_pack2(GTK_PANED(new_paned), ctx->detail_paned, TRUE, FALSE);
+        gtk_paned_pack1(GTK_PANED(new_paned), ctx->system_panel, FALSE, TRUE);
+        gtk_paned_pack2(GTK_PANED(new_paned), ctx->detail_paned, TRUE, TRUE);
     } else {
-        gtk_paned_pack1(GTK_PANED(new_paned), ctx->detail_paned, TRUE, FALSE);
-        gtk_paned_pack2(GTK_PANED(new_paned), ctx->system_panel, FALSE, FALSE);
+        gtk_paned_pack1(GTK_PANED(new_paned), ctx->detail_paned, TRUE, TRUE);
+        gtk_paned_pack2(GTK_PANED(new_paned), ctx->system_panel, FALSE, TRUE);
     }
 
     if (orient == GTK_ORIENTATION_VERTICAL) {

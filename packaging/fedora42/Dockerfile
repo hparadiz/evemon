@@ -7,6 +7,10 @@ RUN dnf install -y \
     pkg-config \
     # GTK 3
     gtk3-devel \
+    # GPU backends (pinned nvtop)
+    libdrm-devel \
+    systemd-devel \
+    ncurses-devel \
     # fontconfig
     fontconfig-devel \
     # libbpf / eBPF

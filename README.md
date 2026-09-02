@@ -175,6 +175,15 @@ sudo ./build/evemon
 
 Root (or `CAP_BPF` + `CAP_PERFMON`) is required for eBPF tracing and full `/proc` visibility across users. evemon degrades gracefully without privileges — you'll see your own processes and can use the fanotify fallback for fd tracking.
 
+For installed builds, file capabilities avoid running the GTK process itself through `sudo` while still granting the eBPF permissions:
+
+```sh
+sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace+ep /usr/local/bin/evemon
+evemon
+```
+
+Some distro icon loaders behave differently under `sudo`; using file capabilities keeps the normal desktop icon/theme environment intact.
+
 ### Command-Line Options
 
 | Flag | Description |

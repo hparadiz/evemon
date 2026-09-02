@@ -593,6 +593,7 @@ static void on_copy_command(GtkMenuItem *item, gpointer data)
 /* ── Alternate process-list filters ────────────────────────────── */
 
 static void on_toggle_cpu_intensive(GtkCheckMenuItem *item, gpointer data);
+static void on_toggle_gpu_only(GtkCheckMenuItem *item, gpointer data);
 
 static void on_toggle_audio_only(GtkCheckMenuItem *item, gpointer data)
 {
@@ -610,6 +611,18 @@ static void on_toggle_audio_only(GtkCheckMenuItem *item, gpointer data)
                                            FALSE);
             g_signal_handlers_unblock_by_func(ctx->cpu_intensive_menu_item,
                                               on_toggle_cpu_intensive, ctx);
+        }
+    }
+
+    if (ctx->show_audio_only && ctx->show_gpu_only) {
+        ctx->show_gpu_only = FALSE;
+        settings_get()->show_gpu_only = false;
+        if (ctx->gpu_only_menu_item) {
+            g_signal_handlers_block_by_func(ctx->gpu_only_menu_item,
+                                            on_toggle_gpu_only, ctx);
+            gtk_check_menu_item_set_active(ctx->gpu_only_menu_item, FALSE);
+            g_signal_handlers_unblock_by_func(ctx->gpu_only_menu_item,
+                                              on_toggle_gpu_only, ctx);
         }
     }
 
@@ -635,6 +648,8 @@ static void on_toggle_audio_only(GtkCheckMenuItem *item, gpointer data)
          * back to the unfiltered real store. */
         if (ctx->filter_text[0] != '\0')
             rebuild_filter_store(ctx);
+        else if (ctx->show_gpu_only)
+            rebuild_gpu_filter_store(ctx);
         else if (ctx->show_cpu_intensive)
             rebuild_cpu_intensive_filter_store(ctx);
         else
@@ -660,6 +675,18 @@ static void on_toggle_cpu_intensive(GtkCheckMenuItem *item, gpointer data)
         }
     }
 
+    if (ctx->show_cpu_intensive && ctx->show_gpu_only) {
+        ctx->show_gpu_only = FALSE;
+        settings_get()->show_gpu_only = false;
+        if (ctx->gpu_only_menu_item) {
+            g_signal_handlers_block_by_func(ctx->gpu_only_menu_item,
+                                            on_toggle_gpu_only, ctx);
+            gtk_check_menu_item_set_active(ctx->gpu_only_menu_item, FALSE);
+            g_signal_handlers_unblock_by_func(ctx->gpu_only_menu_item,
+                                              on_toggle_gpu_only, ctx);
+        }
+    }
+
     if (ctx->cpu_intensive_menu_item &&
         item != ctx->cpu_intensive_menu_item &&
         gtk_check_menu_item_get_active(ctx->cpu_intensive_menu_item) !=
@@ -680,9 +707,73 @@ static void on_toggle_cpu_intensive(GtkCheckMenuItem *item, gpointer data)
         rebuild_filter_store(ctx);
     } else if (ctx->show_audio_only) {
         rebuild_audio_filter_store(ctx);
+    } else if (ctx->show_gpu_only) {
+        rebuild_gpu_filter_store(ctx);
     } else {
         switch_to_real_store(ctx);
     }
+}
+
+static void on_toggle_gpu_only(GtkCheckMenuItem *item, gpointer data)
+{
+    ui_ctx_t *ctx = data;
+    gboolean requested = gtk_check_menu_item_get_active(item);
+    ctx->show_gpu_only = requested && ctx->has_gpu_plugin;
+    settings_get()->show_gpu_only = ctx->show_gpu_only;
+
+    if (requested != ctx->show_gpu_only) {
+        g_signal_handlers_block_by_func(item, on_toggle_gpu_only, ctx);
+        gtk_check_menu_item_set_active(item, ctx->show_gpu_only);
+        g_signal_handlers_unblock_by_func(item, on_toggle_gpu_only, ctx);
+    }
+
+    if (ctx->show_gpu_only && ctx->show_audio_only) {
+        ctx->show_audio_only = FALSE;
+        settings_get()->show_audio_only = false;
+        if (ctx->audio_only_menu_item) {
+            g_signal_handlers_block_by_func(ctx->audio_only_menu_item,
+                                            on_toggle_audio_only, ctx);
+            gtk_check_menu_item_set_active(ctx->audio_only_menu_item, FALSE);
+            g_signal_handlers_unblock_by_func(ctx->audio_only_menu_item,
+                                              on_toggle_audio_only, ctx);
+        }
+    }
+
+    if (ctx->show_gpu_only && ctx->show_cpu_intensive) {
+        ctx->show_cpu_intensive = FALSE;
+        settings_get()->show_cpu_intensive = false;
+        if (ctx->cpu_intensive_menu_item) {
+            g_signal_handlers_block_by_func(ctx->cpu_intensive_menu_item,
+                                            on_toggle_cpu_intensive, ctx);
+            gtk_check_menu_item_set_active(ctx->cpu_intensive_menu_item, FALSE);
+            g_signal_handlers_unblock_by_func(ctx->cpu_intensive_menu_item,
+                                              on_toggle_cpu_intensive, ctx);
+        }
+    }
+
+    if (ctx->gpu_only_menu_item && item != ctx->gpu_only_menu_item &&
+        gtk_check_menu_item_get_active(ctx->gpu_only_menu_item) !=
+            ctx->show_gpu_only) {
+        g_signal_handlers_block_by_func(ctx->gpu_only_menu_item,
+                                        on_toggle_gpu_only, ctx);
+        gtk_check_menu_item_set_active(ctx->gpu_only_menu_item,
+                                       ctx->show_gpu_only);
+        g_signal_handlers_unblock_by_func(ctx->gpu_only_menu_item,
+                                          on_toggle_gpu_only, ctx);
+    }
+
+    settings_save();
+
+    if (ctx->show_gpu_only)
+        rebuild_gpu_filter_store(ctx);
+    else if (ctx->filter_text[0] != '\0')
+        rebuild_filter_store(ctx);
+    else if (ctx->show_cpu_intensive)
+        rebuild_cpu_intensive_filter_store(ctx);
+    else if (ctx->show_audio_only)
+        rebuild_audio_filter_store(ctx);
+    else
+        switch_to_real_store(ctx);
 }
 
 static GtkWidget *append_audio_only_menu_item(ui_ctx_t *ctx, GtkWidget *menu)
@@ -714,6 +805,20 @@ static GtkWidget *append_cpu_intensive_menu_item(ui_ctx_t *ctx,
     return item;
 }
 
+static GtkWidget *append_gpu_only_menu_item(ui_ctx_t *ctx, GtkWidget *menu)
+{
+    if (!ctx->has_gpu_plugin)
+        return NULL;
+
+    GtkWidget *item = gtk_check_menu_item_new_with_label(
+        "Show GPU Processes Only");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item),
+                                   ctx->show_gpu_only);
+    g_signal_connect(item, "toggled", G_CALLBACK(on_toggle_gpu_only), ctx);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    return item;
+}
+
 
 void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
                                      pid_t pid, const char *name,
@@ -741,6 +846,9 @@ void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
 
     /* ── Show Audio Processes Only toggle ── */
     append_audio_only_menu_item(ctx, menu);
+
+    /* ── Show GPU Processes Only toggle ── */
+    append_gpu_only_menu_item(ctx, menu);
 
     /* ── Show CPU-Intensive Processes Only toggle ── */
     append_cpu_intensive_menu_item(ctx, menu);
@@ -1578,6 +1686,179 @@ static void on_proc_meta(const evemon_event_t *ev, void *ud)
     gtk_widget_set_no_show_all(ctx->sb_meta_frame, TRUE);
 }
 
+/* ── host-side GPU process integration ───────────────────────── */
+
+static void update_status_bar(ui_ctx_t *ctx);
+
+typedef struct {
+    gboolean active;
+    gboolean gpu_valid;
+    gboolean vram_valid;
+    gboolean enc_valid;
+    uint64_t gpu_percent;
+    uint64_t vram_bytes;
+    uint64_t enc_percent;
+} gpu_process_aggregate_t;
+
+static void format_gpu_bytes(uint64_t bytes, char *buf, size_t bufsz)
+{
+    static const char *units[] = { "B", "KiB", "MiB", "GiB", "TiB" };
+    double value = (double)bytes;
+    size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < G_N_ELEMENTS(units)) {
+        value /= 1024.0;
+        unit++;
+    }
+    if (unit == 0)
+        snprintf(buf, bufsz, "%" PRIu64 " %s", bytes, units[unit]);
+    else
+        snprintf(buf, bufsz, "%.1f %s", value, units[unit]);
+}
+
+static gpu_process_aggregate_t gpu_aggregate_for_pid(
+    const evemon_gpu_snapshot_t *snapshot, pid_t pid)
+{
+    gpu_process_aggregate_t aggregate = {0};
+    for (uint32_t i = 0; i < snapshot->process_count; i++) {
+        const evemon_gpu_process_t *process = &snapshot->processes[i];
+        if (process->pid != pid)
+            continue;
+
+        aggregate.active = TRUE;
+        if (process->valid & EVEMON_GPU_PROCESS_VALID_UTILIZATION) {
+            aggregate.gpu_valid = TRUE;
+            aggregate.gpu_percent += process->utilization_percent;
+        }
+        if (process->valid & EVEMON_GPU_PROCESS_VALID_MEMORY) {
+            aggregate.vram_valid = TRUE;
+            if (UINT64_MAX - aggregate.vram_bytes < process->memory_bytes)
+                aggregate.vram_bytes = UINT64_MAX;
+            else
+                aggregate.vram_bytes += process->memory_bytes;
+        }
+        if (process->valid & EVEMON_GPU_PROCESS_VALID_ENCODE) {
+            aggregate.enc_valid = TRUE;
+            aggregate.enc_percent += process->encode_percent;
+        }
+    }
+    return aggregate;
+}
+
+static void apply_gpu_snapshot_rows(ui_ctx_t *ctx, GtkTreeIter *parent)
+{
+    GtkTreeModel *model = GTK_TREE_MODEL(ctx->store);
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(model, &iter, parent);
+    while (valid) {
+        gint pid_value = 0;
+        gtk_tree_model_get(model, &iter, COL_PID, &pid_value, -1);
+        gpu_process_aggregate_t aggregate = gpu_aggregate_for_pid(
+            &ctx->gpu_snapshot, (pid_t)pid_value);
+
+        char gpu_text[32] = "—";
+        char vram_text[32] = "—";
+        char enc_text[32] = "—";
+        gint gpu_value = 0;
+        gint enc_value = 0;
+        gint64 vram_value = 0;
+
+        if (ctx->has_gpu_plugin && aggregate.gpu_valid) {
+            gpu_value = aggregate.gpu_percent > G_MAXINT
+                      ? G_MAXINT : (gint)aggregate.gpu_percent;
+            snprintf(gpu_text, sizeof(gpu_text), "%" G_GUINT64_FORMAT "%%",
+                     aggregate.gpu_percent);
+        }
+        if (ctx->has_gpu_plugin && aggregate.vram_valid) {
+            vram_value = aggregate.vram_bytes > (uint64_t)G_MAXINT64
+                       ? G_MAXINT64 : (gint64)aggregate.vram_bytes;
+            format_gpu_bytes(aggregate.vram_bytes, vram_text,
+                             sizeof(vram_text));
+        }
+        if (ctx->has_gpu_plugin && aggregate.enc_valid) {
+            enc_value = aggregate.enc_percent > G_MAXINT
+                      ? G_MAXINT : (gint)aggregate.enc_percent;
+            snprintf(enc_text, sizeof(enc_text), "%" G_GUINT64_FORMAT "%%",
+                     aggregate.enc_percent);
+        }
+
+        gtk_tree_store_set(ctx->store, &iter,
+                           COL_GPU, gpu_value,
+                           COL_GPU_TEXT, gpu_text,
+                           COL_GPU_VRAM, vram_value,
+                           COL_GPU_VRAM_TEXT, vram_text,
+                           COL_GPU_ENC, enc_value,
+                           COL_GPU_ENC_TEXT, enc_text,
+                           COL_GPU_ACTIVE,
+                               ctx->has_gpu_plugin && aggregate.active,
+                           -1);
+
+        apply_gpu_snapshot_rows(ctx, &iter);
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+}
+
+static void apply_gpu_snapshot_to_store(ui_ctx_t *ctx)
+{
+    if (!ctx || !ctx->store)
+        return;
+    apply_gpu_snapshot_rows(ctx, NULL);
+}
+
+static gboolean gpu_process_store_has_rows(ui_ctx_t *ctx)
+{
+    GtkTreeIter first;
+    return ctx && ctx->store && gtk_tree_model_get_iter_first(
+        GTK_TREE_MODEL(ctx->store), &first);
+}
+
+static void sync_current_filter_after_gpu_change(ui_ctx_t *ctx)
+{
+    if (ctx->show_gpu_only)
+        sync_gpu_filter_store(ctx);
+    else if (ctx->show_cpu_intensive)
+        sync_cpu_intensive_filter_store(ctx);
+    else if (ctx->show_audio_only)
+        sync_audio_filter_store(ctx);
+    else if (ctx->filter_text[0] != '\0')
+        sync_filter_store(ctx);
+}
+
+static void on_gpu_snapshot_host(const evemon_event_t *event, void *opaque)
+{
+    ui_ctx_t *ctx = opaque;
+    if (!ctx || ctx->shutting_down || !event ||
+        event->type != EVEMON_EVENT_GPU_SNAPSHOT || !event->payload)
+        return;
+
+    const evemon_gpu_snapshot_t *src = event->payload;
+    evemon_gpu_device_t *devices = NULL;
+    evemon_gpu_process_t *processes = NULL;
+    if (src->device_count > 0) {
+        devices = g_try_malloc_n(src->device_count, sizeof(*devices));
+        if (!devices) return;
+        memcpy(devices, src->devices,
+               (size_t)src->device_count * sizeof(*devices));
+    }
+    if (src->process_count > 0) {
+        processes = g_try_malloc_n(src->process_count, sizeof(*processes));
+        if (!processes) {
+            g_free(devices);
+            return;
+        }
+        memcpy(processes, src->processes,
+               (size_t)src->process_count * sizeof(*processes));
+    }
+    g_free(ctx->gpu_snapshot.devices);
+    g_free(ctx->gpu_snapshot.processes);
+    ctx->gpu_snapshot = *src;
+    ctx->gpu_snapshot.devices = devices;
+    ctx->gpu_snapshot.processes = processes;
+    apply_gpu_snapshot_to_store(ctx);
+    if (gpu_process_store_has_rows(ctx))
+        sync_current_filter_after_gpu_change(ctx);
+    update_status_bar(ctx);
+}
+
 /* ── detail panel: toggle visibility ─────────────────────────── */
 
 static void detail_panel_relayout(ui_ctx_t *ctx);
@@ -1969,12 +2250,82 @@ static void update_status_bar(ui_ctx_t *ctx)
     double ui_last = 0, ui_avg = 0, ui_max = 0;
     profile_get("ui_render", &ui_last, &ui_avg, &ui_max);
 
-    char status[512];
+    char gpu_status[256] = "";
+    if (ctx->has_gpu_plugin && ctx->gpu_snapshot.device_count > 0) {
+        uint64_t gpu_total = 0;
+        uint32_t gpu_valid_count = 0;
+        uint64_t vram_used = 0;
+        uint64_t vram_total = 0;
+        uint32_t vram_valid_count = 0;
+        uint64_t enc_total = 0;
+        uint32_t enc_valid_count = 0;
+
+        for (uint32_t i = 0; i < ctx->gpu_snapshot.device_count; i++) {
+            const evemon_gpu_device_t *gpu = &ctx->gpu_snapshot.devices[i];
+            if (gpu->valid & EVEMON_GPU_VALID_UTILIZATION) {
+                gpu_total += gpu->utilization_percent;
+                gpu_valid_count++;
+            }
+            if (gpu->valid & EVEMON_GPU_VALID_MEMORY) {
+                vram_used = UINT64_MAX - vram_used < gpu->memory_used_bytes
+                          ? UINT64_MAX
+                          : vram_used + gpu->memory_used_bytes;
+                vram_total = UINT64_MAX - vram_total < gpu->memory_total_bytes
+                           ? UINT64_MAX
+                           : vram_total + gpu->memory_total_bytes;
+                vram_valid_count++;
+            }
+            if (gpu->valid & EVEMON_GPU_VALID_ENCODER) {
+                enc_total += gpu->encoder_percent;
+                enc_valid_count++;
+            }
+        }
+        if (enc_valid_count == 0) {
+            gboolean process_encoder_valid = FALSE;
+            for (uint32_t i = 0; i < ctx->gpu_snapshot.process_count; i++) {
+                const evemon_gpu_process_t *process =
+                    &ctx->gpu_snapshot.processes[i];
+                if (process->valid & EVEMON_GPU_PROCESS_VALID_ENCODE) {
+                    enc_total += process->encode_percent;
+                    process_encoder_valid = TRUE;
+                }
+            }
+            if (process_encoder_valid)
+                enc_valid_count = ctx->gpu_snapshot.device_count;
+        }
+
+        char gpu_text[32] = "—";
+        char vram_text[80] = "—";
+        char enc_text[32] = "—";
+        if (gpu_valid_count > 0)
+            snprintf(gpu_text, sizeof(gpu_text), "%" PRIu64 "%%",
+                     gpu_total / gpu_valid_count);
+        if (vram_valid_count > 0) {
+            char used_text[32], total_text[32];
+            format_gpu_bytes(vram_used, used_text, sizeof(used_text));
+            format_gpu_bytes(vram_total, total_text, sizeof(total_text));
+            snprintf(vram_text, sizeof(vram_text), "%s / %s",
+                     used_text, total_text);
+        }
+        if (enc_valid_count > 0) {
+            uint64_t enc_average = enc_total / enc_valid_count;
+            if (enc_average > 100)
+                enc_average = 100;
+            snprintf(enc_text, sizeof(enc_text), "%" PRIu64 "%%",
+                     enc_average);
+        }
+
+        snprintf(gpu_status, sizeof(gpu_status),
+                 "  |  GPU: %s  |  VRAM: %s  |  ENC: %s",
+                 gpu_text, vram_text, enc_text);
+    }
+
+    char status[768];
     snprintf(status, sizeof(status),
-             " %zu processes  |  %ld CPUs  |  memory: %s / %s  |  "
+             " %zu processes  |  %ld CPUs  |  memory: %s / %s%s  |  "
              "render: %.1f ms (avg %.1f, max %.1f)",
              count, ncpus,
-             mem_used_buf, mem_total_buf,
+             mem_used_buf, mem_total_buf, gpu_status,
              ui_last, ui_avg, ui_max);
     gtk_label_set_text(ctx->status_label, status);
 }
@@ -2081,6 +2432,7 @@ static gboolean on_refresh(gpointer data)
         /* First time: full populate + expand all */
         populate_store_initial(ctx->store, ctx->view, &ctx->pstore,
                                settings_get()->preselected_pid, ctx);
+        apply_gpu_snapshot_to_store(ctx);
         g_first_refresh = 0;
 
         /* Switch from fast startup poll to the normal 1-second interval */
@@ -2105,7 +2457,9 @@ static gboolean on_refresh(gpointer data)
 
             /* Honour the saved alternate view on first load.  The CPU view
              * is installed below, after group totals have been computed. */
-            if (ctx->show_audio_only && !ctx->show_cpu_intensive)
+            if (ctx->show_gpu_only && ctx->has_gpu_plugin)
+                rebuild_gpu_filter_store(ctx);
+            else if (ctx->show_audio_only && !ctx->show_cpu_intensive)
                 rebuild_audio_filter_store(ctx);
 
             /* Kick the plugin broker immediately on first display so the
@@ -2138,6 +2492,7 @@ static gboolean on_refresh(gpointer data)
         remove_pinned_rows(ctx->store);
         /* Incremental: update in-place, no clear, no flash */
         update_store(ctx->store, ctx->view, &ctx->pstore, ctx);
+        apply_gpu_snapshot_to_store(ctx);
     }
 
     /* Rebuild pinned subtrees (copies of pinned PIDs at the top) */
@@ -2195,7 +2550,9 @@ static gboolean on_refresh(gpointer data)
      * This updates data in-place, preserving view state (expand,
      * selection, scroll).  A full rebuild only happens if the set
      * of matching processes has structurally changed. */
-    if (ctx->show_cpu_intensive)
+    if (ctx->show_gpu_only)
+        sync_gpu_filter_store(ctx);
+    else if (ctx->show_cpu_intensive)
         sync_cpu_intensive_filter_store(ctx);
     else if (ctx->show_audio_only)
         sync_audio_filter_store(ctx);
@@ -3023,7 +3380,9 @@ static void on_menu_filter(GtkMenuItem *item, gpointer data)
         filter_cancel_hide_timer(ctx);
         gtk_entry_set_text(GTK_ENTRY(ctx->filter_entry), "");
         ctx->filter_text[0] = '\0';
-        if (ctx->show_cpu_intensive)
+        if (ctx->show_gpu_only)
+            rebuild_gpu_filter_store(ctx);
+        else if (ctx->show_cpu_intensive)
             rebuild_cpu_intensive_filter_store(ctx);
         else if (ctx->show_audio_only)
             rebuild_audio_filter_store(ctx);
@@ -3064,6 +3423,9 @@ static void on_column_toggled(GtkCheckMenuItem *item, gpointer data)
 {
     GtkTreeViewColumn *col = data;
     gboolean active = gtk_check_menu_item_get_active(item);
+    if (g_object_get_data(G_OBJECT(col), "evemon-gpu-column"))
+        g_object_set_data(G_OBJECT(col), "evemon-gpu-wanted",
+                          GINT_TO_POINTER(active ? 1 : 0));
     gtk_tree_view_column_set_visible(col, active);
 
     /* Rebuild the settings columns[] list from the tree view */
@@ -3075,7 +3437,14 @@ static void on_column_toggled(GtkCheckMenuItem *item, gpointer data)
     s->column_count = 0;
     for (GList *c = all_cols; c; c = c->next) {
         GtkTreeViewColumn *tv_col = c->data;
-        if (gtk_tree_view_column_get_visible(tv_col)) {
+        gboolean include = gtk_tree_view_column_get_visible(tv_col);
+        if (g_object_get_data(G_OBJECT(tv_col), "evemon-gpu-column") &&
+            !GPOINTER_TO_INT(g_object_get_data(
+                G_OBJECT(tv_col), "evemon-gpu-available"))) {
+            include = GPOINTER_TO_INT(g_object_get_data(
+                G_OBJECT(tv_col), "evemon-gpu-wanted"));
+        }
+        if (include) {
             const char *title = gtk_tree_view_column_get_title(tv_col);
             if (title && s->column_count < SETTINGS_MAX_COLUMNS) {
                 snprintf(s->columns[s->column_count],
@@ -3093,7 +3462,8 @@ static void on_column_toggled(GtkCheckMenuItem *item, gpointer data)
  * tree view column.  Visibility is initialised from the current
  * column state (which was set from settings at startup).
  */
-static GtkWidget *build_columns_submenu(GtkTreeView *view)
+static GtkWidget *build_columns_submenu(
+    GtkTreeView *view, GtkCheckMenuItem *gpu_items[3])
 {
     GtkWidget *menu = gtk_menu_new();
     GList *cols = gtk_tree_view_get_columns(view);
@@ -3104,14 +3474,125 @@ static GtkWidget *build_columns_submenu(GtkTreeView *view)
         if (!title || title[0] == '\0') continue;
 
         GtkWidget *mi = gtk_check_menu_item_new_with_label(title);
-        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(mi),
-                                       gtk_tree_view_column_get_visible(tv_col));
+        int gpu_slot = GPOINTER_TO_INT(g_object_get_data(
+            G_OBJECT(tv_col), "evemon-gpu-column")) - 1;
+        gboolean active = gtk_tree_view_column_get_visible(tv_col);
+        if (gpu_slot >= 0 && gpu_slot < 3) {
+            active = GPOINTER_TO_INT(g_object_get_data(
+                G_OBJECT(tv_col), "evemon-gpu-wanted"));
+            gtk_widget_set_sensitive(mi, FALSE);
+            gtk_widget_set_no_show_all(mi, TRUE);
+            gtk_widget_hide(mi);
+            if (gpu_items)
+                gpu_items[gpu_slot] = GTK_CHECK_MENU_ITEM(mi);
+        }
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(mi), active);
         g_signal_connect(mi, "toggled",
                          G_CALLBACK(on_column_toggled), tv_col);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
     }
     g_list_free(cols);
     return menu;
+}
+
+void gpu_integration_set_available(ui_ctx_t *ctx, gboolean available)
+{
+    if (!ctx)
+        return;
+
+    gboolean was_available = ctx->has_gpu_plugin;
+    gboolean was_gpu_view = ctx->show_gpu_only;
+
+    if (available && ctx->gpu_subscription_id == 0) {
+        ctx->gpu_subscription_id = evemon_event_bus_subscribe(
+            EVEMON_EVENT_GPU_SNAPSHOT, on_gpu_snapshot_host, ctx);
+    } else if (!available && ctx->gpu_subscription_id != 0) {
+        evemon_event_bus_unsubscribe(ctx->gpu_subscription_id);
+        ctx->gpu_subscription_id = 0;
+    }
+
+    ctx->has_gpu_plugin = available;
+
+    for (int i = 0; i < 3; i++) {
+        GtkTreeViewColumn *column = ctx->gpu_columns[i];
+        GtkCheckMenuItem *menu_item = ctx->gpu_column_menu_items[i];
+        if (!column)
+            continue;
+
+        if (!available && was_available) {
+            g_object_set_data(
+                G_OBJECT(column), "evemon-gpu-wanted",
+                GINT_TO_POINTER(
+                    gtk_tree_view_column_get_visible(column) ? 1 : 0));
+        }
+
+        gboolean wanted = GPOINTER_TO_INT(g_object_get_data(
+            G_OBJECT(column), "evemon-gpu-wanted"));
+        g_object_set_data(G_OBJECT(column), "evemon-gpu-available",
+                          GINT_TO_POINTER(available ? 1 : 0));
+        gtk_tree_view_column_set_visible(column, available && wanted);
+
+        if (menu_item) {
+            g_signal_handlers_block_by_func(menu_item, on_column_toggled,
+                                            column);
+            gtk_check_menu_item_set_active(menu_item, wanted);
+            g_signal_handlers_unblock_by_func(menu_item, on_column_toggled,
+                                              column);
+            gtk_widget_set_sensitive(GTK_WIDGET(menu_item), available);
+            gtk_widget_set_no_show_all(GTK_WIDGET(menu_item), !available);
+            if (available)
+                gtk_widget_show(GTK_WIDGET(menu_item));
+            else
+                gtk_widget_hide(GTK_WIDGET(menu_item));
+        }
+    }
+
+    if (available && !was_available)
+        ctx->show_gpu_only = settings_get()->show_gpu_only;
+    else if (!available)
+        ctx->show_gpu_only = FALSE;
+
+    if (ctx->gpu_only_menu_item) {
+        g_signal_handlers_block_by_func(ctx->gpu_only_menu_item,
+                                        on_toggle_gpu_only, ctx);
+        gtk_check_menu_item_set_active(ctx->gpu_only_menu_item,
+                                       ctx->show_gpu_only);
+        g_signal_handlers_unblock_by_func(ctx->gpu_only_menu_item,
+                                          on_toggle_gpu_only, ctx);
+        gtk_widget_set_sensitive(GTK_WIDGET(ctx->gpu_only_menu_item),
+                                 available);
+        gtk_widget_set_no_show_all(GTK_WIDGET(ctx->gpu_only_menu_item),
+                                   !available);
+        if (available)
+            gtk_widget_show(GTK_WIDGET(ctx->gpu_only_menu_item));
+        else
+            gtk_widget_hide(GTK_WIDGET(ctx->gpu_only_menu_item));
+    }
+
+    if (!available) {
+        g_free(ctx->gpu_snapshot.devices);
+        g_free(ctx->gpu_snapshot.processes);
+        memset(&ctx->gpu_snapshot, 0, sizeof(ctx->gpu_snapshot));
+        if (was_gpu_view) {
+            settings_get()->show_gpu_only = false;
+            settings_save();
+            if (ctx->filter_text[0] != '\0')
+                rebuild_filter_store(ctx);
+            else if (ctx->show_cpu_intensive)
+                rebuild_cpu_intensive_filter_store(ctx);
+            else if (ctx->show_audio_only)
+                rebuild_audio_filter_store(ctx);
+            else
+                switch_to_real_store(ctx);
+        }
+    }
+
+    apply_gpu_snapshot_to_store(ctx);
+    if (available && ctx->show_gpu_only && gpu_process_store_has_rows(ctx))
+        rebuild_gpu_filter_store(ctx);
+    else if (!was_gpu_view && gpu_process_store_has_rows(ctx))
+        sync_current_filter_after_gpu_change(ctx);
+    update_status_bar(ctx);
 }
 
 /* ── status bar right-click context menu ──────────────────────── */
@@ -3156,6 +3637,8 @@ void show_status_context_menu(ui_ctx_t *ctx, GdkEventButton *ev)
     gboolean have_shared_item = FALSE;
 
     if (append_audio_only_menu_item(ctx, menu))
+        have_shared_item = TRUE;
+    if (append_gpu_only_menu_item(ctx, menu))
         have_shared_item = TRUE;
     if (append_cpu_intensive_menu_item(ctx, menu))
         have_shared_item = TRUE;
@@ -3362,6 +3845,12 @@ void register_sort_funcs(GtkTreeModelSort *sm)
         sort_string_inverted, GINT_TO_POINTER(COL_NAME), NULL);
     gtk_tree_sortable_set_sort_func(sortable, COL_CPU,
         sort_int_inverted, GINT_TO_POINTER(COL_CPU), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_GPU,
+        sort_int_inverted, GINT_TO_POINTER(COL_GPU), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_GPU_VRAM,
+        sort_int64_inverted, GINT_TO_POINTER(COL_GPU_VRAM), NULL);
+    gtk_tree_sortable_set_sort_func(sortable, COL_GPU_ENC,
+        sort_int_inverted, GINT_TO_POINTER(COL_GPU_ENC), NULL);
     gtk_tree_sortable_set_sort_func(sortable, COL_RSS,
         sort_int_inverted, GINT_TO_POINTER(COL_RSS), NULL);
     gtk_tree_sortable_set_sort_func(sortable, COL_GROUP_RSS,
@@ -3703,6 +4192,10 @@ static void on_plugin_loaded_gtk(plugin_registry_t *reg,
             system_panel_add_plugin(ctx, inst->widget, system_tab_lbl, inst->instance_id);
             plugin_instance_set_active(inst, TRUE);
             gtk_widget_show_all(inst->widget);
+
+            if (inst->plugin->id &&
+                strcmp(inst->plugin->id, "org.evemon.gpu") == 0)
+                gpu_integration_set_available(ctx, TRUE);
 
             /* Auto-show if setting says open */
             if (settings_get()->system_panel_open &&
@@ -4203,7 +4696,14 @@ void *ui_thread(void *arg)
                                              G_TYPE_INT64,    /* HIGHLIGHT_BORN */
                                              G_TYPE_INT64,    /* HIGHLIGHT_DIED */
                                              G_TYPE_INT,      /* PINNED_ROOT  */
-                                             GDK_TYPE_PIXBUF);/* ICON          */
+                                             GDK_TYPE_PIXBUF, /* ICON          */
+                                             G_TYPE_INT,      /* GPU%          */
+                                             G_TYPE_STRING,   /* GPU% text     */
+                                             G_TYPE_INT64,    /* GPU VRAM bytes*/
+                                             G_TYPE_STRING,   /* GPU VRAM text */
+                                             G_TYPE_INT,      /* GPU ENC%      */
+                                             G_TYPE_STRING,   /* GPU ENC text  */
+                                             G_TYPE_BOOLEAN); /* GPU client    */
 
     /* Sort model wraps the store directly (no filter model – we use
      * a shadow store approach for filtering instead). */
@@ -4220,6 +4720,7 @@ void *ui_thread(void *arg)
     /* Columns */
     GtkCellRenderer *r;
     GtkTreeViewColumn *col;
+    GtkTreeViewColumn *gpu_process_cols[3] = { NULL, NULL, NULL };
 
     r = gtk_cell_renderer_text_new();
     col = gtk_tree_view_column_new_with_attributes("PID", r,
@@ -4273,6 +4774,44 @@ void *ui_thread(void *arg)
     gtk_tree_view_column_set_resizable(col, TRUE);
     gtk_tree_view_column_set_min_width(col, 70);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+
+    r = gtk_cell_renderer_text_new();
+    g_object_set(r, "xalign", 1.0f, NULL);
+    col = gtk_tree_view_column_new_with_attributes("GPU", r,
+                                                   "text", COL_GPU_TEXT, NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_GPU);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 60);
+    g_object_set_data(G_OBJECT(col), "evemon-gpu-column",
+                      GINT_TO_POINTER(1));
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+    gpu_process_cols[0] = col;
+
+    r = gtk_cell_renderer_text_new();
+    g_object_set(r, "xalign", 1.0f, NULL);
+    col = gtk_tree_view_column_new_with_attributes("VRAM", r,
+                                                   "text", COL_GPU_VRAM_TEXT,
+                                                   NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_GPU_VRAM);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 80);
+    g_object_set_data(G_OBJECT(col), "evemon-gpu-column",
+                      GINT_TO_POINTER(2));
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+    gpu_process_cols[1] = col;
+
+    r = gtk_cell_renderer_text_new();
+    g_object_set(r, "xalign", 1.0f, NULL);
+    col = gtk_tree_view_column_new_with_attributes("ENC", r,
+                                                   "text", COL_GPU_ENC_TEXT,
+                                                   NULL);
+    gtk_tree_view_column_set_sort_column_id(col, COL_GPU_ENC);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_min_width(col, 55);
+    g_object_set_data(G_OBJECT(col), "evemon-gpu-column",
+                      GINT_TO_POINTER(3));
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+    gpu_process_cols[2] = col;
 
     r = gtk_cell_renderer_text_new();
     g_object_set(r, "xalign", 1.0f, NULL);   /* right-align numbers */
@@ -4389,27 +4928,36 @@ void *ui_thread(void *arg)
         g_list_free(cols);
     }
 
-    /* Apply column visibility from settings.
-     * If columns[] is non-empty, only listed columns are visible. */
+    /* Apply column visibility from settings.  GPU columns retain their
+     * requested state but remain hidden until the GPU System plugin passes
+     * its availability probe and is enabled. */
     {
         const evemon_settings_t *s = settings_get();
-        if (s->column_count > 0) {
-            GList *all = gtk_tree_view_get_columns(GTK_TREE_VIEW(tree));
-            for (GList *c = all; c; c = c->next) {
-                GtkTreeViewColumn *tv_col = c->data;
-                const char *title = gtk_tree_view_column_get_title(tv_col);
-                if (!title) continue;
-                gboolean found = FALSE;
+        GList *all = gtk_tree_view_get_columns(GTK_TREE_VIEW(tree));
+        for (GList *c = all; c; c = c->next) {
+            GtkTreeViewColumn *tv_col = c->data;
+            const char *title = gtk_tree_view_column_get_title(tv_col);
+            if (!title) continue;
+            gboolean requested = s->column_count == 0;
+            if (!requested) {
                 for (int i = 0; i < s->column_count; i++) {
                     if (strcmp(s->columns[i], title) == 0) {
-                        found = TRUE;
+                        requested = TRUE;
                         break;
                     }
                 }
-                gtk_tree_view_column_set_visible(tv_col, found);
             }
-            g_list_free(all);
+            if (g_object_get_data(G_OBJECT(tv_col), "evemon-gpu-column")) {
+                g_object_set_data(G_OBJECT(tv_col), "evemon-gpu-wanted",
+                                  GINT_TO_POINTER(requested ? 1 : 0));
+                g_object_set_data(G_OBJECT(tv_col), "evemon-gpu-available",
+                                  GINT_TO_POINTER(0));
+                gtk_tree_view_column_set_visible(tv_col, FALSE);
+            } else {
+                gtk_tree_view_column_set_visible(tv_col, requested);
+            }
         }
+        g_list_free(all);
     }
 
     /* Register inverted sort functions so ▲ = largest/highest first. */
@@ -5035,9 +5583,11 @@ void *ui_thread(void *arg)
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), system_panel_pos_item);
 
     /* Columns visibility submenu */
+    GtkCheckMenuItem *gpu_column_menu_items[3] = { NULL, NULL, NULL };
     GtkWidget *columns_item = gtk_menu_item_new_with_label("Columns");
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(columns_item),
-                              build_columns_submenu(GTK_TREE_VIEW(tree)));
+                              build_columns_submenu(GTK_TREE_VIEW(tree),
+                                                    gpu_column_menu_items));
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), columns_item);
 
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),
@@ -5066,6 +5616,16 @@ void *ui_thread(void *arg)
                                    settings_get()->show_audio_only);
     gtk_widget_set_sensitive(audio_only_item, FALSE);
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), audio_only_item);
+
+    /* Show GPU Processes Only – enabled only after a supported GPU plugin
+     * instance passes detection and is loaded. */
+    GtkWidget *gpu_only_item = gtk_check_menu_item_new_with_label(
+        "Show GPU Processes Only");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(gpu_only_item), FALSE);
+    gtk_widget_set_sensitive(gpu_only_item, FALSE);
+    gtk_widget_set_no_show_all(gpu_only_item, TRUE);
+    gtk_widget_hide(gpu_only_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), gpu_only_item);
 
     GtkWidget *cpu_intensive_item = gtk_check_menu_item_new_with_label(
         "Show CPU-Intensive Processes Only");
@@ -5290,6 +5850,11 @@ void *ui_thread(void *arg)
     ctx.filter_text[0] = '\0';
     ctx.show_audio_only = settings_get()->show_audio_only;
     ctx.show_cpu_intensive = settings_get()->show_cpu_intensive;
+    ctx.show_gpu_only = FALSE;  /* restored when the GPU plugin is available */
+    for (int i = 0; i < 3; i++) {
+        ctx.gpu_columns[i] = gpu_process_cols[i];
+        ctx.gpu_column_menu_items[i] = gpu_column_menu_items[i];
+    }
 
     /* Go-to-PID */
     ctx.pid_entry = pid_entry;
@@ -5626,6 +6191,9 @@ void *ui_thread(void *arg)
     ctx.cpu_intensive_menu_item = GTK_CHECK_MENU_ITEM(cpu_intensive_item);
     g_signal_connect(cpu_intensive_item, "toggled",
                      G_CALLBACK(on_toggle_cpu_intensive), &ctx);
+    ctx.gpu_only_menu_item = GTK_CHECK_MENU_ITEM(gpu_only_item);
+    g_signal_connect(gpu_only_item, "toggled",
+                     G_CALLBACK(on_toggle_gpu_only), &ctx);
     ctx.detail_paned          = outer_paned;
     ctx.content_box           = vbox;
     ctx.hpaned                = hpaned;
@@ -5964,13 +6532,18 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
     ctx->plugin_window_count = 0;
     ctx->plugin_window_cap   = 0;
 
-    /* Clean up plugin system */
-    evemon_event_bus_destroy();
+    /* Stop plugin workers and let subscribers detach while the event bus is
+     * still alive.  The GPU service publishes from its collector thread, so
+     * destroying the bus first would race its final publish. */
     if (ctx->plugin_registry) {
         plugin_registry_destroy(ctx->plugin_registry);
         free(ctx->plugin_registry);
         ctx->plugin_registry = NULL;
     }
+    g_free(ctx->gpu_snapshot.devices);
+    g_free(ctx->gpu_snapshot.processes);
+    memset(&ctx->gpu_snapshot, 0, sizeof(ctx->gpu_snapshot));
+    evemon_event_bus_destroy();
     ctx->plugin_notebook = NULL;
 
     /* Destroy the GTK-free process store */

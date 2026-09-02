@@ -152,7 +152,7 @@ RPM_DOCKERFILE_fedora41 := packaging/fedora41
 RPM_IMAGE  := evemon-builder-$(RPM_TARGET)
 RPM_OUTDIR := $(CURDIR)/dist/$(RPM_TARGET)
 
-.PHONY: all clean run debug gdb install uninstall deb rpm
+.PHONY: all clean run debug gdb install uninstall deb rpm nvtop
 
 all: $(CORE_LIB) $(TARGET) $(BPF_OBJ) plugins
 
@@ -203,7 +203,10 @@ PLUGIN_CFLAGS  := -Wall -Wextra -std=c11 -O2 -D_GNU_SOURCE -fPIC -shared \
 PLUGIN_LDFLAGS := $(GTK_LDFLAGS) $(FC_LDFLAGS)
 
 PLUGIN_SRCS := $(filter-out $(SRC_DIR)/plugins/json_service_plugin.c \
-                             $(SRC_DIR)/plugins/proc_meta_service_plugin.c, \
+                             $(SRC_DIR)/plugins/proc_meta_service_plugin.c \
+                             $(SRC_DIR)/plugins/gpu_plugin.c \
+                             $(SRC_DIR)/plugins/gpu_nvtop_adapter.c \
+                             $(SRC_DIR)/plugins/gpu_dcmi_shim.c, \
                              $(wildcard $(SRC_DIR)/plugins/*.c))
 PLUGIN_SOS  := $(patsubst $(SRC_DIR)/plugins/%.c,$(PLUGIN_DIR)/evemon_%.so,$(PLUGIN_SRCS))
 
@@ -212,6 +215,98 @@ $(PLUGIN_DIR):
 
 $(PLUGIN_DIR)/evemon_%.so: $(SRC_DIR)/plugins/%.c $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
 	$(CC) $(PLUGIN_CFLAGS) -o $@ $< $(PLUGIN_LDFLAGS)
+
+# GPU System plugin: compile the UI and complete pinned nvtop 3.3.2 backend
+# set into one self-contained plugin.
+# Vendor SDKs are resolved at runtime by nvtop (or gpu_dcmi_shim.c for
+# Ascend), so one plugin supports mixed-vendor machines without hard runtime
+# dependencies on every vendor library.
+NVTOP_DIR       := third_party/nvtop
+NVTOP_AVAILABLE := $(if $(wildcard $(NVTOP_DIR)/src/extract_gpuinfo.c),1,0)
+NVTOP_INCLUDE   := $(NVTOP_DIR)/include
+NVTOP_SRC_DIR   := $(NVTOP_DIR)/src
+
+ifeq ($(NVTOP_AVAILABLE),0)
+ifeq ($(filter clean nvtop,$(MAKECMDGOALS)),)
+$(info GPU disabled - nvtop missing - run 'make nvtop' to checkout nvtop)
+endif
+endif
+
+nvtop:
+	./scripts/fetch-nvtop.sh
+
+ifeq ($(NVTOP_AVAILABLE),1)
+NVTOP_DRM_CFLAGS := $(shell pkg-config --cflags libdrm 2>/dev/null)
+NVTOP_DRM_LIBS   := $(shell pkg-config --libs libdrm 2>/dev/null)
+NVTOP_UDEV_CFLAGS := $(shell pkg-config --cflags libudev 2>/dev/null)
+NVTOP_UDEV_LIBS   := $(shell pkg-config --libs libudev 2>/dev/null)
+GPU_PLUGIN_CFLAGS := $(filter-out -std=c11,$(PLUGIN_CFLAGS)) \
+                     -std=gnu11 -pthread
+GPU_PLUGIN_LDFLAGS := $(PLUGIN_LDFLAGS) -pthread
+
+NVTOP_COMMON_SRCS := \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo.c \
+    $(NVTOP_SRC_DIR)/time.c
+
+ifeq ($(shell uname -s),Darwin)
+GPU_PLUGIN_CC := clang
+NVTOP_PLATFORM_SRCS := \
+    $(NVTOP_SRC_DIR)/get_process_info_mac.c \
+    $(NVTOP_SRC_DIR)/extract_processinfo_mac.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_apple.m
+NVTOP_PLATFORM_CFLAGS :=
+NVTOP_PLATFORM_LIBS := \
+    -framework Metal -framework AppKit -framework Foundation \
+    -framework QuartzCore -framework IOKit
+GPU_PLUGIN_SYSTEM_LIBS := -lm
+else
+GPU_PLUGIN_CC := $(CC)
+NVTOP_PLATFORM_SRCS := \
+    $(SRC_DIR)/plugins/gpu_dcmi_shim.c \
+    $(NVTOP_SRC_DIR)/get_process_info_linux.c \
+    $(NVTOP_SRC_DIR)/extract_processinfo_fdinfo.c \
+    $(NVTOP_SRC_DIR)/device_discovery_linux.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_nvidia.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_ascend.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_amdgpu.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_amdgpu_utils.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_intel.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_intel_i915.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_intel_xe.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_msm.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_msm_utils.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_panfrost.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_panfrost_utils.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_panthor.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_panthor_utils.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_mali_common.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_v3d.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_v3d_utils.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_tpu.c \
+    $(NVTOP_SRC_DIR)/extract_npuinfo_rockchip.c \
+    $(NVTOP_SRC_DIR)/extract_gpuinfo_metax.c \
+    $(NVTOP_SRC_DIR)/extract_gcuinfo_enflame.c
+NVTOP_PLATFORM_CFLAGS := -DUSING_LIBUDEV $(NVTOP_DRM_CFLAGS) \
+                         $(NVTOP_UDEV_CFLAGS)
+NVTOP_PLATFORM_LIBS := $(NVTOP_DRM_LIBS) $(NVTOP_UDEV_LIBS)
+GPU_PLUGIN_SYSTEM_LIBS := -ldl -lm
+endif
+
+GPU_PLUGIN_SRCS := \
+    $(SRC_DIR)/plugins/gpu_plugin.c \
+    $(SRC_DIR)/plugins/gpu_nvtop_adapter.c \
+    $(NVTOP_COMMON_SRCS) \
+    $(NVTOP_PLATFORM_SRCS)
+
+$(PLUGIN_DIR)/evemon_gpu_plugin.so: $(GPU_PLUGIN_SRCS) \
+        $(SRC_DIR)/plugins/gpu_nvtop_adapter.h $(SRC_DIR)/evemon_plugin.h | $(PLUGIN_DIR)
+	$(GPU_PLUGIN_CC) $(GPU_PLUGIN_CFLAGS) \
+	    -I$(NVTOP_INCLUDE) -I$(NVTOP_SRC_DIR) \
+	    $(NVTOP_PLATFORM_CFLAGS) \
+	    -o $@ $(GPU_PLUGIN_SRCS) $(GPU_PLUGIN_LDFLAGS) \
+	    $(NVTOP_PLATFORM_LIBS) $(GPU_PLUGIN_SYSTEM_LIBS)
+PLUGIN_SOS += $(PLUGIN_DIR)/evemon_gpu_plugin.so
+endif
 
 # PipeWire plugin needs PW flags (only built when PW is available)
 ifneq ($(PW_LDFLAGS),)
@@ -244,6 +339,9 @@ $(PLUGIN_DIR)/evemon_write_monitor_ui_plugin.so: $(SRC_DIR)/plugins/write_monito
 	$(CC) $(PLUGIN_CFLAGS) $(GSV_CFLAGS) -o $@ $< $(PLUGIN_LDFLAGS) $(GSV_LDFLAGS)
 
 plugins: $(PLUGIN_SOS)
+ifeq ($(NVTOP_AVAILABLE),0)
+	rm -f $(PLUGIN_DIR)/evemon_gpu_plugin.so
+endif
 
 deb:
 	@if [ -z "$(DEB_TARGET)" ]; then \
@@ -359,6 +457,11 @@ install: all
 	rm -f $(DESTDIR)$(LIBDIR)/plugins/*.so
 	install -m 644 $(BPF_OBJ) $(DESTDIR)$(LIBDIR)/
 	install -m 755 $(PLUGIN_SOS) $(DESTDIR)$(LIBDIR)/plugins/
+ifeq ($(NVTOP_AVAILABLE),1)
+	install -d $(DESTDIR)$(EVEMON_DATADIR)/licenses
+	install -m 644 $(NVTOP_DIR)/COPYING \
+	    $(DESTDIR)$(EVEMON_DATADIR)/licenses/nvtop-COPYING
+endif
 	install -d $(DESTDIR)$(MILKDROP_PRESETDIR)
 	if [ -d presets ]; then \
 	    cp -a presets/. $(DESTDIR)$(MILKDROP_PRESETDIR)/; \

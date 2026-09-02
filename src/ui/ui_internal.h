@@ -58,6 +58,13 @@ enum {
     COL_HIGHLIGHT_DIED,/* monotonic µs when process vanished (gint64, 0=alive)   */
     COL_PINNED_ROOT,   /* pid_t of the pinned root, or -1 for normal tree */
     COL_ICON,          /* GdkPixbuf* process icon (may be NULL)                  */
+    COL_GPU,           /* aggregate per-process GPU utilization percent          */
+    COL_GPU_TEXT,      /* formatted GPU utilization string                       */
+    COL_GPU_VRAM,      /* aggregate per-process VRAM bytes (gint64)               */
+    COL_GPU_VRAM_TEXT, /* formatted per-process VRAM string                       */
+    COL_GPU_ENC,       /* aggregate per-process encoder utilization percent       */
+    COL_GPU_ENC_TEXT,  /* formatted encoder utilization string                   */
+    COL_GPU_ACTIVE,    /* process owns at least one supported GPU DRM client       */
     NUM_COLS
 };
 
@@ -380,6 +387,11 @@ typedef struct {
     size_t              audio_pid_cap;
     gboolean            has_audio_plugin;  /* TRUE if audio service plugin loaded */
 
+    /* GPU state arrives from the GPU service exclusively through the event bus. */
+    evemon_gpu_snapshot_t gpu_snapshot;
+    int                   gpu_subscription_id;
+    gboolean              has_gpu_plugin;  /* TRUE while the GPU System plugin is enabled */
+
     /* highlight animation timer: fires ~60 fps while rows are highlighted */
     guint               highlight_timer;
 
@@ -392,6 +404,7 @@ typedef struct {
     guint               filter_hide_timer; /* auto-hide after idle (0=none) */
     gboolean            show_audio_only;  /* TRUE = show only audio processes */
     gboolean            show_cpu_intensive; /* TRUE = show CPU-intensive groups */
+    gboolean            show_gpu_only;    /* TRUE = show only GPU processes */
 
     /* Go-to-PID (Ctrl+G) */
     GtkWidget          *pid_entry;
@@ -434,6 +447,9 @@ typedef struct {
     GtkCheckMenuItem   *detail_panel_menu_item;/* View → Detail Panel toggle       */
     GtkCheckMenuItem   *audio_only_menu_item;  /* View → Show Audio Processes Only  */
     GtkCheckMenuItem   *cpu_intensive_menu_item; /* View → CPU-intensive only       */
+    GtkCheckMenuItem   *gpu_only_menu_item;    /* View → Show GPU Processes Only    */
+    GtkTreeViewColumn  *gpu_columns[3];        /* GPU / VRAM / ENC process columns  */
+    GtkCheckMenuItem   *gpu_column_menu_items[3]; /* matching Columns menu entries   */
     GtkWidget          *detail_paned;          /* current GtkPaned holding panel   */
     GtkWidget          *main_content;          /* tree_overlay (stable reference)  */
     GtkWidget          *content_box;           /* vbox holding menubar+content+status */
@@ -645,6 +661,10 @@ void system_panel_relayout(ui_ctx_t *ctx);
  */
 void on_toggle_system_panel(GtkCheckMenuItem *item, gpointer data);
 
+/* Enable/disable the host-side process-list integration owned by the GPU
+ * System plugin.  ui_plugins.c calls this for live plugin menu changes. */
+void gpu_integration_set_available(ui_ctx_t *ctx, gboolean available);
+
 /*
  * Panel position changed callback for system panel radio items.
  */
@@ -675,6 +695,8 @@ void     sync_filter_store(ui_ctx_t *ctx);
 void     switch_to_real_store(ui_ctx_t *ctx);
 void     rebuild_audio_filter_store(ui_ctx_t *ctx);
 void     sync_audio_filter_store(ui_ctx_t *ctx);
+void     rebuild_gpu_filter_store(ui_ctx_t *ctx);
+void     sync_gpu_filter_store(ui_ctx_t *ctx);
 void     rebuild_cpu_intensive_filter_store(ui_ctx_t *ctx);
 void     sync_cpu_intensive_filter_store(ui_ctx_t *ctx);
 void     expand_respecting_collapsed(ui_ctx_t *ctx);

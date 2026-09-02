@@ -105,7 +105,7 @@ void evemon_event_bus_unsubscribe(int subscription_id)
  */
 typedef struct {
     evemon_event_t  event;
-    /* Deep-copied payload for ALBUM_ART_UPDATED */
+    /* Deep-copied payload for deferred dispatch */
     void           *owned_payload;
 } idle_dispatch_t;
 
@@ -126,6 +126,11 @@ static void idle_dispatch_free(idle_dispatch_t *d)
             evemon_json_payload_t *jp = d->owned_payload;
             free((void *)jp->json);
             free(jp);
+        } else if (d->event.type == EVEMON_EVENT_GPU_SNAPSHOT) {
+            evemon_gpu_snapshot_t *snapshot = d->owned_payload;
+            free(snapshot->devices);
+            free(snapshot->processes);
+            free(snapshot);
         } else {
             /* EVEMON_EVENT_PROC_META and EVEMON_EVENT_CUSTOM: flat alloc */
             free(d->owned_payload);
@@ -219,6 +224,59 @@ static idle_dispatch_t *event_to_idle(const evemon_event_t *event)
             *dst = *(const evemon_proc_meta_t *)event->payload;
             d->event.payload = dst;
             d->owned_payload = dst;
+        }
+    }
+    /* GPU_SNAPSHOT: copy the descriptor and both variable-length arrays. */
+    else if (event->type == EVEMON_EVENT_GPU_SNAPSHOT && event->payload) {
+        const evemon_gpu_snapshot_t *src = event->payload;
+        evemon_gpu_snapshot_t *dst = malloc(sizeof(*dst));
+        if (dst) {
+            *dst = *src;
+            dst->devices = NULL;
+            dst->processes = NULL;
+            if (src->device_count > 0) {
+                size_t device_bytes =
+                    (size_t)src->device_count * sizeof(*src->devices);
+                if (!src->devices ||
+                    device_bytes / sizeof(*src->devices) !=
+                        (size_t)src->device_count) {
+                    free(dst);
+                    free(d);
+                    return NULL;
+                }
+                dst->devices = malloc(device_bytes);
+                if (!dst->devices) {
+                    free(dst);
+                    free(d);
+                    return NULL;
+                }
+                memcpy(dst->devices, src->devices, device_bytes);
+            }
+            if (src->process_count > 0) {
+                size_t process_bytes =
+                    (size_t)src->process_count * sizeof(*src->processes);
+                if (!src->processes ||
+                    process_bytes / sizeof(*src->processes) !=
+                        (size_t)src->process_count) {
+                    free(dst->devices);
+                    free(dst);
+                    free(d);
+                    return NULL;
+                }
+                dst->processes = malloc(process_bytes);
+                if (!dst->processes) {
+                    free(dst->devices);
+                    free(dst);
+                    free(d);
+                    return NULL;
+                }
+                memcpy(dst->processes, src->processes, process_bytes);
+            }
+            d->event.payload = dst;
+            d->owned_payload = dst;
+        } else {
+            free(d);
+            return NULL;
         }
     }
     /* JSON_SNAPSHOT: deep-copy the JSON string */

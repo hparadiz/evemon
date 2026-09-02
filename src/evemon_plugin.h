@@ -57,7 +57,8 @@ typedef enum {
     EVEMON_EVENT_FD_WRITE,            /* payload: evemon_fd_write_payload_t*  */
     EVEMON_EVENT_CHILD_EXEC,           /* payload: evemon_exec_payload_t*      */
     EVEMON_EVENT_PROC_META,            /* payload: evemon_proc_meta_t*         */
-    EVEMON_EVENT_CUSTOM                /* payload: user-defined                */
+    EVEMON_EVENT_CUSTOM,               /* payload: user-defined                */
+    EVEMON_EVENT_GPU_SNAPSHOT          /* payload: evemon_gpu_snapshot_t*      */
 } evemon_event_type_t;
 
 /* Event structure passed to subscribers */
@@ -181,6 +182,72 @@ typedef struct {
     pid_t  ppid;         /* parent PID at exec time (best-effort from /proc) */
     char   path[256];    /* executable path (best effort) */
 } evemon_exec_payload_t;
+
+/* GPU snapshot payload for EVEMON_EVENT_GPU_SNAPSHOT.  These declarations
+ * append an event payload type without changing any existing ABI layout. */
+typedef enum {
+    EVEMON_GPU_VALID_UTILIZATION = (1u << 0),
+    EVEMON_GPU_VALID_MEMORY      = (1u << 1),
+    EVEMON_GPU_VALID_TEMPERATURE = (1u << 2),
+    EVEMON_GPU_VALID_POWER       = (1u << 3),
+    EVEMON_GPU_VALID_POWER_LIMIT = (1u << 4),
+    EVEMON_GPU_VALID_FAN_PERCENT = (1u << 5),
+    EVEMON_GPU_VALID_FAN_RPM     = (1u << 6),
+    EVEMON_GPU_VALID_CORE_CLOCK  = (1u << 7),
+    EVEMON_GPU_VALID_MEM_CLOCK   = (1u << 8),
+    EVEMON_GPU_VALID_PCIE_LINK   = (1u << 9),
+    EVEMON_GPU_VALID_ENCODER     = (1u << 10),
+} evemon_gpu_valid_t;
+
+typedef enum {
+    EVEMON_GPU_PROCESS_VALID_UTILIZATION = (1u << 0),
+    EVEMON_GPU_PROCESS_VALID_MEMORY      = (1u << 1),
+    EVEMON_GPU_PROCESS_VALID_ENCODE      = (1u << 2),
+    EVEMON_GPU_PROCESS_VALID_DECODE      = (1u << 3),
+} evemon_gpu_process_valid_t;
+
+typedef struct {
+    char      name[160];
+    char      vendor[64];
+    char      driver[32];
+    char      pdev[16];
+    uint32_t  valid;
+    uint32_t  utilization_percent;
+    uint32_t  temperature_c;
+    uint32_t  power_mw;
+    uint32_t  power_limit_mw;
+    uint32_t  fan_percent;
+    uint32_t  fan_rpm;
+    uint32_t  core_clock_mhz;
+    uint32_t  core_clock_max_mhz;
+    uint32_t  memory_clock_mhz;
+    uint32_t  memory_clock_max_mhz;
+    uint32_t  pcie_generation;
+    uint32_t  pcie_width;
+    uint32_t  encoder_percent;
+    uint64_t  memory_total_bytes;
+    uint64_t  memory_used_bytes;
+} evemon_gpu_device_t;
+
+typedef struct {
+    uint32_t  device_index;
+    pid_t     pid;
+    uint32_t  valid;
+    uint32_t  utilization_percent;
+    uint32_t  encode_percent;
+    uint32_t  decode_percent;
+    uint64_t  memory_bytes;
+    char      name[96];
+    char      user[64];
+} evemon_gpu_process_t;
+
+typedef struct {
+    uint64_t              monotonic_ns;
+    uint32_t              device_count;
+    uint32_t              process_count;
+    evemon_gpu_device_t  *devices;
+    evemon_gpu_process_t *processes;
+} evemon_gpu_snapshot_t;
 
 /* ── Data needs bitmask ──────────────────────────────────────── */
 

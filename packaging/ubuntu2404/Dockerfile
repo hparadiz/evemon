@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     # GTK 3
     libgtk-3-dev \
+    # GPU backends (pinned nvtop)
+    libdrm-dev \
+    libudev-dev \
     # fontconfig
     libfontconfig1-dev \
     # libbpf / eBPF

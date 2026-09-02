@@ -116,14 +116,15 @@ Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: evemon contributors
 Installed-Size: ${INSTALLED_SIZE}
-Depends: libgtk-3-0, libfontconfig1, libbpf1, libelf1, zlib1g, libjansson4, libsqlite3-0, libpipewire-0.3-0, libsoup-3.0-0, libgtksourceview-4-0, libepoxy0, libx11-6
+Depends: libgtk-3-0, libfontconfig1, libbpf1, libelf1, zlib1g, libjansson4, libsqlite3-0, libpipewire-0.3-0, libsoup-3.0-0, libgtksourceview-4-0, libepoxy0, libx11-6, libdrm2, libudev1
 Section: utils
 Priority: optional
 Homepage: https://github.com/hparadiz/evemon
 Description: Linux process monitor with deep per-process introspection
  evemon drills into individual processes: file descriptors, network sockets,
  environment variables, memory maps, shared libraries, cgroup limits,
- container context, Steam/Proton metadata, and live PipeWire audio streams.
+ container context, Steam/Proton metadata, live PipeWire audio streams, and
+ multi-vendor GPU telemetry.
  Powered by eBPF tracepoints and a plugin-based sidebar.
 EOF
 

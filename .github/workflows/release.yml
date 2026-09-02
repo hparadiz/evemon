@@ -17,6 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch pinned nvtop sources
+        run: make nvtop
+
       - name: Derive version from tag
         id: ver
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
@@ -49,6 +52,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch pinned nvtop sources
+        run: make nvtop
 
       - name: Derive version from tag
         id: ver

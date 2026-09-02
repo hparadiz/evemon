@@ -33,6 +33,7 @@ extern void register_sort_funcs(GtkTreeModelSort *sm);
 extern void rebuild_filter_store(ui_ctx_t *ctx);
 extern void switch_to_real_store(ui_ctx_t *ctx);
 extern void rebuild_audio_filter_store(ui_ctx_t *ctx);
+extern void rebuild_gpu_filter_store(ui_ctx_t *ctx);
 extern void rebuild_cpu_intensive_filter_store(ui_ctx_t *ctx);
 
 /* ── overlay positioning ─────────────────────────────────────── */
@@ -138,7 +139,9 @@ gboolean on_filter_entry_key_release(GtkWidget *widget, GdkEventKey *ev,
         filter_cancel_hide_timer(ctx);
         gtk_entry_set_text(GTK_ENTRY(ctx->filter_entry), "");
         ctx->filter_text[0] = '\0';
-        if (ctx->show_cpu_intensive)
+        if (ctx->show_gpu_only)
+            rebuild_gpu_filter_store(ctx);
+        else if (ctx->show_cpu_intensive)
             rebuild_cpu_intensive_filter_store(ctx);
         else if (ctx->show_audio_only)
             rebuild_audio_filter_store(ctx);
@@ -164,7 +167,9 @@ gboolean on_filter_entry_key_release(GtkWidget *widget, GdkEventKey *ev,
         filter_cancel_hide_timer(ctx);
         rebuild_filter_store(ctx);
     } else {
-        if (ctx->show_cpu_intensive)
+        if (ctx->show_gpu_only)
+            rebuild_gpu_filter_store(ctx);
+        else if (ctx->show_cpu_intensive)
             rebuild_cpu_intensive_filter_store(ctx);
         else if (ctx->show_audio_only)
             rebuild_audio_filter_store(ctx);
@@ -615,7 +620,9 @@ gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data)
                 filter_cancel_hide_timer(ctx);
                 gtk_entry_set_text(GTK_ENTRY(ctx->filter_entry), "");
                 ctx->filter_text[0] = '\0';
-                if (ctx->show_cpu_intensive)
+                if (ctx->show_gpu_only)
+                    rebuild_gpu_filter_store(ctx);
+                else if (ctx->show_cpu_intensive)
                     rebuild_cpu_intensive_filter_store(ctx);
                 else if (ctx->show_audio_only)
                     rebuild_audio_filter_store(ctx);

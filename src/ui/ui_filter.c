@@ -3,7 +3,7 @@
  *
  * The filter is implemented as a shadow GtkTreeStore that mirrors
  * the subset of rows from the real store that match the current
- * filter text, audio-PID set, or CPU-intensive group tree.  The real
+ * filter text, audio-PID set, GPU-client set, or CPU-intensive group tree.  The real
  * store is never modified;
  * switching between real and filtered view is a matter of swapping
  * the sort model.
@@ -14,6 +14,8 @@
  *   switch_to_real_store()
  *   rebuild_audio_filter_store()
  *   sync_audio_filter_store()
+ *   rebuild_gpu_filter_store()
+ *   sync_gpu_filter_store()
  *   rebuild_cpu_intensive_filter_store()
  *   sync_cpu_intensive_filter_store()
  *   copy_subtree()
@@ -43,13 +45,16 @@ static GtkTreeIter copy_row(GtkTreeStore *dst, GtkTreeIter *dst_parent,
 
     gint pid, ppid, cpu, rss, grp_rss, grp_cpu, pinned_root;
     gint io_read_rate, io_write_rate;
-    gint64 start_time, hl_born, hl_died;
+    gint gpu, gpu_enc;
+    gint64 start_time, hl_born, hl_died, gpu_vram;
+    gboolean gpu_active;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
           *cwd = NULL, *cmdline = NULL;
     gchar *spark_data = NULL;
+    gchar *gpu_text = NULL, *gpu_vram_text = NULL, *gpu_enc_text = NULL;
     gint spark_peak;
     GdkPixbuf *icon = NULL;
 
@@ -69,6 +74,10 @@ static GtkTreeIter copy_row(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
         COL_PINNED_ROOT, &pinned_root,
         COL_ICON, &icon,
+        COL_GPU, &gpu, COL_GPU_TEXT, &gpu_text,
+        COL_GPU_VRAM, &gpu_vram, COL_GPU_VRAM_TEXT, &gpu_vram_text,
+        COL_GPU_ENC, &gpu_enc, COL_GPU_ENC_TEXT, &gpu_enc_text,
+        COL_GPU_ACTIVE, &gpu_active,
         -1);
 
     gtk_tree_store_set(dst, &dst_iter,
@@ -87,6 +96,10 @@ static GtkTreeIter copy_row(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
         COL_PINNED_ROOT, pinned_root,
         COL_ICON, icon,
+        COL_GPU, gpu, COL_GPU_TEXT, gpu_text,
+        COL_GPU_VRAM, gpu_vram, COL_GPU_VRAM_TEXT, gpu_vram_text,
+        COL_GPU_ENC, gpu_enc, COL_GPU_ENC_TEXT, gpu_enc_text,
+        COL_GPU_ACTIVE, gpu_active,
         -1);
 
     if (icon) g_object_unref(icon);   /* gtk_tree_model_get reffed it */
@@ -95,6 +108,7 @@ static GtkTreeIter copy_row(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
     g_free(spark_data);
+    g_free(gpu_text); g_free(gpu_vram_text); g_free(gpu_enc_text);
 
     return dst_iter;
 }
@@ -137,6 +151,92 @@ static gboolean match_audio(GtkTreeModel *model, GtkTreeIter *iter,
     gtk_tree_model_get(model, iter, COL_PID, &pid, COL_PINNED_ROOT, &pr, -1);
     if (pr != (gint)PTREE_UNPINNED) return FALSE;
     return audio_pid_is_active(ctx, (pid_t)pid) || pid_is_pinned(ctx, (pid_t)pid);
+}
+
+static gboolean match_gpu(GtkTreeModel *model, GtkTreeIter *iter,
+                          void *userdata)
+{
+    (void)userdata;
+    gboolean active = FALSE;
+    gint pinned_root = 0;
+    gtk_tree_model_get(model, iter,
+                       COL_GPU_ACTIVE, &active,
+                       COL_PINNED_ROOT, &pinned_root,
+                       -1);
+    return pinned_root == (gint)PTREE_UNPINNED && active;
+}
+
+/* Retain only GPU clients and the minimum ancestor chain needed to preserve
+ * their process hierarchy.  A matching parent must not pull unrelated,
+ * non-GPU descendants into the filtered view. */
+static gboolean copy_gpu_branch(GtkTreeStore *dst,
+                                GtkTreeIter *dst_parent,
+                                GtkTreeModel *src,
+                                GtkTreeIter *src_iter)
+{
+    GtkTreeIter dst_iter = copy_row(dst, dst_parent, src, src_iter);
+    gboolean keep = match_gpu(src, src_iter, NULL);
+
+    GtkTreeIter child;
+    gboolean valid = gtk_tree_model_iter_children(src, &child, src_iter);
+    while (valid) {
+        if (copy_gpu_branch(dst, &dst_iter, src, &child))
+            keep = TRUE;
+        valid = gtk_tree_model_iter_next(src, &child);
+    }
+
+    if (!keep)
+        gtk_tree_store_remove(dst, &dst_iter);
+    return keep;
+}
+
+static void copy_gpu_children(GtkTreeStore *dst, GtkTreeModel *src,
+                              GtkTreeIter *src_parent)
+{
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(src, &iter, src_parent);
+    while (valid) {
+        copy_gpu_branch(dst, NULL, src, &iter);
+        valid = gtk_tree_model_iter_next(src, &iter);
+    }
+}
+
+static int count_gpu_branch_rows(GtkTreeModel *model, GtkTreeIter *iter)
+{
+    int descendant_count = 0;
+    GtkTreeIter child;
+    gboolean valid = gtk_tree_model_iter_children(model, &child, iter);
+    while (valid) {
+        descendant_count += count_gpu_branch_rows(model, &child);
+        valid = gtk_tree_model_iter_next(model, &child);
+    }
+    return match_gpu(model, iter, NULL) || descendant_count > 0
+         ? descendant_count + 1 : 0;
+}
+
+static int count_gpu_rows(GtkTreeModel *model)
+{
+    int count = 0;
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
+    while (valid) {
+        count += count_gpu_branch_rows(model, &iter);
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+    return count;
+}
+
+static gboolean gpu_subtree_has_client(GtkTreeModel *model,
+                                       GtkTreeIter *iter)
+{
+    if (match_gpu(model, iter, NULL)) return TRUE;
+    GtkTreeIter child;
+    gboolean valid = gtk_tree_model_iter_children(model, &child, iter);
+    while (valid) {
+        if (gpu_subtree_has_client(model, &child)) return TRUE;
+        valid = gtk_tree_model_iter_next(model, &child);
+    }
+    return FALSE;
 }
 
 static gint cpu_intensive_threshold(void)
@@ -239,13 +339,16 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
 {
     gint pid, ppid, cpu, rss, grp_rss, grp_cpu;
     gint io_read_rate, io_write_rate;
-    gint64 start_time, hl_born, hl_died;
+    gint gpu, gpu_enc;
+    gint64 start_time, hl_born, hl_died, gpu_vram;
+    gboolean gpu_active;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
           *cwd = NULL, *cmdline = NULL;
     gchar *spark_data = NULL;
+    gchar *gpu_text = NULL, *gpu_vram_text = NULL, *gpu_enc_text = NULL;
     gint spark_peak;
 
     gtk_tree_model_get(real, real_iter,
@@ -262,6 +365,10 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_IO_SPARKLINE, &spark_data,
         COL_IO_SPARKLINE_PEAK, &spark_peak,
         COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
+        COL_GPU, &gpu, COL_GPU_TEXT, &gpu_text,
+        COL_GPU_VRAM, &gpu_vram, COL_GPU_VRAM_TEXT, &gpu_vram_text,
+        COL_GPU_ENC, &gpu_enc, COL_GPU_ENC_TEXT, &gpu_enc_text,
+        COL_GPU_ACTIVE, &gpu_active,
         -1);
 
     gint pinned_root;
@@ -283,6 +390,10 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_IO_SPARKLINE_PEAK, spark_peak,
         COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
         COL_PINNED_ROOT, pinned_root,
+        COL_GPU, gpu, COL_GPU_TEXT, gpu_text,
+        COL_GPU_VRAM, gpu_vram, COL_GPU_VRAM_TEXT, gpu_vram_text,
+        COL_GPU_ENC, gpu_enc, COL_GPU_ENC_TEXT, gpu_enc_text,
+        COL_GPU_ACTIVE, gpu_active,
         -1);
 
     g_free(user); g_free(name); g_free(cpu_text); g_free(rss_text);
@@ -290,6 +401,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
     g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
     g_free(spark_data);
+    g_free(gpu_text); g_free(gpu_vram_text); g_free(gpu_enc_text);
 }
 
 static gboolean sync_filter_rows(GtkTreeStore *fs, GtkTreeIter *fs_parent,
@@ -384,6 +496,29 @@ static gboolean cpu_filter_membership_is_current(GtkTreeStore *filter_store,
     return TRUE;
 }
 
+static gboolean gpu_filter_membership_is_current(GtkTreeStore *filter_store,
+                                                  GtkTreeIter *parent,
+                                                  GtkTreeModel *real)
+{
+    GtkTreeModel *filtered = GTK_TREE_MODEL(filter_store);
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_iter_children(filtered, &iter, parent);
+    while (valid) {
+        gint pid = 0;
+        gtk_tree_model_get(filtered, &iter, COL_PID, &pid, -1);
+
+        GtkTreeIter real_iter;
+        if (!find_unpinned_iter_by_pid(real, NULL, (pid_t)pid, &real_iter) ||
+            !gpu_subtree_has_client(real, &real_iter))
+            return FALSE;
+        if (!gpu_filter_membership_is_current(filter_store, &iter, real))
+            return FALSE;
+
+        valid = gtk_tree_model_iter_next(filtered, &iter);
+    }
+    return TRUE;
+}
+
 static gboolean sync_cpu_filter_rows(GtkTreeStore *filter_store,
                                      GtkTreeIter *parent,
                                      GtkTreeModel *real)
@@ -439,7 +574,14 @@ static GtkTreeStore *alloc_filter_store(void)
         G_TYPE_INT64,  /* COL_HIGHLIGHT_BORN    */
         G_TYPE_INT64,  /* COL_HIGHLIGHT_DIED    */
         G_TYPE_INT,    /* COL_PINNED_ROOT       */
-        GDK_TYPE_PIXBUF/* COL_ICON              */
+        GDK_TYPE_PIXBUF,/* COL_ICON             */
+        G_TYPE_INT,    /* COL_GPU               */
+        G_TYPE_STRING, /* COL_GPU_TEXT          */
+        G_TYPE_INT64,  /* COL_GPU_VRAM          */
+        G_TYPE_STRING, /* COL_GPU_VRAM_TEXT     */
+        G_TYPE_INT,    /* COL_GPU_ENC           */
+        G_TYPE_STRING, /* COL_GPU_ENC_TEXT      */
+        G_TYPE_BOOLEAN /* COL_GPU_ACTIVE        */
     );
 }
 
@@ -637,6 +779,43 @@ void sync_audio_filter_store(ui_ctx_t *ctx)
 
     if (expected != current || !sync_filter_rows(ctx->filter_store, NULL, real))
         rebuild_audio_filter_store(ctx);
+}
+
+/* Rebuild the GPU-only process tree from the host model.  A process remains
+ * present at zero instantaneous utilization while any nvtop backend still
+ * reports it as a GPU client. */
+void rebuild_gpu_filter_store(ui_ctx_t *ctx)
+{
+    if (ctx->filter_text[0] != '\0') {
+        rebuild_filter_store(ctx);
+        return;
+    }
+    GtkTreeStore *fs = alloc_filter_store();
+    copy_gpu_children(fs, GTK_TREE_MODEL(ctx->store), NULL);
+    install_populated_filter_store(ctx, fs, expand_respecting_collapsed,
+                                   TRUE);
+}
+
+void sync_gpu_filter_store(ui_ctx_t *ctx)
+{
+    if (!ctx->filter_store) {
+        rebuild_gpu_filter_store(ctx);
+        return;
+    }
+
+    if (ctx->filter_text[0] != '\0') {
+        sync_filter_store(ctx);
+        return;
+    }
+
+    GtkTreeModel *real = GTK_TREE_MODEL(ctx->store);
+    int expected = count_gpu_rows(real);
+    int current = count_store_rows(GTK_TREE_MODEL(ctx->filter_store), NULL);
+
+    if (expected != current ||
+        !gpu_filter_membership_is_current(ctx->filter_store, NULL, real) ||
+        !sync_filter_rows(ctx->filter_store, NULL, real))
+        rebuild_gpu_filter_store(ctx);
 }
 
 static void expand_all_filtered_rows(ui_ctx_t *ctx)

@@ -61,6 +61,7 @@ static void settings_set_defaults(evemon_settings_t *s)
     s->preselected_pid       = 1;        /* init                        */
     s->show_audio_only       = false;
     s->show_cpu_intensive    = false;
+    s->show_gpu_only         = false;
     s->system_panel_open        = false;
     s->system_panel_position    = 0;        /* bottom                      */
     s->column_count          = 0;        /* empty = show all defaults   */
@@ -157,10 +158,17 @@ static int settings_load_from_file(evemon_settings_t *s, const char *path)
     if ((v = json_object_get(root, "show_cpu_intensive")) && json_is_boolean(v))
         s->show_cpu_intensive = json_boolean_value(v);
 
-    /* These are alternate views, not composable filters.  Prefer the
-     * CPU view if an older or hand-edited settings file enables both. */
-    if (s->show_cpu_intensive)
+    if ((v = json_object_get(root, "show_gpu_only")) && json_is_boolean(v))
+        s->show_gpu_only = json_boolean_value(v);
+
+    /* These are alternate views, not composable filters.  Resolve invalid
+     * hand-edited state deterministically: GPU, then CPU, then audio. */
+    if (s->show_gpu_only) {
+        s->show_cpu_intensive = false;
         s->show_audio_only = false;
+    } else if (s->show_cpu_intensive) {
+        s->show_audio_only = false;
+    }
 
     if ((v = json_object_get(root, "spectro_theme")) && json_is_integer(v)) {
         int t = (int)json_integer_value(v);
@@ -296,6 +304,8 @@ int settings_save(void)
                         json_boolean(s->show_audio_only));
     json_object_set_new(root, "show_cpu_intensive",
                         json_boolean(s->show_cpu_intensive));
+    json_object_set_new(root, "show_gpu_only",
+                        json_boolean(s->show_gpu_only));
     json_object_set_new(root, "spectro_theme",
                         json_integer(s->spectro_theme));
     json_object_set_new(root, "system_panel_open",

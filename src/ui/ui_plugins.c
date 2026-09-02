@@ -217,6 +217,26 @@ void on_plugin_toggled(GtkCheckMenuItem *item, gpointer data)
                     continue;
                 if (strcmp(inst->so_path, d->so_path) != 0) continue;
                 if (!PLUGIN_IS_AVAILABLE(inst)) continue;
+
+                if (inst->plugin->role == EVEMON_ROLE_SYSTEM &&
+                    strcmp(inst->plugin->id, "org.evemon.gpu") == 0) {
+                    GtkWidget *system_notebook = ctx->system_panel_notebook;
+                    if (system_notebook &&
+                        gtk_notebook_page_num(GTK_NOTEBOOK(system_notebook),
+                                              inst->widget) < 0) {
+                        const char *lbl = inst->plugin->name
+                                        ? inst->plugin->name
+                                        : inst->plugin->id;
+                        system_panel_add_plugin(ctx, inst->widget, lbl,
+                                                inst->instance_id);
+                    }
+                    plugin_instance_set_pid(inst, 1, FALSE);
+                    plugin_instance_set_active(inst, TRUE);
+                    gtk_widget_show_all(inst->widget);
+                    gpu_integration_set_available(ctx, TRUE);
+                    continue;
+                }
+
                 gboolean found = FALSE;
                 int npages = gtk_notebook_get_n_pages(GTK_NOTEBOOK(notebook));
                 for (int p = 0; p < npages; p++) {
@@ -238,6 +258,8 @@ void on_plugin_toggled(GtkCheckMenuItem *item, gpointer data)
         }
 
     } else {
+        gboolean disabling_gpu =
+            strcmp(d->plugin_id, "org.evemon.gpu") == 0;
         int ids[256];
         size_t n_ids = 0;
         void *handle = NULL;
@@ -247,6 +269,11 @@ void on_plugin_toggled(GtkCheckMenuItem *item, gpointer data)
                 preg->instances[i].plugin->id)
                 snprintf(d->plugin_id, sizeof(d->plugin_id),
                          "%s", preg->instances[i].plugin->id);
+            if (preg->instances[i].plugin &&
+                preg->instances[i].plugin->id &&
+                strcmp(preg->instances[i].plugin->id,
+                       "org.evemon.gpu") == 0)
+                disabling_gpu = TRUE;
             if (n_ids < 256)
                 ids[n_ids++] = preg->instances[i].instance_id;
             if (!handle)
@@ -266,11 +293,31 @@ void on_plugin_toggled(GtkCheckMenuItem *item, gpointer data)
             }
         }
 
+        if (disabling_gpu && ctx->system_panel_notebook) {
+            GtkWidget *system_notebook = ctx->system_panel_notebook;
+            for (size_t i = 0; i < preg->count; i++) {
+                if (strcmp(preg->instances[i].so_path, d->so_path) != 0)
+                    continue;
+                if (!preg->instances[i].widget) continue;
+                int page = gtk_notebook_page_num(
+                    GTK_NOTEBOOK(system_notebook),
+                    preg->instances[i].widget);
+                if (page >= 0)
+                    gtk_notebook_remove_page(GTK_NOTEBOOK(system_notebook),
+                                             page);
+            }
+            ctx->system_panel_has_plugins =
+                gtk_notebook_get_n_pages(GTK_NOTEBOOK(system_notebook)) > 0;
+        }
+
         for (size_t i = 0; i < n_ids; i++)
             plugin_instance_destroy(preg, ids[i]);
 
         if (handle)
             dlclose(handle);
+
+        if (disabling_gpu)
+            gpu_integration_set_available(ctx, FALSE);
 
         settings_plugin_set_enabled(d->plugin_id[0] ? d->plugin_id : NULL,
                                     false);

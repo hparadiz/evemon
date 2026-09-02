@@ -784,14 +784,16 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     gtk_tree_store_append(dst, &dst_iter, dst_parent);
 
     gint pid, ppid, cpu, rss, grp_rss, grp_cpu;
-    gint io_read_rate, io_write_rate;
-    gint64 start_time, hl_born, hl_died;
+    gint io_read_rate, io_write_rate, gpu, gpu_enc;
+    gint64 start_time, hl_born, hl_died, gpu_vram;
+    gboolean gpu_active;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
     gchar *io_read_text = NULL, *io_write_text = NULL;
     gchar *start_text = NULL, *container = NULL, *service = NULL,
           *cwd = NULL, *cmdline = NULL;
     gchar *spark_data = NULL;
+    gchar *gpu_text = NULL, *gpu_vram_text = NULL, *gpu_enc_text = NULL;
     gint spark_peak;
     GdkPixbuf *icon = NULL;
 
@@ -810,6 +812,10 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_IO_SPARKLINE_PEAK, &spark_peak,
         COL_HIGHLIGHT_BORN, &hl_born, COL_HIGHLIGHT_DIED, &hl_died,
         COL_ICON, &icon,
+        COL_GPU, &gpu, COL_GPU_TEXT, &gpu_text,
+        COL_GPU_VRAM, &gpu_vram, COL_GPU_VRAM_TEXT, &gpu_vram_text,
+        COL_GPU_ENC, &gpu_enc, COL_GPU_ENC_TEXT, &gpu_enc_text,
+        COL_GPU_ACTIVE, &gpu_active,
         -1);
 
     gtk_tree_store_set(dst, &dst_iter,
@@ -828,6 +834,10 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_HIGHLIGHT_BORN, hl_born, COL_HIGHLIGHT_DIED, hl_died,
         COL_PINNED_ROOT, pinned_root,
         COL_ICON, icon,
+        COL_GPU, gpu, COL_GPU_TEXT, gpu_text,
+        COL_GPU_VRAM, gpu_vram, COL_GPU_VRAM_TEXT, gpu_vram_text,
+        COL_GPU_ENC, gpu_enc, COL_GPU_ENC_TEXT, gpu_enc_text,
+        COL_GPU_ACTIVE, gpu_active,
         -1);
 
     if (icon) g_object_unref(icon);   /* gtk_tree_model_get reffed it */
@@ -836,6 +846,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     g_free(io_read_text); g_free(io_write_text); g_free(start_text);
     g_free(container); g_free(service); g_free(cwd); g_free(cmdline);
     g_free(spark_data);
+    g_free(gpu_text); g_free(gpu_vram_text); g_free(gpu_enc_text);
 
     /* Recurse into children */
     GtkTreeIter child;

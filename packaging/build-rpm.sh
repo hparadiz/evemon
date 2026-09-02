@@ -41,7 +41,7 @@ Name:           evemon
 Version:        ${VERSION}
 Release:        ${RELEASE}%{?dist}
 Summary:        Linux process monitor with deep per-process introspection
-License:        MIT
+License:        GPL-3.0-or-later
 URL:            https://github.com/akujin/evemon
 
 BuildArch:      ${ARCH}
@@ -58,11 +58,14 @@ Requires: libsoup3
 Requires: gtksourceview4
 Requires: libepoxy
 Requires: libX11
+Requires: libdrm
+Requires: systemd-libs
 
 %description
 evemon drills into individual processes: file descriptors, network sockets,
 environment variables, memory maps, shared libraries, cgroup limits,
-container context, Steam/Proton metadata, and live PipeWire audio streams.
+container context, Steam/Proton metadata, live PipeWire audio streams, and
+multi-vendor GPU telemetry.
 Powered by eBPF tracepoints and a plugin-based sidebar.
 
 %install
@@ -75,6 +78,7 @@ cp -a ${DESTDIR}/. %{buildroot}/
 %{_datadir}/pixmaps/evemon.png
 %dir %{_datadir}/evemon
 %{_datadir}/evemon/software-directory.sqlite
+%{_datadir}/evemon/licenses
 %dir %{_datadir}/evemon/milkdrop
 %{_datadir}/evemon/milkdrop/presets
 %dir %{_libdir}/evemon
