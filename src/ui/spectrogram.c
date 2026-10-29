@@ -1,3 +1,4 @@
+#include "../ipc/query.h"
 /*
  * spectrogram.c – real-time audio spectrogram for a selected process.
  *
@@ -10,7 +11,11 @@
 
 #ifdef HAVE_PIPEWIRE
 
+#ifdef EVEMON_QT_WIDGETS
+#include "../qt/audio_services_native.h"
+#else
 #include "ui_internal.h"
+#endif
 
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
@@ -800,6 +805,7 @@ void spectrogram_stop(ui_ctx_t *ctx, GtkDrawingArea *draw_area)
 void spectrogram_start_for_node(ui_ctx_t *ctx, GtkDrawingArea *draw_area,
                                 uint32_t node_id)
 {
+    if (query_is_foreign_host()) return;
     if (!draw_area) return;
 
     /* If we're already capturing this exact node on this draw area, do nothing */

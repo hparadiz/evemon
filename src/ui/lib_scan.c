@@ -18,7 +18,7 @@
  */
 
 #include "ui_internal.h"
-#include "../steam.h"
+#include "../core/steam.h"
 
 #include <unistd.h>
 

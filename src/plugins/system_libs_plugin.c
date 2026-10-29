@@ -1,3 +1,5 @@
+#include "../ipc/query.h"
+#include "broker_data.h"
 /*
  * system_libs_plugin.c – Shared Libraries plugin for the System Panel.
  *
@@ -6,7 +8,7 @@
  * process that has the library mapped in the right-hand detail pane.
  */
 
-#include "../evemon_plugin.h"
+#include "evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
 #include <strings.h>
@@ -85,6 +87,21 @@ typedef struct {
     char  path[512];
 } slib_row_t;
 
+typedef struct { size_t first_idx; size_t proc_count; size_t total_size_kb; } merged_t;
+static int merged_cmp(const void *a, const void *b, void *opaque)
+{
+    static const int cat_prio[LIB_CAT_COUNT] = {
+        [LIB_CAT_APPLICATION] = 0, [LIB_CAT_RUNTIME] = 1, [LIB_CAT_SYSTEM] = 2,
+        [LIB_CAT_WINE_BUILTIN] = 3, [LIB_CAT_WINDOWS_DLL] = 4, [LIB_CAT_OTHER] = 5,
+    };
+    const merged_t *ma = a, *mb = b;
+    const slib_entry_t *entries = opaque;
+    int pa = cat_prio[entries[ma->first_idx].cat];
+    int pb = cat_prio[entries[mb->first_idx].cat];
+    if (pa != pb) return pa - pb;
+    return strcasecmp(entries[ma->first_idx].name, entries[mb->first_idx].name);
+}
+
 /* ── per-instance state ──────────────────────────────────────── */
 
 typedef struct {
@@ -105,8 +122,12 @@ typedef struct {
     /* snapshot for detail lookup */
     slib_entry_t   *snap;
     size_t          snap_count;
+    GHashTable     *maps;
+    gint            refs, destroyed;
+    int             busy;
     /* background worker coordination */
     guint           generation;
+    GThread        *worker;
 } slib_ctx_t;
 
 /* ── worker job / result ─────────────────────────────────────── */
@@ -124,9 +145,23 @@ typedef struct {
     size_t        row_count;
     slib_entry_t *snap;
     size_t        snap_count;
+    GHashTable   *maps;
     slib_ctx_t   *ctx;
     guint         generation;
 } slib_result_t;
+
+static void slib_unref(slib_ctx_t *ctx)
+{
+    if (!g_atomic_int_dec_and_test(&ctx->refs)) return;
+    if (ctx->maps) g_hash_table_unref(ctx->maps);
+    free(ctx->snap); free(ctx);
+}
+static void slib_result_free(slib_result_t *res)
+{
+    free(res->rows); free(res->snap);
+    if (res->maps) g_hash_table_unref(res->maps);
+    slib_unref(res->ctx); free(res);
+}
 
 /* ── UTF-8 helpers ───────────────────────────────────────────── */
 
@@ -251,14 +286,27 @@ static void sl_format_size(size_t kb, char *buf, size_t bufsz)
         buf[0] = '\0';
 }
 
+/* The evemon owns process files, even when it runs on another machine. */
+static FILE *evemon_maps(pid_t pid, char **owned)
+{
+    *owned = NULL;
+    broker_pid_data_t *result = broker_request(pid, evemon_NEED_MMAP, NULL);
+    if (!result) return NULL;
+    if (result->data.raw_maps && result->data.raw_maps[0]) *owned = strdup(result->data.raw_maps);
+    broker_pid_data_free(result); free(result);
+    if (!*owned) return NULL;
+    FILE *file = fmemopen(*owned, strlen(*owned), "r");
+    if (!file) { free(*owned); *owned = NULL; }
+    return file;
+}
+
 /* ── gather libs for one PID into a growable array ───────────── */
 
 static void sl_gather_pid(pid_t pid,
-                          slib_entry_t **buf, size_t *count, size_t *cap)
+                          slib_entry_t **buf, size_t *count, size_t *cap, GHashTable *cache)
 {
-    char maps_path[64];
-    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", (int)pid);
-    FILE *f = fopen(maps_path, "r");
+    char *maps = NULL;
+    FILE *f = evemon_maps(pid, &maps);
     if (!f) return;
 
     char line[1024];
@@ -313,10 +361,13 @@ static void sl_gather_pid(pid_t pid,
         if (found) continue;
 
         if (*count >= *cap) {
-            *cap *= 2;
-            slib_entry_t *nb = realloc(*buf, *cap * sizeof(slib_entry_t));
+            if (*cap > SIZE_MAX / 2 / sizeof(slib_entry_t)) break;
+            size_t new_cap = *cap * 2;
+            slib_entry_t *nb = realloc(
+                *buf, new_cap * sizeof(slib_entry_t));
             if (!nb) break;
             *buf = nb;
+            *cap = new_cap;
         }
 
         slib_entry_t *e = &(*buf)[*count];
@@ -331,6 +382,7 @@ static void sl_gather_pid(pid_t pid,
         (*count)++;
     }
     fclose(f);
+    g_hash_table_insert(cache, GINT_TO_POINTER(pid), maps);
 }
 
 /* ── detail panel ────────────────────────────────────────────── */
@@ -339,23 +391,11 @@ static void sl_gather_pid(pid_t pid,
 static void append_detail_rows(slib_ctx_t *ctx, pid_t spid,
                                const char *lib_path)
 {
-    /* Process name */
-    char comm[64] = "";
-    char tmp[80];
-    snprintf(tmp, sizeof(tmp), "/proc/%d/comm", (int)spid);
-    FILE *f = fopen(tmp, "r");
-    if (f) {
-        if (fgets(comm, sizeof(comm), f)) {
-            size_t l = strlen(comm);
-            if (l > 0 && comm[l-1] == '\n') comm[l-1] = '\0';
-        }
-        fclose(f);
-    }
+    char comm[256] = "";
+    query_cached_process(spid, NULL, comm, sizeof(comm));
     if (!comm[0]) snprintf(comm, sizeof(comm), "%d", (int)spid);
-
-    char maps_path[64];
-    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", (int)spid);
-    f = fopen(maps_path, "r");
+    char *maps = ctx->maps ? g_hash_table_lookup(ctx->maps, GINT_TO_POINTER(spid)) : NULL;
+    FILE *f = maps ? fmemopen(maps, strlen(maps), "r") : NULL;
     if (!f) return;
 
     char *comm_esc = g_markup_escape_text(comm, -1);
@@ -633,12 +673,9 @@ static gboolean slib_apply_result(gpointer data)
     slib_result_t *res = data;
     slib_ctx_t    *ctx = res->ctx;
 
-    /* Drop stale result from a previous tick */
-    if (res->generation != ctx->generation) {
-        free(res->rows);
-        free(res->snap);
-        free(res);
-        return G_SOURCE_REMOVE;
+    g_atomic_int_set(&ctx->busy, 0);
+    if (g_atomic_int_get(&ctx->destroyed) || res->generation != ctx->generation) {
+        slib_result_free(res); return G_SOURCE_REMOVE;
     }
 
     GtkTreeModel *model = GTK_TREE_MODEL(ctx->store);
@@ -680,12 +717,14 @@ static gboolean slib_apply_result(gpointer data)
     free(ctx->snap);
     ctx->snap       = res->snap;
     ctx->snap_count = res->snap_count;
+    if (ctx->maps) g_hash_table_unref(ctx->maps);
+    ctx->maps = res->maps;
+    res->snap = NULL; res->maps = NULL;
 
     if (ctx->selected_path[0])
         populate_detail(ctx, ctx->selected_path);
 
-    free(res->rows);
-    free(res);
+    slib_result_free(res);
     return G_SOURCE_REMOVE;
 }
 
@@ -696,15 +735,15 @@ static void *slib_worker(void *arg)
     /* ── gather ── */
     size_t cap = 256, count = 0;
     slib_entry_t *all = malloc(cap * sizeof(slib_entry_t));
-    if (!all) { free(job->pids); free(job); return NULL; }
+    if (!all) { g_atomic_int_set(&job->ctx->busy, 0); slib_unref(job->ctx); free(job->pids); free(job); return NULL; }
+    GHashTable *maps = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, free);
 
-    for (size_t i = 0; i < job->pid_count; i++)
-        sl_gather_pid(job->pids[i], &all, &count, &cap);
+    for (size_t i = 0; i < job->pid_count && !g_atomic_int_get(&job->ctx->destroyed); i++)
+        sl_gather_pid(job->pids[i], &all, &count, &cap, maps);
 
     /* ── filter + merge ── */
     gboolean has_filter = job->filter[0] != '\0';
 
-    typedef struct { size_t first_idx; size_t proc_count; size_t total_size_kb; } merged_t;
     merged_t *merged = malloc((count > 0 ? count : 1) * sizeof(merged_t));
     size_t    mcount = 0;
 
@@ -734,29 +773,12 @@ static void *slib_worker(void *arg)
 
     /* ── sort: Application first, then Runtime, System, Wine, Windows, Other ── */
     if (mcount > 1) {
-        static const int cat_prio[LIB_CAT_COUNT] = {
-            [LIB_CAT_APPLICATION]  = 0,
-            [LIB_CAT_RUNTIME]      = 1,
-            [LIB_CAT_SYSTEM]       = 2,
-            [LIB_CAT_WINE_BUILTIN] = 3,
-            [LIB_CAT_WINDOWS_DLL]  = 4,
-            [LIB_CAT_OTHER]        = 5,
-        };
-        int merged_cmp(const void *a, const void *b, void *ctx) {
-            const merged_t *ma = a, *mb = b;
-            slib_entry_t   *entries = ctx;
-            int pa = cat_prio[entries[ma->first_idx].cat];
-            int pb = cat_prio[entries[mb->first_idx].cat];
-            if (pa != pb) return pa - pb;
-            return strcasecmp(entries[ma->first_idx].name,
-                              entries[mb->first_idx].name);
-        }
         qsort_r(merged, mcount, sizeof(merged_t), merged_cmp, all);
     }
 
     /* ── pre-render rows ── */
     slib_row_t *rows = malloc((mcount > 0 ? mcount : 1) * sizeof(slib_row_t));
-    if (!rows) { free(merged); free(all); free(job->pids); free(job); return NULL; }
+    if (!rows) { g_atomic_int_set(&job->ctx->busy, 0); g_hash_table_unref(maps); slib_unref(job->ctx); free(merged); free(all); free(job->pids); free(job); return NULL; }
 
     for (size_t i = 0; i < mcount; i++) {
         slib_entry_t *e = &all[merged[i].first_idx];
@@ -808,18 +830,20 @@ static void *slib_worker(void *arg)
     free(merged);
 
     slib_result_t *res = malloc(sizeof(slib_result_t));
-    if (!res) { free(rows); free(all); free(job->pids); free(job); return NULL; }
+    if (!res) { g_atomic_int_set(&job->ctx->busy, 0); g_hash_table_unref(maps); slib_unref(job->ctx); free(rows); free(all); free(job->pids); free(job); return NULL; }
     res->rows       = rows;
     res->row_count  = mcount;
     res->snap       = all;
     res->snap_count = count;
+    res->maps       = maps;
     res->ctx        = job->ctx;
     res->generation = job->generation;
 
     free(job->pids);
     free(job);
 
-    g_idle_add(slib_apply_result, res);
+    if (g_atomic_int_get(&res->ctx->destroyed)) slib_result_free(res);
+    else g_idle_add(slib_apply_result, res);
     return NULL;
 }
 
@@ -828,6 +852,7 @@ static void *slib_worker(void *arg)
 static void slib_update(void *opaque, const evemon_proc_data_t *data)
 {
     slib_ctx_t *ctx = opaque;
+    if (g_atomic_int_get(&ctx->busy) || g_atomic_int_get(&ctx->destroyed)) return;
     ctx->last_pid = data->pid;
     ctx->generation++;
 
@@ -850,11 +875,10 @@ static void slib_update(void *opaque, const evemon_proc_data_t *data)
     job->generation = ctx->generation;
     g_strlcpy(job->filter, ctx->filter_text, sizeof(job->filter));
 
-    GThread *t = g_thread_try_new("slib_worker", slib_worker, job, NULL);
-    if (!t)
-        slib_worker(job);   /* fallback: run inline */
-    else
-        g_thread_unref(t);
+    g_atomic_int_set(&ctx->busy, 1); g_atomic_int_inc(&ctx->refs);
+    if (ctx->worker) g_thread_join(ctx->worker);
+    ctx->worker = g_thread_try_new("slib_worker", slib_worker, job, NULL);
+    if (!ctx->worker) { g_atomic_int_set(&ctx->busy, 0); slib_unref(ctx); free(job->pids); free(job); }
 }
 
 static void slib_clear(void *opaque)
@@ -863,6 +887,8 @@ static void slib_clear(void *opaque)
     gtk_list_store_clear(ctx->store);
     gtk_list_store_clear(ctx->detail_store);
     ctx->selected_path[0] = '\0';
+    ++ctx->generation;
+    if (ctx->maps) { g_hash_table_unref(ctx->maps); ctx->maps = NULL; }
     free(ctx->snap);
     ctx->snap       = NULL;
     ctx->snap_count = 0;
@@ -872,8 +898,9 @@ static void slib_clear(void *opaque)
 static void slib_destroy(void *opaque)
 {
     slib_ctx_t *ctx = opaque;
-    free(ctx->snap);
-    free(ctx);
+    g_atomic_int_set(&ctx->destroyed, 1);
+    if (ctx->worker) g_thread_join(ctx->worker);
+    slib_unref(ctx);
 }
 
 static int slib_wants_update(void *opaque)
@@ -892,6 +919,7 @@ evemon_plugin_t *evemon_plugin_init(void)
 {
     slib_ctx_t *ctx = calloc(1, sizeof(slib_ctx_t));
     if (!ctx) return NULL;
+    ctx->refs = 1;
 
     evemon_plugin_t *p = calloc(1, sizeof(evemon_plugin_t));
     if (!p) { free(ctx); return NULL; }

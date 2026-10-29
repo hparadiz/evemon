@@ -4,7 +4,7 @@
 # Produces a .rpm in /out (bind-mounted from the host).
 set -euo pipefail
 
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-0.2.0}"
 ARCH="${ARCH:-$(uname -m)}"
 DEBUG="${DEBUG:-0}"
 RELEASE="${RELEASE:-1}"
@@ -19,18 +19,17 @@ cd "${WORKDIR}"
 
 # ── 2. Compile ──────────────────────────────────────────────────
 unset MAKEFLAGS
-make clean
-
+CONFIGURE_FLAGS="--with-gtk --without-qt --prefix=/usr --libdir=lib"
 if [ "${DEBUG}" = "1" ]; then
-    make debug PREFIX=/usr
-else
-    make all PREFIX=/usr
+    CONFIGURE_FLAGS="${CONFIGURE_FLAGS} --enable-debug"
 fi
+make -j"$(nproc)" BUILD_DIR=build-package CONFIGURE_FLAGS="${CONFIGURE_FLAGS}"
 
 # ── 3. Stage install into a temp tree ───────────────────────────
 DESTDIR="/tmp/evemon-root"
 rm -rf "${DESTDIR}"
-make install PREFIX=/usr DESTDIR="${DESTDIR}"
+DESTDIR="${DESTDIR}" make BUILD_DIR=build-package \
+    CONFIGURE_FLAGS="${CONFIGURE_FLAGS}" install
 
 # ── 4. Write the spec file ──────────────────────────────────────
 SPECDIR="/tmp/rpmbuild/SPECS"

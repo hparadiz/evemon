@@ -8,7 +8,7 @@
  */
 
 #include "ui_internal.h"
-#include "../fdmon.h"
+#include "../platform/fdmon.h"
 
 #include <unistd.h>
 
@@ -197,10 +197,15 @@ static void collect_sock_inodes(pid_t pid,
         if (ino == 0) continue;
 
         if (*inode_count >= *inode_cap) {
-            *inode_cap = *inode_cap ? *inode_cap * 2 : 64;
-            unsigned long *tmp = realloc(*inodes, *inode_cap * sizeof(**inodes));
+            size_t new_cap = *inode_cap ? *inode_cap * 2 : 64;
+            if (new_cap <= *inode_cap ||
+                new_cap > SIZE_MAX / sizeof(**inodes))
+                break;
+            unsigned long *tmp = realloc(
+                *inodes, new_cap * sizeof(**inodes));
             if (!tmp) continue;
             *inodes = tmp;
+            *inode_cap = new_cap;
         }
         (*inodes)[(*inode_count)++] = ino;
     }

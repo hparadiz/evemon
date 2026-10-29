@@ -7,7 +7,9 @@
  * evemon session.
  */
 
+#ifndef EVEMON_NO_GTK
 #include "ui_internal.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +37,9 @@ static const char *dev_cache_get(const char *key)
 
 static const char *dev_cache_put(const char *key, const char *name)
 {
-    if (g_dev_cache_count >= DEV_CACHE_MAX) return name;
+    /* Callers commonly pass a stack buffer.  Returning it when the cache is
+     * saturated would turn the result into a dangling pointer. */
+    if (g_dev_cache_count >= DEV_CACHE_MAX) return NULL;
     dev_cache_entry_t *e = &g_dev_cache[g_dev_cache_count++];
     snprintf(e->key,  sizeof(e->key),  "%s", key);
     snprintf(e->name, sizeof(e->name), "%s", name);

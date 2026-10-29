@@ -2,8 +2,8 @@
  * gpu_plugin.c – Event-driven GPU dashboard for the System Panel.
  */
 
-#include "../evemon_plugin.h"
-#include "../settings.h"
+#include "evemon_plugin.h"
+#include "../core/settings.h"
 #include "gpu_nvtop_adapter.h"
 
 #include <glib.h>
@@ -81,7 +81,7 @@ typedef struct {
 struct gpu_ui_ctx {
     const evemon_host_services_t *host;
     int                           subscription_id;
-    GThread                      *collector_thread;
+    GThread                      *sample_thread;
     gint                          stopping;
     evemon_gpu_backend_t         *backend;
     GtkWidget                    *root;
@@ -114,7 +114,7 @@ static uint64_t monotonic_ns(void)
            (uint64_t)ts.tv_nsec;
 }
 
-static gpointer gpu_collector_thread(gpointer opaque)
+static gpointer gpu_sample_thread(gpointer opaque)
 {
     gpu_ui_ctx_t *ctx = opaque;
     while (!g_atomic_int_get(&ctx->stopping)) {
@@ -996,10 +996,10 @@ static void gpu_activate(void *opaque,
             services->host_ctx, EVEMON_EVENT_GPU_SNAPSHOT,
             on_gpu_snapshot, ctx);
     if (services && services->publish && ctx->backend &&
-        !ctx->collector_thread) {
+        !ctx->sample_thread) {
         g_atomic_int_set(&ctx->stopping, 0);
-        ctx->collector_thread = g_thread_new(
-            "evemon-gpu", gpu_collector_thread, ctx);
+        ctx->sample_thread = g_thread_new(
+            "evemon-gpu", gpu_sample_thread, ctx);
     }
 }
 
@@ -1031,8 +1031,8 @@ static void gpu_destroy(void *opaque)
     gpu_ui_ctx_t *ctx = opaque;
     if (!ctx) return;
     g_atomic_int_set(&ctx->stopping, 1);
-    if (ctx->collector_thread)
-        g_thread_join(ctx->collector_thread);
+    if (ctx->sample_thread)
+        g_thread_join(ctx->sample_thread);
     if (ctx->host && ctx->host->unsubscribe && ctx->subscription_id)
         ctx->host->unsubscribe(ctx->host->host_ctx, ctx->subscription_id);
     g_free(ctx->snapshot.devices);

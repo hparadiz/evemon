@@ -24,8 +24,17 @@
 
 #ifdef HAVE_PIPEWIRE
 
+#ifdef EVEMON_NO_GTK
+#include "../core/log.h"
+#include <glib.h>
+#include <stdio.h>
+#else
 #include "ui_internal.h"
+#endif
 #include "pipewire_graph.h"
+#include "../plugins/broker_data.h"
+#include "../platform/desktop_session.h"
+#include "../core/log.h"
 
 #include <pipewire/pipewire.h>
 #include <spa/utils/dict.h>
@@ -34,6 +43,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -42,6 +52,8 @@ static void pw_graph_init(pw_graph_t *g)
 {
     memset(g, 0, sizeof(*g));
 }
+
+#define PW_SNAPSHOT_OBJECT_LIMIT 65536U
 
 void pw_graph_free(pw_graph_t *g)
 {
@@ -54,8 +66,11 @@ void pw_graph_free(pw_graph_t *g)
 
 static pw_snap_node_t *pw_graph_push_node(pw_graph_t *g)
 {
+    if (g->node_count >= PW_SNAPSHOT_OBJECT_LIMIT) return NULL;
     if (g->node_count >= g->node_cap) {
         size_t nc = g->node_cap ? g->node_cap * 2 : 128;
+        if (nc <= g->node_cap || nc > SIZE_MAX / sizeof(*g->nodes))
+            return NULL;
         pw_snap_node_t *tmp = realloc(g->nodes, nc * sizeof(*tmp));
         if (!tmp) return NULL;
         g->nodes    = tmp;
@@ -68,8 +83,11 @@ static pw_snap_node_t *pw_graph_push_node(pw_graph_t *g)
 
 static pw_snap_port_t *pw_graph_push_port(pw_graph_t *g)
 {
+    if (g->port_count >= PW_SNAPSHOT_OBJECT_LIMIT) return NULL;
     if (g->port_count >= g->port_cap) {
         size_t nc = g->port_cap ? g->port_cap * 2 : 256;
+        if (nc <= g->port_cap || nc > SIZE_MAX / sizeof(*g->ports))
+            return NULL;
         pw_snap_port_t *tmp = realloc(g->ports, nc * sizeof(*tmp));
         if (!tmp) return NULL;
         g->ports    = tmp;
@@ -82,8 +100,11 @@ static pw_snap_port_t *pw_graph_push_port(pw_graph_t *g)
 
 static pw_snap_link_t *pw_graph_push_link(pw_graph_t *g)
 {
+    if (g->link_count >= PW_SNAPSHOT_OBJECT_LIMIT) return NULL;
     if (g->link_count >= g->link_cap) {
         size_t nc = g->link_cap ? g->link_cap * 2 : 128;
+        if (nc <= g->link_cap || nc > SIZE_MAX / sizeof(*g->links))
+            return NULL;
         pw_snap_link_t *tmp = realloc(g->links, nc * sizeof(*tmp));
         if (!tmp) return NULL;
         g->links    = tmp;
@@ -96,8 +117,11 @@ static pw_snap_link_t *pw_graph_push_link(pw_graph_t *g)
 
 static pw_snap_client_t *pw_graph_push_client(pw_graph_t *g)
 {
+    if (g->client_count >= PW_SNAPSHOT_OBJECT_LIMIT) return NULL;
     if (g->client_count >= g->client_cap) {
         size_t nc = g->client_cap ? g->client_cap * 2 : 64;
+        if (nc <= g->client_cap || nc > SIZE_MAX / sizeof(*g->clients))
+            return NULL;
         pw_snap_client_t *tmp = realloc(g->clients, nc * sizeof(*tmp));
         if (!tmp) return NULL;
         g->clients    = tmp;
@@ -108,7 +132,7 @@ static pw_snap_client_t *pw_graph_push_client(pw_graph_t *g)
     return c;
 }
 
-static const pw_snap_node_t *pw_graph_find_node(const pw_graph_t *g,
+const pw_snap_node_t *pw_graph_find_node(const pw_graph_t *g,
                                                  uint32_t id)
 {
     for (size_t i = 0; i < g->node_count; i++)
@@ -212,7 +236,7 @@ static pthread_mutex_t  g_watcher_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static pw_graph_t       g_live_graph;           /* protected by g_watcher_mutex */
 static int              g_live_ready     = 0;   /* set after first full enumeration */
 static pthread_t        g_watcher_tid    = 0;
-static int              g_watcher_stop   = 0;
+static atomic_int       g_watcher_stop   = 0;
 
 /* Watcher-internal connection state (accessed only on watcher thread) */
 
@@ -631,10 +655,16 @@ static void watcher_on_core_done(void *data, uint32_t id, int seq)
 static void watcher_on_core_error(void *data, uint32_t id, int seq,
                                    int res, const char *message)
 {
-    (void)id; (void)seq; (void)res; (void)message;
+    (void)seq;
     pw_watcher_t *w = data;
-    /* On fatal error, quit so the thread can restart */
-    pw_main_loop_quit(w->loop);
+    if (evemon_debug_audio)
+        fprintf(stderr, "evemon: PipeWire object %u: %s (%d)\n", id, message, res);
+    /* Denied or vanished individual objects must not disable the entire audio
+     * graph for unprivileged users. Only a broken core connection is fatal. */
+    if (id == PW_ID_CORE && (res == -EPIPE || res == -ECONNRESET || res == -ENOTCONN)) {
+        atomic_store(&g_watcher_stop, 1);
+        pw_main_loop_quit(w->loop);
+    }
 }
 
 static void *pw_watcher_thread(void *arg)
@@ -682,8 +712,8 @@ static void *pw_watcher_thread(void *arg)
     w.sync_seq = pw_core_sync(w.core, PW_ID_CORE, 0);
 
     /* Run until stop is requested or an error quits the loop */
-    while (!g_watcher_stop)
-        pw_main_loop_run(w.loop);
+    while (!atomic_load(&g_watcher_stop))
+        pw_loop_iterate(pw_main_loop_get_loop(w.loop), 250);
 
     /* Teardown */
     for (size_t i = 0; i < w.bound_count; i++) {
@@ -715,60 +745,9 @@ void pw_watcher_start(void)
 {
     if (g_watcher_tid) return;
 
-    /* Resolve PIPEWIRE_REMOTE once on the main thread. */
-    if (getuid() == 0 && !getenv("PIPEWIRE_REMOTE")) {
-        char pw_remote_buf[256] = {0};
-        const char *uid_str = getenv("SUDO_UID");
-        if (!uid_str) uid_str = getenv("PKEXEC_UID");
-        if (uid_str) {
-            /* Validate that the UID string is purely numeric (OBS-A). */
-            int is_numeric = 1;
-            for (const char *p = uid_str; *p; p++) {
-                if (*p < '0' || *p > '9') { is_numeric = 0; break; }
-            }
-            if (is_numeric)
-                snprintf(pw_remote_buf, sizeof(pw_remote_buf),
-                         "/run/user/%s/pipewire-0", uid_str);
-        } else {
-            DIR *run_dir = opendir("/run/user");
-            if (run_dir) {
-                struct dirent *de;
-                while ((de = readdir(run_dir)) != NULL) {
-                    if (de->d_name[0] == '.') continue;
-                    if (strcmp(de->d_name, "0") == 0) continue;
-
-                    /* Validate d_name is a purely numeric UID (FIND-1). */
-                    int is_numeric = 1;
-                    for (const char *p = de->d_name; *p; p++) {
-                        if (*p < '0' || *p > '9') { is_numeric = 0; break; }
-                    }
-                    if (!is_numeric) continue;
-
-                    /* d_name is purely numeric (validated above), so the
-                     * path length is bounded: "/run/user/" (10) + UID
-                     * digits (≤10 for 32-bit) + "/pipewire-0" (11) < 40.
-                     * Use a larger intermediate buffer to silence the
-                     * -Wformat-truncation false positive. */
-                    char probe[PATH_MAX];
-                    snprintf(probe, sizeof(probe),
-                             "/run/user/%s/pipewire-0", de->d_name);
-
-                    /* Verify ownership matches the directory UID (FIND-1). */
-                    struct stat st;
-                    if (stat(probe, &st) != 0) continue;
-                    uid_t expected_uid = (uid_t)strtoul(de->d_name, NULL, 10);
-                    if (st.st_uid != expected_uid) continue;
-
-                    snprintf(pw_remote_buf, sizeof(pw_remote_buf),
-                             "%s", probe);
-                    break;
-                }
-                closedir(run_dir);
-            }
-        }
-        if (pw_remote_buf[0])
-            setenv("PIPEWIRE_REMOTE", pw_remote_buf, 1);
-    }
+    /* The launcher resolved the invoking user's environment before any worker
+     * started. Do not mutate environ here or guess a different logged-in user. */
+    desktop_session_init();
 
     pw_graph_init(&g_live_graph);
     g_watcher_stop = 0;
@@ -782,11 +761,9 @@ void pw_watcher_start(void)
 void pw_watcher_stop(void)
 {
     if (!g_watcher_tid) return;
-    g_watcher_stop = 1;
-    /* We can't easily signal the PW main loop from outside without
-     * a pipewire reference, so just detach and let it exit on next
-     * iteration check.  The process is shutting down anyway. */
-    pthread_detach(g_watcher_tid);
+    atomic_store(&g_watcher_stop, 1);
+    /* The bounded loop iteration observes shutdown before storage is freed. */
+    pthread_join(g_watcher_tid, NULL);
     g_watcher_tid = 0;
 
     pthread_mutex_lock(&g_watcher_mutex);
@@ -1029,531 +1006,79 @@ int pw_snapshot(pw_graph_t *out)
     return rc;
 }
 
-/* ── per-PID result building ─────────────────────────────────── */
-
-/*
- * Categories for the PipeWire detail panel tree.
- */
-typedef enum {
-    PW_CAT_OUTPUT,    /* streams sending audio out (playback)   */
-    PW_CAT_INPUT,     /* streams capturing audio in (record)    */
-    PW_CAT_VIDEO,     /* video streams                          */
-    PW_CAT_MIDI,      /* MIDI streams                           */
-    PW_CAT_OTHER,     /* anything else                          */
-    PW_CAT_COUNT
-} pw_scan_category_t;
-
-static const char *pw_cat_label[PW_CAT_COUNT] = {
-    [PW_CAT_OUTPUT] = "Audio Output",
-    [PW_CAT_INPUT]  = "Audio Input",
-    [PW_CAT_VIDEO]  = "Video",
-    [PW_CAT_MIDI]   = "MIDI",
-    [PW_CAT_OTHER]  = "Other",
-};
-
-typedef struct {
-    char text[512];
-    pw_scan_category_t cat;
-    uint32_t node_id;    /* PipeWire node ID (for spectrogram selection) */
-} pw_result_entry_t;
-
-typedef struct {
-    pw_result_entry_t *entries;
-    size_t count;
-    size_t capacity;
-} pw_result_list_t;
-
-static void pw_result_init(pw_result_list_t *l) { memset(l, 0, sizeof(*l)); }
-
-static void pw_result_free(pw_result_list_t *l)
+void pw_broker_gather(broker_pid_data_t *d)
 {
-    free(l->entries);
-    memset(l, 0, sizeof(*l));
-}
+    pw_graph_t graph;
+    if (!d || pw_snapshot(&graph)) return;
 
-static void pw_result_push(pw_result_list_t *l, pw_scan_category_t cat,
-                           const char *text, uint32_t node_id)
-{
-    if (l->count >= l->capacity) {
-        size_t nc = l->capacity ? l->capacity * 2 : 32;
-        pw_result_entry_t *tmp = realloc(l->entries, nc * sizeof(*tmp));
-        if (!tmp) return;
-        l->entries  = tmp;
-        l->capacity = nc;
-    }
-    pw_result_entry_t *e = &l->entries[l->count++];
-    e->cat = cat;
-    e->node_id = node_id;
-    snprintf(e->text, sizeof(e->text), "%s", text);
-}
-
-static pw_scan_category_t classify_media_class(const char *mc)
-{
-    if (!mc || !mc[0]) return PW_CAT_OTHER;
-    if (strstr(mc, "Audio") && strstr(mc, "Output"))  return PW_CAT_OUTPUT;
-    if (strstr(mc, "Audio") && strstr(mc, "Input"))   return PW_CAT_INPUT;
-    if (strstr(mc, "Audio") && strstr(mc, "Sink"))    return PW_CAT_OUTPUT;
-    if (strstr(mc, "Audio") && strstr(mc, "Source"))  return PW_CAT_INPUT;
-    if (strstr(mc, "Video"))                          return PW_CAT_VIDEO;
-    if (strstr(mc, "Midi"))                           return PW_CAT_MIDI;
-    return PW_CAT_OTHER;
-}
-
-/*
- * Get the best human-readable label for a node.
- * For streams: prefer media_name (tab title, song name),
- * then node_desc, then app_name, then node_name.
- */
-static const char *node_label(const pw_snap_node_t *n)
-{
-    if (n->media_name[0])  return n->media_name;
-    if (n->node_desc[0])   return n->node_desc;
-    if (n->app_name[0])    return n->app_name;
-    if (n->node_name[0])   return n->node_name;
-    return "(unknown)";
-}
-
-/*
- * Build the per-PID result list from a graph snapshot.
- *
- * For each node owned by `pid`:
- *   1. Classify it (output/input/video/midi/other)
- *   2. Follow links to find what it's connected to
- *   3. Format a display string:
- *        "App Name → Sink Description (media class)"
- *      or for inputs:
- *        "Source Description → App Name (media class)"
- */
-static void build_pid_results(const pw_graph_t *g, pid_t pid,
-                              pw_result_list_t *out)
-{
-    for (size_t ni = 0; ni < g->node_count; ni++) {
-        const pw_snap_node_t *node = &g->nodes[ni];
-        if (node->pid != pid)
-            continue;
-
-        pw_scan_category_t cat = classify_media_class(node->media_class);
-        const char *self_label = node_label(node);
-
-        /* Collect unique peer node IDs this node links to.
-         * For an output stream (Stream/Output/Audio), the stream
-         * is the output side of the link → peer is the input side.
-         * For an input stream (Stream/Input/Audio), the stream
-         * is the input side → peer is the output side. */
-        uint32_t peers[64];
-        size_t npeer = 0;
-
-        for (size_t li = 0; li < g->link_count; li++) {
-            const pw_snap_link_t *lk = &g->links[li];
-            uint32_t peer_id = 0;
-
-            if (lk->output_node_id == node->id)
-                peer_id = lk->input_node_id;
-            else if (lk->input_node_id == node->id)
-                peer_id = lk->output_node_id;
-            else
-                continue;
-
-            if (peer_id == 0 || peer_id == node->id)
-                continue;
-
-            /* Dedup */
-            int found = 0;
-            for (size_t k = 0; k < npeer; k++)
-                if (peers[k] == peer_id) { found = 1; break; }
-            if (!found && npeer < 64)
-                peers[npeer++] = peer_id;
-        }
-
-        if (npeer == 0) {
-            /* Node exists but has no active links */
-            char buf[512];
-            snprintf(buf, sizeof(buf), "%s  (not connected)", self_label);
-            pw_result_push(out, cat, buf, node->id);
-        } else {
-            for (size_t pi = 0; pi < npeer; pi++) {
-                const pw_snap_node_t *peer = pw_graph_find_node(g, peers[pi]);
-                const char *peer_label = peer ? node_label(peer) : "(unknown)";
-
-                char buf[512];
-                if (cat == PW_CAT_OUTPUT) {
-                    /* Our stream → Sink */
-                    snprintf(buf, sizeof(buf), "%s → %s",
-                             self_label, peer_label);
-                } else if (cat == PW_CAT_INPUT) {
-                    /* Source → Our stream */
-                    snprintf(buf, sizeof(buf), "%s → %s",
-                             peer_label, self_label);
-                } else {
-                    snprintf(buf, sizeof(buf), "%s ↔ %s",
-                             self_label, peer_label);
-                }
-                pw_result_push(out, cat, buf, node->id);
+    if (graph.node_count > 0) {
+        d->pw_nodes = calloc(graph.node_count, sizeof(*d->pw_nodes));
+        if (d->pw_nodes) {
+            d->pw_node_cap = graph.node_count;
+            for (size_t i = 0; i < graph.node_count; ++i) {
+                const pw_snap_node_t *s = &graph.nodes[i];
+                evemon_pw_node_t *n = &d->pw_nodes[i];
+                n->id = s->id;
+                n->client_id = s->client_id;
+                n->pid = s->pid;
+                memcpy(n->app_name, s->app_name, sizeof(n->app_name));
+                memcpy(n->node_name, s->node_name, sizeof(n->node_name));
+                memcpy(n->node_desc, s->node_desc, sizeof(n->node_desc));
+                memcpy(n->media_class, s->media_class, sizeof(n->media_class));
+                memcpy(n->media_name, s->media_name, sizeof(n->media_name));
+            }
+            d->data.pw_nodes = d->pw_nodes;
+            d->data.pw_node_count = graph.node_count;
+            for (size_t i = 0; i < graph.node_count; ++i) {
+                const evemon_pw_node_t *n = &d->pw_nodes[i];
+                if (n->pid != d->pid) continue;
+                evemon_log(LOG_AUDIO,
+                    "[pw] pid=%-6d id=%-5u  class=%-30s  media=%-30s  node=%s",
+                    (int)n->pid, n->id,
+                    n->media_class[0] ? n->media_class : "-",
+                    n->media_name[0] ? n->media_name : "-",
+                    n->node_name[0] ? n->node_name : "-");
             }
         }
     }
-}
 
-/* ── Pango markup ────────────────────────────────────────────── */
-
-static char *pw_entry_to_markup(const char *text)
-{
-    /* Highlight the arrow and the part after it in a colour */
-    const char *arrow = strstr(text, " → ");
-    if (!arrow)
-        arrow = strstr(text, " ↔ ");
-
-    if (arrow) {
-        char *left  = g_markup_escape_text(text, (gssize)(arrow - text));
-        char *right = g_markup_escape_text(arrow + strlen(" → "), -1);
-        /* Pick a nice colour for the target device */
-        char *markup = g_strdup_printf(
-            "<b>%s</b> → <span foreground=\"#6699cc\">%s</span>",
-            left, right);
-        g_free(left);
-        g_free(right);
-        return markup;
+    if (graph.link_count > 0) {
+        d->pw_links = calloc(graph.link_count, sizeof(*d->pw_links));
+        if (d->pw_links) {
+            d->pw_link_cap = graph.link_count;
+            for (size_t i = 0; i < graph.link_count; ++i) {
+                const pw_snap_link_t *s = &graph.links[i];
+                evemon_pw_link_t *l = &d->pw_links[i];
+                l->output_node = s->output_node_id;
+                l->output_port = s->output_port_id;
+                l->input_node = s->input_node_id;
+                l->input_port = s->input_port_id;
+            }
+            d->data.pw_links = d->pw_links;
+            d->data.pw_link_count = graph.link_count;
+        }
     }
 
-    return g_markup_escape_text(text, -1);
-}
-
-/* ── GTask async scan ────────────────────────────────────────── */
-
-typedef struct {
-    pid_t              pid;
-    guint              generation;
-    pw_result_list_t   buckets[PW_CAT_COUNT];
-    uint32_t           audio_node_id;   /* first Stream/Output/Audio node for pid, or 0 */
-    uint32_t           audio_node_ids[64]; /* all audio output node IDs for this pid */
-    size_t             audio_node_count;
-    ui_ctx_t          *ctx;
-} pw_scan_task_t;
-
-static void pw_scan_task_free(pw_scan_task_t *t)
-{
-    if (!t) return;
-    for (int c = 0; c < PW_CAT_COUNT; c++)
-        pw_result_free(&t->buckets[c]);
-    free(t);
-}
-
-static void pw_scan_thread_func(GTask        *task,
-                                gpointer      source_object,
-                                gpointer      task_data,
-                                GCancellable *cancellable)
-{
-    (void)source_object;
-    pw_scan_task_t *t = task_data;
-
-    if (g_cancellable_is_cancelled(cancellable))
-        return;
-
-    pw_graph_t graph;
-    if (pw_snapshot(&graph) != 0) {
-        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
-                               "PipeWire connection failed");
-        return;
-    }
-
-    if (g_cancellable_is_cancelled(cancellable)) {
-        pw_graph_free(&graph);
-        return;
-    }
-
-    /* Build per-PID results */
-    pw_result_list_t all;
-    pw_result_init(&all);
-    build_pid_results(&graph, t->pid, &all);
-
-    /* Find all audio output nodes for the spectrogram */
-    t->audio_node_id = 0;
-    t->audio_node_count = 0;
-    for (size_t i = 0; i < graph.node_count; i++) {
-        if (graph.nodes[i].pid == t->pid &&
-            strstr(graph.nodes[i].media_class, "Stream") &&
-            strstr(graph.nodes[i].media_class, "Output") &&
-            strstr(graph.nodes[i].media_class, "Audio")) {
-            if (t->audio_node_count < 64)
-                t->audio_node_ids[t->audio_node_count++] = graph.nodes[i].id;
-            if (t->audio_node_id == 0)
-                t->audio_node_id = graph.nodes[i].id;
+    if (graph.port_count > 0) {
+        d->pw_ports = calloc(graph.port_count, sizeof(*d->pw_ports));
+        if (d->pw_ports) {
+            d->pw_port_cap = graph.port_count;
+            for (size_t i = 0; i < graph.port_count; ++i) {
+                const pw_snap_port_t *s = &graph.ports[i];
+                evemon_pw_port_t *p = &d->pw_ports[i];
+                p->id = s->id;
+                p->node_id = s->node_id;
+                memcpy(p->port_name, s->port_name, sizeof(p->port_name));
+                memcpy(p->direction, s->direction, sizeof(p->direction));
+                memcpy(p->format_dsp, s->format_dsp, sizeof(p->format_dsp));
+            }
+            d->data.pw_ports = d->pw_ports;
+            d->data.pw_port_count = graph.port_count;
         }
     }
 
     pw_graph_free(&graph);
-
-    /* Split into per-category buckets */
-    for (int c = 0; c < PW_CAT_COUNT; c++)
-        pw_result_init(&t->buckets[c]);
-
-    for (size_t i = 0; i < all.count; i++) {
-        pw_scan_category_t cat = all.entries[i].cat;
-        pw_result_push(&t->buckets[cat], cat, all.entries[i].text,
-                       all.entries[i].node_id);
-    }
-    pw_result_free(&all);
-
-    g_task_return_boolean(task, TRUE);
 }
 
-static void pw_scan_complete(GObject      *source_object,
-                             GAsyncResult *result,
-                             gpointer      user_data)
-{
-    (void)source_object;
-    ui_ctx_t *ctx = user_data;
-
-    GTask *task = G_TASK(result);
-    pw_scan_task_t *t = g_task_get_task_data(task);
-
-    if (!t || t->generation != ctx->pw_generation)
-        return;
-    if (g_task_had_error(task))
-        return;
-
-    /* Save scroll position */
-    GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(
-        GTK_SCROLLED_WINDOW(gtk_widget_get_parent(
-            GTK_WIDGET(ctx->pw_view))));
-    double scroll_pos = gtk_adjustment_get_value(vadj);
-
-    GtkTreeModel *model = GTK_TREE_MODEL(ctx->pw_store);
-
-    /* Index existing category rows */
-    GtkTreeIter cat_iters[PW_CAT_COUNT];
-    gboolean    cat_exists[PW_CAT_COUNT];
-    memset(cat_exists, 0, sizeof(cat_exists));
-
-    {
-        GtkTreeIter top;
-        gboolean valid = gtk_tree_model_iter_children(model, &top, NULL);
-        while (valid) {
-            gint cat_id = -1;
-            gtk_tree_model_get(model, &top, PW_COL_CAT, &cat_id, -1);
-            if (cat_id >= 0 && cat_id < PW_CAT_COUNT) {
-                cat_iters[cat_id]  = top;
-                cat_exists[cat_id] = TRUE;
-            }
-            valid = gtk_tree_model_iter_next(model, &top);
-        }
-    }
-
-    /* Remove empty categories */
-    for (int c = 0; c < PW_CAT_COUNT; c++) {
-        if (cat_exists[c] && t->buckets[c].count == 0) {
-            gtk_tree_store_remove(ctx->pw_store, &cat_iters[c]);
-            cat_exists[c] = FALSE;
-        }
-    }
-
-    /* Populate / update each category */
-    for (int c = 0; c < PW_CAT_COUNT; c++) {
-        if (t->buckets[c].count == 0) continue;
-
-        char hdr[128];
-        snprintf(hdr, sizeof(hdr), "%s (%zu)",
-                 pw_cat_label[c], t->buckets[c].count);
-
-        GtkTreeIter parent;
-        if (!cat_exists[c]) {
-            char *hdr_escaped = g_markup_escape_text(hdr, -1);
-            gtk_tree_store_append(ctx->pw_store, &parent, NULL);
-            gtk_tree_store_set(ctx->pw_store, &parent,
-                               PW_COL_TEXT, hdr,
-                               PW_COL_MARKUP, hdr_escaped,
-                               PW_COL_CAT, (gint)c, -1);
-            g_free(hdr_escaped);
-            cat_exists[c] = TRUE;
-            cat_iters[c]  = parent;
-        } else {
-            parent = cat_iters[c];
-            char *hdr_escaped = g_markup_escape_text(hdr, -1);
-            gtk_tree_store_set(ctx->pw_store, &parent,
-                               PW_COL_TEXT, hdr,
-                               PW_COL_MARKUP, hdr_escaped, -1);
-            g_free(hdr_escaped);
-        }
-
-        /* Update child rows in place, adding/removing as needed */
-        GtkTreeIter child;
-        gboolean child_valid = gtk_tree_model_iter_children(
-            model, &child, &parent);
-        size_t bi = 0;
-
-        while (bi < t->buckets[c].count && child_valid) {
-            char *markup = pw_entry_to_markup(t->buckets[c].entries[bi].text);
-            gtk_tree_store_set(ctx->pw_store, &child,
-                               PW_COL_TEXT, t->buckets[c].entries[bi].text,
-                               PW_COL_MARKUP, markup,
-                               PW_COL_CAT, (gint)-1,
-                               PW_COL_NODE_ID, (guint)t->buckets[c].entries[bi].node_id, -1);
-            g_free(markup);
-            bi++;
-            child_valid = gtk_tree_model_iter_next(model, &child);
-        }
-
-        /* Append new rows */
-        while (bi < t->buckets[c].count) {
-            GtkTreeIter new_child;
-            char *markup = pw_entry_to_markup(t->buckets[c].entries[bi].text);
-            gtk_tree_store_append(ctx->pw_store, &new_child, &parent);
-            gtk_tree_store_set(ctx->pw_store, &new_child,
-                               PW_COL_TEXT, t->buckets[c].entries[bi].text,
-                               PW_COL_MARKUP, markup,
-                               PW_COL_CAT, (gint)-1,
-                               PW_COL_NODE_ID, (guint)t->buckets[c].entries[bi].node_id, -1);
-            g_free(markup);
-            bi++;
-        }
-
-        /* Remove excess rows */
-        while (child_valid) {
-            child_valid = gtk_tree_store_remove(ctx->pw_store, &child);
-        }
-
-        /* Restore expand/collapse state */
-        GtkTreePath *cat_path = gtk_tree_model_get_path(
-            model, &cat_iters[c]);
-        if (ctx->pw_collapsed & (1u << c))
-            gtk_tree_view_collapse_row(ctx->pw_view, cat_path);
-        else
-            gtk_tree_view_expand_row(ctx->pw_view, cat_path, FALSE);
-        gtk_tree_path_free(cat_path);
-    }
-
-    gtk_adjustment_set_value(vadj, scroll_pos);
-
-    /* Start (or stop) the spectrogram based on audio node availability.
-     *
-     * If we're already capturing one of this PID's audio nodes,
-     * keep it (the user may have explicitly selected it).
-     * Otherwise, auto-start on the first available audio output node.
-     */
-    if (t->audio_node_count > 0) {
-        /* Only auto-start spectrogram if user has explicitly shown it */
-        if (ctx->sb_spectro_user_shown) {
-            uint32_t current_node = spectrogram_get_target_node(ctx, NULL);
-            int found_current = 0;
-            for (size_t i = 0; i < t->audio_node_count; i++) {
-                if (t->audio_node_ids[i] == current_node) {
-                    found_current = 1;
-                    break;
-                }
-            }
-            if (!found_current)
-                spectrogram_start_for_node(ctx, NULL,
-                                           t->audio_node_ids[0]);
-        }
-
-        /* Start peak meters for all audio output nodes */
-        pw_meter_start(ctx, t->audio_node_ids, t->audio_node_count);
-    } else {
-        spectrogram_stop(ctx, NULL);
-        pw_meter_stop(ctx);
-    }
-}
-
-/* ── public API ──────────────────────────────────────────────── */
-
-void pipewire_scan_start(ui_ctx_t *ctx, pid_t pid)
-{
-    /* Disabled: PipeWire audio is now handled entirely by the
-     * PipeWire plugin (src/plugins/pipewire_plugin.c).  The old
-     * detail panel scanner is kept compiled but not called to avoid
-     * conflicting PipeWire sink creation. */
-    (void)ctx;
-    (void)pid;
-}
-
-/* ── signal callbacks ────────────────────────────────────────── */
-
-void on_pw_row_collapsed(GtkTreeView *view, GtkTreeIter *iter,
-                         GtkTreePath *path, gpointer data)
-{
-    (void)view; (void)path;
-    ui_ctx_t *ctx = data;
-    gint cat_id = -1;
-    gtk_tree_model_get(GTK_TREE_MODEL(ctx->pw_store), iter,
-                       PW_COL_CAT, &cat_id, -1);
-    if (cat_id >= 0 && cat_id < PW_CAT_COUNT)
-        ctx->pw_collapsed |= (1u << cat_id);
-}
-
-void on_pw_row_expanded(GtkTreeView *view, GtkTreeIter *iter,
-                        GtkTreePath *path, gpointer data)
-{
-    (void)view; (void)path;
-    ui_ctx_t *ctx = data;
-    gint cat_id = -1;
-    gtk_tree_model_get(GTK_TREE_MODEL(ctx->pw_store), iter,
-                       PW_COL_CAT, &cat_id, -1);
-    if (cat_id >= 0 && cat_id < PW_CAT_COUNT)
-        ctx->pw_collapsed &= ~(1u << cat_id);
-}
-
-gboolean on_pw_key_press(GtkWidget *widget, GdkEventKey *ev, gpointer data)
-{
-    (void)data;
-
-    if (ev->keyval != GDK_KEY_Return && ev->keyval != GDK_KEY_KP_Enter)
-        return FALSE;
-
-    GtkTreeView *view = GTK_TREE_VIEW(widget);
-    GtkTreeSelection *sel = gtk_tree_view_get_selection(view);
-    GtkTreeModel *model = NULL;
-    GtkTreeIter iter;
-
-    if (!gtk_tree_selection_get_selected(sel, &model, &iter))
-        return FALSE;
-
-    gint cat_id = -1;
-    gtk_tree_model_get(model, &iter, PW_COL_CAT, &cat_id, -1);
-    if (cat_id < 0)
-        return FALSE;
-
-    GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
-    if (!path)
-        return FALSE;
-
-    if (gtk_tree_view_row_expanded(view, path))
-        gtk_tree_view_collapse_row(view, path);
-    else
-        gtk_tree_view_expand_row(view, path, FALSE);
-
-    gtk_tree_path_free(path);
-    return TRUE;
-}
-
-/*
- * Double-click (or Enter on) a leaf row in the PipeWire tree to
- * switch the spectrogram to that specific audio stream.
- */
-void on_pw_row_activated(GtkTreeView *view, GtkTreePath *path,
-                         GtkTreeViewColumn *col, gpointer data)
-{
-    (void)col;
-    ui_ctx_t *ctx = data;
-
-    GtkTreeModel *model = gtk_tree_view_get_model(view);
-    GtkTreeIter iter;
-    if (!gtk_tree_model_get_iter(model, &iter, path))
-        return;
-
-    /* Only act on leaf rows (cat == -1) */
-    gint cat_id = -1;
-    gtk_tree_model_get(model, &iter, PW_COL_CAT, &cat_id, -1);
-    if (cat_id >= 0)
-        return;   /* category header row — handled by expand/collapse */
-
-    guint node_id = 0;
-    gtk_tree_model_get(model, &iter, PW_COL_NODE_ID, &node_id, -1);
-    if (node_id == 0)
-        return;
-
-    /* Mark that the user explicitly wants the spectrogram visible */
-    ctx->sb_spectro_user_shown = TRUE;
-    spectrogram_start_for_node(ctx, NULL, (uint32_t)node_id);
-}
 
 #endif /* HAVE_PIPEWIRE */

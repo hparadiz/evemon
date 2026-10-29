@@ -1,3 +1,4 @@
+#include "../ipc/query.h"
 /*
  * proc_meta_service_plugin.c – Process Metadata service plugin for evemon.
  *
@@ -16,7 +17,8 @@
  *   /usr/share/evemon/software-directory.sqlite
  */
 
-#include "../evemon_plugin.h"
+#include "evemon_plugin.h"
+#include "../app/runtime.h"
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,7 +70,9 @@ static sqlite3 *open_database(void)
      * (HOME, XDG_DATA_HOME) are intentionally excluded to prevent a
      * local user from substituting a malicious database. */
     const char *candidates[2];
-    candidates[0] = "/usr/local/share/evemon/software-directory.sqlite";
+    char data_path[4096];
+    if (evemon_data_path("software-directory.sqlite", data_path, sizeof(data_path))) return NULL;
+    candidates[0] = data_path;
     candidates[1] = "/usr/share/evemon/software-directory.sqlite";
 
     for (int i = 0; i < 2; i++) {
@@ -249,28 +253,15 @@ static void meta_update(void *vctx, const evemon_proc_data_t *data)
     meta_ctx_t *ctx = vctx;
     if (!ctx->host || !ctx->db) return;
 
-    /* data->name is not populated by the broker (no evemon_NEED_NAME flag
-     * exists).  Read the process name directly from /proc/<pid>/comm. */
-    char comm_buf[64] = "";
-    {
-        char path[64];
-        snprintf(path, sizeof(path), "/proc/%d/comm", (int)data->pid);
-        FILE *f = fopen(path, "r");
-        if (f) {
-            if (fgets(comm_buf, sizeof(comm_buf), f)) {
-                size_t l = strlen(comm_buf);
-                if (l > 0 && comm_buf[l-1] == '\n') comm_buf[l-1] = '\0';
-            }
-            fclose(f);
-        }
-    }
-    const char *name = comm_buf[0] ? comm_buf : (data->name ? data->name : "");
+    char comm_buf[256] = "";
+    query_cached_process(data->pid, NULL, comm_buf, sizeof(comm_buf));
+    const char *name = data->name && data->name[0] ? data->name : comm_buf;
 
     /* For PID 1, the comm may be a generic "init" that won't match anything.
      * Use the detected init system name (set at activate time) as the lookup
      * key so that selecting PID 1 shows the systemd/openrc software card. */
     char pid1_name_buf[64];
-    if (data->pid == 1 && ctx->init_system[0] &&
+    if (!query_is_foreign_host() && data->pid == 1 && ctx->init_system[0] &&
         (strcmp(name, "init") == 0 || strcmp(name, "1") == 0 || name[0] == '\0')) {
         snprintf(pid1_name_buf, sizeof(pid1_name_buf), "%s", ctx->init_system);
         name = pid1_name_buf;

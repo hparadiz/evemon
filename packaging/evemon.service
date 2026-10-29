@@ -1,0 +1,16 @@
+[Unit]
+Description=Evemon
+
+[Service]
+Type=simple
+User=root
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/evemon --headless --interval 1000
+# Evemon creates /run/evemon without resetting existing directory/default ACLs.
+# Do not remove that directory on stop: its ACL is the access policy.
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

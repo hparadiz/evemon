@@ -1,3 +1,4 @@
+#include "../ipc/query.h"
 /*
  * gentoo_plugin.c – Gentoo/Portage package info plugin for evemon.
  *
@@ -32,7 +33,7 @@
  *       $(pkg-config --cflags --libs gtk+-3.0)
  */
 
-#include "../evemon_plugin.h"
+#include "evemon_plugin.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -826,7 +827,7 @@ evemon_plugin_t *evemon_plugin_init(void)
      * without any error and no tab is added.
      */
     struct stat st;
-    if (stat("/var/db/pkg", &st) != 0 || !S_ISDIR(st.st_mode))
+    if (query_is_foreign_host() || stat("/var/db/pkg", &st) != 0 || !S_ISDIR(st.st_mode))
         return NULL;
 
     gentoo_ctx_t *ctx = g_slice_new0(gentoo_ctx_t);

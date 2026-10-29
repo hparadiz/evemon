@@ -89,4 +89,9 @@ void pw_graph_free(pw_graph_t *g);
 void pw_watcher_start(void);
 void pw_watcher_stop(void);
 
+struct broker_pid_data;
+void pw_broker_gather(struct broker_pid_data *data);
+
+const pw_snap_node_t *pw_graph_find_node(const pw_graph_t *g, uint32_t id);
+
 #endif /* HAVE_PIPEWIRE */

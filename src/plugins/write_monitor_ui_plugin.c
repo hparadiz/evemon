@@ -1,4 +1,5 @@
-#include "../evemon_plugin.h"
+#include "../ipc/query.h"
+#include "evemon_plugin.h"
 #include <gtksourceview/gtksource.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,35 +148,10 @@ typedef struct {
 static void proc_lookup(pid_t pid, char *name_out, size_t name_sz,
                         pid_t *ppid_out)
 {
-    name_out[0] = '\0';
-    *ppid_out   = 0;
+    proc_entry_t entry = {0};
+    query_cached_process(pid, &entry, name_out, name_sz);
+    *ppid_out = entry.ppid;
 
-    /* name from /proc/PID/comm */
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
-    FILE *f = fopen(path, "r");
-    if (f) {
-        if (fgets(name_out, (int)name_sz, f)) {
-            /* strip trailing newline */
-            size_t l = strlen(name_out);
-            if (l > 0 && name_out[l - 1] == '\n') name_out[l - 1] = '\0';
-        }
-        fclose(f);
-    }
-
-    /* ppid from /proc/PID/status line "PPid:\t<n>" */
-    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
-    f = fopen(path, "r");
-    if (f) {
-        char line[64];
-        while (fgets(line, sizeof(line), f)) {
-            if (strncmp(line, "PPid:\t", 6) == 0) {
-                *ppid_out = (pid_t)atoi(line + 6);
-                break;
-            }
-        }
-        fclose(f);
-    }
 }
 
 /* ── Gutter entry helpers ─────────────────────────────────────── */

@@ -9,7 +9,7 @@
  *       $(pkg-config --cflags --libs gtk+-3.0)
  */
 
-#include "../evemon_plugin.h"
+#include "evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>

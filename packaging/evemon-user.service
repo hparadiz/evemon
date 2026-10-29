@@ -1,0 +1,13 @@
+[Unit]
+Description=Evemon (user service)
+
+[Service]
+Type=simple
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/evemon --headless --interval 1000
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+UMask=0077
+
+[Install]
+WantedBy=default.target

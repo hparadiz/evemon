@@ -1,0 +1,73 @@
+#!/bin/sh
+set -eu
+
+if [ "${EVEMON_MAKE_BUILD:-}" != 1 ]; then
+    printf 'Use make or make configure; direct configuration is not supported.\n' >&2
+    exit 2
+fi
+
+src_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+build_dir="$src_dir/build"
+prefix=/usr/local
+libdir_arg=
+gtk=ON
+qt=OFF
+selected=no
+pipewire=ON
+milkdrop=ON
+gpu=ON
+ebpf=ON
+lto=OFF
+default_ui=
+build_type=RelWithDebInfo
+for arg in "$@"; do
+    case "$arg" in
+        --with-qt|--with-gtk)
+            if [ "$selected" = no ]; then gtk=OFF; qt=OFF; selected=yes; fi
+            case "$arg" in --with-qt) qt=ON;; --with-gtk) gtk=ON;; esac ;;
+        --without-qt) qt=OFF ;;
+        --without-gtk) gtk=OFF ;;
+        --without-pipewire) pipewire=OFF; milkdrop=OFF ;;
+        --with-pipewire) pipewire=ON ;;
+        --without-milkdrop) milkdrop=OFF ;;
+        --with-milkdrop) milkdrop=ON ;;
+        --without-gpu) gpu=OFF ;;
+        --with-gpu) gpu=ON ;;
+        --without-ebpf) ebpf=OFF ;;
+        --with-ebpf) ebpf=ON ;;
+        --enable-lto) lto=ON ;;
+        --disable-lto) lto=OFF ;;
+        --enable-debug) build_type=Debug ;;
+        --prefix=*) prefix=${arg#*=} ;;
+        --libdir=*) libdir_arg="-DCMAKE_INSTALL_LIBDIR=${arg#*=}" ;;
+        --build-dir=*) build_dir=${arg#*=} ;;
+        --with-default-ui=*) default_ui=${arg#*=} ;;
+        --help|-h)
+            cat <<'HELP'
+Usage: ./configure [OPTIONS]
+  --with-qt                 Build Qt 6 frontend
+  --with-gtk                Build GTK 3 frontend (default without UI flags)
+  --without-qt --without-gtk  Build only the headless executable
+  --with-default-ui=gtk|qt|headless  Initial default (saved preference overrides)
+  --without-pipewire        Disable audio and MilkDrop
+  --without-milkdrop        Disable visualization
+  --without-gpu             Disable nvtop GPU support
+  --without-ebpf            Disable eBPF tracing and kernel program compilation
+  --enable-debug            Debug build
+  --enable-lto              Link-time optimization
+  --prefix=PATH             Install prefix (default /usr/local)
+  --libdir=PATH             Library directory name (for example lib or lib64)
+  --build-dir=PATH          Build directory (default ./build)
+Then: make [BUILD_DIR=PATH] [-jN], make install [DESTDIR=PATH]
+Both --with-qt and --with-gtk build one executable with selectable UI modules.
+HELP
+            exit 0 ;;
+        *) printf 'configure: unknown option: %s\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+exec cmake -S "$src_dir" -B "$build_dir" -DCMAKE_INSTALL_PREFIX="$prefix" \
+    $libdir_arg \
+    -DCMAKE_BUILD_TYPE="$build_type" -DEVEMON_GTK="$gtk" -DEVEMON_QT="$qt" \
+    -DEVEMON_PIPEWIRE="$pipewire" -DEVEMON_MILKDROP="$milkdrop" -DEVEMON_GPU="$gpu" \
+    -DEVEMON_EBPF="$ebpf" \
+    -DEVEMON_LTO="$lto" -DEVEMON_DEFAULT_UI="$default_ui"

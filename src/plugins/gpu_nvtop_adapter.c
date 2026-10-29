@@ -2,6 +2,8 @@
  * event-bus GPU snapshot ABI. */
 
 #include "gpu_nvtop_adapter.h"
+#include "../ipc/query.h"
+#include "../ipc/query_gpu.h"
 
 #include "list.h"
 #include "nvtop/extract_gpuinfo.h"
@@ -17,6 +19,7 @@ struct evemon_gpu_backend {
     struct list_head devices;
     unsigned         device_count;
     int              initialized;
+    int              remote;
 };
 
 static const char *backend_driver_name(const char *vendor)
@@ -195,15 +198,29 @@ evemon_gpu_backend_t *evemon_gpu_backend_new(void)
 void evemon_gpu_backend_free(evemon_gpu_backend_t *backend)
 {
     if (!backend) return;
-    if (backend->initialized)
+    if (backend->initialized && !backend->remote)
         gpuinfo_shutdown_info_extraction(&backend->devices);
     free(backend);
 }
 
 uint32_t evemon_gpu_backend_init(evemon_gpu_backend_t *backend)
 {
+    if (backend && query_remote_path()) {
+        backend->remote = 1; backend->initialized = 1;
+        if (!(query_remote_capabilities() & IPC_CAP_GPU)) return 0;
+        /* A compiled backend is not proof that this evemon found a GPU.
+         * Only a successful snapshot with zero devices disables the plugin;
+         * a transient transport failure must leave its normal retry running. */
+        evemon_gpu_snapshot_t snapshot = {0};
+        if (!evemon_gpu_backend_snapshot(backend, &snapshot, 0)) return 1;
+        backend->device_count = snapshot.device_count;
+        evemon_gpu_snapshot_clear(&snapshot);
+        if (!backend->device_count)
+            fputs("evemon: evemon detected no supported GPUs; GPU plugin disabled for this session\n", stderr);
+        return backend->device_count;
+    }
     if (!backend) return 0;
-    if (backend->initialized) return backend->device_count;
+    if (backend->initialized && !backend->remote) return backend->device_count;
 
     INIT_LIST_HEAD(&backend->devices);
     backend->device_count = 0;
@@ -229,6 +246,14 @@ int evemon_gpu_backend_snapshot(evemon_gpu_backend_t *backend,
                                 evemon_gpu_snapshot_t *snapshot,
                                 uint64_t monotonic_ns)
 {
+    if (backend && backend->remote) {
+        ipc_buf_t request = {0}, response = {0};
+        int rc = query_exchange(query_remote_path(), IPC_GPU, &request, &response);
+        if (!rc) rc = query_gpu_decode(&response, snapshot);
+        if (!rc) snapshot->monotonic_ns = monotonic_ns;
+        ipc_free(&response); return rc == 0;
+    }
+
     if (!backend || !backend->initialized || !snapshot) return 0;
 
     memset(snapshot, 0, sizeof(*snapshot));

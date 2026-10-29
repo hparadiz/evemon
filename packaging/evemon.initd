@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+
+description="Evemon"
+command="@CMAKE_INSTALL_FULL_BINDIR@/evemon"
+command_args="--headless --interval 1000"
+supervisor="supervise-daemon"
+respawn_delay=2
+respawn_max=5
+respawn_period=60
+retry="TERM/10/KILL/5"
+umask=0077
+
+if yesno "${RC_USER_SERVICES}"; then
+	pidfile="${XDG_RUNTIME_DIR}/${RC_SVCNAME}.pid"
+	output_log="${XDG_RUNTIME_DIR}/${RC_SVCNAME}.log"
+else
+	pidfile="/run/${RC_SVCNAME}.pid"
+	output_log="/var/log/${RC_SVCNAME}.log"
+fi
+error_log="${output_log}"
+
+# Evemon creates its runtime directory. Never chmod or remove it here: its
+# access/default ACLs control clients and must survive service restarts.

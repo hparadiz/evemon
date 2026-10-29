@@ -29,8 +29,8 @@
  */
 
 #include "ui_internal.h"
-#include "../steam.h"
-#include "../fdmon.h"
+#include "../core/steam.h"
+#include "../platform/fdmon.h"
 #include <time.h>
 #include <dirent.h>
 #include <pwd.h>

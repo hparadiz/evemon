@@ -16,8 +16,8 @@
  * Role: EVEMON_ROLE_SERVICE (headless, auto-activated, no UI tab)
  */
 
-#include "../evemon_plugin.h"
-#include "../art_loader.h"
+#include "evemon_plugin.h"
+#include "../media/art_loader.h"
 
 #include <stdio.h>
 #include <stdlib.h>

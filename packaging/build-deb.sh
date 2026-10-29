@@ -4,7 +4,7 @@
 # Produces a .deb in /out (bind-mounted from the host).
 set -euo pipefail
 
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-0.2.0}"
 ARCH="${ARCH:-$(dpkg --print-architecture)}"
 DEBUG="${DEBUG:-0}"
 PKG="evemon_${VERSION}_${ARCH}"
@@ -23,21 +23,16 @@ cd "${WORKDIR}"
 # Unset MAKEFLAGS so the host's make flags (e.g. -j, target=...) don't
 # leak into these recursive invocations via the environment.
 unset MAKEFLAGS
-make clean
-# On Debian/Ubuntu, clang's BPF target can't find asm/types.h from the
-# multiarch include path without help.  Point it at the arch-specific dir.
-ARCH_TRIPLE=$(gcc -dumpmachine)
-MAKE_EXTRA="PREFIX=/usr BPF_CFLAGS=\"-O2 -target bpf -g -D__TARGET_ARCH_x86 -I/usr/include/${ARCH_TRIPLE}\""
-
+CONFIGURE_FLAGS="--with-gtk --without-qt --prefix=/usr --libdir=lib"
 if [ "${DEBUG}" = "1" ]; then
-    eval make debug "${MAKE_EXTRA}"
-else
-    eval make all "${MAKE_EXTRA}"
+    CONFIGURE_FLAGS="${CONFIGURE_FLAGS} --enable-debug"
 fi
+make -j"$(nproc)" BUILD_DIR=build-package CONFIGURE_FLAGS="${CONFIGURE_FLAGS}"
 
 # ── 2. Stage install into a temp tree ──────────────────────────
 rm -rf "${DESTDIR}"
-make install PREFIX=/usr DESTDIR="${DESTDIR}"
+DESTDIR="${DESTDIR}" make BUILD_DIR=build-package \
+    CONFIGURE_FLAGS="${CONFIGURE_FLAGS}" install
 
 # ── 2b. Split debug symbols into a .ddeb (debug=1 only) ────────
 if [ "${DEBUG}" = "1" ]; then
@@ -80,7 +75,7 @@ if [ "${DEBUG}" = "1" ]; then
     split_debug "${DESTDIR}/usr/bin/evemon"
 
     # Also split the plugin .so files
-    find "${DESTDIR}/usr/lib/evemon/plugins" -name '*.so' | while read -r so; do
+    find "${DESTDIR}/usr/lib/evemon" -type f -name '*.so*' | while read -r so; do
         split_debug "${so}"
     done
 

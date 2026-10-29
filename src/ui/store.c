@@ -199,11 +199,13 @@ void proc_store_update(proc_store_t *s,
     proc_strtab_t old_strtab = { NULL, 0, 0 };
     if (s->strtab.len > 1) {
         old_strtab.buf = (char *)malloc(s->strtab.len);
-        if (old_strtab.buf) {
-            memcpy(old_strtab.buf, s->strtab.buf, s->strtab.len);
-            old_strtab.len = s->strtab.len;
-            old_strtab.cap = s->strtab.len;
-        }
+        /* Without this independent copy, resetting and then growing the
+         * destination table can invalidate the source pointers of DYING
+         * records mid-copy.  Preserve the previous coherent view on OOM. */
+        if (!old_strtab.buf) return;
+        memcpy(old_strtab.buf, s->strtab.buf, s->strtab.len);
+        old_strtab.len = s->strtab.len;
+        old_strtab.cap = s->strtab.len;
     }
 
     /* Reset the store strtab and extras so we can repopulate cleanly */
@@ -233,8 +235,7 @@ void proc_store_update(proc_store_t *s,
         } else {
             /* PID gone — re-push strings from the old strtab so they
              * stay valid in the freshly-reset store strtab. */
-            proc_strtab_t *src_strtab = old_strtab.buf ? &old_strtab : &s->strtab;
-            re_push_entry_strings(s, rec, &rec->entry, src_strtab);
+            re_push_entry_strings(s, rec, &rec->entry, &old_strtab);
             rec->entry.extra_idx = UINT32_MAX;   /* steam not preserved for dying */
 
             if (rec->status == PROC_ALIVE) {

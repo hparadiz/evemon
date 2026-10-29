@@ -16,7 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "../proc.h"   /* proc_entry_t, steam_info_t */
+#include "../core/proc.h"   /* proc_entry_t, steam_info_t */
 
 /* ── constants ──────────────────────────────────────────────── */
 

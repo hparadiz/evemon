@@ -178,6 +178,7 @@ static void set_row_data(GtkTreeStore *store, GtkTreeIter *iter,
                        COL_IO_WRITE_RATE,      (gint)(e->io_write_rate),
                        COL_IO_WRITE_RATE_TEXT,  io_write_text,
                        COL_START_TIME,      (gint64)e->start_time,
+                       COL_START_TICKS, e->start_ticks, COL_EVEMON_INSTANCE, e->evemon_instance,
                        COL_START_TIME_TEXT, start_text,
                        COL_CONTAINER,  PROC_STR(strtab, e->container_off),
                        COL_SERVICE,    PROC_STR(strtab, e->service_off),
@@ -786,6 +787,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     gint pid, ppid, cpu, rss, grp_rss, grp_cpu;
     gint io_read_rate, io_write_rate, gpu, gpu_enc;
     gint64 start_time, hl_born, hl_died, gpu_vram;
+    guint64 start_ticks, evemon_instance;
     gboolean gpu_active;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
@@ -806,6 +808,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_IO_READ_RATE, &io_read_rate, COL_IO_READ_RATE_TEXT, &io_read_text,
         COL_IO_WRITE_RATE, &io_write_rate, COL_IO_WRITE_RATE_TEXT, &io_write_text,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
+        COL_START_TICKS, &start_ticks, COL_EVEMON_INSTANCE, &evemon_instance,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
         COL_IO_SPARKLINE, &spark_data,
@@ -827,6 +830,7 @@ static void copy_subtree_pinned(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_IO_READ_RATE, io_read_rate, COL_IO_READ_RATE_TEXT, io_read_text,
         COL_IO_WRITE_RATE, io_write_rate, COL_IO_WRITE_RATE_TEXT, io_write_text,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
+        COL_START_TICKS, start_ticks, COL_EVEMON_INSTANCE, evemon_instance,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
         COL_IO_SPARKLINE, spark_data,

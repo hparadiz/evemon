@@ -28,7 +28,7 @@
  */
 
 #include "proc_icon.h"
-#include "../log.h"
+#include "../core/log.h"
 
 #include <gtk/gtk.h>
 #include <gio/gio.h>

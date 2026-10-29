@@ -1,7 +1,7 @@
 #ifndef EVEMON_GPU_NVTOP_ADAPTER_H
 #define EVEMON_GPU_NVTOP_ADAPTER_H
 
-#include "../evemon_plugin.h"
+#include "evemon_plugin.h"
 
 #include <stdint.h>
 

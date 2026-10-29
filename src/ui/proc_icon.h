@@ -28,7 +28,7 @@
 #define UI_PROC_ICON_H
 
 #include <gtk/gtk.h>
-#include "../steam.h"
+#include "../core/steam.h"
 
 /* Pixel size of icons shown in the tree.  Matches a comfortable 16 px
  * default row height; callers may scale this with font size if needed. */

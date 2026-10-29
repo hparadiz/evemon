@@ -7,12 +7,12 @@
 #ifndef UI_INTERNAL_H
 #define UI_INTERNAL_H
 
-#include "../proc.h"
+#include "../core/proc.h"
 #include "store.h"
-#include "../log.h"
-#include "../profile.h"
-#include "../evemon_plugin.h"
-#include "../settings.h"
+#include "../core/log.h"
+#include "../core/profile.h"
+#include "../plugins/evemon_plugin.h"
+#include "../core/settings.h"
 #include "proc_icon.h"
 #include "steam_map.h"
 
@@ -65,6 +65,8 @@ enum {
     COL_GPU_ENC,       /* aggregate per-process encoder utilization percent       */
     COL_GPU_ENC_TEXT,  /* formatted encoder utilization string                   */
     COL_GPU_ACTIVE,    /* process owns at least one supported GPU DRM client       */
+    COL_START_TICKS,
+    COL_EVEMON_INSTANCE,
     NUM_COLS
 };
 
@@ -584,6 +586,7 @@ void remove_pinned_rows(GtkTreeStore *store);
 
 /* ── helpers shared across modules ───────────────────────────── */
 
+GtkWidget *build_frontend_submenu(GtkWidget *window);
 void     format_memory(long kb, char *buf, size_t bufsz);
 void     format_fuzzy_time(time_t epoch, char *buf, size_t bufsz);
 gboolean find_iter_by_pid(GtkTreeModel *model, GtkTreeIter *parent,

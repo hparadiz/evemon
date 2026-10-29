@@ -20,9 +20,9 @@
  */
 
 #include "ui_internal.h"
-#include "../plugin_loader.h"
-#include "../plugin_broker.h"
-#include "../settings.h"
+#include "../plugins/plugin_loader.h"
+#include "../plugins/plugin_broker.h"
+#include "../core/settings.h"
 
 /* ── pin / unpin helpers ─────────────────────────────────────── */
 

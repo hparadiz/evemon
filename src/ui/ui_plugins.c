@@ -8,10 +8,10 @@
  */
 
 #include "ui_internal.h"
-#include "../plugin_loader.h"
-#include "../plugin_broker.h"
-#include "../settings.h"
-#include "../fdmon_internal.h"
+#include "../plugins/plugin_loader.h"
+#include "../plugins/plugin_broker.h"
+#include "../core/settings.h"
+#include "../platform/fdmon_internal.h"
 
 #include <dlfcn.h>
 #include <dirent.h>
@@ -326,6 +326,12 @@ void on_plugin_toggled(GtkCheckMenuItem *item, gpointer data)
 
 typedef struct { char path[4096]; char name[256]; } so_entry_t;
 
+static int plugin_label_compare(const void *left, const void *right)
+{
+    const so_entry_t *a = left, *b = right;
+    return g_ascii_strcasecmp(a->name, b->name);
+}
+
 static so_entry_t *scan_so_files(const char *dir, size_t *out_count)
 {
     *out_count = 0;
@@ -341,10 +347,13 @@ static so_entry_t *scan_so_files(const char *dir, size_t *out_count)
         size_t len = strlen(de->d_name);
         if (len < 4 || strcmp(de->d_name + len - 3, ".so") != 0) continue;
         if (count >= cap) {
-            cap *= 2;
-            so_entry_t *tmp = realloc(entries, cap * sizeof(so_entry_t));
+            if (cap > SIZE_MAX / 2 / sizeof(so_entry_t)) break;
+            size_t new_cap = cap * 2;
+            so_entry_t *tmp = realloc(entries,
+                                      new_cap * sizeof(so_entry_t));
             if (!tmp) break;
             entries = tmp;
+            cap = new_cap;
         }
         snprintf(entries[count].path, sizeof(entries[count].path),
                  "%s/%s", dir, de->d_name);
@@ -353,9 +362,13 @@ static so_entry_t *scan_so_files(const char *dir, size_t *out_count)
         snprintf(entries[count].name, sizeof(entries[count].name), "%s", n);
         char *dot = strrchr(entries[count].name, '.');
         if (dot) *dot = '\0';
+        evemon_plugin_manifest_t manifest;
+        if (evemon_manifest_read(entries[count].path, &manifest) == 0 && manifest.name[0])
+            snprintf(entries[count].name, sizeof(entries[count].name), "%s", manifest.name);
         count++;
     }
     closedir(dp);
+    qsort(entries, count, sizeof(*entries), plugin_label_compare);
     *out_count = count;
     return entries;
 }

@@ -3,9 +3,9 @@
  */
 
 #include "ui_internal.h"
-#include "../settings.h"
-#include "../plugin_loader.h"
-#include "../plugin_broker.h"
+#include "../core/settings.h"
+#include "../plugins/plugin_loader.h"
+#include "../plugins/plugin_broker.h"
 #include <malloc.h>
 
 static void system_panel_release_plugins(ui_ctx_t *ctx)
@@ -89,7 +89,6 @@ GtkWidget *system_panel_build(ui_ctx_t *ctx)
     GtkWidget *notebook = gtk_notebook_new();
     gtk_notebook_set_tab_pos(GTK_NOTEBOOK(notebook), GTK_POS_TOP);
     gtk_notebook_set_scrollable(GTK_NOTEBOOK(notebook), TRUE);
-    gtk_widget_set_size_request(notebook, -1, 200);
 
     gtk_style_context_add_class(
         gtk_widget_get_style_context(notebook), "evemon-plugins");
@@ -128,9 +127,13 @@ GtkWidget *system_panel_build(ui_ctx_t *ctx)
     gtk_notebook_set_action_widget(GTK_NOTEBOOK(notebook),
                                    close_btn, GTK_PACK_END);
 
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(scroll), TRUE);
+    gtk_container_add(GTK_CONTAINER(scroll), notebook);
     GtkWidget *frame = gtk_frame_new(NULL);
-    gtk_container_add(GTK_CONTAINER(frame), notebook);
-    gtk_widget_set_size_request(frame, -1, 200);
+    gtk_container_add(GTK_CONTAINER(frame), scroll);
 
     ctx->system_panel_notebook = notebook;
     ctx->system_panel          = frame;
@@ -178,7 +181,6 @@ void system_panel_relayout(ui_ctx_t *ctx)
     if (old_paned) {
         gtk_container_remove(GTK_CONTAINER(old_paned), ctx->detail_paned);
         gtk_container_remove(GTK_CONTAINER(old_paned), ctx->system_panel);
-        gtk_container_remove(GTK_CONTAINER(ctx->content_box), old_paned);
     } else {
         /* First show: detail_paned is directly in content_box; pull it out. */
         gtk_container_remove(GTK_CONTAINER(ctx->content_box), ctx->detail_paned);
@@ -210,7 +212,10 @@ void system_panel_relayout(ui_ctx_t *ctx)
         break;
     }
 
-    GtkWidget *new_paned = gtk_paned_new(orient);
+    /* Keep the splitter itself alive when switching sides, including its
+     * accessible object and its place in the content hierarchy. */
+    GtkWidget *new_paned = old_paned ? old_paned : gtk_paned_new(orient);
+    gtk_orientable_set_orientation(GTK_ORIENTABLE(new_paned), orient);
 
     if (panel_is_child1) {
         gtk_paned_pack1(GTK_PANED(new_paned), ctx->system_panel, FALSE, TRUE);
@@ -238,16 +243,21 @@ void system_panel_relayout(ui_ctx_t *ctx)
 
     ctx->system_panel_paned = new_paned;
 
-    gtk_box_pack_start(GTK_BOX(ctx->content_box), new_paned, TRUE, TRUE, 0);
-    gtk_box_reorder_child(GTK_BOX(ctx->content_box), new_paned, 1);
+    if (!old_paned) {
+        gtk_box_pack_start(GTK_BOX(ctx->content_box), new_paned, TRUE, TRUE, 0);
+        gtk_box_reorder_child(GTK_BOX(ctx->content_box), new_paned, 1);
+    }
 
     /* Show the paned and its inner content, but preserve the panel's
      * current visibility — don't force it shown if it was hidden. */
     gboolean panel_was_visible = gtk_widget_get_visible(ctx->system_panel);
+    gboolean detail_was_visible = gtk_widget_get_visible(ctx->detail_vbox);
     gtk_widget_set_no_show_all(ctx->system_panel, TRUE);
     gtk_widget_show_all(new_paned);
     if (!panel_was_visible)
         gtk_widget_hide(ctx->system_panel);
+    if (!detail_was_visible)
+        gtk_widget_hide(ctx->detail_vbox);
 
     g_object_unref(ctx->system_panel);
     g_object_unref(ctx->detail_paned);

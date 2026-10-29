@@ -1,4 +1,4 @@
-#include "../evemon_plugin.h"
+#include "evemon_plugin.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

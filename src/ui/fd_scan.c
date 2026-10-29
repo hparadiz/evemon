@@ -4,7 +4,7 @@
  */
 
 #include "ui_internal.h"
-#include "../fdmon.h"
+#include "../platform/fdmon.h"
 
 #include <unistd.h>
 
@@ -505,10 +505,13 @@ void collect_descendant_pids(GtkTreeModel *model, GtkTreeIter *parent,
         gint pid;
         gtk_tree_model_get(model, &child, COL_PID, &pid, -1);
         if (*out_count >= *out_cap) {
-            *out_cap = *out_cap ? *out_cap * 2 : 64;
-            pid_t *tmp = realloc(*out, *out_cap * sizeof(pid_t));
+            size_t new_cap = *out_cap ? *out_cap * 2 : 64;
+            if (new_cap <= *out_cap || new_cap > SIZE_MAX / sizeof(pid_t))
+                return;
+            pid_t *tmp = realloc(*out, new_cap * sizeof(pid_t));
             if (!tmp) return;
             *out = tmp;
+            *out_cap = new_cap;
         }
         (*out)[(*out_count)++] = (pid_t)pid;
         collect_descendant_pids(model, &child, out, out_count, out_cap);

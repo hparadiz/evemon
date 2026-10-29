@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Build essentials
     gcc \
     make \
+    cmake \
     pkg-config \
     # GTK 3
     libgtk-3-dev \
@@ -27,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-dev-bin \
     # Jansson (JSON settings)
     libjansson-dev \
+    libsqlite3-dev \
     # PipeWire (optional but include it)
     libpipewire-0.3-dev \
     # libsoup 3 (album art in audio_service_plugin)

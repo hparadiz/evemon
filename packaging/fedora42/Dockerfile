@@ -4,6 +4,7 @@ RUN dnf install -y \
     # Build essentials
     gcc \
     make \
+    cmake \
     pkg-config \
     # GTK 3
     gtk3-devel \
@@ -25,6 +26,7 @@ RUN dnf install -y \
     glib2-devel \
     # Jansson (JSON settings)
     jansson-devel \
+    sqlite-devel \
     # PipeWire (optional but include it)
     pipewire-devel \
     # libsoup 3 (album art in audio_service_plugin)

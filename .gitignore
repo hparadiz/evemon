@@ -1,4 +1,6 @@
 build/
+/build-android-arm64/
+/third_party/nvtop/
 *.o
 *.d
 *.swp
@@ -6,3 +8,5 @@ build/
 dist
 screencap_cache/
 presets.community
+artifacts
+build-native

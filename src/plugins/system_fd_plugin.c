@@ -1,3 +1,4 @@
+#include "../ipc/query.h"
 /*
  * system_fd_plugin.c – File Descriptors plugin for the System Panel.
  *
@@ -5,7 +6,7 @@
  * and registered as EVEMON_ROLE_SYSTEM so it appears in the System Panel.
  */
 
-#include "../evemon_plugin.h"
+#include "evemon_plugin.h"
 #include <string.h>
 #include <stdio.h>
 #include <strings.h>
@@ -131,18 +132,8 @@ static void populate_detail(fd_ctx_t *ctx, const char *path)
         pid_t spid = ctx->snap_fds[i].source_pid;
         int   fdn  = ctx->snap_fds[i].fd;
 
-        /* read /proc/<pid>/comm for process name */
         char comm[64] = "";
-        char comm_path[64];
-        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int)spid);
-        FILE *f = fopen(comm_path, "r");
-        if (f) {
-            if (fgets(comm, sizeof(comm), f)) {
-                size_t len = strlen(comm);
-                if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
-            }
-            fclose(f);
-        }
+        query_cached_process(spid, NULL, comm, sizeof(comm));
         if (!comm[0]) snprintf(comm, sizeof(comm), "%d", (int)spid);
 
         char *fd_esc   = g_markup_escape_text(comm, -1);

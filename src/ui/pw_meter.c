@@ -1,3 +1,4 @@
+#include "../ipc/query.h"
 /*
  * pw_meter.c – real-time L/R peak level meters for PipeWire audio nodes.
  *
@@ -13,7 +14,11 @@
 
 #ifdef HAVE_PIPEWIRE
 
+#ifdef EVEMON_QT_WIDGETS
+#include "../qt/audio_services_native.h"
+#else
 #include "ui_internal.h"
+#endif
 
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
@@ -311,6 +316,7 @@ static int meter_add_stream(pw_meter_state_t *ms, uint32_t node_id)
 
 void pw_meter_start(ui_ctx_t *ctx, const uint32_t *node_ids, size_t count)
 {
+    if (query_is_foreign_host()) return;
     if (count == 0) return;
 
     pw_meter_state_t *ms = meter_ensure_running(ctx);
@@ -423,6 +429,7 @@ void pw_meter_remove_nodes(ui_ctx_t *ctx, const uint32_t *node_ids,
  *   "level-r"  gint  0..1000  right channel level
  */
 
+#ifndef EVEMON_QT_WIDGETS
 #define PW_TYPE_CELL_RENDERER_METER (pw_cell_renderer_meter_get_type())
 
 typedef struct _PwCellRendererMeter      PwCellRendererMeter;
@@ -601,5 +608,7 @@ GtkCellRenderer *pw_cell_renderer_meter_new(void)
 {
     return g_object_new(PW_TYPE_CELL_RENDERER_METER, NULL);
 }
+
+#endif /* !EVEMON_QT_WIDGETS */
 
 #endif /* HAVE_PIPEWIRE */

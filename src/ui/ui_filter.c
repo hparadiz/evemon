@@ -47,6 +47,7 @@ static GtkTreeIter copy_row(GtkTreeStore *dst, GtkTreeIter *dst_parent,
     gint io_read_rate, io_write_rate;
     gint gpu, gpu_enc;
     gint64 start_time, hl_born, hl_died, gpu_vram;
+    guint64 start_ticks, evemon_instance;
     gboolean gpu_active;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
@@ -67,6 +68,7 @@ static GtkTreeIter copy_row(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_IO_READ_RATE, &io_read_rate, COL_IO_READ_RATE_TEXT, &io_read_text,
         COL_IO_WRITE_RATE, &io_write_rate, COL_IO_WRITE_RATE_TEXT, &io_write_text,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
+        COL_START_TICKS, &start_ticks, COL_EVEMON_INSTANCE, &evemon_instance,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
         COL_IO_SPARKLINE, &spark_data,
@@ -89,6 +91,7 @@ static GtkTreeIter copy_row(GtkTreeStore *dst, GtkTreeIter *dst_parent,
         COL_IO_READ_RATE, io_read_rate, COL_IO_READ_RATE_TEXT, io_read_text,
         COL_IO_WRITE_RATE, io_write_rate, COL_IO_WRITE_RATE_TEXT, io_write_text,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
+        COL_START_TICKS, start_ticks, COL_EVEMON_INSTANCE, evemon_instance,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
         COL_IO_SPARKLINE, spark_data,
@@ -341,6 +344,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
     gint io_read_rate, io_write_rate;
     gint gpu, gpu_enc;
     gint64 start_time, hl_born, hl_died, gpu_vram;
+    guint64 start_ticks, evemon_instance;
     gboolean gpu_active;
     gchar *user = NULL, *name = NULL, *cpu_text = NULL, *rss_text = NULL;
     gchar *grp_rss_text = NULL, *grp_cpu_text = NULL;
@@ -360,6 +364,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_IO_READ_RATE, &io_read_rate, COL_IO_READ_RATE_TEXT, &io_read_text,
         COL_IO_WRITE_RATE, &io_write_rate, COL_IO_WRITE_RATE_TEXT, &io_write_text,
         COL_START_TIME, &start_time, COL_START_TIME_TEXT, &start_text,
+        COL_START_TICKS, &start_ticks, COL_EVEMON_INSTANCE, &evemon_instance,
         COL_CONTAINER, &container, COL_SERVICE, &service,
         COL_CWD, &cwd, COL_CMDLINE, &cmdline,
         COL_IO_SPARKLINE, &spark_data,
@@ -384,6 +389,7 @@ static void sync_row_from_real(GtkTreeStore *fs, GtkTreeIter *fs_iter,
         COL_IO_READ_RATE, io_read_rate, COL_IO_READ_RATE_TEXT, io_read_text,
         COL_IO_WRITE_RATE, io_write_rate, COL_IO_WRITE_RATE_TEXT, io_write_text,
         COL_START_TIME, start_time, COL_START_TIME_TEXT, start_text,
+        COL_START_TICKS, start_ticks, COL_EVEMON_INSTANCE, evemon_instance,
         COL_CONTAINER, container, COL_SERVICE, service,
         COL_CWD, cwd, COL_CMDLINE, cmdline,
         COL_IO_SPARKLINE, spark_data,
@@ -581,7 +587,8 @@ static GtkTreeStore *alloc_filter_store(void)
         G_TYPE_STRING, /* COL_GPU_VRAM_TEXT     */
         G_TYPE_INT,    /* COL_GPU_ENC           */
         G_TYPE_STRING, /* COL_GPU_ENC_TEXT      */
-        G_TYPE_BOOLEAN /* COL_GPU_ACTIVE        */
+        G_TYPE_BOOLEAN, /* COL_GPU_ACTIVE        */
+        G_TYPE_UINT64, G_TYPE_UINT64
     );
 }
 
