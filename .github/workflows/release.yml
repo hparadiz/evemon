@@ -9,13 +9,22 @@ permissions:
   contents: write   # needed to upload assets to the GitHub Release
 
 jobs:
+  build-android-runtime:
+    uses: ./.github/workflows/android-runtime.yml
+
   build-deb-debian12:
     name: Build .deb (Debian 12)
+    needs: build-android-runtime
     runs-on: ubuntu-latest
     outputs:
       deb_path: ${{ steps.find.outputs.deb_path }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: evemon-android-arm64
+          path: data/android-arm64
 
       - name: Fetch pinned nvtop sources
         run: make nvtop
@@ -49,9 +58,15 @@ jobs:
 
   build-rpm-fedora42:
     name: Build .rpm (Fedora 42)
+    needs: build-android-runtime
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: evemon-android-arm64
+          path: data/android-arm64
 
       - name: Fetch pinned nvtop sources
         run: make nvtop

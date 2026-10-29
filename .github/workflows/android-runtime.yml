@@ -1,0 +1,54 @@
+name: Android ARM64 runtime
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    container: debian:12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libglib2.0-dev \
+            libbpf-dev libelf-dev libjansson-dev
+
+      - name: Build headless Evemon
+        run: |
+          cmake -S . -B build-android-runtime \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DEVEMON_GTK=OFF -DEVEMON_QT=OFF \
+            -DEVEMON_PIPEWIRE=OFF -DEVEMON_GPU=OFF -DEVEMON_EBPF=OFF
+          cmake --build build-android-runtime --parallel "$(nproc)"
+
+      - name: Package Android runtime
+        shell: bash
+        run: |
+          mkdir -p android-runtime/lib data/android-arm64
+          install -m 755 build-android-runtime/evemon android-runtime/evemon
+          strip android-runtime/evemon
+          ldd android-runtime/evemon > runtime-libraries.txt
+          if grep -q 'not found' runtime-libraries.txt; then
+            cat runtime-libraries.txt
+            exit 1
+          fi
+          awk '/=> \// {print $3} /^[[:space:]]*\// {print $1}' runtime-libraries.txt |
+            while IFS= read -r library; do
+              cp -L "$library" android-runtime/lib/
+            done
+          (cd android-runtime && sha256sum evemon lib/* > manifest.sha256)
+          tar -czf data/android-arm64/evemon-arm64.tar.gz -C android-runtime .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: evemon-android-arm64
+          path: data/android-arm64/evemon-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 1

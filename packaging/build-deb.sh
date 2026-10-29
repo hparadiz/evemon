@@ -23,16 +23,18 @@ cd "${WORKDIR}"
 # Unset MAKEFLAGS so the host's make flags (e.g. -j, target=...) don't
 # leak into these recursive invocations via the environment.
 unset MAKEFLAGS
-CONFIGURE_FLAGS="--with-gtk --without-qt --prefix=/usr --libdir=lib"
+BUILD_TYPE=RelWithDebInfo
 if [ "${DEBUG}" = "1" ]; then
-    CONFIGURE_FLAGS="${CONFIGURE_FLAGS} --enable-debug"
+    BUILD_TYPE=Debug
 fi
-make -j"$(nproc)" BUILD_DIR=build-package CONFIGURE_FLAGS="${CONFIGURE_FLAGS}"
+cmake -S . -B build-package -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+    -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib \
+    -DEVEMON_GTK=ON -DEVEMON_QT=OFF
+cmake --build build-package --parallel "$(nproc)"
 
 # ── 2. Stage install into a temp tree ──────────────────────────
 rm -rf "${DESTDIR}"
-DESTDIR="${DESTDIR}" make BUILD_DIR=build-package \
-    CONFIGURE_FLAGS="${CONFIGURE_FLAGS}" install
+DESTDIR="${DESTDIR}" cmake --install build-package
 
 # ── 2b. Split debug symbols into a .ddeb (debug=1 only) ────────
 if [ "${DEBUG}" = "1" ]; then

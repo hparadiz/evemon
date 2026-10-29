@@ -19,17 +19,19 @@ cd "${WORKDIR}"
 
 # ── 2. Compile ──────────────────────────────────────────────────
 unset MAKEFLAGS
-CONFIGURE_FLAGS="--with-gtk --without-qt --prefix=/usr --libdir=lib"
+BUILD_TYPE=RelWithDebInfo
 if [ "${DEBUG}" = "1" ]; then
-    CONFIGURE_FLAGS="${CONFIGURE_FLAGS} --enable-debug"
+    BUILD_TYPE=Debug
 fi
-make -j"$(nproc)" BUILD_DIR=build-package CONFIGURE_FLAGS="${CONFIGURE_FLAGS}"
+cmake -S . -B build-package -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+    -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib \
+    -DEVEMON_GTK=ON -DEVEMON_QT=OFF
+cmake --build build-package --parallel "$(nproc)"
 
 # ── 3. Stage install into a temp tree ───────────────────────────
 DESTDIR="/tmp/evemon-root"
 rm -rf "${DESTDIR}"
-DESTDIR="${DESTDIR}" make BUILD_DIR=build-package \
-    CONFIGURE_FLAGS="${CONFIGURE_FLAGS}" install
+DESTDIR="${DESTDIR}" cmake --install build-package
 
 # ── 4. Write the spec file ──────────────────────────────────────
 SPECDIR="/tmp/rpmbuild/SPECS"
@@ -75,15 +77,8 @@ cp -a ${DESTDIR}/. %{buildroot}/
 %{_datadir}/applications/evemon.desktop
 %{_datadir}/icons/hicolor/256x256/apps/evemon.png
 %{_datadir}/pixmaps/evemon.png
-%dir %{_datadir}/evemon
-%{_datadir}/evemon/software-directory.sqlite
-%{_datadir}/evemon/licenses
-%dir %{_datadir}/evemon/milkdrop
-%{_datadir}/evemon/milkdrop/presets
-%dir %{_libdir}/evemon
-%dir %{_libdir}/evemon/plugins
-%{_libdir}/evemon/*.o
-%{_libdir}/evemon/plugins/*.so
+%{_datadir}/evemon
+%{_libdir}/evemon
 
 %post
 if command -v update-desktop-database >/dev/null 2>&1; then

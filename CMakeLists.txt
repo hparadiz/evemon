@@ -127,6 +127,8 @@ if(EVEMON_GPU)
     include(cmake/Gpu.cmake)
     target_link_libraries(evemon_core PRIVATE evemon_gpu PkgConfig::DRM PkgConfig::UDEV)
     target_compile_definitions(evemon_core PUBLIC HAVE_NVTOP)
+    install(FILES "${NVTOP_DIR}/COPYING"
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/evemon/licenses RENAME nvtop-COPYING)
 endif()
 set(EVEMON_MILKDROP_SOURCES src/plugins/milkdrop_expression.c
     src/plugins/milkdrop_presets.c src/plugins/milkdrop_render.c
@@ -162,6 +164,7 @@ install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/packaging/openrc/evemon
 if(EVEMON_GTK OR EVEMON_QT)
     install(FILES evemon.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
     install(FILES icon.png DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/256x256/apps RENAME evemon.png)
+    install(FILES icon.png DESTINATION ${CMAKE_INSTALL_DATADIR}/pixmaps RENAME evemon.png)
     install(FILES data/software-directory.sqlite DESTINATION ${CMAKE_INSTALL_DATADIR}/evemon)
     install(FILES "${EVEMON_ANDROID_ARCHIVE}"
         DESTINATION ${CMAKE_INSTALL_DATADIR}/evemon/android
