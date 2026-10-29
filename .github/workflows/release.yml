@@ -13,7 +13,7 @@ jobs:
     uses: ./.github/workflows/android-runtime.yml
 
   build-deb-debian12:
-    name: Build .deb (Debian 12)
+    name: Build .deb (Debian 12, amd64)
     needs: build-android-runtime
     runs-on: ubuntu-latest
     outputs:
@@ -57,7 +57,7 @@ jobs:
           files: ${{ steps.find.outputs.deb_path }}
 
   build-rpm-fedora42:
-    name: Build .rpm (Fedora 42)
+    name: Build .rpm (Fedora 42, amd64)
     needs: build-android-runtime
     runs-on: ubuntu-latest
     steps:
@@ -98,3 +98,39 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.find.outputs.rpm_path }}
+
+  build-steamos-arm64:
+    name: Build SteamOS (arm64)
+    needs: build-android-runtime
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: evemon-android-arm64
+          path: data/android-arm64
+
+      - name: Fetch pinned nvtop sources
+        run: make nvtop
+
+      - name: Derive version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: docker build -t evemon-builder-steamos-arm64 -f packaging/steamos-arm64/Dockerfile .
+
+      - name: Build SteamOS package
+        run: |
+          mkdir -p dist/steamos-arm64
+          docker run --rm \
+            -e VERSION=${{ steps.ver.outputs.version }} \
+            -v "${{ github.workspace }}:/src:ro" \
+            -v "${{ github.workspace }}/dist/steamos-arm64:/out" \
+            evemon-builder-steamos-arm64
+
+      - name: Upload SteamOS package to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/steamos-arm64/*.tar.xz

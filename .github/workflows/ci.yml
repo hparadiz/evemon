@@ -11,7 +11,7 @@ jobs:
     uses: ./.github/workflows/android-runtime.yml
 
   build-deb-debian12:
-    name: Build .deb (Debian 12)
+    name: Build .deb (Debian 12, amd64)
     needs: build-android-runtime
     runs-on: ubuntu-latest
     steps:
@@ -44,11 +44,11 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/release/')
         uses: actions/upload-artifact@v4
         with:
-          name: evemon-debian12-deb
+          name: evemon-debian12-amd64-deb
           path: dist/debian12/*.deb
 
   build-rpm-fedora42:
-    name: Build .rpm (Fedora 42)
+    name: Build .rpm (Fedora 42, amd64)
     needs: build-android-runtime
     runs-on: ubuntu-latest
     steps:
@@ -82,5 +82,42 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/release/')
         uses: actions/upload-artifact@v4
         with:
-          name: evemon-fedora42-rpm
+          name: evemon-fedora42-amd64-rpm
           path: dist/fedora42/*.rpm
+
+  build-steamos-arm64:
+    name: Build SteamOS (arm64)
+    needs: build-android-runtime
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: evemon-android-arm64
+          path: data/android-arm64
+
+      - name: Fetch pinned nvtop sources
+        run: make nvtop
+
+      - name: Build Docker image
+        run: docker build -t evemon-builder-steamos-arm64 -f packaging/steamos-arm64/Dockerfile .
+
+      - name: Build SteamOS package
+        run: |
+          mkdir -p dist/steamos-arm64
+          docker run --rm \
+            -e VERSION=0.0.0-ci \
+            -v "${{ github.workspace }}:/src:ro" \
+            -v "${{ github.workspace }}/dist/steamos-arm64:/out" \
+            evemon-builder-steamos-arm64
+
+      - name: Verify package was produced
+        run: ls -lh dist/steamos-arm64/*.tar.xz
+
+      - name: Upload SteamOS artifact
+        if: startsWith(github.ref, 'refs/heads/release/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: evemon-steamos-arm64
+          path: dist/steamos-arm64/*.tar.xz
