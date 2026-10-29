@@ -1,3 +1,5 @@
+#include <gio/gio.h>
+
 extern "C" {
 #include "../ipc/query.h"
 #include "../ipc/query_about.h"
