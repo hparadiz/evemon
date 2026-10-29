@@ -4,7 +4,8 @@
 # Produces a .deb in /out (bind-mounted from the host).
 set -euo pipefail
 
-VERSION="${VERSION:-0.2.0}"
+VERSION="${VERSION:-$(sed -n 's/^project(evemon VERSION \([^[:space:]]*\).*/\1/p' /src/CMakeLists.txt)}"
+: "${VERSION:?Unable to read Evemon version from CMakeLists.txt}"
 ARCH="${ARCH:-$(dpkg --print-architecture)}"
 DEBUG="${DEBUG:-0}"
 PKG="evemon_${VERSION}_${ARCH}"

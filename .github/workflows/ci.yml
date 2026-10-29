@@ -32,7 +32,6 @@ jobs:
         run: |
           mkdir -p dist/debian12
           docker run --rm \
-            -e VERSION=0.0.0-ci \
             -v "${{ github.workspace }}:/src:ro" \
             -v "${{ github.workspace }}/dist/debian12:/out" \
             evemon-builder-debian12
@@ -69,8 +68,6 @@ jobs:
         run: |
           mkdir -p dist/fedora42
           docker run --rm \
-            -e VERSION=0.0.0 \
-            -e RELEASE=ci \
             -v "${{ github.workspace }}:/src:ro" \
             -v "${{ github.workspace }}/dist/fedora42:/out" \
             evemon-builder-fedora42
@@ -107,7 +104,6 @@ jobs:
         run: |
           mkdir -p dist/steamos-arm64
           docker run --rm \
-            -e VERSION=0.0.0-ci \
             -v "${{ github.workspace }}:/src:ro" \
             -v "${{ github.workspace }}/dist/steamos-arm64:/out" \
             evemon-builder-steamos-arm64

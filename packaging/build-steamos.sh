@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${VERSION:-0.2.0}"
+VERSION="${VERSION:-$(sed -n 's/^project(evemon VERSION \([^[:space:]]*\).*/\1/p' /src/CMakeLists.txt)}"
+: "${VERSION:?Unable to read Evemon version from CMakeLists.txt}"
 DEBUG="${DEBUG:-0}"
 
 if [ "$(uname -m)" != aarch64 ]; then

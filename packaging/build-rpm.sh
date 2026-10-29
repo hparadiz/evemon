@@ -4,7 +4,8 @@
 # Produces a .rpm in /out (bind-mounted from the host).
 set -euo pipefail
 
-VERSION="${VERSION:-0.2.0}"
+VERSION="${VERSION:-$(sed -n 's/^project(evemon VERSION \([^[:space:]]*\).*/\1/p' /src/CMakeLists.txt)}"
+: "${VERSION:?Unable to read Evemon version from CMakeLists.txt}"
 ARCH="${ARCH:-$(uname -m)}"
 DEBUG="${DEBUG:-0}"
 RELEASE="${RELEASE:-1}"
