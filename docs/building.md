@@ -20,6 +20,18 @@
 | libsoup 3 *(optional)* | `libsoup-3.0-dev` | `libsoup3` | Album art HTTP download |
 | PipeWire *(optional)* | `libpipewire-0.3-dev` | `pipewire` | Audio graph + spectrogram |
 
+Debian/Ubuntu:
+
+```bash
+sudo apt install libgtk-3-dev qt6-base-dev libglib2.0-dev libfontconfig1-dev libbpf-dev libelf-dev zlib1g-dev libjansson-dev libsqlite3-dev clang libglib2.0-dev-bin libepoxy-dev libgtksourceview-4-dev libsoup-3.0-dev libpipewire-0.3-dev
+```
+
+Arch:
+
+```bash
+sudo pacman -S gtk3 qt6-base glib2 fontconfig libbpf libelf zlib jansson sqlite clang libepoxy gtksourceview4 libsoup3 pipewire
+```
+
 ## Compile
 
 One source tree, executable, monitoring core, and install tree serve all modes:
