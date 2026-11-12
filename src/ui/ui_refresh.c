@@ -1,4 +1,5 @@
 #include "ui_gtk_private.h"
+#include "../ipc/query.h"
 
 /* ── periodic refresh callback ───────────────────────────────── */
 
@@ -77,12 +78,16 @@ void gtk_ui_update_status_bar(ui_ctx_t *ctx)
     pthread_mutex_unlock(&ctx->mon->lock);
     char system_text[256];
     snprintf(system_text, sizeof(system_text),
-             "up %llud %lluh %llum  |  %u user%s  |  load: %.2f %.2f %.2f ",
+             "up %llud %lluh %llum  |  %u user%s  |  load: %.2f %.2f %.2f  |  %llu.%llu.%llu%s ",
              (unsigned long long)system.uptime_seconds / 86400,
              (unsigned long long)system.uptime_seconds / 3600 % 24,
              (unsigned long long)system.uptime_seconds / 60 % 60,
              system.users, system.users == 1 ? "" : "s",
-             system.load[0], system.load[1], system.load[2]);
+             system.load[0], system.load[1], system.load[2],
+             (unsigned long long)query_daemon_build() / 10000,
+             (unsigned long long)query_daemon_build() / 100 % 100,
+             (unsigned long long)query_daemon_build() % 100,
+             query_daemon_build() < ipc_build() ? " (older)" : "");
     gtk_label_set_text(ctx->status_right, disconnected ? "Evemon disconnected — reconnecting" : system_text);
     long mem_total_kb = system.memory_total / 1024, mem_avail_kb = system.memory_available / 1024;
     long mem_used_kb = mem_total_kb - mem_avail_kb;

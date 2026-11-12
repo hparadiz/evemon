@@ -10,6 +10,10 @@ static gboolean redraw_tick(gpointer data)
     if (ctx->gl_area && GTK_IS_WIDGET(ctx->gl_area) &&
         gtk_widget_get_realized(ctx->gl_area))
         gtk_widget_queue_draw(ctx->gl_area);
+    /* The Cairo overlay is a sibling, so GL redraws do not invalidate it. */
+    if (ctx->fs_info_area && GTK_IS_WIDGET(ctx->fs_info_area) &&
+        gtk_widget_get_realized(ctx->fs_info_area))
+        gtk_widget_queue_draw(ctx->fs_info_area);
     return G_SOURCE_CONTINUE;
 }
 
@@ -249,7 +253,7 @@ static void md_undo_mashup(md_ctx_t *ctx)
 #ifndef EVEMON_QT_MILKDROP
 /* ── signal handlers ─────────────────────────────────────────── */
 
-gboolean on_button_press(GtkWidget *w, GdkEventButton *ev, gpointer data)
+gboolean md_on_button_press(GtkWidget *w, GdkEventButton *ev, gpointer data)
 {
     md_ctx_t *ctx = data;
     if (ev->type==GDK_2BUTTON_PRESS && ev->button==1) {
@@ -268,13 +272,13 @@ gboolean on_button_press(GtkWidget *w, GdkEventButton *ev, gpointer data)
 
 /* Forward declarations */
 static void md_toggle_fullscreen(md_ctx_t *ctx);
-gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data);
+gboolean md_on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data);
 
 /* Key handler for the fullscreen window itself */
 static gboolean on_fs_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 {
     /* Forward to the main key handler (which knows about F and Escape) */
-    return on_key_press(w, ev, data);
+    return md_on_key_press(w, ev, data);
 }
 
 /* Resize FBO textures to match the current rendering resolution */
@@ -394,7 +398,7 @@ static void md_toggle_fullscreen(md_ctx_t *ctx) { ctx->fullscreen = !ctx->fullsc
 gboolean md_handle_key(md_ctx_t *ctx, unsigned keyval, unsigned state)
 {
 #else
-gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
+gboolean md_on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 {
     (void)w; md_ctx_t *ctx=data;
 

@@ -1,21 +1,17 @@
 #!/bin/sh
 set -eu
 
-if [ "${EVEMON_MAKE_BUILD:-}" != 1 ]; then
-    printf 'Use make or make configure; direct configuration is not supported.\n' >&2
-    exit 2
-fi
-
 src_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 build_dir="$src_dir/build"
 prefix=/usr/local
 libdir_arg=
 gtk=ON
-qt=OFF
+qt=ON
 selected=no
 pipewire=ON
 milkdrop=ON
-gpu=ON
+gpu_arg=
+android_arg=
 ebpf=ON
 lto=OFF
 default_ui=
@@ -31,8 +27,10 @@ for arg in "$@"; do
         --with-pipewire) pipewire=ON ;;
         --without-milkdrop) milkdrop=OFF ;;
         --with-milkdrop) milkdrop=ON ;;
-        --without-gpu) gpu=OFF ;;
-        --with-gpu) gpu=ON ;;
+        --without-gpu) gpu_arg=-DEVEMON_GPU=OFF ;;
+        --with-gpu) gpu_arg=-DEVEMON_GPU=ON ;;
+        --without-android) android_arg=-DEVEMON_ANDROID=OFF ;;
+        --with-android) android_arg=-DEVEMON_ANDROID=ON ;;
         --without-ebpf) ebpf=OFF ;;
         --with-ebpf) ebpf=ON ;;
         --enable-lto) lto=ON ;;
@@ -45,13 +43,16 @@ for arg in "$@"; do
         --help|-h)
             cat <<'HELP'
 Usage: ./configure [OPTIONS]
-  --with-qt                 Build Qt 6 frontend
-  --with-gtk                Build GTK 3 frontend (default without UI flags)
+  --with-qt                 Build Qt 6 frontend only
+  --with-gtk                Build GTK 3 frontend only
   --without-qt --without-gtk  Build only the headless executable
   --with-default-ui=gtk|qt|headless  Initial default (saved preference overrides)
   --without-pipewire        Disable audio and MilkDrop
   --without-milkdrop        Disable visualization
   --without-gpu             Disable nvtop GPU support
+  --with-gpu                Require the nvtop checkout (default: use if present)
+  --without-android         Omit the Android runtime bundle
+  --with-android            Require the Android archive (default: use if present)
   --without-ebpf            Disable eBPF tracing and kernel program compilation
   --enable-debug            Debug build
   --enable-lto              Link-time optimization
@@ -60,6 +61,7 @@ Usage: ./configure [OPTIONS]
   --build-dir=PATH          Build directory (default ./build)
 Then: make [BUILD_DIR=PATH] [-jN], make install [DESTDIR=PATH]
 Both --with-qt and --with-gtk build one executable with selectable UI modules.
+Without UI flags, both frontends are built. Plain make needs no configure step.
 HELP
             exit 0 ;;
         *) printf 'configure: unknown option: %s\n' "$arg" >&2; exit 2 ;;
@@ -68,6 +70,7 @@ done
 exec cmake -S "$src_dir" -B "$build_dir" -DCMAKE_INSTALL_PREFIX="$prefix" \
     $libdir_arg \
     -DCMAKE_BUILD_TYPE="$build_type" -DEVEMON_GTK="$gtk" -DEVEMON_QT="$qt" \
-    -DEVEMON_PIPEWIRE="$pipewire" -DEVEMON_MILKDROP="$milkdrop" -DEVEMON_GPU="$gpu" \
+    -DEVEMON_PIPEWIRE="$pipewire" -DEVEMON_MILKDROP="$milkdrop" \
+    ${gpu_arg:+"$gpu_arg"} ${android_arg:+"$android_arg"} \
     -DEVEMON_EBPF="$ebpf" \
     -DEVEMON_LTO="$lto" -DEVEMON_DEFAULT_UI="$default_ui"

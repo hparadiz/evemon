@@ -60,6 +60,7 @@ Built-in process plugins:
 | **PipeWire Audio** | Audio graph connections for the selected process with real-time L/R peak meters and an interactive FFT spectrogram. |
 | **MilkDrop** | GPU-accelerated MilkDrop visualiser driven by the selected process's audio output via PipeWire. Uses the same rendering engine in dockable GTK and Qt OpenGL surfaces, with fullscreen and keyboard controls. |
 | **Gentoo / Portage** | On Gentoo systems, resolves the selected process executable back to the owning Portage package and shows atom, repository, SLOT, EAPI, license, homepage, KEYWORDS, installed size, build time, USE flags, and runtime dependencies. Lookups run on a serialized worker and are coalesced across rapid selection changes. |
+| **Debian / Ubuntu (APT)** | On dpkg systems (Debian, Ubuntu and derivatives; the tab is named after the distribution), resolves the selected process executable to the owning package and shows version, architecture, source package, the APT repositories carrying the installed version (suite/component or PPA, via `apt-cache policy`), section, maintainer, homepage, license from the machine-readable copyright file, installed size, install time, whether it was installed manually or as a dependency, package flags, description, and Depends/Pre-Depends/Recommends/Suggests. Snaps are recognized from their `/snap/<name>/<revision>/` path and described from `meta/snap.yaml`. Uses the same serialized, cancellable worker as the Gentoo plugin. |
 
 Built-in headless service plugins:
 

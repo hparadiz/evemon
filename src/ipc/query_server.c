@@ -3,6 +3,7 @@
 #include "query_events.h"
 #include "query_gpu.h"
 #include "query_about.h"
+#include "query_dpkg.h"
 #ifdef HAVE_NVTOP
 #include "../plugins/gpu_nvtop_adapter.h"
 #endif
@@ -21,9 +22,17 @@
 #include <unistd.h>
 
 #define CLIENTS 16
-/* One bounded inspector queue, separate from both sampling and socket I/O. */
+/* Bounded job queues, separate from both sampling and socket I/O.  The
+ * inspector and package lanes each own half of the table, so a backlog of slow
+ * package lookups can never use up the inspector's slots. */
+#define JOBS (2 * CLIENTS)
+#define LANE_START(package) ((package) ? CLIENTS : 0)
+/* An unchanged snapshot is repeated this often; clients treat a subscription
+ * that stays silent for IPC_TIMEOUT_MS as a dead connection. */
+#define SUBSCRIPTION_KEEPALIVE_MS 2000
 typedef struct {
     int state; /* 0 free, 1 queued, 2 running, 3 complete */
+    int abandoned; /* the requesting client left while this was running */
     uint64_t ticket;
     pid_t pid;
     unsigned needs;
@@ -35,12 +44,12 @@ struct query_server {
     monitor_state_t *state;
     query_events_t *events;
     int listener, wake[2], lock_fd;
-    pthread_t thread, inspector;
+    pthread_t thread, inspector, package;
     pthread_mutex_t jobs_lock;
     pthread_cond_t jobs_changed;
-    inspect_job_t jobs[CLIENTS];
+    inspect_job_t jobs[JOBS];
     atomic_uint clients;
-    int stopping, inspector_started;
+    int stopping, inspector_started, package_started;
     uint64_t instance;
     char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
     dev_t device;
@@ -59,9 +68,22 @@ typedef struct {
     uint64_t event_cursor;
     int64_t next_event;
     int64_t next_sample, deadline;
+    uint64_t pushed_generation;
+    int64_t keepalive;
 } client_t;
 static void client_close(query_server_t *s, client_t *c)
 {
+    if (c->fd >= 0 && c->job >= 0) {
+        /* Nobody is left to read this reply.  Forget it if it has not started;
+         * otherwise a package lookup stops at its next cancellation check. */
+        pthread_mutex_lock(&s->jobs_lock);
+        inspect_job_t *job = &s->jobs[c->job];
+        if (job->ticket == c->ticket) {
+            if (job->state == 1) job->state = 0;
+            else if (job->state == 2) job->abandoned = 1;
+        }
+        pthread_mutex_unlock(&s->jobs_lock);
+    }
     if (c->fd >= 0) {
         query_controls_drop(s->events, c->ticket);
         close(c->fd);
@@ -99,7 +121,8 @@ static void *inspect_worker(void *arg)
     for (;;) {
         int index = -1;
         for (unsigned i = 0; i < CLIENTS; ++i) { unsigned slot = (next_job + i) % CLIENTS;
-            if (s->jobs[slot].state == 1) { index = slot; next_job = (slot + 1) % CLIENTS; break; } }
+            if (s->jobs[LANE_START(0) + slot].state == 1) {
+                index = LANE_START(0) + slot; next_job = (slot + 1) % CLIENTS; break; } }
         if (s->stopping) break;
         if (index < 0) { pthread_cond_wait(&s->jobs_changed, &s->jobs_lock); continue; }
         inspect_job_t *j = &s->jobs[index]; j->state = 2;
@@ -142,6 +165,42 @@ static void *inspect_worker(void *arg)
 #endif
     return NULL;
 }
+typedef struct { query_server_t *server; inspect_job_t *job; } package_check_t;
+static gboolean package_cancelled(void *arg)
+{
+    package_check_t *check = arg;
+    pthread_mutex_lock(&check->server->jobs_lock);
+    int stop = check->server->stopping || check->job->abandoned;
+    pthread_mutex_unlock(&check->server->jobs_lock);
+    return stop;
+}
+/* Package lookups can scan thousands of dpkg file lists on a cold cache;
+ * they get their own lane so they never delay inspector replies. */
+static void *package_worker(void *arg)
+{
+    query_server_t *s = arg;
+    pthread_setname_np(pthread_self(), "ev-package");
+    unsigned next_job = 0;
+    pthread_mutex_lock(&s->jobs_lock);
+    for (;;) {
+        int index = -1;
+        for (unsigned i = 0; i < CLIENTS; ++i) { unsigned slot = (next_job + i) % CLIENTS;
+            if (s->jobs[LANE_START(1) + slot].state == 1) {
+                index = LANE_START(1) + slot; next_job = (slot + 1) % CLIENTS; break; } }
+        if (s->stopping) break;
+        if (index < 0) { pthread_cond_wait(&s->jobs_changed, &s->jobs_lock); continue; }
+        inspect_job_t *j = &s->jobs[index]; j->state = 2;
+        pthread_mutex_unlock(&s->jobs_lock);
+        ipc_buf_t body = {0};
+        /* The slot stays this job's until the query thread reaps state 3. */
+        package_check_t check = {s, j};
+        int error = query_dpkg_encode(j->pid, &body, package_cancelled, &check);
+        pthread_mutex_lock(&s->jobs_lock);
+        j->error = error; j->result = body; j->state = 3;
+    }
+    pthread_mutex_unlock(&s->jobs_lock);
+    return NULL;
+}
 static void request_dispatch(query_server_t *s, client_t *c)
 {
     ipc_header_t h = c->incoming;
@@ -153,6 +212,7 @@ static void request_dispatch(query_server_t *s, client_t *c)
         if (h.size || c->hello) { error = IPC_BAD_REQUEST; break; }
         c->hello = 1;
         ipc_put_u32(&out, IPC_CAP_SNAPSHOT | IPC_CAP_INSPECT | IPC_CAP_MPRIS | IPC_CAP_EVENTS | IPC_CAP_SIGNAL | IPC_CAP_ABOUT
+                    | (dpkg_available() ? IPC_CAP_DPKG : 0)
 #ifdef HAVE_PIPEWIRE
                     | IPC_CAP_PIPEWIRE
 #endif
@@ -163,6 +223,10 @@ static void request_dispatch(query_server_t *s, client_t *c)
         ipc_put_u32(&out, IPC_LIMIT); ipc_put_u64(&out, s->instance);
         ipc_put_u32(&out, s->state->fdmon ? fdmon_active_backend(s->state->fdmon) : 0);
         ipc_put_string(&out, EVEMON_VERSION);
+        break;
+    case IPC_CHECKSUM:
+        if (h.size) error = IPC_BAD_REQUEST;
+        else ipc_put_u32(&out, ipc_self_checksum());
         break;
     case IPC_HOST:
         if (h.size) error = IPC_BAD_REQUEST;
@@ -198,19 +262,27 @@ static void request_dispatch(query_server_t *s, client_t *c)
         c->event_cursor = query_events_latest(s->events); c->next_event = ipc_now_ms();
         ipc_put_u32(&out, enabled); break;
     }
+    case IPC_DPKG:
     case IPC_GPU:
     case IPC_ABOUT:
     case IPC_INSPECT: {
-        uint32_t pid = h.type == IPC_INSPECT ? ipc_get_u32(&in) : 1;
+        uint32_t pid = h.type == IPC_INSPECT || h.type == IPC_DPKG ? ipc_get_u32(&in) : 1;
         uint32_t needs = h.type == IPC_INSPECT ? ipc_get_u32(&in) : 0;
+        if (h.type == IPC_DPKG && ipc_done(&in) && pid <= INT_MAX) {
+            if (!dpkg_available()) { error = IPC_UNSUPPORTED; break; }
+            /* The label alone is an os-release read; answer it inline. */
+            if (!pid) { error = query_dpkg_encode(0, &out, NULL, NULL); break; }
+        }
         if (!ipc_done(&in) || !pid || pid > INT_MAX || needs & ~2047u) { error = IPC_BAD_REQUEST; break; }
         pthread_mutex_lock(&s->jobs_lock);
-        int index = -1;
-        for (int i = 0; i < CLIENTS; ++i) if (!s->jobs[i].state) { index = i; break; }
+        int index = -1, first = LANE_START(h.type == IPC_DPKG);
+        for (int i = first; i < first + CLIENTS; ++i) if (!s->jobs[i].state) { index = i; break; }
         if (index >= 0) {
             s->jobs[index] = (inspect_job_t){.state = 1, .ticket = c->ticket, .pid = pid, .needs = needs, .type = h.type};
-            c->job = index; c->deadline = ipc_now_ms() + IPC_TIMEOUT_MS;
-            pthread_cond_signal(&s->jobs_changed);
+            c->job = index;
+            c->deadline = ipc_now_ms() + (h.type == IPC_DPKG ? IPC_PACKAGE_TIMEOUT_MS : IPC_TIMEOUT_MS);
+            /* Two lanes wait on this condition; wake the one that owns the job. */
+            pthread_cond_broadcast(&s->jobs_changed);
         }
         pthread_mutex_unlock(&s->jobs_lock);
         if (index >= 0) return;
@@ -258,7 +330,7 @@ static void *query_worker(void *arg)
         int64_t now = ipc_now_ms();
         /* Reap completed work by connection identity; descriptor reuse cannot steal replies. */
         pthread_mutex_lock(&s->jobs_lock);
-        for (int i = 0; i < CLIENTS; ++i) if (s->jobs[i].state == 3) {
+        for (int i = 0; i < JOBS; ++i) if (s->jobs[i].state == 3) {
             inspect_job_t *job = &s->jobs[i];
             for (int j = 0; j < CLIENTS; ++j) {
                 client_t *c = &clients[j];
@@ -279,9 +351,22 @@ static void *query_worker(void *arg)
             int has_input = c->fd >= 0 && poll(&input, 1, 0) > 0 && (input.revents & POLLIN);
             if (!has_input && c->fd >= 0 && c->period && !c->writing && c->job < 0 && !c->used) {
                 if (now >= c->next_sample) {
-                    ipc_buf_t body = {0}; int error = query_snapshot_encode(s->state, IPC_SNAPSHOT, 0, &body);
-                    if (error) { ipc_free(&body); reply_error(c, c->subscription, error); }
-                    else reply(c, IPC_SNAPSHOT | IPC_REPLY, c->subscription, &body);
+                    /* Send each sample once.  The period only bounds how
+                     * soon a new one is noticed. */
+                    pthread_mutex_lock(&s->state->lock);
+                    uint64_t generation = s->state->generation;
+                    pthread_mutex_unlock(&s->state->lock);
+                    if (generation != c->pushed_generation || now >= c->keepalive) {
+                        ipc_buf_t body = {0}; int error = query_snapshot_encode(s->state, IPC_SNAPSHOT, 0, &body);
+                        if (error) { ipc_free(&body); reply_error(c, c->subscription, error); }
+                        else {
+                            /* The frame starts with the generation it carries. */
+                            ipc_buf_t sent = body;
+                            c->pushed_generation = ipc_get_u64(&sent);
+                            reply(c, IPC_SNAPSHOT | IPC_REPLY, c->subscription, &body);
+                        }
+                        c->keepalive = now + SUBSCRIPTION_KEEPALIVE_MS;
+                    }
                     c->next_sample = now + c->period;
                 } else if (c->next_sample - now < timeout) timeout = (int)(c->next_sample - now);
             }
@@ -346,12 +431,13 @@ int query_default_path(char *path, size_t capacity)
 
 static void server_free(query_server_t *s)
 {
-    if (s->inspector_started) {
+    if (s->inspector_started || s->package_started) {
         pthread_mutex_lock(&s->jobs_lock); s->stopping = 1;
-        pthread_cond_signal(&s->jobs_changed); pthread_mutex_unlock(&s->jobs_lock);
-        pthread_join(s->inspector, NULL);
+        pthread_cond_broadcast(&s->jobs_changed); pthread_mutex_unlock(&s->jobs_lock);
+        if (s->inspector_started) pthread_join(s->inspector, NULL);
+        if (s->package_started) pthread_join(s->package, NULL);
     }
-    for (int i = 0; i < CLIENTS; ++i) ipc_free(&s->jobs[i].result);
+    for (int i = 0; i < JOBS; ++i) ipc_free(&s->jobs[i].result);
     pthread_mutex_destroy(&s->jobs_lock); pthread_cond_destroy(&s->jobs_changed);
     if (s->listener >= 0) close(s->listener);
     if (s->wake[0] >= 0) close(s->wake[0]);
@@ -442,6 +528,9 @@ query_server_t *query_server_start(monitor_state_t *state, const char *path)
     int rc = pthread_create(&s->inspector, NULL, inspect_worker, s);
     if (rc) { errno = rc; goto fail; }
     s->inspector_started = 1;
+    rc = pthread_create(&s->package, NULL, package_worker, s);
+    if (rc) { errno = rc; goto fail; }
+    s->package_started = 1;
     rc = pthread_create(&s->thread, NULL, query_worker, s);
     if (rc) { errno = rc; goto fail; }
     return s;

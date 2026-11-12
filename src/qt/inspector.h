@@ -9,7 +9,8 @@ class WriteView;
 
 class Inspector : public QWidget {
 public:
-    enum Kind { Audio, Network, Environment, Writes, Files, Threads, Devices, Maps, Libraries, Cgroup, Gentoo, MilkDrop, SystemFiles, SystemLibraries, Gpu };
+    // Kinds from SystemFiles on are system-dock tabs; per-process kinds go before it.
+    enum Kind { Audio, Network, Environment, Writes, Files, Threads, Devices, Maps, Libraries, Cgroup, Gentoo, Dpkg, MilkDrop, SystemFiles, SystemLibraries, Gpu };
     Inspector(Kind kind, const QString &title, QWidget *parent = nullptr);
     ~Inspector() override;
     Kind kind;
@@ -31,6 +32,7 @@ public:
     void refreshNeeds();
     WriteView *writes = nullptr;
     int writeMask() const;
+    void setWriteCaptureAvailable(bool available);
     void setMediaEnabled(bool enabled);
     QString menuTitle() const { return native && native->name ? QString::fromUtf8(native->name) : title; }
     QLabel *status = nullptr;

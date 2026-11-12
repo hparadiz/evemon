@@ -3,10 +3,17 @@ add_library(evemon_ui_qt MODULE src/qt/main.cpp src/qt/process_model.cpp
     src/qt/main_window.cpp src/qt/main_menus.cpp src/qt/remote_dialog.cpp src/qt/theme.cpp src/qt/scrollbars.cpp src/qt/about_dialog.cpp src/qt/compatibility_dialog.cpp src/qt/inspector.cpp src/qt/widget_bridge.cpp src/qt/detail_panel.cpp src/qt/write_view.cpp)
 target_link_libraries(evemon_ui_qt PRIVATE evemon Qt6::Core Qt6::Gui
     Qt6::Widgets PkgConfig::SQLITE PkgConfig::PANGO)
+find_package(KF6SyntaxHighlighting QUIET)
+if(TARGET KF6::SyntaxHighlighting)
+    target_link_libraries(evemon_ui_qt PRIVATE KF6::SyntaxHighlighting)
+    target_compile_definitions(evemon_ui_qt PRIVATE HAVE_QT_SYNTAX)
+else()
+    message(STATUS "Qt Write Log: built-in log highlighting; optional KF6SyntaxHighlighting code languages unavailable")
+endif()
 target_compile_definitions(evemon_ui_qt PRIVATE
     EVEMON_DATADIR="${CMAKE_INSTALL_FULL_DATADIR}/evemon")
 qt_add_resources(evemon_ui_qt assets PREFIX "/evemon" FILES icon.png font-logos.ttf)
-set(EVEMON_INSPECTORS fd env devices mmap libs threads cgroup system_fd system_libs net gentoo)
+set(EVEMON_INSPECTORS fd env devices mmap libs threads cgroup system_fd system_libs net gentoo dpkg)
 if(EVEMON_PIPEWIRE)
     list(APPEND EVEMON_INSPECTORS pipewire audio_service)
 endif()

@@ -237,8 +237,11 @@ void ThemeManager::apply(const QString &requested)
         "QToolButton[evemonPanelClose=\"true\"] { border: none; padding: 0; min-width: 20px; max-width: 20px; min-height: 20px; max-height: 20px; background: transparent; border-radius: 4px; }"
         "QToolButton[evemonPanelClose=\"true\"]:hover { background: palette(mid); }");
     const QString menuBarStyle = QStringLiteral(
+        "QMenuBar,QMenuBar::item { color: %3; }"
+        "QMenuBar::item:disabled { color: %4; }"
         "QMenuBar::item:selected { background: %1; color: %2; border-radius: 5px; }")
-        .arg(palette.color(QPalette::Highlight).name(), palette.color(QPalette::HighlightedText).name());
+        .arg(palette.color(QPalette::Highlight).name(), palette.color(QPalette::HighlightedText).name(),
+             palette.color(QPalette::WindowText).name(), palette.color(QPalette::Disabled, QPalette::WindowText).name());
     qApp->setStyleSheet(frameStyle + (glass ? menuBarStyle + QStringLiteral(
         "QMainWindow,QDockWidget,QTabWidget::pane,QScrollArea,QTreeView,QTableView,QListView,"
         "QTextEdit,QPlainTextEdit,QMenuBar,QStatusBar,QSplitter,QFrame { background: transparent; }"

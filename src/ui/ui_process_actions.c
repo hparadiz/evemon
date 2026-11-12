@@ -4,54 +4,35 @@
 
 /* ── right-click: end process / end process tree ─────────────── */
 
-/*
- * Collect all descendant PIDs of `parent_pid` from the current tree model.
- * Uses the tree structure (not /proc) so it matches what the user sees.
- */
-static void collect_tree_descendants(GtkTreeModel *model, GtkTreeIter *parent,
-                                    pid_t **out, size_t *cnt, size_t *cap)
+/* Capture each identity once while walking the displayed subtree.  Signals
+ * still validate start_ticks at delivery, so PID reuse cannot change targets. */
+static void capture_signal_targets(GtkTreeModel *model, GtkTreeIter *iter,
+                                    GArray *targets, gboolean descendants)
 {
-    GtkTreeIter child;
-    gboolean valid = gtk_tree_model_iter_children(model, &child, parent);
-    while (valid) {
-        gint pid;
-        gtk_tree_model_get(model, &child, COL_PID, &pid, -1);
-        if (*cnt >= *cap) {
-            size_t new_cap = *cap ? *cap * 2 : 64;
-            if (new_cap <= *cap || new_cap > SIZE_MAX / sizeof(pid_t))
-                return;
-            pid_t *tmp = realloc(*out, new_cap * sizeof(pid_t));
-            if (!tmp) return;
-            *out = tmp;
-            *cap = new_cap;
+    if (descendants) {
+        GtkTreeIter child;
+        gboolean valid = gtk_tree_model_iter_children(model, &child, iter);
+        while (valid) {
+            capture_signal_targets(model, &child, targets, TRUE);
+            valid = gtk_tree_model_iter_next(model, &child);
         }
-        (*out)[(*cnt)++] = (pid_t)pid;
-        collect_tree_descendants(model, &child, out, cnt, cap);
-        valid = gtk_tree_model_iter_next(model, &child);
     }
+    proc_entry_t entry = {0};
+    gtk_tree_model_get(model, iter, COL_PID, &entry.pid,
+                       COL_START_TICKS, &entry.start_ticks,
+                       COL_EVEMON_INSTANCE, &entry.evemon_instance, -1);
+    if (entry.pid > 1) g_array_append_val(targets, entry);
 }
 
-/* Capture identities when the menu is opened, before the user selects an action. */
 typedef struct { GArray *targets; int signo; char path[108]; } send_signal_data_t;
-static send_signal_data_t *signal_data(ui_ctx_t *ctx, pid_t pid, int signo, int group)
+static send_signal_data_t *signal_data(GArray *targets, int signo)
 {
     send_signal_data_t *data = g_new0(send_signal_data_t, 1);
-    data->targets = g_array_new(FALSE, FALSE, sizeof(proc_entry_t)); data->signo = signo;
+    data->targets = g_array_ref(targets);
+    data->signo = signo;
     const char *path = query_remote_path();
     if (path) g_strlcpy(data->path, path, sizeof(data->path));
-    GtkTreeModel *model = GTK_TREE_MODEL(ctx->store); GtkTreeIter iter;
-    if (!find_iter_by_pid(model, NULL, pid, &iter)) return data;
-    pid_t *pids = NULL; size_t count = 0, cap = 0;
-    if (group) collect_tree_descendants(model, &iter, &pids, &count, &cap);
-    for (size_t i = count + 1; i > 0; --i) {
-        pid_t target = i == 1 ? pid : pids[i - 2];
-        if (!find_iter_by_pid(model, NULL, target, &iter)) continue;
-        proc_entry_t entry = {.pid = target};
-        gtk_tree_model_get(model, &iter, COL_START_TICKS, &entry.start_ticks,
-                           COL_EVEMON_INSTANCE, &entry.evemon_instance, -1);
-        if (target > 1) g_array_append_val(data->targets, entry);
-    }
-    free(pids); return data;
+    return data;
 }
 static void signal_data_free(gpointer opaque, GClosure *closure)
 {
@@ -88,6 +69,21 @@ static void on_send_signal(GtkMenuItem *item, gpointer opaque)
     (void)item;
     send_signal_data_t *data = g_new(send_signal_data_t, 1);
     *data = *(send_signal_data_t *)opaque; g_array_ref(data->targets);
+    if (!data->targets->len) { signal_task_free(data); return; }
+    if (data->signo != SIGCONT) {
+        GtkWidget *dialog = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL,
+            GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE, "Send %s to %u process%s?",
+            strsignal(data->signo), data->targets->len,
+            data->targets->len == 1 ? "" : "es");
+        gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),
+            "Unsaved work in the affected processes may be lost.");
+        gtk_dialog_add_buttons(GTK_DIALOG(dialog), "Cancel", GTK_RESPONSE_CANCEL,
+                                "Send Signal", GTK_RESPONSE_ACCEPT, NULL);
+        gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_CANCEL);
+        int response = gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        if (response != GTK_RESPONSE_ACCEPT) { signal_task_free(data); return; }
+    }
     GTask *task = g_task_new(NULL, NULL, signal_complete, NULL);
     g_task_set_task_data(task, data, signal_task_free);
     g_task_run_in_thread(task, signal_worker); g_object_unref(task);
@@ -338,6 +334,15 @@ void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
                                      const char *cmdline)
 {
     GtkWidget *menu = gtk_menu_new();
+    GArray *single_targets = g_array_new(FALSE, FALSE, sizeof(proc_entry_t));
+    GArray *tree_targets = g_array_new(FALSE, FALSE, sizeof(proc_entry_t));
+    GtkTreeModel *model = GTK_TREE_MODEL(ctx->store);
+    GtkTreeIter target;
+    if (find_iter_by_pid(model, NULL, pid, &target)) {
+        capture_signal_targets(model, &target, single_targets, FALSE);
+        capture_signal_targets(model, &target, tree_targets, TRUE);
+    }
+    g_signal_connect_swapped(menu, "selection-done", G_CALLBACK(gtk_widget_destroy), menu);
 
     /* ── Pin / Unpin toggle (at the very top) ── */
     {
@@ -396,14 +401,14 @@ void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
     snprintf(label1, sizeof(label1), "End Process (%s, pid %d)", name, pid);
     GtkWidget *mi1 = gtk_menu_item_new_with_label(label1);
     g_signal_connect_data(mi1, "activate", G_CALLBACK(on_send_signal),
-                          signal_data(ctx, pid, SIGTERM, 0), signal_data_free, 0);
+                          signal_data(single_targets, SIGTERM), signal_data_free, 0);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi1);
 
     char label2[320];
     snprintf(label2, sizeof(label2), "End Process Tree (%s, pid %d)", name, pid);
     GtkWidget *mi2 = gtk_menu_item_new_with_label(label2);
     g_signal_connect_data(mi2, "activate", G_CALLBACK(on_send_signal),
-                          signal_data(ctx, pid, SIGTERM, 1), signal_data_free, 0);
+                          signal_data(tree_targets, SIGTERM), signal_data_free, 0);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi2);
 
     /* ── Send Signal submenu ── */
@@ -438,7 +443,7 @@ void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
             }
             GtkWidget *mi = gtk_menu_item_new_with_label(signals[i].label);
             g_signal_connect_data(mi, "activate", G_CALLBACK(on_send_signal),
-                                  signal_data(ctx, pid, signals[i].signo, 0), signal_data_free, 0);
+                                  signal_data(single_targets, signals[i].signo), signal_data_free, 0);
             gtk_menu_shell_append(GTK_MENU_SHELL(sig_menu), mi);
         }
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), sig_item);
@@ -459,12 +464,14 @@ void show_process_context_menu(ui_ctx_t *ctx, GdkEventButton *ev,
             }
             GtkWidget *mi = gtk_menu_item_new_with_label(signals[i].label);
             g_signal_connect_data(mi, "activate", G_CALLBACK(on_send_signal),
-                                  signal_data(ctx, pid, signals[i].signo, 1), signal_data_free, 0);
+                                  signal_data(tree_targets, signals[i].signo), signal_data_free, 0);
             gtk_menu_shell_append(GTK_MENU_SHELL(sig_tree_menu), mi);
         }
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), sig_tree_item);
     }
 
+    g_array_unref(single_targets);
+    g_array_unref(tree_targets);
     gtk_widget_show_all(menu);
     gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
 }

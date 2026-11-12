@@ -52,6 +52,7 @@ typedef struct {
     uint64_t prev_recv;      /* recv_bytes at last snapshot        */
     uint64_t delta_send;     /* bytes sent since last snapshot     */
     uint64_t delta_recv;     /* bytes received since last snapshot */
+    uint64_t last_active_ns;
     int      used;
 } net_io_entry_t;
 
@@ -72,6 +73,7 @@ typedef struct {
     uint64_t prev_recv;
     uint64_t delta_send;
     uint64_t delta_recv;
+    uint64_t last_active_ns;
     int      used;
 } sock_io_entry_t;
 
@@ -105,6 +107,9 @@ struct fdmon_ctx {
     /* Per-PID network I/O counters (populated by eBPF backend) */
     pthread_mutex_t   net_io_lock;
     net_io_entry_t    net_io[NET_IO_HT_SIZE];
+    uint64_t         net_sample_ns;
+    uint64_t         net_gc_ns;
+    double           net_window_seconds;
 
     /* Per-socket (4-tuple) network I/O counters */
     sock_io_entry_t   sock_io[SOCK_IO_HT_SIZE];
@@ -126,6 +131,8 @@ void submit_sock_event(fdmon_ctx_t *ctx, pid_t tgid,
                        uint32_t raddr, uint16_t rport,
                        uint64_t inode,
                        uint32_t bytes, int is_send);
+
+int fdmon_ebpf_open_enable(fdmon_ctx_t *ctx, int enabled);
 
 /* Dynamic write monitoring helpers (eBPF backend) */
 int  fdmon_write_enable(struct fdmon_ctx *ctx);

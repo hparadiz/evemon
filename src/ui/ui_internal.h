@@ -432,6 +432,7 @@ typedef struct {
 
     /* plugin system */
     void               *plugin_registry; /* plugin_registry_t* (opaque to avoid header dep) */
+    GHashTable         *write_subscriptions; /* (PID, fd) -> GTK consumer count */
     GtkWidget          *plugin_notebook; /* GtkNotebook holding plugin tabs */
     void               *plugin_broker;   /* broker state (opaque void*)     */
     char                plugin_dir[4096]; /* directory scanned for .so files */

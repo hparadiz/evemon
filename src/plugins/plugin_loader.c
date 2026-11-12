@@ -31,6 +31,9 @@ static int plugin_built(const char *id)
     if (query_is_foreign_host() &&
         !(query_remote_capabilities() & IPC_CAP_PIPEWIRE) &&
         !strcmp(id, "org.evemon.pipewire")) return 0;
+    if (query_is_foreign_host() &&
+        !(query_remote_capabilities() & IPC_CAP_DPKG) &&
+        !strcmp(id, "org.evemon.dpkg")) return 0;
     if (query_is_foreign_host() && (!strcmp(id, "org.evemon.milkdrop") ||
                                   !strcmp(id, "org.evemon.audio_service") ||
                                   !strcmp(id, "org.evemon.gentoo"))) return 0;

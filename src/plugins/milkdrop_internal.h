@@ -416,7 +416,7 @@ gboolean on_render(GtkGLArea *area, GdkGLContext *glctx, gpointer data);
 void on_unrealize(GtkGLArea *area, gpointer data);
 #endif
 #ifndef EVEMON_QT_MILKDROP
-gboolean on_button_press(GtkWidget *w, GdkEventButton *ev, gpointer data);
+gboolean md_on_button_press(GtkWidget *w, GdkEventButton *ev, gpointer data);
 #endif
 #ifndef EVEMON_QT_MILKDROP
 gboolean on_scroll(GtkWidget *w, GdkEventScroll *ev, gpointer data);
@@ -425,7 +425,7 @@ gboolean on_scroll(GtkWidget *w, GdkEventScroll *ev, gpointer data);
 gboolean md_handle_key(md_ctx_t *ctx, unsigned keyval, unsigned state);
 gboolean md_draw_overlay(md_ctx_t *ctx, cairo_t *cr, int ww, int hh);
 #else
-gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data);
+gboolean md_on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data);
 gboolean on_overlay_draw(GtkWidget *w, cairo_t *cr, gpointer data);
 #endif
 

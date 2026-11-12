@@ -15,6 +15,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,7 @@
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <bpf/btf.h>
 #include <linux/perf_event.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
@@ -88,11 +90,44 @@ struct fdmon_bpf_event {
 /* Minimum bytes needed to read write.len safely. */
 #define FDMON_BPF_WRITE_HDR_SIZE ((uint32_t)offsetof(struct fdmon_bpf_event, write.data))
 
+/*
+ * One write-capture registration in the monitored_pids map, keyed by pid.
+ * A write to fd 1 (bit 0) or fd 2 (bit 1) is captured when any of the four
+ * masks has the fd's bit.  Userspace owns `own` and `root`; the kernel fills
+ * `inh` and `origin` when a registered process forks.  Must match
+ * fdmon_ebpf_kern.c.
+ */
+struct fdmon_watch {
+    __u8  own;       /* registered for this process alone                 */
+    __u8  root;      /* registered for this process and what it forks     */
+    __u8  inh;       /* copied from the parent at fork                    */
+    __u8  orphan;    /* automatically registered non-TTY output */
+    __u32 origin;    /* registered process `inh` was copied from, or 0    */
+};
+
+/* Kernel structure offsets for the BPF programs.  Must match
+ * fdmon_ebpf_kern.c. */
+struct fdmon_config {
+    __u32 sock_inode_known;
+    __u32 sk_socket_off;     /* struct sock          :: sk_socket */
+    __u32 socket_file_off;   /* struct socket        :: file      */
+    __u32 file_inode_off;    /* struct file          :: f_inode   */
+    __u32 inode_ino_off;     /* struct inode         :: i_ino     */
+    __u32 tuple_known;
+    __u32 sk_common_off;
+    __u32 daddr_off, saddr_off, dport_off, num_off;
+    __u32 group_live_known;
+    __u32 task_signal_off;   /* struct task_struct   :: signal    */
+    __u32 signal_live_off;   /* struct signal_struct :: live      */
+};
+
 typedef struct {
     struct bpf_object     *obj;
+    /* Open/close tracing: attached only while a PID group is watched. */
     struct bpf_link       *link_enter_openat;
     struct bpf_link       *link_exit_openat;
     struct bpf_link       *link_enter_close;
+    /* Write capture: attached only while something is registered. */
     struct bpf_link       *link_enter_write;
     struct bpf_link       *link_enter_writev;
     struct bpf_link       *link_enter_pwrite64;
@@ -101,21 +136,26 @@ typedef struct {
     struct bpf_link       *link_enter_sendmmsg;
     struct bpf_link       *link_enter_splice;
     struct bpf_link       *link_enter_sendfile;
-    struct bpf_link       *link_tcp_sendmsg;
+    /* Network byte accounting: an entry kprobe and a kretprobe per function. */
+    struct bpf_link       *link_tcp_sendmsg_entry;
+    struct bpf_link       *link_tcp_sendmsg_ret;
     struct bpf_link       *link_tcp_recvmsg_entry;
     struct bpf_link       *link_tcp_recvmsg_ret;
-    /* UDP kprobes — same pattern as TCP, no root required */
-    struct bpf_link       *link_udp_sendmsg;
+    struct bpf_link       *link_udp_sendmsg_entry;
+    struct bpf_link       *link_udp_sendmsg_ret;
     struct bpf_link       *link_udp_recvmsg_entry;
     struct bpf_link       *link_udp_recvmsg_ret;
     /* udpv6_sendmsg / udpv6_recvmsg — separate kernel functions for IPv6 UDP */
-    struct bpf_link       *link_udpv6_sendmsg;
+    struct bpf_link       *link_udpv6_sendmsg_entry;
+    struct bpf_link       *link_udpv6_sendmsg_ret;
     struct bpf_link       *link_udpv6_recvmsg_entry;
     struct bpf_link       *link_udpv6_recvmsg_ret;
-    /* sched_process_exec tracepoint for orphan-stdout detection */
+    /* sched_process_exec: exec events, orphan-stdout detection */
     struct bpf_link       *link_sched_exec;
-    /* sched_process_fork: inherit monitored fds into child immediately */
-    struct bpf_link       *link_sched_fork;
+    /* task_newtask: copy a registration to the child at fork */
+    struct bpf_link       *link_task_newtask;
+    /* sched_process_exit: drop the registrations of tasks that are gone */
+    struct bpf_link       *link_sched_exit;
     struct perf_buffer    *pb;
     pthread_t              reader_thread;
     atomic_int             running;
@@ -123,19 +163,12 @@ typedef struct {
     /* When non-zero, auto-register fd 1/2 of any newly exec'd process
      * whose stdout/stderr is not a TTY (orphan stdout capture mode). */
     atomic_int             orphan_stdout_mode;
-    /*
-     * Watched-parent table: when a process in this table exec()s a child,
-     * we immediately insert the child's entry into monitored_pids IN the
-     * reader thread — no GTK idle dispatch, no race.
-     * fd_mask: bit 0 = fd 1, bit 1 = fd 2.
-     */
-#define WATCHED_PARENT_MAX 64
-    struct {
-        pid_t pid;
-        int   fd_mask;   /* bit0 = fd1, bit1 = fd2 */
-    } watched_parents[WATCHED_PARENT_MAX];
-    int             watched_parent_count;
-    pthread_mutex_t watched_parent_lock;
+    /* Serialises every read-modify-write of monitored_pids, the sweep over
+     * it, and attaching or detaching the on-demand probes. */
+    pthread_mutex_t        lock;
+    /* A registration was narrowed or withdrawn: its inherited copies in the
+     * map are stale until the reader thread sweeps. */
+    atomic_int             sweep_pending;
 } ebpf_state_t;
 
 /* ── extern declarations ─────────────────────────────────────── */
@@ -147,6 +180,267 @@ typedef struct {
  */
 
 
+
+/* ── probes attached on demand ───────────────────────────────── */
+
+static int silent_print(enum libbpf_print_level level,
+                        const char *fmt, va_list ap);
+
+static struct bpf_link *attach_program(ebpf_state_t *st, const char *name)
+{
+    struct bpf_program *prog = bpf_object__find_program_by_name(st->obj, name);
+    if (!prog) return NULL;
+    struct bpf_link *link = bpf_program__attach(prog);
+    return !link || libbpf_get_error(link) ? NULL : link;
+}
+
+static void detach_link(struct bpf_link **link)
+{
+    if (*link) bpf_link__destroy(*link);
+    *link = NULL;
+}
+
+/* An entry probe alone would only fill its stash map, so the return probe
+ * goes on first and the pair is all or nothing. */
+static void attach_pair(ebpf_state_t *st, const char *entry, const char *ret,
+                        struct bpf_link **entry_link, struct bpf_link **ret_link)
+{
+    *ret_link   = attach_program(st, ret);
+    *entry_link = *ret_link ? attach_program(st, entry) : NULL;
+    if (!*entry_link) detach_link(ret_link);
+}
+
+static void open_probes_detach(ebpf_state_t *st)
+{
+    detach_link(&st->link_enter_close);
+    detach_link(&st->link_exit_openat);
+    detach_link(&st->link_enter_openat);
+}
+
+/* Every open and close on the machine becomes a perf event while these are
+ * attached, so they are only attached while someone consumes the events. */
+static int open_probes_attach(ebpf_state_t *st)
+{
+    if (st->link_enter_openat) return 0;
+    st->link_enter_openat = attach_program(st, "trace_enter_openat");
+    st->link_exit_openat  = attach_program(st, "trace_exit_openat");
+    st->link_enter_close  = attach_program(st, "trace_enter_close");
+    if (st->link_enter_openat && st->link_exit_openat && st->link_enter_close)
+        return 0;
+    open_probes_detach(st);
+    return -1;
+}
+
+static void write_probes_detach(ebpf_state_t *st)
+{
+    detach_link(&st->link_enter_sendfile);
+    detach_link(&st->link_enter_splice);
+    detach_link(&st->link_enter_sendmmsg);
+    detach_link(&st->link_enter_sendmsg);
+    detach_link(&st->link_enter_sendto);
+    detach_link(&st->link_enter_pwrite64);
+    detach_link(&st->link_enter_writev);
+    detach_link(&st->link_enter_write);
+}
+
+/* st->lock held.  trace_enter_write is required; kernels may lack some of
+ * the other syscall tracepoints, and those are simply left out. */
+static int write_probes_attach(ebpf_state_t *st)
+{
+    if (st->link_enter_write) return 0;
+    libbpf_print_fn_t old_print = libbpf_set_print(silent_print);
+    st->link_enter_write = attach_program(st, "trace_enter_write");
+    if (st->link_enter_write) {
+        st->link_enter_writev   = attach_program(st, "trace_enter_writev");
+        st->link_enter_pwrite64 = attach_program(st, "trace_enter_pwrite64");
+        st->link_enter_sendto   = attach_program(st, "trace_enter_sendto");
+        st->link_enter_sendmsg  = attach_program(st, "trace_enter_sendmsg");
+        st->link_enter_sendmmsg = attach_program(st, "trace_enter_sendmmsg");
+        st->link_enter_splice   = attach_program(st, "trace_enter_splice");
+        st->link_enter_sendfile = attach_program(st, "trace_enter_sendfile");
+    }
+    libbpf_set_print(old_print);
+    return st->link_enter_write ? 0 : -1;
+}
+
+/* ── write-capture registrations ─────────────────────────────── */
+
+/*
+ * Change what userspace has registered for one process: OR `own_set` into
+ * and clear `own_clear` from its own mask, and with `set_root` replace its
+ * tree mask.  Inherited bits are the kernel's and are left alone; an entry
+ * with no bits left is removed.  st->lock held.  Returns 0, or -1 with errno.
+ */
+static int watch_update(ebpf_state_t *st, pid_t pid, __u8 own_set,
+                        __u8 own_clear, int set_root, __u8 root, int orphan)
+{
+    int fd = st->monitored_pids_map_fd;
+    __u32 key = (__u32)pid;
+    if (fd < 0) { errno = ENOENT; return -1; }
+
+    /* The kernel adds an entry when the parent forks and removes it when
+     * the task exits, either of which can happen between the lookup and
+     * the update; EXIST/NOEXIST make that visible instead of overwriting
+     * an inherited mask or bringing a dead task's entry back. */
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        struct fdmon_watch w = {0};
+        int existed = bpf_map_lookup_elem(fd, &key, &w) == 0;
+        w.own = (__u8)((w.own | own_set) & ~own_clear);
+        if (set_root) w.root = root;
+        if (orphan >= 0) w.orphan = (__u8)orphan;
+        if (!(w.own | w.root | w.inh | w.orphan)) {
+            if (existed) bpf_map_delete_elem(fd, &key);
+            return 0;
+        }
+        if (bpf_map_update_elem(fd, &key, &w, existed ? BPF_EXIST : BPF_NOEXIST) == 0) {
+            if (!existed && kill(pid, 0) != 0 && errno == ESRCH)
+                bpf_map_delete_elem(fd, &key);   /* it exited before we wrote */
+            return 0;
+        }
+        if (errno != ENOENT && errno != EEXIST) return -1;
+    }
+    errno = EAGAIN;
+    return -1;
+}
+
+/*
+ * Userspace stand-in for trace_task_newtask on kernels where that program
+ * could not be attached: when a child execs, give it its parent's masks the
+ * way the kernel would have at fork.
+ */
+static void watch_inherit(ebpf_state_t *st, pid_t child, pid_t parent)
+{
+    int fd = st->monitored_pids_map_fd;
+    __u32 parent_key = (__u32)parent, child_key = (__u32)child;
+    struct fdmon_watch p, w = {0};
+    if (fd < 0) return;
+
+    pthread_mutex_lock(&st->lock);
+    if (bpf_map_lookup_elem(fd, &parent_key, &p) == 0) {
+        w.inh    = p.root | p.inh;
+        w.origin = p.root ? parent_key : p.origin;
+        if (w.inh && bpf_map_update_elem(fd, &child_key, &w, BPF_NOEXIST) == 0 &&
+            kill(child, 0) != 0 && errno == ESRCH)
+            bpf_map_delete_elem(fd, &child_key);
+    }
+    pthread_mutex_unlock(&st->lock);
+}
+
+typedef struct {
+    __u32              pid;
+    struct fdmon_watch w;
+    int                changed;
+} watch_row_t;
+
+static int watch_row_order(const void *a, const void *b)
+{
+    __u32 x = ((const watch_row_t *)a)->pid, y = ((const watch_row_t *)b)->pid;
+    return x < y ? -1 : x > y;
+}
+
+/*
+ * Bring the inherited halves of the map back in line with the registrations
+ * they were copied from.  The kernel copies a registered process's masks to
+ * everything it forks; when userspace later narrows or withdraws that
+ * registration, this pass narrows or removes the copies instead of flushing
+ * the whole map, so other registrations are untouched.  It also drops entries
+ * of tasks that no longer exist, and detaches the write probes once nothing
+ * is left to capture.  st->lock held.
+ */
+static void watch_sweep(ebpf_state_t *st)
+{
+    int fd = st->monitored_pids_map_fd;
+    if (fd < 0) return;
+
+    size_t count = 0, cap = 256, steps = 0;
+    watch_row_t *rows = malloc(cap * sizeof(*rows));
+    if (!rows) return;
+
+    /* get_next_key starts over from the first key when the key it is given
+     * has just been removed, and tasks exit all the time: the walk may see a
+     * key twice.  Duplicates are dropped below; `steps` bounds the walk. */
+    __u32 key = 0, next = 0;
+    int rc = bpf_map_get_next_key(fd, NULL, &next);
+    while (rc == 0 && steps++ < (1u << 18)) {
+        key = next;
+        if (count == cap) {
+            watch_row_t *grown = realloc(rows, 2 * cap * sizeof(*rows));
+            if (!grown) break;
+            rows = grown;
+            cap *= 2;
+        }
+        rows[count].pid = key;
+        rows[count].changed = 0;
+        if (bpf_map_lookup_elem(fd, &key, &rows[count].w) == 0) count++;
+        rc = bpf_map_get_next_key(fd, &key, &next);
+    }
+    int complete = rc != 0 && errno == ENOENT;   /* reached the end of the map */
+    if (!complete) { free(rows); atomic_store(&st->sweep_pending, 1); return; }
+    qsort(rows, count, sizeof(*rows), watch_row_order);
+    size_t unique = 0;
+    for (size_t i = 0; i < count; i++)
+        if (!unique || rows[unique - 1].pid != rows[i].pid) rows[unique++] = rows[i];
+    count = unique;
+
+    /* Tasks whose exit went unseen, and thread ids retired by an exec. */
+    for (size_t i = 0; i < count; i++) {
+        if (rows[i].w.orphan && !atomic_load(&st->orphan_stdout_mode)) {
+            rows[i].w.orphan = 0;
+            rows[i].changed = 1;
+        }
+        if (kill((pid_t)rows[i].pid, 0) != 0 && errno == ESRCH) {
+            rows[i].w = (struct fdmon_watch){0};
+            rows[i].changed = 1;
+        }
+    }
+
+    /* An heir's mask is whatever its origin captures now.  Origins can be
+     * heirs of an outer registration themselves, hence the passes. */
+    for (int pass = 0, moved = 1; moved && pass < 8; pass++) {
+        moved = 0;
+        for (size_t i = 0; i < count; i++) {
+            watch_row_t *r = &rows[i];
+            if (!r->w.inh && !r->w.origin) continue;
+            watch_row_t probe = {.pid = r->w.origin};
+            watch_row_t *o = r->w.origin != r->pid
+                ? bsearch(&probe, rows, count, sizeof(*rows), watch_row_order) : NULL;
+            __u8 inh = 0;
+            __u32 origin = 0;
+            if (o && o->w.root) {
+                inh = o->w.root | o->w.inh;
+                origin = o->pid;
+            } else if (o && o->w.inh && o->w.origin) {
+                /* Its origin is only an heir itself now: answer to the same
+                 * registration that one does. */
+                inh = o->w.inh;
+                origin = o->w.origin;
+            }
+            if (!inh) origin = 0;
+            if (inh != r->w.inh || origin != r->w.origin) {
+                r->w.inh = inh;
+                r->w.origin = origin;
+                r->changed = moved = 1;
+            }
+        }
+    }
+
+    size_t remaining = 0;
+    for (size_t i = 0; i < count; i++) {
+        watch_row_t *r = &rows[i];
+        if (!(r->w.own | r->w.root | r->w.inh | r->w.orphan)) {
+            bpf_map_delete_elem(fd, &r->pid);
+            continue;
+        }
+        remaining++;
+        /* EXIST: a task that exited meanwhile must stay gone. */
+        if (r->changed) bpf_map_update_elem(fd, &r->pid, &r->w, BPF_EXIST);
+    }
+    free(rows);
+
+    if (complete && !remaining &&
+        !atomic_load_explicit(&st->orphan_stdout_mode, memory_order_relaxed))
+        write_probes_detach(st);
+}
 
 /* ── orphan stdout helpers ───────────────────────────────────── */
 
@@ -225,10 +519,27 @@ static void maybe_register_orphan_fds(ebpf_state_t *st, pid_t pid)
     }
     if (!mask) return;
 
-    __u32 key = (uint32_t)pid;
-    __u8 val  = mask;
-    bpf_map_update_elem(st->monitored_pids_map_fd,
-                         &key, &val, BPF_ANY);
+    pthread_mutex_lock(&st->lock);
+    watch_update(st, pid, 0, 0, 0, 0, mask);
+    pthread_mutex_unlock(&st->lock);
+}
+
+/* Parent of a process, or 0 when it has already gone. */
+static pid_t proc_ppid(pid_t pid)
+{
+    char path[64], line[128];
+    pid_t ppid = 0;
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "PPid:", 5) == 0) {
+            ppid = (pid_t)atoi(line + 5);
+            break;
+        }
+    }
+    fclose(f);
+    return ppid;
 }
 
 /* ── perf buffer callback ────────────────────────────────────── */
@@ -294,85 +605,27 @@ static void handle_event(void *cookie, int cpu, void *data, __u32 size)
     if (ev->type == FDMON_BPF_EXEC) {
         ebpf_state_t *st = ctx->ebpf_state;
         pid_t new_pid = (pid_t)ev->pid;
+        /* /proc is the quickest reliable source for the parent, and is
+         * there as soon as execve has completed. */
+        pid_t ppid = proc_ppid(new_pid);
 
         if (st && atomic_load_explicit(&st->orphan_stdout_mode,
                                        memory_order_relaxed)) {
             maybe_register_orphan_fds(st, new_pid);
         }
 
-        /*
-         * Inline (reader-thread) child-fd registration.
-         * Read the ppid from /proc/<pid>/status — this is the fastest
-         * reliable way to get it, and /proc is available immediately
-         * after execve completes.  If the new process's ppid matches
-         * any entry in watched_parents, insert its fds into the BPF map
-         * right now, before returning.  No GTK dispatch, no race.
-         */
-        if (st && st->monitored_pids_map_fd >= 0 &&
-            st->watched_parent_count > 0) {
-
-            pid_t ppid = 0;
-            {
-                char spath[64];
-                snprintf(spath, sizeof(spath), "/proc/%d/status", (int)new_pid);
-                FILE *sf = fopen(spath, "r");
-                if (sf) {
-                    char line[128];
-                    while (fgets(line, sizeof(line), sf)) {
-                        if (strncmp(line, "PPid:", 5) == 0) {
-                            ppid = (pid_t)atoi(line + 5);
-                            break;
-                        }
-                    }
-                    fclose(sf);
-                }
-            }
-
-            if (ppid != 0) {
-                int fd_mask = 0;
-                pthread_mutex_lock(&st->watched_parent_lock);
-                for (int i = 0; i < st->watched_parent_count; i++) {
-                    if (st->watched_parents[i].pid == ppid) {
-                        fd_mask = st->watched_parents[i].fd_mask;
-                        break;
-                    }
-                }
-                pthread_mutex_unlock(&st->watched_parent_lock);
-
-                if (fd_mask) {
-                    /* The fork BPF program already propagated this entry.
-                     * But if exec replaced the process image (new command),
-                     * we re-confirm the entry is present with the right mask. */
-                    __u32 key = (uint32_t)new_pid;
-                    __u8 val  = (__u8)fd_mask;
-                    bpf_map_update_elem(st->monitored_pids_map_fd,
-                                        &key, &val, BPF_ANY);
-                }
-            }
-        }
+        /* The kernel copies a registration to the child at fork.  Where
+         * that program is not attached, do it here, in the reader thread,
+         * before the new image has had much chance to write. */
+        if (st && !st->link_task_newtask && ppid > 0)
+            watch_inherit(st, new_pid, ppid);
 
         /* Publish CHILD_EXEC unconditionally so write-monitor subscribers
          * can immediately register the new process's fds in the BPF map
          * before it has a chance to call write(). */
         evemon_exec_payload_t xp;
-        xp.pid  = (pid_t)ev->pid;
-        xp.ppid = 0;
-        /* Best-effort ppid from /proc/<pid>/status */
-        {
-            char spath[64];
-            snprintf(spath, sizeof(spath), "/proc/%d/status", (int)ev->pid);
-            FILE *sf = fopen(spath, "r");
-            if (sf) {
-                char line[128];
-                while (fgets(line, sizeof(line), sf)) {
-                    if (strncmp(line, "PPid:", 5) == 0) {
-                        xp.ppid = (pid_t)atoi(line + 5);
-                        break;
-                    }
-                }
-                fclose(sf);
-            }
-        }
+        xp.pid  = new_pid;
+        xp.ppid = ppid;
         /* Copy executable path from the BPF event header */
         strncpy(xp.path, ev->path, sizeof(xp.path) - 1);
         xp.path[sizeof(xp.path) - 1] = '\0';
@@ -416,13 +669,31 @@ static void handle_lost(void *cookie, int cpu, __u64 count)
 
 /* ── reader thread ───────────────────────────────────────────── */
 
+/* While anything is being captured the registrations are re-checked this
+ * often even if nobody asked, which also notices that the last one is gone. */
+#define WATCH_SWEEP_SECONDS 5
+
 static void *ebpf_reader_thread(void *arg)
 {
     ebpf_state_t *st = arg;
     pthread_setname_np(pthread_self(), "ev-ebpf");
+    struct timespec swept;
+    clock_gettime(CLOCK_MONOTONIC, &swept);
     while (atomic_load_explicit(&st->running, memory_order_relaxed)) {
         /* poll for 200ms then check running flag */
         perf_buffer__poll(st->pb, 200);
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int due = atomic_exchange_explicit(&st->sweep_pending, 0, memory_order_relaxed);
+        pthread_mutex_lock(&st->lock);
+        if (st->link_enter_write && now.tv_sec - swept.tv_sec >= WATCH_SWEEP_SECONDS)
+            due = 1;
+        if (due) {
+            watch_sweep(st);
+            swept = now;
+        }
+        pthread_mutex_unlock(&st->lock);
     }
     return NULL;
 }
@@ -481,270 +752,162 @@ static int find_bpf_object(char *buf, size_t bufsz)
 
 /* ── public init / destroy ───────────────────────────────────── */
 
+/* Resolve named members, including those inside anonymous unions/structs. */
+static int btf_member_offset(const struct btf *btf, int id, const char *name,
+                              __u32 *offset, int depth)
+{
+    if (id <= 0 || depth > 8) return -1;
+    id = btf__resolve_type(btf, (__u32)id);
+    const struct btf_type *t = id > 0 ? btf__type_by_id(btf, (__u32)id) : NULL;
+    if (!t || (!btf_is_struct(t) && !btf_is_union(t))) return -1;
+    const struct btf_member *m = btf_members(t);
+    for (unsigned i = 0; i < btf_vlen(t); i++) {
+        const char *member = btf__name_by_offset(btf, m[i].name_off);
+        __u32 bits = btf_member_bit_offset(t, i), nested = 0;
+        if (bits % 8 || btf_member_bitfield_size(t, i)) continue;
+        if (member && !strcmp(member, name)) {
+            *offset = bits / 8;
+            return 0;
+        }
+        if ((!member || !*member) &&
+            !btf_member_offset(btf, m[i].type, name, &nested, depth + 1)) {
+            *offset = bits / 8 + nested;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int kernel_offset(const struct btf *btf, const char *type,
+                          const char *member, __u32 *offset)
+{
+    return btf_member_offset(btf, btf__find_by_name_kind(btf, type, BTF_KIND_STRUCT),
+                               member, offset, 0);
+}
+
+static void configure_kernel_offsets(ebpf_state_t *st)
+{
+    struct fdmon_config cfg = {0};
+    struct btf *btf = btf__load_vmlinux_btf();
+    if (btf && !libbpf_get_error(btf)) {
+        cfg.sock_inode_known =
+            !kernel_offset(btf, "sock", "sk_socket", &cfg.sk_socket_off) &&
+            !kernel_offset(btf, "socket", "file", &cfg.socket_file_off) &&
+            !kernel_offset(btf, "file", "f_inode", &cfg.file_inode_off) &&
+            !kernel_offset(btf, "inode", "i_ino", &cfg.inode_ino_off);
+        cfg.tuple_known =
+            !kernel_offset(btf, "sock", "__sk_common", &cfg.sk_common_off) &&
+            !kernel_offset(btf, "sock_common", "skc_daddr", &cfg.daddr_off) &&
+            !kernel_offset(btf, "sock_common", "skc_rcv_saddr", &cfg.saddr_off) &&
+            !kernel_offset(btf, "sock_common", "skc_dport", &cfg.dport_off) &&
+            !kernel_offset(btf, "sock_common", "skc_num", &cfg.num_off);
+        cfg.group_live_known =
+            !kernel_offset(btf, "task_struct", "signal", &cfg.task_signal_off) &&
+            !kernel_offset(btf, "signal_struct", "live", &cfg.signal_live_off);
+        btf__free(btf);
+    }
+    int fd = bpf_object__find_map_fd_by_name(st->obj, "fdmon_config");
+    __u32 key = 0;
+    if (fd >= 0) bpf_map_update_elem(fd, &key, &cfg, BPF_ANY);
+}
+
+static void ebpf_state_free(ebpf_state_t *st)
+{
+    if (!st) return;
+    open_probes_detach(st);
+    write_probes_detach(st);
+    detach_link(&st->link_tcp_sendmsg_entry);
+    detach_link(&st->link_tcp_sendmsg_ret);
+    detach_link(&st->link_tcp_recvmsg_entry);
+    detach_link(&st->link_tcp_recvmsg_ret);
+    detach_link(&st->link_udp_sendmsg_entry);
+    detach_link(&st->link_udp_sendmsg_ret);
+    detach_link(&st->link_udp_recvmsg_entry);
+    detach_link(&st->link_udp_recvmsg_ret);
+    detach_link(&st->link_udpv6_sendmsg_entry);
+    detach_link(&st->link_udpv6_sendmsg_ret);
+    detach_link(&st->link_udpv6_recvmsg_entry);
+    detach_link(&st->link_udpv6_recvmsg_ret);
+    detach_link(&st->link_task_newtask);
+    detach_link(&st->link_sched_exec);
+    detach_link(&st->link_sched_exit);
+    if (st->pb) perf_buffer__free(st->pb);
+    if (st->obj) bpf_object__close(st->obj);
+    pthread_mutex_destroy(&st->lock);
+    free(st);
+}
+
 int fdmon_ebpf_init(struct fdmon_ctx *ctx)
 {
-    /* Suppress libbpf errors during probe — we fall back gracefully. */
     libbpf_print_fn_t old_print = libbpf_set_print(silent_print);
-
-    /*
-     * Raise the locked-memory limit to unlimited so the BPF maps
-     * (especially write_event_scratch at 4136 bytes × nCPUs) can be
-     * pinned.  On kernels ≥ 5.11 this is handled automatically via
-     * CAP_BPF, but setting it explicitly is always safe and ensures
-     * correct behaviour on older kernels or when running as root.
-     */
-    {
-        struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
-        if (setrlimit(RLIMIT_MEMLOCK, &rl) != 0)
-            fprintf(stderr, "evemon: setrlimit(RLIMIT_MEMLOCK, RLIM_INFINITY) failed: %s\n",
-                    strerror(errno));
-    }
-
+    struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
+    (void)setrlimit(RLIMIT_MEMLOCK, &rl);
     int ret = -1;
     ebpf_state_t *st = calloc(1, sizeof(*st));
     if (!st) goto out;
+    pthread_mutex_init(&st->lock, NULL);
+    st->monitored_pids_map_fd = -1;
 
-    /* Find the BPF object. */
     char obj_path[PATH_MAX];
-    if (find_bpf_object(obj_path, sizeof(obj_path)) != 0)
-        goto fail;
-
-    /* Open and load the BPF object. */
+    if (find_bpf_object(obj_path, sizeof(obj_path))) goto fail;
     st->obj = bpf_object__open(obj_path);
     if (!st->obj || libbpf_get_error(st->obj)) {
         st->obj = NULL;
         goto fail;
     }
-
-    /*
-     * Sanity-check the scratch map value size before loading.
-     * FDMON_BPF_WRITE_MAX was raised from 256 → 4096, making
-     * sizeof(fdmon_bpf_event) = 4136.  The BPF verifier enforces
-     * that every bpf_probe_read_user() stays within the map value.
-     * If the struct layout in this file has drifted from what was
-     * compiled into the .o, nothing will work.
-     */
-    {
-        struct bpf_map *scratch =
-            bpf_object__find_map_by_name(st->obj, "write_event_scratch");
-        if (scratch) {
-            __u32 vs = bpf_map__value_size(scratch);
-            if (vs != (uint32_t)sizeof(struct fdmon_bpf_event)) {
-                fprintf(stderr,
-                    "evemon: BPF write_event_scratch value_size mismatch: "
-                    ".o has %u bytes, userspace struct is %zu bytes. "
-                    "Rebuild with matching FDMON_BPF_WRITE_MAX (%d).\n",
-                    vs, sizeof(struct fdmon_bpf_event), FDMON_BPF_WRITE_MAX);
-                goto fail;
-            }
-        }
-    }
-
-    /* Resize monitored_pids to match the live kernel pid_max so the map
-     * can never be full as long as the kernel allows the PID to exist. */
-    {
-        __u32 pid_max = 32768; /* safe default */
-        FILE *f = fopen("/proc/sys/kernel/pid_max", "r");
-        if (f) {
-            unsigned long v;
-            if (fscanf(f, "%lu", &v) == 1 && v > 0 && v <= 4194304)
-                pid_max = (__u32)v;
-            fclose(f);
-        }
-        struct bpf_map *mpmap =
-            bpf_object__find_map_by_name(st->obj, "monitored_pids");
-        if (mpmap)
-            bpf_map__set_max_entries(mpmap, pid_max);
-    }
-
-    int load_error = bpf_object__load(st->obj);
-    if (load_error != 0) {
-        fprintf(stderr,
-            "evemon: eBPF unavailable (%s). Kernel permissions or verifier "
-            "rejection can prevent loading; other monitoring remains available.\n",
-            strerror(load_error < 0 ? -load_error : load_error));
+    /* Reject stale objects before exchanging differently-sized map values. */
+    struct bpf_map *scratch = bpf_object__find_map_by_name(st->obj, "write_event_scratch");
+    struct bpf_map *watches = bpf_object__find_map_by_name(st->obj, "monitored_pids");
+    struct bpf_map *config = bpf_object__find_map_by_name(st->obj, "fdmon_config");
+    if (!scratch || bpf_map__value_size(scratch) != sizeof(struct fdmon_bpf_event) ||
+        !watches || bpf_map__value_size(watches) != sizeof(struct fdmon_watch) ||
+        !config || bpf_map__value_size(config) != sizeof(struct fdmon_config)) {
+        fprintf(stderr, "evemon: BPF object layout mismatch; rebuild fdmon_ebpf_kern.o\n");
         goto fail;
     }
+    if (bpf_object__load(st->obj)) goto fail;
+    configure_kernel_offsets(st);
+    st->monitored_pids_map_fd = bpf_map__fd(watches);
 
-    /* Find and attach programs. */
-    struct bpf_program *prog;
+    /* Validate open/close support, then leave it idle until somebody watches. */
+    if (open_probes_attach(st)) goto fail;
+    open_probes_detach(st);
+    st->link_sched_exit = attach_program(st, "trace_sched_process_exit");
+    if (!st->link_sched_exit) goto fail;
+    st->link_sched_exec = attach_program(st, "trace_sched_process_exec");
+    st->link_task_newtask = attach_program(st, "trace_task_newtask");
 
-    prog = bpf_object__find_program_by_name(st->obj, "trace_enter_openat");
-    if (!prog) goto fail;
-    st->link_enter_openat = bpf_program__attach(prog);
-    if (!st->link_enter_openat || libbpf_get_error(st->link_enter_openat)) {
-        st->link_enter_openat = NULL;
-        goto fail;
-    }
+    attach_pair(st, "trace_tcp_sendmsg", "trace_tcp_sendmsg_ret",
+                &st->link_tcp_sendmsg_entry, &st->link_tcp_sendmsg_ret);
+    attach_pair(st, "trace_tcp_recvmsg", "trace_tcp_recvmsg_ret",
+                &st->link_tcp_recvmsg_entry, &st->link_tcp_recvmsg_ret);
+    attach_pair(st, "trace_udp_sendmsg", "trace_udp_sendmsg_ret",
+                &st->link_udp_sendmsg_entry, &st->link_udp_sendmsg_ret);
+    attach_pair(st, "trace_udp_recvmsg", "trace_udp_recvmsg_ret",
+                &st->link_udp_recvmsg_entry, &st->link_udp_recvmsg_ret);
+    attach_pair(st, "trace_udpv6_sendmsg", "trace_udpv6_sendmsg_ret",
+                &st->link_udpv6_sendmsg_entry, &st->link_udpv6_sendmsg_ret);
+    attach_pair(st, "trace_udpv6_recvmsg", "trace_udpv6_recvmsg_ret",
+                &st->link_udpv6_recvmsg_entry, &st->link_udpv6_recvmsg_ret);
 
-    prog = bpf_object__find_program_by_name(st->obj, "trace_exit_openat");
-    if (!prog) goto fail;
-    st->link_exit_openat = bpf_program__attach(prog);
-    if (!st->link_exit_openat || libbpf_get_error(st->link_exit_openat)) {
-        st->link_exit_openat = NULL;
-        goto fail;
-    }
-
-    prog = bpf_object__find_program_by_name(st->obj, "trace_enter_close");
-    if (!prog) goto fail;
-    st->link_enter_close = bpf_program__attach(prog);
-    if (!st->link_enter_close || libbpf_get_error(st->link_enter_close)) {
-        st->link_enter_close = NULL;
-        goto fail;
-    }
-
-    /* Attach tcp_sendmsg kprobe (optional – don't fail if unavailable) */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_tcp_sendmsg");
-    if (prog) {
-        st->link_tcp_sendmsg = bpf_program__attach(prog);
-        if (!st->link_tcp_sendmsg || libbpf_get_error(st->link_tcp_sendmsg))
-            st->link_tcp_sendmsg = NULL;
-    }
-
-    /* Attach tcp_recvmsg kprobe entry (stashes sock pointer) */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_tcp_recvmsg");
-    if (prog) {
-        st->link_tcp_recvmsg_entry = bpf_program__attach(prog);
-        if (!st->link_tcp_recvmsg_entry || libbpf_get_error(st->link_tcp_recvmsg_entry))
-            st->link_tcp_recvmsg_entry = NULL;
-    }
-
-    /* Attach tcp_recvmsg kretprobe (captures bytes + 4-tuple) */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_tcp_recvmsg_ret");
-    if (prog) {
-        st->link_tcp_recvmsg_ret = bpf_program__attach(prog);
-        if (!st->link_tcp_recvmsg_ret || libbpf_get_error(st->link_tcp_recvmsg_ret))
-            st->link_tcp_recvmsg_ret = NULL;
-    }
-
-    /* Attach udp_sendmsg kprobe (optional – non-fatal if unavailable) */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_udp_sendmsg");
-    if (prog) {
-        st->link_udp_sendmsg = bpf_program__attach(prog);
-        if (!st->link_udp_sendmsg || libbpf_get_error(st->link_udp_sendmsg))
-            st->link_udp_sendmsg = NULL;
-    }
-
-    /* Attach udp_recvmsg kprobe entry (stashes sock pointer) */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_udp_recvmsg");
-    if (prog) {
-        st->link_udp_recvmsg_entry = bpf_program__attach(prog);
-        if (!st->link_udp_recvmsg_entry || libbpf_get_error(st->link_udp_recvmsg_entry))
-            st->link_udp_recvmsg_entry = NULL;
-    }
-
-    /* Attach udp_recvmsg kretprobe (captures bytes + 4-tuple) */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_udp_recvmsg_ret");
-    if (prog) {
-        st->link_udp_recvmsg_ret = bpf_program__attach(prog);
-        if (!st->link_udp_recvmsg_ret || libbpf_get_error(st->link_udp_recvmsg_ret))
-            st->link_udp_recvmsg_ret = NULL;
-    }
-
-    /* Attach udpv6_sendmsg kprobe (IPv6 UDP send takes a different function) */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_udpv6_sendmsg");
-    if (prog) {
-        st->link_udpv6_sendmsg = bpf_program__attach(prog);
-        if (!st->link_udpv6_sendmsg || libbpf_get_error(st->link_udpv6_sendmsg))
-            st->link_udpv6_sendmsg = NULL;
-    }
-
-    /* Attach udpv6_recvmsg kprobe entry */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_udpv6_recvmsg");
-    if (prog) {
-        st->link_udpv6_recvmsg_entry = bpf_program__attach(prog);
-        if (!st->link_udpv6_recvmsg_entry || libbpf_get_error(st->link_udpv6_recvmsg_entry))
-            st->link_udpv6_recvmsg_entry = NULL;
-    }
-
-    /* Attach udpv6_recvmsg kretprobe */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_udpv6_recvmsg_ret");
-    if (prog) {
-        st->link_udpv6_recvmsg_ret = bpf_program__attach(prog);
-        if (!st->link_udpv6_recvmsg_ret || libbpf_get_error(st->link_udpv6_recvmsg_ret))
-            st->link_udpv6_recvmsg_ret = NULL;
-    }
-
-    /* Attach sched_process_exec tracepoint (optional – for orphan-stdout mode).
-     * Failure here is non-fatal; orphan_stdout_mode simply won't auto-fire. */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_sched_process_exec");
-    if (prog) {
-        st->link_sched_exec = bpf_program__attach(prog);
-        if (!st->link_sched_exec || libbpf_get_error(st->link_sched_exec))
-            st->link_sched_exec = NULL;
-    }
-
-    /* Attach sched_process_fork tracepoint (optional – for child fd inheritance).
-     * Enables zero-latency fd registration when a monitored process forks. */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_sched_process_fork");
-    if (prog) {
-        st->link_sched_fork = bpf_program__attach(prog);
-        if (!st->link_sched_fork || libbpf_get_error(st->link_sched_fork))
-            st->link_sched_fork = NULL;
-    }
-
-    /* Open the perf buffer on the "events" map. */
     int map_fd = bpf_object__find_map_fd_by_name(st->obj, "events");
     if (map_fd < 0) goto fail;
-
-    /* Find optional monitored_pids map for write filtering */
-    int mpfd = bpf_object__find_map_fd_by_name(st->obj, "monitored_pids");
-    if (mpfd >= 0)
-        st->monitored_pids_map_fd = mpfd;
-    else
-        st->monitored_pids_map_fd = -1;
-
-    st->pb = perf_buffer__new(map_fd, 64 /* pages per cpu */,
-                              handle_event, handle_lost, ctx, NULL);
+    st->pb = perf_buffer__new(map_fd, 64, handle_event, handle_lost, ctx, NULL);
     if (!st->pb || libbpf_get_error(st->pb)) {
         st->pb = NULL;
         goto fail;
     }
-
-    /* Start reader thread. */
-    atomic_store_explicit(&st->running, 1, memory_order_relaxed);
-    atomic_store_explicit(&st->orphan_stdout_mode, 0, memory_order_relaxed);
-    st->watched_parent_count = 0;
-    pthread_mutex_init(&st->watched_parent_lock, NULL);
-    if (pthread_create(&st->reader_thread, NULL,
-                       ebpf_reader_thread, st) != 0)
-        goto fail;
-
-    /* Store state in ctx directly. */
+    /* The callback can run as soon as the reader starts. */
     ctx->ebpf_state = st;
-
+    atomic_store(&st->running, 1);
+    if (pthread_create(&st->reader_thread, NULL, ebpf_reader_thread, st)) {
+        ctx->ebpf_state = NULL;
+        goto fail;
+    }
     ret = 0;
     goto out;
-
 fail:
-    if (st) {
-        if (st->pb)               perf_buffer__free(st->pb);
-        if (st->link_udpv6_recvmsg_ret)     bpf_link__destroy(st->link_udpv6_recvmsg_ret);
-        if (st->link_udpv6_recvmsg_entry)   bpf_link__destroy(st->link_udpv6_recvmsg_entry);
-        if (st->link_udpv6_sendmsg)         bpf_link__destroy(st->link_udpv6_sendmsg);
-        if (st->link_udp_recvmsg_ret)   bpf_link__destroy(st->link_udp_recvmsg_ret);
-        if (st->link_udp_recvmsg_entry) bpf_link__destroy(st->link_udp_recvmsg_entry);
-        if (st->link_udp_sendmsg)       bpf_link__destroy(st->link_udp_sendmsg);
-        if (st->link_tcp_recvmsg_ret)   bpf_link__destroy(st->link_tcp_recvmsg_ret);
-        if (st->link_tcp_recvmsg_entry) bpf_link__destroy(st->link_tcp_recvmsg_entry);
-        if (st->link_tcp_sendmsg) bpf_link__destroy(st->link_tcp_sendmsg);
-        if (st->link_sched_fork)  bpf_link__destroy(st->link_sched_fork);
-        if (st->link_sched_exec)  bpf_link__destroy(st->link_sched_exec);
-        if (st->link_enter_sendfile)    bpf_link__destroy(st->link_enter_sendfile);
-        if (st->link_enter_splice)      bpf_link__destroy(st->link_enter_splice);
-        if (st->link_enter_sendmmsg)    bpf_link__destroy(st->link_enter_sendmmsg);
-        if (st->link_enter_sendmsg)     bpf_link__destroy(st->link_enter_sendmsg);
-        if (st->link_enter_sendto)      bpf_link__destroy(st->link_enter_sendto);
-        if (st->link_enter_pwrite64)    bpf_link__destroy(st->link_enter_pwrite64);
-        if (st->link_enter_writev)      bpf_link__destroy(st->link_enter_writev);
-        if (st->link_enter_write)       bpf_link__destroy(st->link_enter_write);
-        if (st->link_enter_close) bpf_link__destroy(st->link_enter_close);
-        if (st->link_exit_openat) bpf_link__destroy(st->link_exit_openat);
-        if (st->link_enter_openat)bpf_link__destroy(st->link_enter_openat);
-        if (st->obj)              bpf_object__close(st->obj);
-        free(st);
-    }
-
+    ebpf_state_free(st);
 out:
     libbpf_set_print(old_print);
     return ret;
@@ -753,253 +916,81 @@ out:
 void fdmon_ebpf_destroy(struct fdmon_ctx *ctx)
 {
     if (!ctx || !ctx->ebpf_state) return;
-
     ebpf_state_t *st = ctx->ebpf_state;
-
-    atomic_store_explicit(&st->running, 0, memory_order_relaxed);
+    atomic_store(&st->running, 0);
     pthread_join(st->reader_thread, NULL);
-    pthread_mutex_destroy(&st->watched_parent_lock);
-
-    if (st->pb)                     perf_buffer__free(st->pb);
-    if (st->link_udpv6_recvmsg_ret)    bpf_link__destroy(st->link_udpv6_recvmsg_ret);
-    if (st->link_udpv6_recvmsg_entry)  bpf_link__destroy(st->link_udpv6_recvmsg_entry);
-    if (st->link_udpv6_sendmsg)        bpf_link__destroy(st->link_udpv6_sendmsg);
-    if (st->link_udp_recvmsg_ret)   bpf_link__destroy(st->link_udp_recvmsg_ret);
-    if (st->link_udp_recvmsg_entry) bpf_link__destroy(st->link_udp_recvmsg_entry);
-    if (st->link_udp_sendmsg)       bpf_link__destroy(st->link_udp_sendmsg);
-    if (st->link_tcp_recvmsg_ret)   bpf_link__destroy(st->link_tcp_recvmsg_ret);
-    if (st->link_tcp_recvmsg_entry) bpf_link__destroy(st->link_tcp_recvmsg_entry);
-    if (st->link_tcp_sendmsg)       bpf_link__destroy(st->link_tcp_sendmsg);
-    if (st->link_sched_fork)        bpf_link__destroy(st->link_sched_fork);
-    if (st->link_sched_exec)        bpf_link__destroy(st->link_sched_exec);
-    if (st->link_enter_write)       bpf_link__destroy(st->link_enter_write);
-    if (st->link_enter_writev)      bpf_link__destroy(st->link_enter_writev);
-    if (st->link_enter_pwrite64)    bpf_link__destroy(st->link_enter_pwrite64);
-    if (st->link_enter_sendto)      bpf_link__destroy(st->link_enter_sendto);
-    if (st->link_enter_sendmsg)     bpf_link__destroy(st->link_enter_sendmsg);
-    if (st->link_enter_sendmmsg)    bpf_link__destroy(st->link_enter_sendmmsg);
-    if (st->link_enter_splice)      bpf_link__destroy(st->link_enter_splice);
-    if (st->link_enter_sendfile)    bpf_link__destroy(st->link_enter_sendfile);
-    if (st->link_enter_close) bpf_link__destroy(st->link_enter_close);
-    if (st->link_exit_openat) bpf_link__destroy(st->link_exit_openat);
-    if (st->link_enter_openat)bpf_link__destroy(st->link_enter_openat);
-    if (st->obj)              bpf_object__close(st->obj);
-    free(st);
+    ctx->ebpf_state = NULL;
+    ebpf_state_free(st);
 }
 
-/* ── dynamic stdout/stderr (write) control ─────────────────── */
+int fdmon_ebpf_open_enable(fdmon_ctx_t *ctx, int enabled)
+{
+    ebpf_state_t *st = ctx->ebpf_state;
+    if (!st) { errno = ENOTSUP; return -1; }
+    pthread_mutex_lock(&st->lock);
+    int rc = 0;
+    if (enabled) rc = open_probes_attach(st);
+    else open_probes_detach(st);
+    pthread_mutex_unlock(&st->lock);
+    return rc;
+}
 
 int fdmon_write_enable(struct fdmon_ctx *ctx)
 {
     if (ctx && ctx->remote) { if (query_fdmon_backend(ctx) == FDMON_BACKEND_EBPF) return 0; errno = ENOTSUP; return -1; }
     if (!ctx || !ctx->ebpf_state) { errno = EINVAL; return -1; }
     ebpf_state_t *st = ctx->ebpf_state;
-    if (st->link_enter_write)
-        return 0; /* already attached */
-
-    /* Attach all write-like tracepoint programs */
-    struct bpf_program *prog = NULL;
-    /* Suppress libbpf prints while attaching optional programs to avoid
-     * noisy kernel-specific tracepoint errors (some kernels lack certain
-     * syscall tracepoints).  We still treat the core `trace_enter_write`
-     * program as required; other programs are optional. */
-    libbpf_print_fn_t old_print = libbpf_set_print(silent_print);
-
-    prog = bpf_object__find_program_by_name(st->obj, "trace_enter_write");
-    if (!prog) {
-        libbpf_set_print(old_print);
-        goto fail_attach;
-    }
-    st->link_enter_write = bpf_program__attach(prog);
-    if (!st->link_enter_write || libbpf_get_error(st->link_enter_write)) {
-        libbpf_set_print(old_print);
-        goto fail_attach;
-    }
-
-    /* For the remaining programs treat attach failures as non-fatal
-     * (kernel may not expose these tracepoints).  If attach fails we
-     * clear the link pointer and continue. */
-    prog = bpf_object__find_program_by_name(st->obj, "trace_enter_writev");
-    if (prog) {
-        struct bpf_link *l = bpf_program__attach(prog);
-        if (!l || libbpf_get_error(l)) l = NULL;
-        st->link_enter_writev = l;
-    }
-
-    prog = bpf_object__find_program_by_name(st->obj, "trace_enter_pwrite64");
-    if (prog) {
-        struct bpf_link *l = bpf_program__attach(prog);
-        if (!l || libbpf_get_error(l)) l = NULL;
-        st->link_enter_pwrite64 = l;
-    }
-
-    prog = bpf_object__find_program_by_name(st->obj, "trace_enter_sendto");
-    if (prog) {
-        struct bpf_link *l = bpf_program__attach(prog);
-        if (!l || libbpf_get_error(l)) l = NULL;
-        st->link_enter_sendto = l;
-    }
-
-    prog = bpf_object__find_program_by_name(st->obj, "trace_enter_sendmsg");
-    if (prog) {
-        struct bpf_link *l = bpf_program__attach(prog);
-        if (!l || libbpf_get_error(l)) l = NULL;
-        st->link_enter_sendmsg = l;
-    }
-
-    prog = bpf_object__find_program_by_name(st->obj, "trace_enter_sendmmsg");
-    if (prog) {
-        struct bpf_link *l = bpf_program__attach(prog);
-        if (!l || libbpf_get_error(l)) l = NULL;
-        st->link_enter_sendmmsg = l;
-    }
-
-    prog = bpf_object__find_program_by_name(st->obj, "trace_enter_splice");
-    if (prog) {
-        struct bpf_link *l = bpf_program__attach(prog);
-        if (!l || libbpf_get_error(l)) l = NULL;
-        st->link_enter_splice = l;
-    }
-
-    prog = bpf_object__find_program_by_name(st->obj, "trace_enter_sendfile");
-    if (prog) {
-        struct bpf_link *l = bpf_program__attach(prog);
-        if (!l || libbpf_get_error(l)) l = NULL;
-        st->link_enter_sendfile = l;
-    }
-
-    /* restore libbpf print handler */
-    libbpf_set_print(old_print);
-
-        /* Diagnostic: report which optional probes attached */
-        return 0;
-
-fail_attach:
-    /* clean up any links attached so far */
-    if (st->link_enter_sendfile)    { bpf_link__destroy(st->link_enter_sendfile); st->link_enter_sendfile = NULL; }
-    if (st->link_enter_splice)      { bpf_link__destroy(st->link_enter_splice); st->link_enter_splice = NULL; }
-    if (st->link_enter_sendmmsg)    { bpf_link__destroy(st->link_enter_sendmmsg); st->link_enter_sendmmsg = NULL; }
-    if (st->link_enter_sendmsg)     { bpf_link__destroy(st->link_enter_sendmsg); st->link_enter_sendmsg = NULL; }
-    if (st->link_enter_sendto)      { bpf_link__destroy(st->link_enter_sendto); st->link_enter_sendto = NULL; }
-    if (st->link_enter_pwrite64)    { bpf_link__destroy(st->link_enter_pwrite64); st->link_enter_pwrite64 = NULL; }
-    if (st->link_enter_writev)      { bpf_link__destroy(st->link_enter_writev); st->link_enter_writev = NULL; }
-    if (st->link_enter_write)       { bpf_link__destroy(st->link_enter_write); st->link_enter_write = NULL; }
-    return -1;
+    pthread_mutex_lock(&st->lock);
+    int rc = write_probes_attach(st);
+    pthread_mutex_unlock(&st->lock);
+    return rc;
 }
 
 void fdmon_write_disable(struct fdmon_ctx *ctx)
 {
-    if (ctx && ctx->remote) return;
-    if (!ctx || !ctx->ebpf_state) return;
+    if (!ctx || ctx->remote || !ctx->ebpf_state) return;
     ebpf_state_t *st = ctx->ebpf_state;
-    if (st->link_enter_sendfile)    { bpf_link__destroy(st->link_enter_sendfile); st->link_enter_sendfile = NULL; }
-    if (st->link_enter_splice)      { bpf_link__destroy(st->link_enter_splice); st->link_enter_splice = NULL; }
-    if (st->link_enter_sendmmsg)    { bpf_link__destroy(st->link_enter_sendmmsg); st->link_enter_sendmmsg = NULL; }
-    if (st->link_enter_sendmsg)     { bpf_link__destroy(st->link_enter_sendmsg); st->link_enter_sendmsg = NULL; }
-    if (st->link_enter_sendto)      { bpf_link__destroy(st->link_enter_sendto); st->link_enter_sendto = NULL; }
-    if (st->link_enter_pwrite64)    { bpf_link__destroy(st->link_enter_pwrite64); st->link_enter_pwrite64 = NULL; }
-    if (st->link_enter_writev)      { bpf_link__destroy(st->link_enter_writev); st->link_enter_writev = NULL; }
-    if (st->link_enter_write)       { bpf_link__destroy(st->link_enter_write); st->link_enter_write = NULL; }
+    pthread_mutex_lock(&st->lock);
+    /* Other views may still own registrations. */
+    watch_sweep(st);
+    pthread_mutex_unlock(&st->lock);
 }
 
 int fdmon_add_pid_fd(struct fdmon_ctx *ctx, pid_t pid, int fd)
 {
     if (ctx && ctx->remote) return query_fdmon_control(ctx, 1, pid, fd, 0);
-    if (!ctx || !ctx->ebpf_state) { errno = EINVAL; return -1; }
+    if (!ctx || !ctx->ebpf_state || pid <= 0 || (fd != 1 && fd != 2)) { errno = EINVAL; return -1; }
     ebpf_state_t *st = ctx->ebpf_state;
-    if (st->monitored_pids_map_fd < 0) { errno = ENOENT; return -1; }
-    if (fd != 1 && fd != 2) { errno = EINVAL; return -1; }
-
-    __u32 key  = (uint32_t)pid;
-    __u8  bit  = (__u8)(1 << (fd - 1));
-    __u8  mask = 0;
-
-    /* Read existing mask (if any) and OR in the new bit. */
-    bpf_map_lookup_elem(st->monitored_pids_map_fd, &key, &mask);
-    mask |= bit;
-
-    int rc = bpf_map_update_elem(st->monitored_pids_map_fd, &key, &mask, BPF_ANY);
-    if (rc != 0) {
-        fprintf(stderr, "evemon: fdmon_add_pid_fd failed pid=%d fd=%d rc=%d errno=%d\n", (int)pid, fd, rc, errno);
-        return -1;
-    }
-    return 0;
+    pthread_mutex_lock(&st->lock);
+    int rc = write_probes_attach(st);
+    if (!rc) rc = watch_update(st, pid, 1u << (fd - 1), 0, 0, 0, -1);
+    pthread_mutex_unlock(&st->lock);
+    return rc;
 }
 
 int fdmon_remove_pid_fd(struct fdmon_ctx *ctx, pid_t pid, int fd)
 {
     if (ctx && ctx->remote) return query_fdmon_control(ctx, 1, pid, fd, 1);
-    if (!ctx || !ctx->ebpf_state) { errno = EINVAL; return -1; }
+    if (!ctx || !ctx->ebpf_state || pid <= 0 || (fd != 1 && fd != 2)) { errno = EINVAL; return -1; }
     ebpf_state_t *st = ctx->ebpf_state;
-    if (st->monitored_pids_map_fd < 0) { errno = ENOENT; return -1; }
-    if (fd != 1 && fd != 2) { errno = EINVAL; return -1; }
-
-    __u32 key = (uint32_t)pid;
-    __u8  bit = (__u8)(1 << (fd - 1));
-    __u8  mask = 0;
-
-    if (bpf_map_lookup_elem(st->monitored_pids_map_fd, &key, &mask) != 0)
-        return 0;  /* not present, nothing to do */
-
-    mask &= ~bit;
-    int rc;
-    if (mask == 0)
-        rc = bpf_map_delete_elem(st->monitored_pids_map_fd, &key);
-    else
-        rc = bpf_map_update_elem(st->monitored_pids_map_fd, &key, &mask, BPF_EXIST);
-
-    if (rc != 0) {
-        fprintf(stderr, "evemon: fdmon_remove_pid_fd failed pid=%d fd=%d rc=%d errno=%d\n", (int)pid, fd, rc, errno);
-        return -1;
-    }
-    return 0;
+    pthread_mutex_lock(&st->lock);
+    int rc = watch_update(st, pid, 0, 1u << (fd - 1), 0, 0, -1);
+    atomic_store(&st->sweep_pending, 1);
+    pthread_mutex_unlock(&st->lock);
+    return rc;
 }
 
-/* ── orphan-stdout mode ──────────────────────────────────────── */
-
-/*
- * Enable automatic capture of stdout/stderr for any newly exec'd process
- * whose output fd is NOT a TTY.  This catches cron jobs, systemd services,
- * and any process whose output would otherwise be silently discarded.
- *
- * Mechanism:
- *   1. The sched_process_exec BPF tracepoint fires on every successful
- *      execve().  It emits a FDMON_BPF_EXEC event to userspace.
- *   2. handle_event() sees the exec event and, if orphan_stdout_mode is
- *      set, calls maybe_register_orphan_fds() which inspects
- *      /proc/<pid>/fd/1 and /proc/<pid>/fd/2 via readlink().
- *   3. If the target is a pipe, regular file, or /dev/null (anything that
- *      is not a real TTY), a pid→fd_mask entry is inserted into the
- *      monitored_pids BPF map.
- *   4. From that point on, write()/writev()/pwrite64() calls from that
- *      process to those fds are captured and published on the event bus
- *      as EVEMON_EVENT_FD_WRITE events.
- *
- * Note: entries for short-lived processes accumulate in the BPF map.
- * Callers are responsible for periodically pruning dead PIDs via
- * fdmon_remove_pid_fd(), or rely on map eviction when it fills.
- */
 int fdmon_orphan_stdout_enable(struct fdmon_ctx *ctx)
 {
     if (ctx && ctx->remote) return query_fdmon_control(ctx, 3, 0, 0, 0);
     if (!ctx || !ctx->ebpf_state) { errno = EINVAL; return -1; }
     ebpf_state_t *st = ctx->ebpf_state;
-
-    /* sched_process_exec tracepoint must be attached */
-    if (!st->link_sched_exec) {
-        fprintf(stderr, "evemon: orphan_stdout: sched_process_exec tracepoint not attached\n");
-        errno = ENOTSUP;
-        return -1;
-    }
-
-    /* Ensure the write tracepoints are live */
-    if (!st->link_enter_write) {
-        if (fdmon_write_enable(ctx) != 0)
-            return -1;
-    }
-
-    atomic_store_explicit(&st->orphan_stdout_mode, 1, memory_order_relaxed);
-    return 0;
+    if (!st->link_sched_exec) { errno = ENOTSUP; return -1; }
+    pthread_mutex_lock(&st->lock);
+    int rc = write_probes_attach(st);
+    if (!rc) atomic_store(&st->orphan_stdout_mode, 1);
+    pthread_mutex_unlock(&st->lock);
+    return rc;
 }
 
 void fdmon_orphan_stdout_disable(struct fdmon_ctx *ctx)
@@ -1007,61 +998,22 @@ void fdmon_orphan_stdout_disable(struct fdmon_ctx *ctx)
     if (ctx && ctx->remote) { query_fdmon_control(ctx, 3, 0, 0, 1); return; }
     if (!ctx || !ctx->ebpf_state) return;
     ebpf_state_t *st = ctx->ebpf_state;
-    atomic_store_explicit(&st->orphan_stdout_mode, 0, memory_order_relaxed);
+    atomic_store(&st->orphan_stdout_mode, 0);
+    atomic_store(&st->sweep_pending, 1);
 }
 
-/*
- * Register a parent PID so that when any of its direct children call
- * execve(), their fd 1 and/or fd 2 are inserted into the BPF map
- * immediately in the reader thread — before the child can write.
- *
- * fd_mask: bit 0 = fd 1 (stdout), bit 1 = fd 2 (stderr).
- * This replaces any existing entry for the same pid.
- */
 int fdmon_watch_parent_fds(struct fdmon_ctx *ctx, pid_t pid, int fd_mask)
 {
     if (ctx && ctx->remote) return query_fdmon_control(ctx, 2, pid, fd_mask, 0);
-    if (!ctx || !ctx->ebpf_state || pid <= 0) { errno = EINVAL; return -1; }
+    if (!ctx || !ctx->ebpf_state || pid <= 0 || (fd_mask & ~3)) { errno = EINVAL; return -1; }
     ebpf_state_t *st = ctx->ebpf_state;
-
-    /* Ensure the sched_process_exec tracepoint is attached */
-    if (!st->link_sched_exec) {
-        errno = ENOTSUP;
-        return -1;
-    }
-
-    /* Register the root pid directly in the BPF map so its own writes
-     * (and those of already-forked children) are captured immediately,
-     * without waiting for any exec/fork event. */
-    if (st->monitored_pids_map_fd >= 0 && fd_mask) {
-        __u32 key = (uint32_t)pid;
-        __u8  val = (__u8)fd_mask;
-        bpf_map_update_elem(st->monitored_pids_map_fd, &key, &val, BPF_ANY);
-    }
-
-    pthread_mutex_lock(&st->watched_parent_lock);
-
-    /* Update existing entry if present */
-    for (int i = 0; i < st->watched_parent_count; i++) {
-        if (st->watched_parents[i].pid == pid) {
-            st->watched_parents[i].fd_mask = fd_mask;
-            pthread_mutex_unlock(&st->watched_parent_lock);
-            return 0;
-        }
-    }
-
-    /* Add new entry if there is room */
-    if (st->watched_parent_count >= WATCHED_PARENT_MAX) {
-        pthread_mutex_unlock(&st->watched_parent_lock);
-        errno = ENOMEM;
-        return -1;
-    }
-    st->watched_parents[st->watched_parent_count].pid     = pid;
-    st->watched_parents[st->watched_parent_count].fd_mask = fd_mask;
-    st->watched_parent_count++;
-
-    pthread_mutex_unlock(&st->watched_parent_lock);
-    return 0;
+    if (!st->link_task_newtask && !st->link_sched_exec) { errno = ENOTSUP; return -1; }
+    pthread_mutex_lock(&st->lock);
+    int rc = fd_mask ? write_probes_attach(st) : 0;
+    if (!rc) rc = watch_update(st, pid, 0, 0, 1, fd_mask, -1);
+    if (!rc) watch_sweep(st);
+    pthread_mutex_unlock(&st->lock);
+    return rc;
 }
 
 void fdmon_unwatch_parent_fds(struct fdmon_ctx *ctx, pid_t pid)
@@ -1069,35 +1021,8 @@ void fdmon_unwatch_parent_fds(struct fdmon_ctx *ctx, pid_t pid)
     if (ctx && ctx->remote) { query_fdmon_control(ctx, 2, pid, 0, 1); return; }
     if (!ctx || !ctx->ebpf_state || pid <= 0) return;
     ebpf_state_t *st = ctx->ebpf_state;
-
-    /* Walk the entire monitored_pids map and delete every entry.
-     * The fork BPF program will have propagated the root pid's entry to
-     * every descendant, so we can't know which pids were added — the only
-     * safe thing is to flush the whole map.
-     *
-     * bpf_map_get_next_key semantics: passing NULL gets the first key;
-     * we collect all keys first, then delete, to avoid iterator invalidation. */
-    if (st->monitored_pids_map_fd >= 0) {
-        __u32 keys[8192];
-        int   nkeys = 0;
-        __u32 cur, next;
-        int   rc = bpf_map_get_next_key(st->monitored_pids_map_fd, NULL, &next);
-        while (rc == 0 && nkeys < (int)(sizeof(keys)/sizeof(keys[0]))) {
-            cur = next;
-            keys[nkeys++] = cur;
-            rc = bpf_map_get_next_key(st->monitored_pids_map_fd, &cur, &next);
-        }
-        for (int i = 0; i < nkeys; i++)
-            bpf_map_delete_elem(st->monitored_pids_map_fd, &keys[i]);
-    }
-
-    pthread_mutex_lock(&st->watched_parent_lock);
-    for (int i = 0; i < st->watched_parent_count; i++) {
-        if (st->watched_parents[i].pid == pid) {
-            st->watched_parents[i] =
-                st->watched_parents[--st->watched_parent_count];
-            break;
-        }
-    }
-    pthread_mutex_unlock(&st->watched_parent_lock);
+    pthread_mutex_lock(&st->lock);
+    watch_update(st, pid, 0, 0, 1, 0, -1);
+    watch_sweep(st);
+    pthread_mutex_unlock(&st->lock);
 }

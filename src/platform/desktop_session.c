@@ -278,26 +278,27 @@ void desktop_child_use_user(void *unused)
         setgid(session_gid) || setuid(session_uid)) _exit(126);
 }
 
+/* Start the privileged process from an allowlisted environment.  In
+ * particular, never carry loader/module selectors or the caller's PATH
+ * across the privilege boundary. */
+static const char *elevation_keys[] = {
+    "EVEMON_DESKTOP_UID", "HOME", "USER", "LOGNAME", "SHELL",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP", "DESKTOP_SESSION",
+    "XDG_SESSION_TYPE", "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY",
+    "XAUTHORITY", "SSH_AUTH_SOCK", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE",
+    "QT_SCALE_FACTOR",
+    "PIPEWIRE_REMOTE", "PIPEWIRE_RUNTIME_DIR", "PULSE_SERVER", "LANG", "LC_ALL", NULL
+};
+
 char *desktop_elevation_command(const char *executable, const char *frontend)
 {
     desktop_session_init();
-    const char *keys[] = {
-        "EVEMON_DESKTOP_UID", "HOME", "USER", "LOGNAME", "SHELL",
-        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
-        "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP", "DESKTOP_SESSION",
-        "XDG_SESSION_TYPE", "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY",
-        "XAUTHORITY", "SSH_AUTH_SOCK", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE",
-        "QT_SCALE_FACTOR",
-        "PIPEWIRE_REMOTE", "PIPEWIRE_RUNTIME_DIR", "PULSE_SERVER", "LANG", "LC_ALL", NULL
-    };
-    /* Start the privileged process from an allowlisted environment.  In
-     * particular, never carry loader/module selectors or the caller's PATH
-     * across the privilege boundary. */
     GString *command = g_string_new(
         "/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin");
-    for (int i = 0; keys[i]; ++i) {
-        const char *value = getenv(keys[i]); if (!value) continue;
-        char *assignment = g_strdup_printf("%s=%s", keys[i], value);
+    for (int i = 0; elevation_keys[i]; ++i) {
+        const char *value = getenv(elevation_keys[i]); if (!value) continue;
+        char *assignment = g_strdup_printf("%s=%s", elevation_keys[i], value);
         char *quoted = g_shell_quote(assignment);
         g_string_append_c(command, ' '); g_string_append(command, quoted);
         g_free(quoted); g_free(assignment);
@@ -309,8 +310,105 @@ char *desktop_elevation_command(const char *executable, const char *frontend)
     return g_string_free(command, FALSE);
 }
 
+static gboolean find_elevator(const char *name, char *path, size_t size)
+{
+    /* kdesu is a libexec helper outside PATH on most distributions. */
+    static const char *directories[] = {
+        "/usr/bin", "/usr/local/bin",
+        "/usr/lib/kf6", "/usr/libexec/kf6", "/usr/lib64/libexec/kf6",
+        "/usr/lib/x86_64-linux-gnu/libexec/kf6", "/usr/lib/aarch64-linux-gnu/libexec/kf6",
+        "/usr/lib/kf5", "/usr/libexec/kf5", "/usr/lib64/libexec/kf5",
+        "/usr/lib/x86_64-linux-gnu/libexec/kf5", "/usr/lib/aarch64-linux-gnu/libexec/kf5", NULL
+    };
+    for (int i = 0; directories[i]; ++i) {
+        snprintf(path, size, "%s/%s", directories[i], name);
+        if (!access(path, X_OK)) return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean session_runs(const char *const prefixes[])
+{
+    /* comm is truncated to 15 bytes, so long agent names match by prefix. */
+    GDir *directory = g_dir_open("/proc", 0, NULL);
+    if (!directory) return FALSE;
+    gboolean found = FALSE;
+    const char *entry;
+    while (!found && (entry = g_dir_read_name(directory))) {
+        if (entry[0] < '1' || entry[0] > '9' || strspn(entry, "0123456789") != strlen(entry)) continue;
+        char path[64], *comm = NULL;
+        struct stat st;
+        snprintf(path, sizeof(path), "/proc/%s", entry);
+        if (stat(path, &st) || st.st_uid != session_uid) continue;
+        snprintf(path, sizeof(path), "/proc/%s/comm", entry);
+        if (!g_file_get_contents(path, &comm, NULL, NULL)) continue;
+        comm[strcspn(comm, "\n")] = 0;
+        for (int i = 0; prefixes[i] && !found; ++i) found = g_str_has_prefix(comm, prefixes[i]);
+        g_free(comm);
+    }
+    g_dir_close(directory);
+    return found;
+}
+
+/* Prefer the desktop's own prompt: kdesu on Plasma, pkexec wherever a polkit
+ * agent is running, otherwise whichever is installed.  EVEMON_ELEVATOR=kdesu
+ * or pkexec overrides the guess when that tool exists. */
+static gboolean choose_elevator(char *path, size_t size, gboolean *pkexec)
+{
+    static const char *plasma[] = {"plasmashell", "kwin_wayland", "kwin_x11", NULL};
+    static const char *agents[] = {"polkit-", "gnome-shell", "hyprpolkitagent", "lxpolkit",
+        "lxqt-policykit", "xfce-polkit", "cinnamon", "budgie-polkit", "soteria", NULL};
+    char kdesu_path[PATH_MAX], pkexec_path[PATH_MAX];
+    gboolean have_kdesu = find_elevator("kdesu", kdesu_path, sizeof(kdesu_path));
+    gboolean have_pkexec = find_elevator("pkexec", pkexec_path, sizeof(pkexec_path));
+    if (!have_kdesu && !have_pkexec) return FALSE;
+    const char *forced = getenv("EVEMON_ELEVATOR");
+    if (forced && !strcmp(forced, "kdesu") && have_kdesu) *pkexec = FALSE;
+    else if (forced && !strcmp(forced, "pkexec") && have_pkexec) *pkexec = TRUE;
+    else if (!have_kdesu || !have_pkexec) *pkexec = have_pkexec;
+    else *pkexec = !session_runs(plasma) && session_runs(agents);
+    g_strlcpy(path, *pkexec ? pkexec_path : kdesu_path, size);
+    return TRUE;
+}
+
+static int start_pkexec(const char *pkexec, const char *executable, const char *frontend)
+{
+    /* pkexec authorizes its parent and refuses one reparented to init, which
+     * happens once a launcher exits.  Keep a shell alive as that parent rather
+     * than exec pkexec in place.  pkexec takes argv, so nothing is re-quoted. */
+    GPtrArray *argv = g_ptr_array_new_with_free_func(g_free);
+    const char *prefix[] = {"/bin/sh", "-c", "\"$@\"; exit $?", "sh", pkexec,
+        "/usr/bin/env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", NULL};
+    for (int i = 0; prefix[i]; ++i) g_ptr_array_add(argv, g_strdup(prefix[i]));
+    for (int i = 0; elevation_keys[i]; ++i) {
+        const char *value = getenv(elevation_keys[i]);
+        if (value) g_ptr_array_add(argv, g_strdup_printf("%s=%s", elevation_keys[i], value));
+    }
+    g_ptr_array_add(argv, g_strdup(executable));
+    if (frontend && (!strcmp(frontend, "gtk") || !strcmp(frontend, "qt"))) {
+        g_ptr_array_add(argv, g_strdup("--ui"));
+        g_ptr_array_add(argv, g_strdup(frontend));
+    }
+    g_ptr_array_add(argv, NULL);
+    execv("/bin/sh", (char **)argv->pdata);
+    int saved = errno;
+    g_ptr_array_free(argv, TRUE);
+    fprintf(stderr, "evemon: could not start %s: %s\n", pkexec, strerror(saved));
+    errno = saved;
+    return -1;
+}
+
 int desktop_start_elevated(const char *executable, const char *frontend)
 {
+    desktop_session_init();
+    char elevator[PATH_MAX];
+    gboolean pkexec = FALSE;
+    if (!choose_elevator(elevator, sizeof(elevator), &pkexec)) {
+        fprintf(stderr, "evemon: neither kdesu nor pkexec is installed\n");
+        errno = ENOENT;
+        return -1;
+    }
+    if (pkexec) return start_pkexec(elevator, executable, frontend);
     char *command = desktop_elevation_command(executable, frontend);
     char *script_path = NULL;
     /* The installed phone verifier accepts at most 512 command characters.
@@ -349,7 +447,7 @@ int desktop_start_elevated(const char *executable, const char *frontend)
             quoted, quoted_digest, quoted);
         g_free(quoted_digest); g_free(digest); g_free(quoted); g_free(script);
     }
-    char *argv[] = {"/usr/bin/kdesu", "-n", "--noignorebutton", "-c", command, NULL};
+    char *argv[] = {elevator, "-n", "--noignorebutton", "-c", command, NULL};
     /* Preserve the original restart behavior: replace this session and all
      * its threads, rather than leave it running beside the new instance. */
     execv(argv[0], argv);
@@ -357,7 +455,7 @@ int desktop_start_elevated(const char *executable, const char *frontend)
     if (script_path) unlink(script_path);
     g_free(script_path);
     g_free(command);
-    fprintf(stderr, "evemon: could not start /usr/bin/kdesu: %s\n", strerror(saved));
+    fprintf(stderr, "evemon: could not start %s: %s\n", elevator, strerror(saved));
     errno = saved;
     return -1;
 }

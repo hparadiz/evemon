@@ -150,3 +150,13 @@ int query_fdmon_control(fdmon_ctx_t *ctx, unsigned kind, pid_t pid, int value, i
     }
     pthread_mutex_unlock(&r->lock); return 0;
 }
+
+double query_fdmon_window(const fdmon_ctx_t *ctx)
+{
+    remote_t *r = ctx->remote;
+    pthread_mutex_lock(&r->state->lock);
+    double seconds = r->state->net_window_seconds;
+    if (seconds <= 0.0) seconds = r->state->interval_ms / 1000.0;
+    pthread_mutex_unlock(&r->state->lock);
+    return seconds > 0.0 ? seconds : 1.0;
+}

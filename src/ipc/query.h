@@ -21,7 +21,13 @@ void query_connection_stop(query_connection_t *connection);
 void query_set_remote(const char *path);
 const char *query_remote_path(void);
 uint32_t query_remote_capabilities(void);
+uint64_t query_connection_build(const query_connection_t *connection);
+uint64_t query_daemon_build(void);
 int query_exchange(const char *path, uint16_t type, const ipc_buf_t *request, ipc_buf_t *response);
+/* As query_exchange, waiting up to timeout_ms for the reply; a readable
+ * wake_fd (-1 for none) abandons the wait with errno ECANCELED. */
+int query_exchange_wait(const char *path, uint16_t type, const ipc_buf_t *request, ipc_buf_t *response,
+                        int wake_fd, int timeout_ms);
 /* Host identity changes only after the previous frontend's workers stop. */
 typedef struct { char name[256]; int foreign; } query_host_t;
 int query_host_read(const char *path, query_host_t *host);

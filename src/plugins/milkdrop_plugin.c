@@ -179,9 +179,9 @@ static GtkWidget *md_create_widget(void *opaque)
     g_signal_connect(ctx->gl_area, "render", G_CALLBACK(on_render), ctx);
     g_signal_connect(ctx->gl_area, "unrealize", G_CALLBACK(on_unrealize), ctx);
     g_signal_connect(ctx->gl_area, "button-press-event",
-                     G_CALLBACK(on_button_press), ctx);
+                     G_CALLBACK(md_on_button_press), ctx);
     g_signal_connect(ctx->gl_area, "key-press-event",
-                     G_CALLBACK(on_key_press), ctx);
+                     G_CALLBACK(md_on_key_press), ctx);
     g_signal_connect(ctx->gl_area, "scroll-event",
                      G_CALLBACK(on_scroll), ctx);
 
@@ -296,6 +296,8 @@ static void md_on_album_art_event(const evemon_event_t *event,
 #ifndef EVEMON_QT_MILKDROP
     if (ctx->gl_area && GTK_IS_WIDGET(ctx->gl_area))
         gtk_widget_queue_draw(ctx->gl_area);
+    if (ctx->fs_info_area && GTK_IS_WIDGET(ctx->fs_info_area))
+        gtk_widget_queue_draw(ctx->fs_info_area);
 #endif
 }
 

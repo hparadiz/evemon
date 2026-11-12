@@ -68,16 +68,20 @@ static void wm_gutter_renderer_query_data(GtkSourceGutterRenderer *renderer,
     if (ent && ent->ts[0]) {
         /* "name  pid │ HH:MM:SS.mmm" */
         char name_trunc[17];
-        strncpy(name_trunc, ent->name[0] ? ent->name : "[kernel]",
+        strncpy(name_trunc, ent->name[0] ? ent->name : "[unknown]",
                 sizeof(name_trunc) - 1);
         name_trunc[sizeof(name_trunc) - 1] = '\0';
+        char name_padded[17];
+        snprintf(name_padded, sizeof(name_padded), "%-16s", name_trunc);
+        gchar *name_markup = g_markup_escape_text(name_padded, -1);
         snprintf(markup, sizeof(markup),
-                 "<span foreground=\"#7a8499\">%-16s</span>"
+                 "<span foreground=\"#7a8499\">%s</span>"
                  "<span foreground=\"#2e3a4a\">  </span>"
                  "<span foreground=\"#556070\">%7d</span>"
                  "<span foreground=\"#3d4a5c\"> \xe2\x94\x82 </span>"
                  "<span foreground=\"#7a8499\">%s</span>",
-                 name_trunc, (int)ent->pid, ent->ts);
+                 name_markup, (int)ent->pid, ent->ts);
+        g_free(name_markup);
     } else {
         snprintf(markup, sizeof(markup), " ");
     }
@@ -127,7 +131,6 @@ typedef struct {
     pid_t            *desc_pids;
     size_t            desc_count;
     size_t            desc_cap;
-    int               sub_pid_select_id;
     int               sub_fd_write_id;
     /* Gutter renderer + data */
     WmGutterRenderer *gutter_renderer;
@@ -143,15 +146,35 @@ typedef struct {
     int               exclude_kernel;   /* 1 = drop writes from pid 0 / ppid 0 kernel threads */
 } wm_ui_ctx_t;
 
-/* ── Direct /proc lookup ────────────────────────────────────────── */
+/* Activated views share the backend's single tree registration per PID. */
+static GList *write_views;
 
-static void proc_lookup(pid_t pid, char *name_out, size_t name_sz,
+static void sync_tree_watch(wm_ui_ctx_t *c, pid_t pid)
+{
+    if (pid <= 0 || !c->hsvc) return;
+    int mask = 0;
+    for (GList *it = write_views; it; it = it->next) {
+        wm_ui_ctx_t *view = it->data;
+        if (view->hsvc == c->hsvc && view->current_pid == pid && view->include_descendants)
+            mask |= (view->subscribed_fd_stdout ? 1 : 0) |
+                    (view->subscribed_fd_stderr ? 2 : 0);
+    }
+    if (mask && c->hsvc->monitor_watch_children)
+        c->hsvc->monitor_watch_children(c->hsvc->host_ctx, pid, mask);
+    else if (!mask && c->hsvc->monitor_unwatch_children)
+        c->hsvc->monitor_unwatch_children(c->hsvc->host_ctx, pid);
+}
+
+
+/* ── Process snapshot lookup ───────────────────────────────────── */
+
+static int proc_lookup(pid_t pid, char *name_out, size_t name_sz,
                         pid_t *ppid_out)
 {
     proc_entry_t entry = {0};
-    query_cached_process(pid, &entry, name_out, name_sz);
+    int known = query_cached_process(pid, &entry, name_out, name_sz);
     *ppid_out = entry.ppid;
-
+    return known;
 }
 
 /* ── Gutter entry helpers ─────────────────────────────────────── */
@@ -207,11 +230,16 @@ static void on_fd_write_event(const evemon_event_t *ev, void *user_data)
     if (c->current_pid == 0) return;
 
     int pid_match = (p->tgid == c->current_pid);
-    if (!pid_match && c->include_descendants)
-        pid_match = 1;
-    if (!pid_match) {
+    if (!pid_match && c->include_descendants) {
         for (size_t i = 0; i < c->desc_count; ++i)
             if (c->desc_pids[i] == p->tgid) { pid_match = 1; break; }
+        pid_t ancestor = p->tgid;
+        for (int depth = 0; !pid_match && ancestor > 0 && depth < 256; depth++) {
+            proc_entry_t entry = {0};
+            if (!query_cached_process(ancestor, &entry, NULL, 0) || entry.ppid == ancestor) break;
+            ancestor = entry.ppid;
+            if (ancestor == c->current_pid) pid_match = 1;
+        }
     }
     if (!pid_match) return;
 
@@ -220,11 +248,12 @@ static void on_fd_write_event(const evemon_event_t *ev, void *user_data)
      * ppid == 0 (their parent is the idle/swapper process). */
     char   entry_name[32];
     pid_t  entry_ppid;
-    proc_lookup(p->tgid, entry_name, sizeof(entry_name), &entry_ppid);
+    int known = proc_lookup(p->tgid, entry_name, sizeof(entry_name), &entry_ppid);
 
     /* Kernel threads: ppid == 0 (true kernel threads), or comm wrapped in
      * brackets e.g. "[kworker/0:1]" (reparented ones whose ppid is now 1). */
-    if (c->exclude_kernel && (entry_ppid == 0 || entry_name[0] == '[')) return;
+    if (c->exclude_kernel && known && p->tgid != 1 &&
+        (entry_ppid == 0 || entry_name[0] == '[')) return;
 
     /* Sanitise: strip ANSI escapes, keep printable ASCII + \n + \t */
     size_t src_len = p->len;
@@ -310,9 +339,6 @@ static void subscribe_descendant(wm_ui_ctx_t *c, pid_t dpid)
     for (size_t i = 0; i < c->desc_count; ++i)
         if (c->desc_pids[i] == dpid) return;
 
-    if (c->subscribed_fd_stdout) subscribe_to_fd(c, dpid, 1);
-    if (c->subscribed_fd_stderr) subscribe_to_fd(c, dpid, 2);
-
     if (c->desc_count >= c->desc_cap) {
         size_t new_cap = c->desc_cap ? c->desc_cap * 2 : 8;
         pid_t *tmp = realloc(c->desc_pids, new_cap * sizeof(pid_t));
@@ -320,6 +346,9 @@ static void subscribe_descendant(wm_ui_ctx_t *c, pid_t dpid)
         c->desc_pids = tmp;
         c->desc_cap  = new_cap;
     }
+    if (c->subscribed_fd_stdout) subscribe_to_fd(c, dpid, 1);
+    if (c->subscribed_fd_stderr) subscribe_to_fd(c, dpid, 2);
+
     c->desc_pids[c->desc_count++] = dpid;
 }
 
@@ -338,6 +367,8 @@ static void apply_selection(wm_ui_ctx_t *c, int idx)
     pid_t pid = c->current_pid;
     int want_stdout = (idx == 1 || idx == 3);
     int want_stderr = (idx == 2 || idx == 3);
+    if (want_stdout != c->subscribed_fd_stdout || want_stderr != c->subscribed_fd_stderr)
+        unsubscribe_all_descendants(c);
 
     if (want_stdout && !c->subscribed_fd_stdout) {
         if (subscribe_to_fd(c, pid, 1) == 0) c->subscribed_fd_stdout = 1;
@@ -351,37 +382,19 @@ static void apply_selection(wm_ui_ctx_t *c, int idx)
         unsubscribe_from_fd(c, pid, 2);
         c->subscribed_fd_stderr = 0;
     }
+    sync_tree_watch(c, pid);
 }
 
 static void clear_current_pid(wm_ui_ctx_t *c)
 {
     if (!c || c->current_pid == 0) return;
-    if (c->subscribed_fd_stdout) {
-        unsubscribe_from_fd(c, c->current_pid, 1);
-        c->subscribed_fd_stdout = 0;
-    }
-    if (c->subscribed_fd_stderr) {
-        unsubscribe_from_fd(c, c->current_pid, 2);
-        c->subscribed_fd_stderr = 0;
-    }
+    pid_t pid = c->current_pid;
     unsubscribe_all_descendants(c);
-    if (c->hsvc && c->hsvc->monitor_unwatch_children)
-        c->hsvc->monitor_unwatch_children(c->hsvc->host_ctx, c->current_pid);
+    if (c->subscribed_fd_stdout) unsubscribe_from_fd(c, pid, 1);
+    if (c->subscribed_fd_stderr) unsubscribe_from_fd(c, pid, 2);
+    c->subscribed_fd_stdout = c->subscribed_fd_stderr = 0;
     c->current_pid = 0;
-}
-
-static void activate_pid(wm_ui_ctx_t *c, pid_t pid)
-{
-    if (!c || pid == 0) return;
-    c->current_pid = pid;
-    int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(c->combo));
-    apply_selection(c, idx);
-    if (c->hsvc && c->hsvc->monitor_watch_children) {
-        int mask = (c->subscribed_fd_stdout ? 1 : 0) |
-                   (c->subscribed_fd_stderr ? 2 : 0);
-        if (mask)
-            c->hsvc->monitor_watch_children(c->hsvc->host_ctx, pid, mask);
-    }
+    sync_tree_watch(c, pid);
 }
 
 /* ── Signal handlers ──────────────────────────────────────────── */
@@ -392,14 +405,6 @@ static void on_combo_changed(GtkComboBox *combo, gpointer user_data)
     if (!c || c->current_pid == 0) return;
     int idx = gtk_combo_box_get_active(combo);
     apply_selection(c, idx);
-    if (c->hsvc && c->hsvc->monitor_watch_children) {
-        int mask = (c->subscribed_fd_stdout ? 1 : 0) |
-                   (c->subscribed_fd_stderr ? 2 : 0);
-        if (mask)
-            c->hsvc->monitor_watch_children(c->hsvc->host_ctx, c->current_pid, mask);
-        else
-            c->hsvc->monitor_unwatch_children(c->hsvc->host_ctx, c->current_pid);
-    }
 }
 
 static void on_check_descendants_toggled(GtkToggleButton *btn, gpointer user_data)
@@ -409,29 +414,7 @@ static void on_check_descendants_toggled(GtkToggleButton *btn, gpointer user_dat
     c->include_descendants = gtk_toggle_button_get_active(btn);
     if (!c->include_descendants)
         unsubscribe_all_descendants(c);
-}
-
-static void on_process_selected(const evemon_event_t *ev, void *user_data)
-{
-    wm_ui_ctx_t *c = user_data;
-    if (!c) return;
-    pid_t sel = ev->payload ? *(pid_t *)ev->payload : 0;
-    if (c->current_pid == sel) return;
-    clear_current_pid(c);
-    if (c->buf)
-        gtk_text_buffer_set_text(c->buf, "", 0);
-    gutter_entries_clear(c);
-    c->current_pid = sel;
-    if (sel != 0) {
-        int idx = c->combo ? gtk_combo_box_get_active(GTK_COMBO_BOX(c->combo)) : 0;
-        apply_selection(c, idx);
-        if (c->hsvc && c->hsvc->monitor_watch_children) {
-            int mask = (c->subscribed_fd_stdout ? 1 : 0) |
-                       (c->subscribed_fd_stderr ? 2 : 0);
-            if (mask)
-                c->hsvc->monitor_watch_children(c->hsvc->host_ctx, sel, mask);
-        }
-    }
+    sync_tree_watch(c, c->current_pid);
 }
 
 static void on_check_gutter_toggled(GtkToggleButton *btn, gpointer user_data)
@@ -596,6 +579,7 @@ static void plugin_activate(void *ctx, const evemon_host_services_t *services)
     wm_ui_ctx_t *c = ctx;
     if (!c) return;
     c->hsvc                 = services;
+    write_views = g_list_prepend(write_views, c);
     c->current_pid          = 0;
     c->subscribed_fd_stdout = 0;
     c->subscribed_fd_stderr = 0;
@@ -603,13 +587,9 @@ static void plugin_activate(void *ctx, const evemon_host_services_t *services)
     c->desc_pids            = NULL;
     c->desc_count           = 0;
     c->desc_cap             = 0;
-    c->sub_pid_select_id    = 0;
     c->sub_fd_write_id      = 0;
 
     if (services && services->subscribe) {
-        c->sub_pid_select_id = services->subscribe(services->host_ctx,
-                                                   EVEMON_EVENT_PROCESS_SELECTED,
-                                                   on_process_selected, c);
         c->sub_fd_write_id   = services->subscribe(services->host_ctx,
                                                    EVEMON_EVENT_FD_WRITE,
                                                    on_fd_write_event, c);
@@ -622,11 +602,10 @@ static void plugin_destroy(void *ctx)
     if (!c) return;
     if (c->hsvc) {
         clear_current_pid(c);
-        if (c->sub_pid_select_id && c->hsvc->unsubscribe)
-            c->hsvc->unsubscribe(c->hsvc->host_ctx, c->sub_pid_select_id);
         if (c->sub_fd_write_id && c->hsvc->unsubscribe)
             c->hsvc->unsubscribe(c->hsvc->host_ctx, c->sub_fd_write_id);
     }
+    write_views = g_list_remove(write_views, c);
     free(c->desc_pids);
     free(c->gutter_entries);
     free(c);
@@ -646,12 +625,6 @@ static void plugin_update(void *ctx, const evemon_proc_data_t *data)
         if (sel != 0) {
             int idx = c->combo ? gtk_combo_box_get_active(GTK_COMBO_BOX(c->combo)) : 0;
             apply_selection(c, idx);
-            if (c->hsvc && c->hsvc->monitor_watch_children) {
-                int mask = (c->subscribed_fd_stdout ? 1 : 0) |
-                           (c->subscribed_fd_stderr ? 2 : 0);
-                if (mask)
-                    c->hsvc->monitor_watch_children(c->hsvc->host_ctx, sel, mask);
-            }
         }
     }
     if (c->include_descendants &&

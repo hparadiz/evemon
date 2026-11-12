@@ -196,6 +196,8 @@ typedef struct {
     uint64_t         generation; /* incremented on publication, under lock */
     struct timespec  sampled_at; /* CLOCK_MONOTONIC publication time */
     unsigned         interval_ms; /* fixed before starting monitor thread */
+    uint64_t         remote_sample_ns; /* remote monotonic timestamp */
+    double           net_window_seconds;
     int              running;    /* 0 = shutdown requested          */
     fdmon_ctx_t     *fdmon;      /* eBPF fd/network monitor (may be NULL) */
     pid_t            preselect_pid; /* PID to fast-path on first scan (0 = none) */

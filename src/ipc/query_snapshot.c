@@ -180,6 +180,12 @@ int query_snapshot_decode(ipc_buf_t *b, monitor_state_t *state, int status_only)
     uint64_t local_ns = (uint64_t)received.tv_sec * 1000000000 + received.tv_nsec;
     uint64_t age = sent - ns;
     uint64_t local_sample = ns && age <= local_ns ? local_ns - age : 0;
+    if (generation != state->generation) {
+        state->net_window_seconds = state->remote_sample_ns &&
+            ns > state->remote_sample_ns && generation == state->generation + 1
+            ? (double)(ns - state->remote_sample_ns) / 1e9 : interval / 1000.0;
+        state->remote_sample_ns = ns;
+    }
     state->generation = generation;
     state->sampled_at = (struct timespec){local_sample / 1000000000, local_sample % 1000000000};
     state->interval_ms = interval; state->snapshot_complete = ready; state->system = system;

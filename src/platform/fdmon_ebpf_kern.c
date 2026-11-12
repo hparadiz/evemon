@@ -129,19 +129,73 @@ struct {
 } open_args SEC(".maps");
 
 /*
- * Map of monitored PIDs.
- * Key = u32 pid (tgid).  Value = u8 fd_mask: bit 0 = fd 1, bit 1 = fd 2.
- * Populated by userspace for the selected root process; propagated to
- * children automatically by trace_sched_process_fork in kernel space.
- * Entries are removed by trace_sched_process_exit so dead PIDs never
- * accumulate.  Size matches the kernel default pid_max of 32768.
+ * Write-capture registrations.  Key = u32 pid (tgid).  In each mask bit 0 is
+ * fd 1 and bit 1 is fd 2; a write is captured when any mask has its bit.
+ *
+ *   own     set by userspace for this process alone
+ *   root    set by userspace: this process and everything it forks
+ *   inh     copied from the parent by trace_task_newtask at fork
+ *   origin  the registered process `inh` was copied from (0 = none)
+ *
+ * The masks are kept apart so userspace can withdraw one registration without
+ * disturbing another, and can find what a withdrawn one had propagated
+ * instead of flushing the whole map.  trace_sched_process_exit removes
+ * entries, so the map only ever holds live tasks; it is preallocated, which
+ * is why it has a fixed size instead of one entry per possible pid.
+ * Must match struct fdmon_watch in fdmon_ebpf.c.
  */
+struct fdmon_watch {
+    __u8  own;
+    __u8  root;
+    __u8  inh;
+    __u8  orphan;    /* automatically registered non-TTY output */
+    __u32 origin;
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 32768);
+    __uint(max_entries, 65536);
     __type(key, __u32);
-    __type(value, __u8);
+    __type(value, struct fdmon_watch);
 } monitored_pids SEC(".maps");
+
+/* Nonzero when writes of process `pid` to `fd` are being captured. */
+static __always_inline int fd_is_watched(__u32 pid, __u32 fd)
+{
+    if (fd != 1 && fd != 2)
+        return 0;
+    struct fdmon_watch *w = bpf_map_lookup_elem(&monitored_pids, &pid);
+    if (!w)
+        return 0;
+    return ((w->own | w->root | w->inh | w->orphan) >> (fd - 1)) & 1;
+}
+
+/*
+ * Kernel structure offsets, filled in by userspace from the running kernel's
+ * BTF before any probe is attached.  A zero `*_known` flag means the lookup
+ * failed and the fields it guards must not be used.
+ * Must match struct fdmon_config in fdmon_ebpf.c.
+ */
+struct fdmon_config {
+    __u32 sock_inode_known;
+    __u32 sk_socket_off;     /* struct sock          :: sk_socket */
+    __u32 socket_file_off;   /* struct socket        :: file      */
+    __u32 file_inode_off;    /* struct file          :: f_inode   */
+    __u32 inode_ino_off;     /* struct inode         :: i_ino     */
+    __u32 tuple_known;
+    __u32 sk_common_off;
+    __u32 daddr_off, saddr_off, dport_off, num_off;
+    __u32 group_live_known;
+    __u32 task_signal_off;   /* struct task_struct   :: signal    */
+    __u32 signal_live_off;   /* struct signal_struct :: live      */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct fdmon_config);
+} fdmon_config SEC(".maps");
 
 /*
  * Per-CPU scratch space for write events.
@@ -158,10 +212,12 @@ struct {
 } write_event_scratch SEC(".maps");
 
 /*
- * Per-CPU scratch map to stash the struct sock* pointer between
- * tcp_recvmsg entry and kretprobe exit.
+ * The struct sock* of a recvmsg or sendmsg call in progress, stashed by the
+ * entry kprobe for the kretprobe that learns how many bytes really moved.
  *
- * Key = tid (u32), value = sock pointer (u64).
+ * Key = tid (u32), value = sock pointer (u64).  The return probe always
+ * removes its entry, and so does the thread's exit, so a call that returned
+ * nothing or was never seen returning cannot use a slot up for good.
  */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -170,65 +226,65 @@ struct {
     __type(value, __u64);
 } recvmsg_args SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32);
+    __type(value, __u64);
+} sendmsg_args SEC(".maps");
+
 /*
- * Helper: read the 4-tuple from struct sock using BPF field offsets.
- * struct sock → __sk_common (type struct sock_common) at offset 0:
- *   skc_daddr      at offset 0   (u32) – remote IPv4
- *   skc_rcv_saddr  at offset 4   (u32) – local IPv4
- *   skc_dport      at offset 12  (u16) – remote port (network order)
- *   skc_num        at offset 14  (u16) – local port (host order)
- *
- * We use bpf_probe_read_kernel to be safe across kernel versions.
+ * Read the IPv4 tuple using the running kernel's BTF offsets. Unknown
+ * layouts leave the tuple zeroed; per-process byte accounting still works.
  */
 static __always_inline void read_sock_tuple(void *sk,
                                             __u32 *laddr, __u32 *raddr,
                                             __u16 *lport, __u16 *rport)
 {
-    bpf_probe_read_kernel(raddr, sizeof(*raddr), sk);          /* skc_daddr      @0  */
-    bpf_probe_read_kernel(laddr, sizeof(*laddr), sk + 4);      /* skc_rcv_saddr  @4  */
-    bpf_probe_read_kernel(rport, sizeof(*rport), sk + 12);     /* skc_dport      @12 */
-    bpf_probe_read_kernel(lport, sizeof(*lport), sk + 14);     /* skc_num        @14 */
+    __u32 zero = 0;
+    struct fdmon_config *cfg = bpf_map_lookup_elem(&fdmon_config, &zero);
+    if (!cfg || !cfg->tuple_known) return;
+    void *common = sk + cfg->sk_common_off;
+    bpf_probe_read_kernel(raddr, sizeof(*raddr), common + cfg->daddr_off);
+    bpf_probe_read_kernel(laddr, sizeof(*laddr), common + cfg->saddr_off);
+    bpf_probe_read_kernel(rport, sizeof(*rport), common + cfg->dport_off);
+    bpf_probe_read_kernel(lport, sizeof(*lport), common + cfg->num_off);
 }
 
 /*
- * Read the socket inode number from struct sock.
+ * Read the socket inode number from struct sock:
  *
- * Layout chain (stable since Linux 3.x, verified via BTF):
- *   struct sock      { ... struct socket *sk_socket; ... }  @ offset 600 (x86_64)
- *   struct socket    { ... struct file   *file;      ... }  @ offset 24
- *   struct file      { ... struct inode  *f_inode;   ... }  @ offset 32
- *   struct inode     { ... unsigned long  i_ino;     ... }  @ offset 64
+ *   sock->sk_socket (struct socket *) ->file (struct file *)
+ *       ->f_inode (struct inode *) ->i_ino
  *
- * We use fixed offsets rather than BTF helpers to keep the program
- * self-contained and compatible with kernels that lack BPF CO-RE.
+ * These members sit at different offsets in every kernel build, so the
+ * offsets come from fdmon_config, which userspace fills from the running
+ * kernel's BTF.  Without them the inode is reported as 0 and userspace
+ * matches the connection by its address 4-tuple instead.
  * Returns 0 on any probe failure (verifier sees the early-out).
- *
- * Offsets verified via pahole/BTF on this kernel build.
- * If the kernel changes, rebuild with BTF enabled and re-check via:
- *   pahole -C sock /sys/kernel/btf/vmlinux | grep sk_socket
  */
-#define SK_SOCKET_OFF   288  /* struct sock   :: sk_socket */
-#define SOCKET_FILE_OFF  16  /* struct socket :: file      */
-#define FILE_INODE_OFF   32  /* struct file   :: f_inode   */
-#define INODE_INO_OFF    64  /* struct inode  :: i_ino     */
-
 static __always_inline __u64 read_sock_inode(void *sk)
 {
     void *sk_socket = NULL;
     void *file      = NULL;
     void *inode     = NULL;
     __u64 ino       = 0;
+    __u32 zero      = 0;
+
+    struct fdmon_config *cfg = bpf_map_lookup_elem(&fdmon_config, &zero);
+    if (!cfg || !cfg->sock_inode_known)
+        return 0;
 
     if (bpf_probe_read_kernel(&sk_socket, sizeof(sk_socket),
-                               sk + SK_SOCKET_OFF) != 0 || !sk_socket)
+                               sk + cfg->sk_socket_off) != 0 || !sk_socket)
         return 0;
     if (bpf_probe_read_kernel(&file, sizeof(file),
-                               sk_socket + SOCKET_FILE_OFF) != 0 || !file)
+                               sk_socket + cfg->socket_file_off) != 0 || !file)
         return 0;
     if (bpf_probe_read_kernel(&inode, sizeof(inode),
-                               file + FILE_INODE_OFF) != 0 || !inode)
+                               file + cfg->file_inode_off) != 0 || !inode)
         return 0;
-    bpf_probe_read_kernel(&ino, sizeof(ino), inode + INODE_INO_OFF);
+    bpf_probe_read_kernel(&ino, sizeof(ino), inode + cfg->inode_ino_off);
     return ino;
 }
 
@@ -358,13 +414,8 @@ int trace_enter_write(struct sys_enter_write_args *ctx)
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = (__u32)(pid_tgid >> 32);
 
-    __u8 *mask = bpf_map_lookup_elem(&monitored_pids, &pid);
-    if (!mask) return 0;
-    /* Check fd against mask: bit0=fd1, bit1=fd2 */
     __u32 fd = (__u32)ctx->fd;
-    if (fd == 1 && !(*mask & 1)) return 0;
-    if (fd == 2 && !(*mask & 2)) return 0;
-    if (fd != 1 && fd != 2) return 0;
+    if (!fd_is_watched(pid, fd)) return 0;
 
     unsigned long cnt = ctx->count;
     if (cnt == 0)
@@ -431,12 +482,8 @@ int trace_enter_writev(struct sys_enter_writev_args *ctx)
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = (__u32)(pid_tgid >> 32);
 
-    __u8 *mask = bpf_map_lookup_elem(&monitored_pids, &pid);
-    if (!mask) return 0;
     __u32 fd = (__u32)ctx->fd;
-    if (fd == 1 && !(*mask & 1)) return 0;
-    if (fd == 2 && !(*mask & 2)) return 0;
-    if (fd != 1 && fd != 2) return 0;
+    if (!fd_is_watched(pid, fd)) return 0;
 
     if (!ctx->iov || ctx->iovcnt == 0) return 0;
 
@@ -517,12 +564,8 @@ int trace_enter_pwrite64(struct sys_enter_pwrite64_args *ctx)
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = (__u32)(pid_tgid >> 32);
 
-    __u8 *mask = bpf_map_lookup_elem(&monitored_pids, &pid);
-    if (!mask) return 0;
     __u32 fd = (__u32)ctx->fd;
-    if (fd == 1 && !(*mask & 1)) return 0;
-    if (fd == 2 && !(*mask & 2)) return 0;
-    if (fd != 1 && fd != 2) return 0;
+    if (!fd_is_watched(pid, fd)) return 0;
 
     unsigned long cnt = ctx->count;
     if (cnt == 0) return 0;
@@ -574,12 +617,8 @@ int trace_enter_sendto(struct sys_enter_sendto_args *ctx)
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = (__u32)(pid_tgid >> 32);
 
-    __u8 *mask = bpf_map_lookup_elem(&monitored_pids, &pid);
-    if (!mask) return 0;
     __u32 fd = (__u32)ctx->fd;
-    if (fd == 1 && !(*mask & 1)) return 0;
-    if (fd == 2 && !(*mask & 2)) return 0;
-    if (fd != 1 && fd != 2) return 0;
+    if (!fd_is_watched(pid, fd)) return 0;
 
     unsigned long cnt = ctx->len;
     if (cnt == 0) return 0;
@@ -628,12 +667,8 @@ int trace_enter_sendmsg(struct sys_enter_sendmsg_args *ctx)
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = (__u32)(pid_tgid >> 32);
 
-    __u8 *mask = bpf_map_lookup_elem(&monitored_pids, &pid);
-    if (!mask) return 0;
     __u32 fd = (__u32)ctx->fd;
-    if (fd == 1 && !(*mask & 1)) return 0;
-    if (fd == 2 && !(*mask & 2)) return 0;
-    if (fd != 1 && fd != 2) return 0;
+    if (!fd_is_watched(pid, fd)) return 0;
 
     struct msghdr_user msgh;
     if (bpf_probe_read_user(&msgh, sizeof(msgh), (void *)ctx->msg) != 0)
@@ -707,12 +742,8 @@ int trace_enter_sendmmsg(struct sys_enter_sendmmsg_args *ctx)
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = (__u32)(pid_tgid >> 32);
 
-    __u8 *mask = bpf_map_lookup_elem(&monitored_pids, &pid);
-    if (!mask) return 0;
     __u32 fd = (__u32)ctx->fd;
-    if (fd == 1 && !(*mask & 1)) return 0;
-    if (fd == 2 && !(*mask & 2)) return 0;
-    if (fd != 1 && fd != 2) return 0;
+    if (!fd_is_watched(pid, fd)) return 0;
 
     /* msgvec is complex; emit a zero-payload write notification. */
     struct fdmon_bpf_event_hdr ev = {};
@@ -751,12 +782,8 @@ int trace_enter_splice(struct sys_enter_splice_args *ctx)
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = (__u32)(pid_tgid >> 32);
 
-    __u8 *mask = bpf_map_lookup_elem(&monitored_pids, &pid);
-    if (!mask) return 0;
     __u32 fd = (__u32)ctx->fd_out;
-    if (fd == 1 && !(*mask & 1)) return 0;
-    if (fd == 2 && !(*mask & 2)) return 0;
-    if (fd != 1 && fd != 2) return 0;
+    if (!fd_is_watched(pid, fd)) return 0;
 
     struct fdmon_bpf_event_hdr ev = {};
     ev.type      = FDMON_BPF_WRITE;
@@ -790,12 +817,8 @@ int trace_enter_sendfile(struct sys_enter_sendfile_args *ctx)
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = (__u32)(pid_tgid >> 32);
 
-    __u8 *mask = bpf_map_lookup_elem(&monitored_pids, &pid);
-    if (!mask) return 0;
     __u32 fd = (__u32)ctx->out_fd;
-    if (fd == 1 && !(*mask & 1)) return 0;
-    if (fd == 2 && !(*mask & 2)) return 0;
-    if (fd != 1 && fd != 2) return 0;
+    if (!fd_is_watched(pid, fd)) return 0;
 
     struct fdmon_bpf_event_hdr ev = {};
     ev.type      = FDMON_BPF_WRITE;
@@ -810,118 +833,139 @@ int trace_enter_sendfile(struct sys_enter_sendfile_args *ctx)
     return 0;
 }
 
-/* ── tcp_sendmsg / tcp_recvmsg tracepoints ───────────────────── */
+/* ── socket send / receive byte accounting ───────────────────── */
 
 /*
- * kprobe context: tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
- * We use a kprobe on tcp_sendmsg to capture the 'size' argument
- * (the number of bytes the application is sending).
- *
- * Similarly for tcp_recvmsg we use a kretprobe to get the return
- * value (number of bytes received, or negative error).
- *
- * Using fentry/fexit (BPF trampoline) for better performance when
- * available, falling back to kprobe-style attachment.  libbpf will
- * auto-select the best attachment type for these program types.
+ * tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size) and
+ * tcp_recvmsg(struct sock *sk, ...) return the number of bytes that actually
+ * moved, or a negative error.  What an application asks to send is not what
+ * a non-blocking socket accepts, so both directions count the return value:
+ * the entry kprobe stashes the sock pointer and the kretprobe pairs it with
+ * the result.  udp_sendmsg / udp_recvmsg and their IPv6 counterparts have the
+ * same shape (PARM1 = sk, return value = bytes).
  */
-
-SEC("kprobe/tcp_sendmsg")
-int trace_tcp_sendmsg(struct pt_regs *ctx)
-{
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    void *sk   = (void *)PT_REGS_PARM1(ctx);
-    __u32 size = (__u32)PT_REGS_PARM3(ctx);
-
-    struct fdmon_bpf_event_hdr ev = {};
-    ev.type       = FDMON_BPF_NET_SEND;
-    ev.pid        = (__u32)(pid_tgid >> 32);
-    ev.tid        = (__u32)pid_tgid;
-    ev.fd         = -1;
-    ev.timestamp  = bpf_ktime_get_ns();
-    ev.net.bytes  = size;
-    ev.net.inode  = read_sock_inode(sk);
-    read_sock_tuple(sk, &ev.net.laddr, &ev.net.raddr,
-                    &ev.net.lport, &ev.net.rport);
-
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
-                          &ev, sizeof(ev));
-    return 0;
+#define DEFINE_SOCK_ENTRY_PROBE(name, section, stash)                   \
+SEC(section)                                                            \
+int name(struct pt_regs *ctx)                                           \
+{                                                                       \
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();                     \
+    __u64 sk  = (__u64)PT_REGS_PARM1(ctx);                             \
+    bpf_map_update_elem(&stash, &tid, &sk, BPF_ANY);                   \
+    return 0;                                                           \
 }
 
-SEC("kprobe/tcp_recvmsg")
-int trace_tcp_recvmsg(struct pt_regs *ctx)
-{
-    __u32 tid = (__u32)bpf_get_current_pid_tgid();
-    __u64 sk  = (__u64)PT_REGS_PARM1(ctx);
-    bpf_map_update_elem(&recvmsg_args, &tid, &sk, BPF_ANY);
-    return 0;
+#define DEFINE_SOCK_RETURN_PROBE(name, section, stash, event)           \
+SEC(section)                                                            \
+int name(struct pt_regs *ctx)                                           \
+{                                                                       \
+    __u64 pid_tgid = bpf_get_current_pid_tgid();                       \
+    __u32 tid = (__u32)pid_tgid;                                        \
+    __u64 *sk_ptr = bpf_map_lookup_elem(&stash, &tid);                 \
+    if (!sk_ptr) return 0;                                              \
+    void *sk = (void *)*sk_ptr;                                         \
+    /* Release the slot whatever the call returned. */                  \
+    bpf_map_delete_elem(&stash, &tid);                                  \
+    int ret = (int)PT_REGS_RC(ctx);                                     \
+    if (ret <= 0) return 0;   /* an error, or nothing moved */          \
+    struct fdmon_bpf_event_hdr ev = {};                                 \
+    ev.type      = event;                                               \
+    ev.pid       = (__u32)(pid_tgid >> 32);                             \
+    ev.tid       = tid;                                                 \
+    ev.fd        = -1;                                                  \
+    ev.timestamp = bpf_ktime_get_ns();                                  \
+    ev.net.bytes = (__u32)ret;                                          \
+    ev.net.inode = read_sock_inode(sk);                                 \
+    read_sock_tuple(sk, &ev.net.laddr, &ev.net.raddr,                  \
+                    &ev.net.lport, &ev.net.rport);                      \
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,             \
+                          &ev, sizeof(ev));                             \
+    return 0;                                                           \
 }
 
-SEC("kretprobe/tcp_recvmsg")
-int trace_tcp_recvmsg_ret(struct pt_regs *ctx)
-{
-    int ret = (int)PT_REGS_RC(ctx);
-    if (ret <= 0)
-        return 0;  /* error or no data – skip */
+/* TCP, both address families */
+DEFINE_SOCK_ENTRY_PROBE(trace_tcp_sendmsg, "kprobe/tcp_sendmsg", sendmsg_args)
+DEFINE_SOCK_RETURN_PROBE(trace_tcp_sendmsg_ret, "kretprobe/tcp_sendmsg",
+                         sendmsg_args, FDMON_BPF_NET_SEND)
+DEFINE_SOCK_ENTRY_PROBE(trace_tcp_recvmsg, "kprobe/tcp_recvmsg", recvmsg_args)
+DEFINE_SOCK_RETURN_PROBE(trace_tcp_recvmsg_ret, "kretprobe/tcp_recvmsg",
+                         recvmsg_args, FDMON_BPF_NET_RECV)
 
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 tid = (__u32)pid_tgid;
+/* IPv4 UDP */
+DEFINE_SOCK_ENTRY_PROBE(trace_udp_sendmsg, "kprobe/udp_sendmsg", sendmsg_args)
+DEFINE_SOCK_RETURN_PROBE(trace_udp_sendmsg_ret, "kretprobe/udp_sendmsg",
+                         sendmsg_args, FDMON_BPF_NET_SEND)
+DEFINE_SOCK_ENTRY_PROBE(trace_udp_recvmsg, "kprobe/udp_recvmsg", recvmsg_args)
+DEFINE_SOCK_RETURN_PROBE(trace_udp_recvmsg_ret, "kretprobe/udp_recvmsg",
+                         recvmsg_args, FDMON_BPF_NET_RECV)
 
-    /* Retrieve the stashed sock pointer */
-    __u64 *sk_ptr = bpf_map_lookup_elem(&recvmsg_args, &tid);
-    if (!sk_ptr) return 0;
-    void *sk = (void *)*sk_ptr;
-    bpf_map_delete_elem(&recvmsg_args, &tid);
-
-    struct fdmon_bpf_event_hdr ev = {};
-    ev.type       = FDMON_BPF_NET_RECV;
-    ev.pid        = (__u32)(pid_tgid >> 32);
-    ev.tid        = (__u32)pid_tgid;
-    ev.fd         = -1;
-    ev.timestamp  = bpf_ktime_get_ns();
-    ev.net.bytes  = (__u32)ret;
-    ev.net.inode  = read_sock_inode(sk);
-    read_sock_tuple(sk, &ev.net.laddr, &ev.net.raddr,
-                    &ev.net.lport, &ev.net.rport);
-
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
-                          &ev, sizeof(ev));
-    return 0;
-}
+/* IPv6 UDP — separate kernel functions */
+DEFINE_SOCK_ENTRY_PROBE(trace_udpv6_sendmsg, "kprobe/udpv6_sendmsg", sendmsg_args)
+DEFINE_SOCK_RETURN_PROBE(trace_udpv6_sendmsg_ret, "kretprobe/udpv6_sendmsg",
+                         sendmsg_args, FDMON_BPF_NET_SEND)
+DEFINE_SOCK_ENTRY_PROBE(trace_udpv6_recvmsg, "kprobe/udpv6_recvmsg", recvmsg_args)
+DEFINE_SOCK_RETURN_PROBE(trace_udpv6_recvmsg_ret, "kretprobe/udpv6_recvmsg",
+                         recvmsg_args, FDMON_BPF_NET_RECV)
 
 /* ── sched_process_exit tracepoint ──────────────────────────── */
 
 /*
- * Format (from /sys/kernel/debug/tracing/events/sched/sched_process_exit):
- *   common header  (8 bytes)
- *   char comm[16]; (offset 8)
- *   pid_t pid;     (offset 24)
- *   int prio;      (offset 28)
- *
- * pid here is the thread pid.  For the group leader (main thread) pid == tgid,
- * which is what we store in monitored_pids, so we can safely delete it.
+ * Runs in the exiting thread.  Nothing is read from the record: its layout
+ * differs between kernel versions, and everything needed is the current task.
  */
 struct sched_process_exit_args {
     unsigned short common_type;
     unsigned char  common_flags;
     unsigned char  common_preempt_count;
     int            common_pid;
-    char           comm[16];
-    __s32          pid;
-    int            prio;
 };
+
+/*
+ * Has the last thread of the current process gone?  do_exit() decrements
+ * signal->live before this tracepoint fires, so zero means the whole thread
+ * group is dead. Without these offsets, userspace reaps dead registrations.
+ */
+static __always_inline int thread_group_dead(__u32 tid, __u32 tgid)
+{
+    __u32 zero = 0;
+    struct fdmon_config *cfg = bpf_map_lookup_elem(&fdmon_config, &zero);
+
+    if (cfg && cfg->group_live_known) {
+        void *task   = (void *)bpf_get_current_task();
+        void *signal = NULL;
+        int   live   = 1;
+
+        if (bpf_probe_read_kernel(&signal, sizeof(signal),
+                                  task + cfg->task_signal_off) == 0 && signal &&
+            bpf_probe_read_kernel(&live, sizeof(live),
+                                  signal + cfg->signal_live_off) == 0)
+            return live <= 0;
+    }
+    (void)tid; (void)tgid;
+    return 0; /* userspace sweeps dead PIDs when BTF is unavailable */
+}
 
 SEC("tracepoint/sched/sched_process_exit")
 int trace_sched_process_exit(struct sched_process_exit_args *ctx)
 {
-    /* Only remove on the group-leader exit (pid == tgid).  Thread exits
-     * fire with pid == tid != tgid and should not remove the entry. */
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 tgid = (__u32)(pid_tgid >> 32);
-    __u32 pid  = (__u32)(pid_tgid & 0xffffffff);
-    if (pid != tgid) return 0;
+    __u32 tid  = (__u32)pid_tgid;
 
-    bpf_map_delete_elem(&monitored_pids, &tgid);
+    /* A call this thread never returned from must not keep its slot. */
+    bpf_map_delete_elem(&recvmsg_args, &tid);
+    bpf_map_delete_elem(&sendmsg_args, &tid);
+    bpf_map_delete_elem(&open_args, &tid);
+
+    /* A thread created while its process was watched got an entry too. */
+    if (tid != tgid)
+        bpf_map_delete_elem(&monitored_pids, &tid);
+
+    /* The process's entry goes with its last thread, not with its leader:
+     * a leader can exit first, and an exec from another thread retires the
+     * leader while the process lives on under the same pid. */
+    if (bpf_map_lookup_elem(&monitored_pids, &tgid) &&
+        thread_group_dead(tid, tgid))
+        bpf_map_delete_elem(&monitored_pids, &tgid);
     return 0;
 }
 
@@ -929,7 +973,7 @@ int trace_sched_process_exit(struct sched_process_exit_args *ctx)
 
 /*
  * Fired after a successful execve() replaces the process image.
- * The tracepoint format (from /sys/kernel/debug/tracing/events/sched/
+ * The tracepoint format (from /sys/kernel/tracing/events/sched/
  * sched_process_exec/format) contains:
  *
  *   common header (8 bytes)
@@ -944,8 +988,8 @@ struct sched_process_exec_args {
     unsigned char  common_flags;
     unsigned char  common_preempt_count;
     int            common_pid;
-    /* __data_loc encoding: high 16 bits = offset from struct start,
-     * low 16 bits = length. */
+    /* __data_loc encoding: low 16 bits = offset from the start of the
+     * record, high 16 bits = length. */
     __u32          __data_loc_filename;
     __u32          pid;
     __u32          old_pid;
@@ -965,9 +1009,14 @@ int trace_sched_process_exec(struct sched_process_exec_args *ctx)
     ev.user_ptr  = 0;
     ev.user_count = 0;
 
-    /* Decode __data_loc: offset is upper 16 bits of the field. */
-    __u16 fname_offset = (__u16)((ctx->__data_loc_filename >> 16) & 0xffff);
-    /* The filename string lives at (ctx + fname_offset). */
+    /* A thread other than the leader that execs takes over the leader's
+     * pid; the entry made for it when it was created names no task now. */
+    __u32 old_pid = ctx->old_pid;
+    if (old_pid != ev.pid)
+        bpf_map_delete_elem(&monitored_pids, &old_pid);
+
+    /* The filename string lives at (ctx + offset). */
+    __u16 fname_offset = (__u16)(ctx->__data_loc_filename & 0xffff);
     void *fname_ptr = (void *)ctx + fname_offset;
     bpf_probe_read_kernel_str(ev.path, sizeof(ev.path), fname_ptr);
 
@@ -976,126 +1025,51 @@ int trace_sched_process_exec(struct sched_process_exec_args *ctx)
     return 0;
 }
 
-/* ── sched_process_fork: inherit monitored fds ───────────────── */
+/* ── task_newtask: inherit monitored fds ─────────────────────── */
 
 /*
- * Fired immediately when fork()/clone() creates a new process.
- * The child inherits the parent's file descriptors — if the parent is
- * being monitored for fd 1 or fd 2, register the same fds for the
- * child RIGHT NOW, in kernel space, with zero latency.
+ * Fired inside fork()/clone() in the parent, before the new task can run.
+ * The child inherits the parent's file descriptors — if the parent's writes
+ * to fd 1 or fd 2 are captured, register the same fds for the child RIGHT
+ * NOW, in kernel space, with zero latency.
  *
- * This closes the race for workers that fork() and write() without
- * ever calling execve() — and also covers the execve() case because
- * the child is registered at fork time, before it even runs.
+ * This closes the race for workers that fork() and write() without ever
+ * calling execve() — and also covers the execve() case because the child is
+ * registered at fork time, before it even runs.
+ *
+ * Only `pid` is read from the record.  It has been the event's first field
+ * for as long as the tracepoint has existed, whereas sched_process_fork
+ * changed layout when its comm arrays became dynamic strings — and a
+ * program that reads past the end of a record cannot be attached at all.
+ * The parent is the current task, which also gets forks made by threads
+ * other than the main one right.
  */
-struct sched_process_fork_args {
+struct task_newtask_args {
     unsigned short common_type;
     unsigned char  common_flags;
     unsigned char  common_preempt_count;
     int            common_pid;
-    char           parent_comm[16]; /* offset 8  */
-    __u32          parent_pid;      /* offset 24 */
-    char           child_comm[16];  /* offset 28 */
-    __u32          child_pid;       /* offset 44 */
+    __s32          pid;   /* the new task; for a new thread, its tid */
 };
 
-SEC("tracepoint/sched/sched_process_fork")
-int trace_sched_process_fork(struct sched_process_fork_args *ctx)
+SEC("tracepoint/task/task_newtask")
+int trace_task_newtask(struct task_newtask_args *ctx)
 {
-    __u32 parent = ctx->parent_pid;
-    __u32 child  = ctx->child_pid;
+    __u32 parent = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    __u32 child  = (__u32)ctx->pid;
 
-    /* If the parent is monitored, register the child with the same fd mask.
-     * The child inherits the parent's fds, so the same mask applies. */
-    __u8 *mask = bpf_map_lookup_elem(&monitored_pids, &parent);
-    if (!mask) return 0;
+    struct fdmon_watch *p = bpf_map_lookup_elem(&monitored_pids, &parent);
+    if (!p) return 0;
 
-    __u8 val = *mask;
-    bpf_map_update_elem(&monitored_pids, &child, &val, BPF_ANY);
+    struct fdmon_watch w = {};
+    w.inh = p->root | p->inh;
+    if (!w.inh) return 0;
+    /* Heirs answer to the nearest "this process and what it forks"
+     * registration; failing that, to whatever their parent answers to. */
+    w.origin = p->root ? parent : p->origin;
 
+    bpf_map_update_elem(&monitored_pids, &child, &w, BPF_ANY);
     return 0;
 }
-
-/* ── UDP kprobes (IPv4 + IPv6) ───────────────────────────────── */
-
-/*
- * Macro to emit a NET_SEND event from a sendmsg-style kprobe.
- * PARM1=sk, PARM3=len for both udp_sendmsg and udpv6_sendmsg.
- */
-#define DEFINE_UDP_SEND_PROBE(name, section)                            \
-SEC(section)                                                            \
-int name(struct pt_regs *ctx)                                           \
-{                                                                       \
-    __u64 pid_tgid = bpf_get_current_pid_tgid();                       \
-    void *sk   = (void *)PT_REGS_PARM1(ctx);                           \
-    __u32 size = (__u32)PT_REGS_PARM3(ctx);                            \
-    struct fdmon_bpf_event_hdr ev = {};                                 \
-    ev.type      = FDMON_BPF_NET_SEND;                                  \
-    ev.pid       = (__u32)(pid_tgid >> 32);                             \
-    ev.tid       = (__u32)pid_tgid;                                     \
-    ev.fd        = -1;                                                  \
-    ev.timestamp = bpf_ktime_get_ns();                                  \
-    ev.net.bytes = size;                                                \
-    ev.net.inode = read_sock_inode(sk);                                 \
-    read_sock_tuple(sk, &ev.net.laddr, &ev.net.raddr,                  \
-                    &ev.net.lport, &ev.net.rport);                      \
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,             \
-                          &ev, sizeof(ev));                             \
-    return 0;                                                           \
-}
-
-/*
- * Macro to stash sock pointer on recvmsg entry.
- * PARM1=sk for both udp_recvmsg and udpv6_recvmsg.
- */
-#define DEFINE_UDP_RECV_ENTRY_PROBE(name, section)                      \
-SEC(section)                                                            \
-int name(struct pt_regs *ctx)                                           \
-{                                                                       \
-    __u32 tid = (__u32)bpf_get_current_pid_tgid();                     \
-    __u64 sk  = (__u64)PT_REGS_PARM1(ctx);                             \
-    bpf_map_update_elem(&recvmsg_args, &tid, &sk, BPF_ANY);            \
-    return 0;                                                           \
-}
-
-/*
- * Macro to emit NET_RECV on recvmsg return.
- */
-#define DEFINE_UDP_RECV_RET_PROBE(name, section)                        \
-SEC(section)                                                            \
-int name(struct pt_regs *ctx)                                           \
-{                                                                       \
-    int ret = (int)PT_REGS_RC(ctx);                                     \
-    if (ret <= 0) return 0;                                             \
-    __u64 pid_tgid = bpf_get_current_pid_tgid();                       \
-    __u32 tid = (__u32)pid_tgid;                                        \
-    __u64 *sk_ptr = bpf_map_lookup_elem(&recvmsg_args, &tid);          \
-    if (!sk_ptr) return 0;                                              \
-    void *sk = (void *)*sk_ptr;                                         \
-    bpf_map_delete_elem(&recvmsg_args, &tid);                           \
-    struct fdmon_bpf_event_hdr ev = {};                                 \
-    ev.type      = FDMON_BPF_NET_RECV;                                  \
-    ev.pid       = (__u32)(pid_tgid >> 32);                             \
-    ev.tid       = (__u32)pid_tgid;                                     \
-    ev.fd        = -1;                                                  \
-    ev.timestamp = bpf_ktime_get_ns();                                  \
-    ev.net.bytes = (__u32)ret;                                          \
-    ev.net.inode = read_sock_inode(sk);                                 \
-    read_sock_tuple(sk, &ev.net.laddr, &ev.net.raddr,                  \
-                    &ev.net.lport, &ev.net.rport);                      \
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,             \
-                          &ev, sizeof(ev));                             \
-    return 0;                                                           \
-}
-
-/* IPv4 UDP */
-DEFINE_UDP_SEND_PROBE(trace_udp_sendmsg,      "kprobe/udp_sendmsg")
-DEFINE_UDP_RECV_ENTRY_PROBE(trace_udp_recvmsg,"kprobe/udp_recvmsg")
-DEFINE_UDP_RECV_RET_PROBE(trace_udp_recvmsg_ret, "kretprobe/udp_recvmsg")
-
-/* IPv6 UDP — separate kernel functions */
-DEFINE_UDP_SEND_PROBE(trace_udpv6_sendmsg,       "kprobe/udpv6_sendmsg")
-DEFINE_UDP_RECV_ENTRY_PROBE(trace_udpv6_recvmsg, "kprobe/udpv6_recvmsg")
-DEFINE_UDP_RECV_RET_PROBE(trace_udpv6_recvmsg_ret, "kretprobe/udpv6_recvmsg")
 
 char _license[] SEC("license") = "GPL";

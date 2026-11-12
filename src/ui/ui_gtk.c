@@ -211,6 +211,7 @@ void ui_ctx_destroy(ui_ctx_t *ctx)
         free(ctx->plugin_registry);
         ctx->plugin_registry = NULL;
     }
+    g_clear_pointer(&ctx->write_subscriptions, g_hash_table_unref);
     g_free(ctx->gpu_snapshot.devices);
     g_free(ctx->gpu_snapshot.processes);
     memset(&ctx->gpu_snapshot, 0, sizeof(ctx->gpu_snapshot));

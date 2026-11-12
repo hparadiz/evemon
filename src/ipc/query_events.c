@@ -82,7 +82,7 @@ static int apply_union(fdmon_ctx_t *fdmon, const watch_t *old, unsigned old_coun
         else if (w.kind == 2) fdmon_unwatch_parent_fds(fdmon, w.pid);
         else fdmon_orphan_stdout_disable(fdmon);
     }
-    /* Reapply all remaining roots: the existing eBPF unwatch flushes inherited entries. */
+    /* Reapply the union so updated root masks also reach inherited entries. */
     for (unsigned i = 0; i < next_count; ++i) {
         watch_t w = next[i]; int rc;
         if (w.kind == 1) rc = fdmon_add_pid_fd(fdmon, w.pid, w.value);

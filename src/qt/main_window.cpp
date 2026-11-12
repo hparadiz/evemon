@@ -168,6 +168,8 @@ MainWindow::MainWindow(monitor_state_t &monitor, int initialPid, bool safeMode)
         addInspector(Inspector::Threads, "Threads", tabs);
         addInspector(Inspector::Devices, "Devices", tabs);
         if (!query_is_foreign_host() && QDir("/var/db/pkg").exists()) addInspector(Inspector::Gentoo, "Gentoo / Portage", tabs);
+        if (query_is_foreign_host() ? bool(query_remote_capabilities() & IPC_CAP_DPKG)
+                                    : QFileInfo("/var/lib/dpkg/status").size() > 0) addInspector(Inspector::Dpkg, QString(), tabs);
         addInspector(Inspector::Maps, "Memory Maps", tabs);
         addInspector(Inspector::Cgroup, "cgroup Limits", tabs);
         addInspector(Inspector::Libraries, "Libraries", tabs);
@@ -354,7 +356,7 @@ Inspector *MainWindow::addInspector(Inspector::Kind kind, const QString &title, 
     }
     inspector->pluginEnabled = settings.value("plugins/" + QString::fromLatin1(inspector->descriptor.id), enabled).toBool();
     inspector->setMediaEnabled(mediaEnabled);
-    inspectors.append(inspector); notebook->addTab(inspector, title);
+    inspectors.append(inspector); notebook->addTab(inspector, inspector->title);
     notebook->setTabVisible(notebook->indexOf(inspector), inspector->pluginEnabled);
     if (kind >= Inspector::SystemFiles) inspector->setPid(1);
     inspector->requestRefresh = [this] { syncWrites(); if (!brokerBusy) startBroker(); };
@@ -420,7 +422,6 @@ void MainWindow::refresh()
     for (auto *bar : {tree->verticalScrollBar(), tree->horizontalScrollBar()})
         bar->setProperty("evemonUpdatingModel", false);
     refreshDetails();
-    if (state.fdmon) fdmon_net_io_snapshot(state.fdmon);
     syncWrites(); if (!brokerBusy) startBroker();
     pthread_mutex_lock(&state.lock);
     const monitor_system_t system = state.system;
@@ -437,10 +438,12 @@ void MainWindow::refresh()
         .arg(count).arg(system.cpus).arg(formatBytes(total - available), formatBytes(total))
         .arg(gpuSummary).arg(refreshMilliseconds, 0, 'f', 1).arg(average, 0, 'f', 1).arg(maximum, 0, 'f', 1));
     load->setText(disconnected ? QStringLiteral("Evemon disconnected — reconnecting") :
-        QString("up %1d %2h %3m  |  %4 user%5  |  load: %6 %7 %8")
+        QString("up %1d %2h %3m  |  %4 user%5  |  load: %6 %7 %8  |  %9")
         .arg(system.uptime_seconds / 86400).arg(system.uptime_seconds / 3600 % 24).arg(system.uptime_seconds / 60 % 60)
         .arg(system.users).arg(system.users == 1 ? "" : "s")
-        .arg(system.load[0], 0, 'f', 2).arg(system.load[1], 0, 'f', 2).arg(system.load[2], 0, 'f', 2));
+        .arg(system.load[0], 0, 'f', 2).arg(system.load[1], 0, 'f', 2).arg(system.load[2], 0, 'f', 2)
+        .arg(QStringLiteral("%1.%2.%3%4").arg(query_daemon_build() / 10000).arg(query_daemon_build() / 100 % 100)
+                 .arg(query_daemon_build() % 100).arg(query_daemon_build() < ipc_build() ? " (older)" : "")));
 }
 void MainWindow::restoreTree()
 {
@@ -470,6 +473,9 @@ void MainWindow::refreshDetails()
     const auto *row = model->process(selectedPid);
     uint64_t send = 0, receive = 0;
     if (state.fdmon) fdmon_net_io_get(state.fdmon, selectedPid, &send, &receive);
+    const double seconds = fdmon_net_io_window(state.fdmon);
+    send = static_cast<uint64_t>(send / seconds);
+    receive = static_cast<uint64_t>(receive / seconds);
     const QIcon icon = row ? model->data(model->forPid(selectedPid, ProcessModel::Name), Qt::DecorationRole).value<QIcon>() : QIcon();
     details->setProcess(row, send, receive, icon);
     if (!row) return;
@@ -493,7 +499,9 @@ bool MainWindow::writerTracks(const Inspector *writer, int pid) const
 }
 void MainWindow::syncWrites()
 {
-    if (!state.fdmon || fdmon_active_backend(state.fdmon) != FDMON_BACKEND_EBPF) return;
+    const bool available = state.fdmon && fdmon_active_backend(state.fdmon) == FDMON_BACKEND_EBPF;
+    for (auto *writer : inspectors) if (writer->kind == Inspector::Writes) writer->setWriteCaptureAvailable(available);
+    if (!available) return;
     QMap<int, int> requested, parents;
     for (auto *writer : inspectors) {
         if (!writesEnabled || writer->kind != Inspector::Writes || !writer->wantsData() || !writer->writeMask()) continue;
@@ -643,7 +651,7 @@ void MainWindow::restart(bool admin)
     if (!admin) { evemon_request_restart(); close(); return; }
     settings.sync();
     if (desktop_start_elevated(QCoreApplication::applicationFilePath().toUtf8().constData(), "qt"))
-        QMessageBox::warning(this, "Restart", "Could not start /usr/bin/kdesu.");
+        QMessageBox::warning(this, "Restart", "Could not start kdesu or pkexec.");
 }
 QString MainWindow::processSettingKey(const QString &key) const
 {

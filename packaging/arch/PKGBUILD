@@ -1,0 +1,55 @@
+# Maintainer: Henry Paradiz <henry.paradiz@gmail.com>
+pkgname=evemon-git
+_pkgname=evemon
+pkgver=0.2.0.r117.g77f7358
+pkgrel=1
+pkgdesc='Everything Monitor: Linux process monitor with eBPF write tracing, PipeWire, GPU and remote inspection'
+arch=('x86_64' 'aarch64')
+url='https://github.com/hparadiz/evemon'
+license=('GPL-3.0-or-later')
+depends=(
+  'cairo' 'fontconfig' 'gdk-pixbuf2' 'glib2' 'gtk3' 'gtksourceview4' 'jansson'
+  'kcolorscheme' 'kwindowsystem' 'libbpf' 'libdrm' 'libelf' 'libepoxy' 'libpipewire'
+  'libsoup3' 'libx11' 'pango' 'qt6-base' 'sqlite' 'systemd-libs' 'wayland'
+)
+makedepends=('clang' 'cmake' 'git' 'wayland-protocols')
+optdepends=(
+  'polkit: Restart as Admin through pkexec'
+  'kde-cli-tools: Restart as Admin through kdesu on Plasma'
+)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=(
+  "$_pkgname::git+$url.git"
+  'nvtop::git+https://github.com/Syllo/nvtop.git#commit=76890233d759199f50ad3bdb57a0c0988e96fc44'
+)
+sha256sums=('SKIP' 'SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  local version
+  version=$(sed -n 's/^project(evemon VERSION \([^[:space:]]*\).*/\1/p' CMakeLists.txt)
+  printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  # Same nvtop 3.3.2 commit that scripts/fetch-nvtop.sh pins.
+  mkdir -p "$_pkgname/third_party"
+  ln -sfn "$srcdir/nvtop" "$_pkgname/third_party/nvtop"
+}
+
+build() {
+  # The Android runtime archive is a CI artifact, so this build omits ADB remotes.
+  cmake -S "$_pkgname" -B build \
+    -DCMAKE_BUILD_TYPE=None \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DEVEMON_GTK=ON \
+    -DEVEMON_QT=ON \
+    -DEVEMON_ANDROID=OFF
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+}

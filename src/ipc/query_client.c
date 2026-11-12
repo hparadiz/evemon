@@ -1,5 +1,7 @@
 #include "query.h"
 #include "query_gpu.h"
+#include "query_dpkg.h"
+#include "../app/client_session.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -9,22 +11,25 @@
 #include <unistd.h>
 
 static char remote_path[108];
+static uint64_t remote_build;
 static uint32_t remote_capabilities;
 static monitor_state_t *remote_state;
 int query_cached_process(pid_t pid, proc_entry_t *entry, char *name, size_t size)
 {
     if (name && size) name[0] = 0;
-    if (!remote_state) return 0;
+    monitor_state_t *state = remote_state;
+    if (!state && !remote_path[0]) state = client_session_state();
+    if (!state) return 0;
     int found = 0;
-    pthread_mutex_lock(&remote_state->lock);
-    for (uint32_t i = 0; i < remote_state->snapshot.len; ++i) {
-        const proc_entry_t *p = &remote_state->snapshot.entries[i];
+    pthread_mutex_lock(&state->lock);
+    for (uint32_t i = 0; i < state->snapshot.len; ++i) {
+        const proc_entry_t *p = &state->snapshot.entries[i];
         if (p->pid != pid) continue;
         if (entry) *entry = *p;
-        if (name && size) snprintf(name, size, "%s", PROC_NAME(&remote_state->snapshot, p));
+        if (name && size) snprintf(name, size, "%s", PROC_NAME(&state->snapshot, p));
         found = 1; break;
     }
-    pthread_mutex_unlock(&remote_state->lock);
+    pthread_mutex_unlock(&state->lock);
     return found;
 }
 uint32_t query_remote_capabilities(void) { return remote_capabilities; }
@@ -35,12 +40,17 @@ void query_set_remote(const char *path)
 const char *query_remote_path(void) { return remote_path[0] ? remote_path : NULL; }
 int query_exchange(const char *path, uint16_t type, const ipc_buf_t *request, ipc_buf_t *response)
 {
+    return query_exchange_wait(path, type, request, response, -1, IPC_TIMEOUT_MS);
+}
+int query_exchange_wait(const char *path, uint16_t type, const ipc_buf_t *request, ipc_buf_t *response,
+                        int wake_fd, int timeout_ms)
+{
     int fd = ipc_connect(path);
     if (fd < 0) return -1;
     ipc_header_t h;
     int result = ipc_hello(fd, NULL, NULL);
     if (!result) result = ipc_send(fd, type, 2, request);
-    if (!result) result = ipc_receive(fd, &h, response, -1);
+    if (!result) result = ipc_receive_wait(fd, &h, response, wake_fd, timeout_ms);
     if (!result && (h.type != (type | IPC_REPLY) || h.id != 2)) {
         if (h.type == IPC_ERROR) {
             uint32_t code = ipc_get_u32(response);
@@ -77,7 +87,7 @@ int query_client(const char *path, const char *request, int binary)
         if (monitor_state_init(&state)) { ipc_free(&result); return -1; }
         /* Count is part of the common status header, independent of row selection. */
         ipc_buf_t cursor = result; cursor.pos = 24;
-        uint32_t count = ipc_get_u32(&cursor);
+        uint32_t count = result.len >= 28 ? ipc_get_u32(&cursor) : 0;
         rc = query_snapshot_decode(&result, &state, type == IPC_STATUS);
         if (!rc) {
             double sampled = state.sampled_at.tv_sec * 1000.0 + state.sampled_at.tv_nsec / 1e6;
@@ -110,6 +120,8 @@ struct query_connection {
     pthread_t thread;
     uint32_t capabilities;
     query_host_t host;
+    char dpkg_label[64];
+    uint64_t build;
     int active;
 };
 static void connected(query_connection_t *c, int value)
@@ -168,8 +180,12 @@ query_connection_t *query_connection_prepare(monitor_state_t *state, const char 
     if (!c) return NULL;
     c->state = state; strcpy(c->path, path);
     c->fd = ipc_connect(path); c->wake[0] = c->wake[1] = -1;
-    if (c->fd < 0 || ipc_hello(c->fd, &c->capabilities, &state->system.fdmon_backend) || pipe2(c->wake, O_CLOEXEC | O_NONBLOCK)) goto fail;
+    if (c->fd < 0 || ipc_version(c->fd, &c->capabilities, &state->system.fdmon_backend, &c->build) || pipe2(c->wake, O_CLOEXEC | O_NONBLOCK)) goto fail;
     if (query_host_read(path, &c->host)) goto fail;
+    /* Tab titles are fixed at plugin load, which happens on the GUI thread. */
+    if ((c->capabilities & IPC_CAP_DPKG) &&
+        query_dpkg_fetch(path, 0, c->dpkg_label, sizeof(c->dpkg_label), NULL, -1))
+        c->dpkg_label[0] = 0;
     state->remote = 1; state->connected = 1;
     int rc = pthread_create(&c->thread, NULL, connection_worker, c);
     if (rc) { errno = rc; goto fail; }
@@ -187,6 +203,8 @@ void query_connection_activate(query_connection_t *c)
     query_set_remote(c->path);
     remote_state = c->state;
     remote_capabilities = c->capabilities;
+    query_dpkg_set_remote_label(c->dpkg_label);
+    remote_build = c->build;
     query_host_activate(&c->host);
     c->active = 1;
 }
@@ -206,6 +224,11 @@ void query_connection_stop(query_connection_t *c)
         query_set_remote(NULL);
         remote_state = NULL;
         remote_capabilities = 0;
+        query_dpkg_set_remote_label(NULL);
+        remote_build = 0;
     }
     free(c);
 }
+uint64_t query_connection_build(const query_connection_t *c) { return c->build; }
+/* Build number of the Evemon collecting this GUI's data (ours when local). */
+uint64_t query_daemon_build(void) { return remote_path[0] ? remote_build : ipc_build(); }

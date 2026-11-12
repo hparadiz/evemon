@@ -111,9 +111,28 @@ static void destination_free(gpointer opaque)
 {
     destination_t *d = opaque; g_free(d->host); g_free(d->socket); g_free(d);
 }
+typedef struct {
+    GMutex lock;
+    GCond changed;
+    GCancellable *cancel;
+    gint64 deadline;
+    unsigned seconds; /* total allowance, for the timeout message */
+    gboolean done, expired;
+} connection_deadline_t;
+/* Installing or upgrading the remote Evemon is not part of an ordinary
+ * connection; the tunnel asks for the extra time when it has to do either. */
+static void extend_deadline(gpointer data, unsigned seconds)
+{
+    connection_deadline_t *d = data;
+    g_mutex_lock(&d->lock);
+    d->deadline += (gint64)seconds * G_TIME_SPAN_SECOND;
+    d->seconds += seconds;
+    g_cond_signal(&d->changed);
+    g_mutex_unlock(&d->lock);
+}
 static client_session_t *prepare_remote_attempt(const char *host,
     const char *socket, int run_daemon, unsigned idle_minutes, int adb,
-    GCancellable *cancel, GError **error)
+    connection_deadline_t *deadline, GCancellable *cancel, GError **error)
 {
     client_session_t *s = session_new();
     if (!s) { g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NO_SPACE, "Could not allocate an Evemon connection."); return NULL; }
@@ -128,7 +147,8 @@ static client_session_t *prepare_remote_attempt(const char *host,
         path = adb_tunnel_path(s->adb);
     } else {
         s->tunnel = ssh_tunnel_open(host, socket, run_daemon,
-                                    idle_minutes * 60, cancel, error);
+                                    idle_minutes * 60, extend_deadline,
+                                    deadline, cancel, error);
         if (!s->tunnel) goto fail;
         path = ssh_tunnel_path(s->tunnel);
     }
@@ -157,18 +177,13 @@ fail:
     client_session_discard(s);
     return NULL;
 }
-typedef struct {
-    GMutex lock;
-    GCond changed;
-    GCancellable *cancel;
-    gint64 deadline;
-    gboolean done, expired;
-} connection_deadline_t;
 static gpointer connection_deadline(gpointer data)
 {
     connection_deadline_t *d = data;
     g_mutex_lock(&d->lock);
-    while (!d->done && g_cond_wait_until(&d->changed, &d->lock, d->deadline)) {}
+    /* Woken early both when the attempt ends and when it is granted more time. */
+    while (!d->done && (g_cond_wait_until(&d->changed, &d->lock, d->deadline) ||
+                        g_get_monotonic_time() < d->deadline)) {}
     d->expired = !d->done;
     g_mutex_unlock(&d->lock);
     if (d->expired) g_cancellable_cancel(d->cancel);
@@ -185,14 +200,14 @@ static client_session_t *prepare_transport(const char *host,
     /* One deadline covers DNS, authentication/askpass, remote discovery,
      * forwarding, protocol negotiation and the first complete snapshot.
      * It also works for --remote, before any GUI main loop exists. */
-    connection_deadline_t d = {.cancel = g_cancellable_new(),
+    connection_deadline_t d = {.cancel = g_cancellable_new(), .seconds = timeout_seconds,
         .deadline = g_get_monotonic_time() + timeout_seconds * G_TIME_SPAN_SECOND};
     g_mutex_init(&d.lock); g_cond_init(&d.changed);
     gulong handler = cancel ? g_cancellable_connect(cancel, G_CALLBACK(cancel_attempt), d.cancel, NULL) : 0;
     GThread *timer = g_thread_new("ev-connect-limit", connection_deadline, &d);
     GError *failure = NULL;
     client_session_t *s = prepare_remote_attempt(host, socket, run_daemon,
-                                                 idle_minutes, adb, d.cancel,
+                                                 idle_minutes, adb, &d, d.cancel,
                                                  &failure);
     g_mutex_lock(&d.lock); d.done = TRUE; g_cond_signal(&d.changed); g_mutex_unlock(&d.lock);
     g_thread_join(timer);
@@ -203,7 +218,7 @@ static client_session_t *prepare_transport(const char *host,
         if (!(cancel && g_cancellable_set_error_if_cancelled(cancel, &failure)))
             g_set_error(&failure, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
                         "Connection to %s timed out after %u seconds. Check the transport and Evemon, then retry.",
-                        host, timeout_seconds);
+                        host, d.seconds);
     }
     g_object_unref(d.cancel); g_cond_clear(&d.changed); g_mutex_clear(&d.lock);
     if (failure) g_propagate_error(error, failure);
@@ -213,7 +228,7 @@ static client_session_t *prepare_remote(const char *host, const char *socket,
     int run_daemon, unsigned idle_minutes, GCancellable *cancel,
     GError **error)
 {
-    return prepare_transport(host, socket, run_daemon, idle_minutes, 0, 5,
+    return prepare_transport(host, socket, run_daemon, idle_minutes, 0, 15,
                              cancel, error);
 }
 static void prepare_worker(GTask *task, gpointer source, gpointer opaque, GCancellable *cancel)

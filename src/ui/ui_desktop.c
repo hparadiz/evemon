@@ -671,7 +671,7 @@ void gtk_ui_on_menu_restart_as_admin(GtkMenuItem *item, gpointer data)
     repair_elevation_environment();
     if (desktop_start_elevated(executable, "gtk")) {
         GtkWidget *error = gtk_message_dialog_new(GTK_WINDOW(data), GTK_DIALOG_MODAL,
-            GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "Could not start /usr/bin/kdesu.");
+            GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "Could not start kdesu or pkexec.");
         gtk_dialog_run(GTK_DIALOG(error)); gtk_widget_destroy(error);
     }
 }

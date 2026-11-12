@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <math.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -198,8 +200,12 @@ int ipc_send(int fd, uint16_t type, uint32_t id, const ipc_buf_t *body)
 }
 int ipc_receive(int fd, ipc_header_t *h, ipc_buf_t *body, int wake_fd)
 {
+    return ipc_receive_wait(fd, h, body, wake_fd, IPC_TIMEOUT_MS);
+}
+int ipc_receive_wait(int fd, ipc_header_t *h, ipc_buf_t *body, int wake_fd, int timeout_ms)
+{
     unsigned char header[IPC_HEADER_SIZE];
-    int64_t deadline = ipc_now_ms() + IPC_TIMEOUT_MS;
+    int64_t deadline = ipc_now_ms() + timeout_ms;
     if (transfer(fd, header, sizeof(header), 0, wake_fd, deadline) || ipc_header_read(header, h)) return -1;
     ipc_free(body);
     if (h->size) {
@@ -209,7 +215,18 @@ int ipc_receive(int fd, ipc_header_t *h, ipc_buf_t *body, int wake_fd)
     }
     return transfer(fd, body->data, body->len, 0, wake_fd, deadline);
 }
+/* "major.minor.patch" -> major * 10000 + minor * 100 + patch. */
+static uint64_t version_number(const char *version)
+{
+    unsigned major = 0, minor = 0, patch = 0;
+    sscanf(version, "%u.%u.%u", &major, &minor, &patch);
+    return (uint64_t)major * 10000 + minor * 100 + patch;
+}
 int ipc_hello(int fd, uint32_t *capabilities, uint32_t *backend)
+{
+    return ipc_version(fd, capabilities, backend, NULL);
+}
+int ipc_version(int fd, uint32_t *capabilities, uint32_t *backend, uint64_t *build)
 {
     ipc_buf_t b = {0}; ipc_header_t h;
     if (ipc_send(fd, IPC_HELLO, 1, &b) || ipc_receive(fd, &h, &b, -1)) { ipc_free(&b); return -1; }
@@ -221,5 +238,48 @@ int ipc_hello(int fd, uint32_t *capabilities, uint32_t *backend)
     if (!valid) { errno = EPROTO; return -1; }
     if (capabilities) *capabilities = caps;
     if (backend) *backend = kind;
+    if (build) *build = version_number(version);
     return 0;
+}
+uint64_t ipc_build(void)
+{
+    return version_number(EVEMON_VERSION);
+}
+int ipc_checksum(int fd, uint32_t *checksum)
+{
+    ipc_buf_t b = {0}; ipc_header_t h;
+    if (ipc_send(fd, IPC_CHECKSUM, 2, &b) || ipc_receive(fd, &h, &b, -1)) {
+        int error = errno; ipc_free(&b); errno = error; return -1;
+    }
+    uint32_t value = ipc_get_u32(&b);
+    int valid = h.type == (IPC_CHECKSUM | IPC_REPLY) && h.id == 2 && ipc_done(&b);
+    /* The error frame begins with its code, read into `value` above. */
+    int unsupported = h.type == IPC_ERROR && h.id == 2 && !b.error && value == IPC_UNSUPPORTED;
+    ipc_free(&b);
+    if (!valid) { errno = unsupported ? ENOTSUP : EPROTO; return -1; }
+    *checksum = value;
+    return 0;
+}
+static uint32_t self_checksum;
+static void compute_self_checksum(void)
+{
+    uint32_t table[256];
+    for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; ++k) c = c & 1 ? 0xedb88320u ^ (c >> 1) : c >> 1;
+        table[i] = c;
+    }
+    FILE *f = fopen("/proc/self/exe", "rb");
+    if (!f) return;
+    unsigned char chunk[16384]; size_t n; uint32_t crc = 0xffffffffu;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0)
+        for (size_t i = 0; i < n; ++i) crc = table[(crc ^ chunk[i]) & 0xff] ^ (crc >> 8);
+    if (!ferror(f)) self_checksum = crc ^ 0xffffffffu;
+    fclose(f);
+}
+uint32_t ipc_self_checksum(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, compute_self_checksum);
+    return self_checksum;
 }

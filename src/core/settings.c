@@ -41,6 +41,8 @@
 #include <errno.h>
 #include <unistd.h>
 #include <pwd.h>
+#include <fcntl.h>
+#include <sys/file.h>
 
 /* ── Singleton ───────────────────────────────────────────────── */
 
@@ -48,6 +50,9 @@ static evemon_settings_t g_settings;
 static int               g_settings_loaded = 0;
 static char              g_settings_path[1024];
 static char              g_settings_host[256];
+static json_t           *g_settings_baseline;
+
+static json_t *settings_encode(const evemon_settings_t *s);
 
 static void read_process_view(evemon_settings_t *s, json_t *root)
 {
@@ -123,26 +128,9 @@ const char *settings_path(void)
 
 /* ── Load ────────────────────────────────────────────────────── */
 
-static int settings_load_from_file(evemon_settings_t *s, const char *path)
+static void settings_read_object(evemon_settings_t *s, json_t *root)
 {
     settings_set_defaults(s);
-
-    json_error_t err;
-    json_t *root = json_load_file(path, 0, &err);
-    if (!root) {
-        /* File doesn't exist → not an error, just use defaults */
-        if (errno == ENOENT)
-            return 0;
-        fprintf(stderr, "evemon: settings parse error: %s (line %d)\n",
-                err.text, err.line);
-        return -1;
-    }
-
-    if (!json_is_object(root)) {
-        json_decref(root);
-        return -1;
-    }
-
     /* ── Scalars ─────────────────────────────────────────────── */
 
     json_t *v;
@@ -261,8 +249,21 @@ static int settings_load_from_file(evemon_settings_t *s, const char *path)
         }
     }
 
-    json_decref(root);
-    return 0;
+}
+
+static json_t *settings_read_file(const char *path)
+{
+    errno = 0;
+    json_error_t err;
+    json_t *root = json_load_file(path, 0, &err);
+    if (!root && errno == ENOENT) return json_object();
+    if (!json_is_object(root)) {
+        fprintf(stderr, "evemon: refusing to overwrite invalid or unreadable settings in %s%s%s\n",
+                path, root ? "" : ": ", root ? "" : err.text);
+        json_decref(root);
+        return NULL;
+    }
+    return root;
 }
 
 int settings_load(void)
@@ -271,7 +272,14 @@ int settings_load(void)
     /* Repair settings left root-owned by older elevated versions as well as
      * preserving ownership on new writes. Never follows a file symlink. */
     desktop_settings_owner(g_settings_path);
-    return settings_load_from_file(&g_settings, g_settings_path);
+    json_t *root = settings_read_file(g_settings_path);
+    settings_read_object(&g_settings, root);
+    json_decref(g_settings_baseline);
+    g_settings_baseline = settings_encode(&g_settings);
+    g_settings_loaded = 1;
+    int rc = root ? 0 : -1;
+    json_decref(root);
+    return rc;
 }
 
 int settings_select_host(const char *hostname)
@@ -284,33 +292,16 @@ int settings_select_host(const char *hostname)
 
 /* ── Save ────────────────────────────────────────────────────── */
 
-int settings_save(void)
+static json_t *settings_encode(const evemon_settings_t *s)
 {
-    build_settings_path();
-
-    /* Ensure ~/.config/evemon/ exists */
-    char dir[1024];
-    snprintf(dir, sizeof(dir), "%s/evemon", get_config_dir());
-    if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
-        fprintf(stderr, "evemon: cannot create %s: %s\n",
-                dir, strerror(errno));
-        return -1;
-    }
-
-    desktop_settings_owner(dir);
-
-    const evemon_settings_t *s = &g_settings;
-
     json_t *root = json_object();
-    if (!root) return -1;
+    if (!root) return NULL;
 
     /* ── Scalars ─────────────────────────────────────────────── */
 
-    if (s->frontend[0])
-        json_object_set_new(root, "frontend", json_string(s->frontend));
+    json_object_set_new(root, "frontend", json_string(s->frontend));
 
-    if (s->theme[0])
-        json_object_set_new(root, "theme", json_string(s->theme));
+    json_object_set_new(root, "theme", json_string(s->theme));
 
     json_object_set_new(root, "font_size",
                         json_integer(s->font_size));
@@ -328,24 +319,16 @@ int settings_save(void)
                         json_boolean(s->show_cpu_intensive));
     json_object_set_new(root, "show_gpu_only",
                         json_boolean(s->show_gpu_only));
-    /* Merge host views from disk so saving either frontend keeps the other
-     * hosts and the local process filters intact. */
-    json_t *previous = json_load_file(g_settings_path, 0, NULL);
-    json_t *hosts = json_deep_copy(json_object_get(previous, "hosts"));
-    if (!json_is_object(hosts)) { json_decref(hosts); hosts = json_object(); }
     if (g_settings_host[0]) {
         static const char *keys[] = {"preselected_pid", "show_audio_only", "show_cpu_intensive", "show_gpu_only"};
-        json_t *view = json_object();
-        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+        json_t *hosts = json_object(), *view = json_object();
+        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
             json_object_set(view, keys[i], json_object_get(root, keys[i]));
-            json_t *local = json_object_get(previous, keys[i]);
-            if (local) json_object_set(root, keys[i], local);
-            else json_object_set_new(root, keys[i], i ? json_false() : json_integer(1));
+            json_object_del(root, keys[i]);
         }
         json_object_set_new(hosts, g_settings_host, view);
+        json_object_set_new(root, "hosts", hosts);
     }
-    if (json_object_size(hosts)) json_object_set(root, "hosts", hosts);
-    json_decref(hosts); json_decref(previous);
     json_object_set_new(root, "spectro_theme",
                         json_integer(s->spectro_theme));
     json_object_set_new(root, "system_panel_open",
@@ -355,7 +338,7 @@ int settings_save(void)
 
     /* ── Columns ─────────────────────────────────────────────── */
 
-    if (s->column_count > 0) {
+    {
         json_t *cols = json_array();
         for (int i = 0; i < s->column_count; i++)
             json_array_append_new(cols, json_string(s->columns[i]));
@@ -364,7 +347,7 @@ int settings_save(void)
 
     /* ── Plugins ─────────────────────────────────────────────── */
 
-    if (s->plugin_count > 0) {
+    {
         json_t *plugins = json_array();
         for (int i = 0; i < s->plugin_count; i++) {
             json_t *p = json_pack("{s:s, s:b}",
@@ -382,7 +365,7 @@ int settings_save(void)
 
     /* ── Custom hotkeys ──────────────────────────────────────── */
 
-    if (s->custom_hotkey_count > 0) {
+    {
         json_t *hkeys = json_array();
         for (int i = 0; i < s->custom_hotkey_count; i++) {
             json_t *h = json_pack("{s:s, s:s}",
@@ -392,6 +375,89 @@ int settings_save(void)
         }
         json_object_set_new(root, "custom_hotkeys", hkeys);
     }
+
+    return root;
+}
+
+static json_t *array_entry(json_t *array, const char *field, const char *id)
+{
+    size_t i; json_t *value;
+    json_array_foreach(array, i, value) {
+        const char *key = json_string_value(json_object_get(value, field));
+        if (key && !strcmp(key, id)) return value;
+    }
+    return NULL;
+}
+
+/* Apply just this instance's edits to the latest disk copy. Nested host
+ * views and plugin/hotkey entries are independent edits too. */
+static void settings_merge(json_t *disk, json_t *base, json_t *local)
+{
+    const char *key; json_t *value;
+    json_object_foreach(local, key, value) {
+        json_t *old = json_object_get(base, key);
+        if (old && json_equal(old, value)) continue;
+        json_t *target = json_object_get(disk, key);
+        if (json_is_object(value)) {
+            if (!json_is_object(target)) {
+                target = json_object();
+                json_object_set_new(disk, key, target);
+            }
+            settings_merge(target, old, value);
+        } else if (json_is_array(value) &&
+                   (!strcmp(key, "plugins") || !strcmp(key, "custom_hotkeys"))) {
+            const char *field = !strcmp(key, "plugins") ? "id" : "action";
+            if (!json_is_array(target)) {
+                target = json_array();
+                json_object_set_new(disk, key, target);
+            }
+            size_t i; json_t *entry;
+            json_array_foreach(value, i, entry) {
+                const char *id = json_string_value(json_object_get(entry, field));
+                if (!id) continue;
+                json_t *previous = array_entry(old, field, id);
+                if (previous && json_equal(previous, entry)) continue;
+                json_t *current = array_entry(target, field, id);
+                if (current) settings_merge(current, previous, entry);
+                else json_array_append(target, entry);
+            }
+            /* Delete only entries this instance actually removed. */
+            for (size_t i = json_array_size(target); i > 0; i--) {
+                json_t *entry = json_array_get(target, i - 1);
+                const char *id = json_string_value(json_object_get(entry, field));
+                if (id && array_entry(old, field, id) && !array_entry(value, field, id))
+                    json_array_remove(target, i - 1);
+            }
+        } else json_object_set(disk, key, value);
+    }
+}
+
+int settings_save(void)
+{
+    settings_get();
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/evemon", get_config_dir());
+    if (mkdir(dir, 0755) && errno != EEXIST) return -1;
+    desktop_settings_owner(dir);
+
+    char lock_path[sizeof(g_settings_path) + 8];
+    snprintf(lock_path, sizeof(lock_path), "%s.lock", g_settings_path);
+    int lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lock < 0) return -1;
+    if (geteuid() == 0 && desktop_session_uid() != 0 &&
+        fchown(lock, desktop_session_uid(), desktop_session_gid())) {
+        close(lock);
+        return -1;
+    }
+    if (flock(lock, LOCK_EX)) { close(lock); return -1; }
+    json_t *root = settings_read_file(g_settings_path);
+    json_t *local = settings_encode(&g_settings);
+    if (!root || !local || !g_settings_baseline) {
+        json_decref(root); json_decref(local); close(lock);
+        return -1;
+    }
+    settings_merge(root, g_settings_baseline, local);
+    json_decref(local);
 
     /* Atomic replacement keeps restart from observing a partial settings file. */
     char temporary[sizeof(g_settings_path) + 16];
@@ -408,13 +474,14 @@ int settings_save(void)
         if (rc == 0 && rename(temporary, g_settings_path)) rc = -1;
         if (rc != 0) unlink(temporary);
     }
+    if (!rc) {
+        settings_read_object(&g_settings, root);
+        json_decref(g_settings_baseline);
+        g_settings_baseline = settings_encode(&g_settings);
+    } else fprintf(stderr, "evemon: failed to write %s\n", g_settings_path);
     json_decref(root);
-    if (rc != 0) {
-        fprintf(stderr, "evemon: failed to write %s\n", g_settings_path);
-        return -1;
-    }
-
-    return 0;
+    close(lock);
+    return rc;
 }
 
 /* ── Singleton accessor ──────────────────────────────────────── */

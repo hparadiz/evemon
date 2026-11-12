@@ -513,7 +513,7 @@ int evemon_collect_compat_results(compat_result_t *out, int capacity)
     /* ── PipeWire audio ───────────────────────────────────────── */
 
     {
-#ifdef HAVE_PIPEWIRE
+#if EVEMON_WITH_PIPEWIRE
         char pw_sock[PATH_MAX] = "";
         const char *runtime = getenv("PIPEWIRE_RUNTIME_DIR");
         if (!runtime || !runtime[0]) runtime = getenv("XDG_RUNTIME_DIR");
@@ -526,9 +526,9 @@ int evemon_collect_compat_results(compat_result_t *out, int capacity)
 
         if (pw_sock[0] && access(pw_sock, F_OK) == 0) {
             PUSH(COMPAT_OK, "PipeWire audio monitoring", "available",
-                 "Socket found at %s (%s).  "
-                 "Audio process graph, peak meters, and spectrogram "
-                 "are fully functional.", pw_sock, pw_how);
+                 "PipeWire support is enabled.  "
+                 "Session socket found at %s (%s).",
+                 pw_sock, pw_how);
         } else if (pw_sock[0]) {
             PUSH(COMPAT_WARN, "PipeWire audio monitoring", "no socket",
                  "PipeWire socket not found at %s.  "
@@ -543,7 +543,7 @@ int evemon_collect_compat_results(compat_result_t *out, int capacity)
 #else
         PUSH(COMPAT_INFO, "PipeWire audio monitoring", "not built",
              "evemon was compiled without PipeWire support.  "
-             "Rebuild with -DHAVE_PIPEWIRE to enable audio graphs "
+             "Build with PipeWire support enabled for audio graphs "
              "and spectrogram visualisation.");
 #endif
     }

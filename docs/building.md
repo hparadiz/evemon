@@ -16,21 +16,117 @@
 | clang | `clang` | `clang` | BPF kernel program compilation |
 | glib-compile-resources | `libglib2.0-dev-bin` | `glib2` | Embedded resources (icon, font) |
 | libepoxy | `libepoxy-dev` | `libepoxy` | OpenGL (MilkDrop plugin) |
-| GtkSourceView 4 (GTK) | `libgtksourceview-4-dev` | `gtksourceview4` | Syntax-highlighted write-monitor output |
+| GtkSourceView 4 *(optional, GTK)* | `libgtksourceview-4-dev` | `gtksourceview4` | GTK Write Log code view |
 | libsoup 3 *(optional)* | `libsoup-3.0-dev` | `libsoup3` | Album art HTTP download |
 | PipeWire *(optional)* | `libpipewire-0.3-dev` | `pipewire` | Audio graph + spectrogram |
+
+### Gentoo
+
+For a full GTK + Qt desktop build, install these dependencies from a root
+shell, reviewing Portage's proposed USE changes before accepting:
+
+```sh
+emerge --ask --noreplace \
+  sys-devel/gcc dev-build/make dev-vcs/git virtual/pkgconfig \
+  'llvm-core/clang[llvm_targets_BPF]' \
+  dev-libs/glib dev-util/glib-utils dev-libs/libbpf virtual/libelf virtual/zlib \
+  dev-libs/jansson dev-db/sqlite \
+  'x11-libs/gtk+:3[X]' x11-libs/gtksourceview:4 \
+  x11-libs/pango x11-libs/gdk-pixbuf media-libs/fontconfig x11-libs/libX11 \
+  'dev-qt/qtbase:6[gui,widgets,opengl]' \
+  media-video/pipewire net-libs/libsoup:3 media-libs/libepoxy
+```
+
+The BPF compiler needs Clang's `llvm_targets_BPF` USE flag. Qt needs `gui`,
+`widgets`, and (for MilkDrop) `opengl`. CMake is only needed when using
+`./configure` or `CONFIGURE_FLAGS`; install `dev-build/cmake` for those paths.
+No Android SDK, NDK, cross compiler, or runtime archive is needed for a local
+desktop build.
 
 ## Compile
 
 One source tree, executable, monitoring core, and install tree serve all modes:
 
 ```sh
-make -j4
+make
 ./build/evemon
 ```
 
-The default Make build includes both GTK and Qt; only the selected toolkit is
-loaded. Pass configuration options through `CONFIGURE_FLAGS`, for example
+Plain `make` needs no configuration step. It detects available dependencies and
+builds the features it can, then prints a summary of the executable, frontends,
+plugins, and omitted features with their missing dependencies. `make -j4` enables
+four parallel jobs; the build does not override your chosen job count.
+
+- GTK and Qt are selected independently. If neither can be built, the executable
+  defaults to headless mode.
+- Missing GtkSourceView or SQLite skips the corresponding GTK plugin. Qt needs
+  SQLite for its frontend.
+- GtkSourceView 4 is the code-view dependency of GTK's **Write Log** panel.
+  If it is missing, both build paths omit that panel with a warning; the GTK
+  frontend still builds. Qt's **Write Log** is native Qt and does not need GTK
+  or GtkSourceView.
+- Missing audio, OpenGL, nvtop, or Clang BPF support skips the affected optional
+  feature. eBPF-disabled builds retain the fanotify fallback.
+- Missing core dependencies (C compiler, archiver, pkg-config, GLib/GIO, libbpf,
+  libelf, or jansson) finish successfully with a prominent **NOTHING BUILT**
+  warning. Existing binaries are not presented as newly built. Install the
+  dependencies and rerun `make` before trying to run or install the program.
+
+Actual compiler and linker errors still fail the build. Dependency changes update
+the build's feature definitions and remove stale outputs for skipped features.
+Only the selected toolkit is loaded at runtime. Android runtime bundling is enabled
+only when `data/android-arm64/evemon-arm64.tar.gz` exists. To omit it even when
+the archive is present, use `make WITH_ANDROID=0`. `WITH_ANDROID=1` requires it.
+
+GPU support is enabled when the pinned nvtop checkout, libdrm, and libudev are
+available. To fetch the checkout, run
+this from the evemon repository root before building:
+
+```sh
+make nvtop
+make -j4
+```
+
+`make nvtop` runs `scripts/fetch-nvtop.sh`, checks out nvtop 3.3.2 into
+`third_party/nvtop`, and verifies its pinned commit. GPU builds also require
+libdrm and libudev (`x11-libs/libdrm virtual/libudev` on Gentoo).
+Missing AMD libdrm headers omit the AMD backend while retaining the other GPU
+backends. NVIDIA's SDK and driver libraries are not build dependencies.
+
+The `Build without optional dependencies` GitHub Actions workflow compiles both
+native Make and CMake builds in clean Debian containers. Its cases cover Qt
+without GTK, GTK without Qt, minimal versions of each frontend, headless without
+either toolkit or GPU dependencies, and GPU builds without AMD or NVIDIA
+development/runtime files. Every case also omits the Android bundle.
+Separate NVIDIA-only, Intel-only, and AMD-only builds compile the GPU plugin or
+Qt inspector and verify that exactly the selected vendor backend is linked.
+The NVIDIA-only container has neither DRM nor udev development files; Intel-only
+has no AMD headers/library, and AMD-only has no Intel headers/library. Select
+these builds with `make GPU_VENDOR=nvidia` (or `intel` / `amd`), or CMake's
+`-DEVEMON_GPU_VENDOR=nvidia`. The default `all` keeps every available backend.
+
+These jobs verify that the excluded dependencies really are absent, require the
+expected executable and frontend/plugin outputs, and check for accidental GTK
+or GPU-vendor link dependencies. They also compile the write-monitor service
+with GIO alone, so a GTK dependency accidentally added to that service fails the
+Qt-only and headless jobs. The shared runner is `scripts/ci-build-case.sh`; run it
+only inside a container with the dependency set in
+`.github/workflows/build-matrix.yml`. It compiles and inspects artifacts without
+launching Evemon.
+
+For custom builds, `./configure` is optional and requires CMake 3.21+. This path
+uses explicit feature selections and reports missing required dependencies as
+configuration errors:
+
+```sh
+./configure --with-qt --without-android
+make -j4
+```
+
+Once configured, `make` and `make install` use that CMake build tree and respect
+its selected options. To enable a later nvtop checkout in an already configured
+tree, rerun `./configure` with `--with-gpu` and your other options.
+You can also pass configuration options through `CONFIGURE_FLAGS`, for example
 `make CONFIGURE_FLAGS=--with-qt` for Qt only or
 `make CONFIGURE_FLAGS=--with-gtk` for GTK only. The earlier `evemon-qt` source
 directory is not needed to build this tree.
@@ -42,7 +138,7 @@ make -j4 BUILD_DIR=build-headless \
   CONFIGURE_FLAGS='--without-gtk --without-qt --without-pipewire --without-gpu'
 ```
 
-CMake 3.21+, a C compiler, pkg-config, GLib/GIO, jansson and libbpf/libelf
+A C compiler, pkg-config, GLib/GIO, jansson and libbpf/libelf
 are required. The eBPF kernel program also requires clang; `--without-ebpf`
 omits that program and disables the eBPF backend, retaining the fanotify fallback.
 Qt builds additionally require a C++17 compiler, Qt 6.4+ Core, Gui,
@@ -50,8 +146,21 @@ Widgets, PangoCairo, GdkPixbuf and SQLite. MilkDrop uses Qt OpenGL/OpenGLWidgets
 only when that module is loaded. Optional KDE Frameworks 6 WindowSystem enables
 native compositor blur; ColorScheme supplies KDE palette roles. Qt still builds
 without either library and reads installed `.colors` files itself. GTK builds require GTK 3, fontconfig, X11,
-PangoCairo, SQLite and GtkSourceView 4. PipeWire/album art, MilkDrop and GPU support
-are enabled by default and require their development dependencies.
+PangoCairo and optionally SQLite and GtkSourceView 4 for their plugins. The native
+Make build detects PipeWire and libsoup 3 together; `HAVE_PIPEWIRE=0` disables
+audio and MilkDrop. MilkDrop additionally needs libepoxy (and Qt OpenGL modules
+for its Qt view). Configured builds enable audio and MilkDrop
+by default; use `--without-pipewire` to omit both.
+
+Qt's Write Log includes read-only output, stdout/stderr selection, descendant and
+kernel-thread filters, a process/PID/timestamp gutter, wrapping, Clear, and
+auto-scroll that pauses when you scroll up and jumps to the end when re-enabled.
+Log highlighting is built in. The Syntax menu also offers code languages when
+KDE Frameworks SyntaxHighlighting is available (`kde-frameworks/syntax-highlighting:6`
+on Gentoo). This is optional: without it, Log and Plain Text remain available and
+the build reports the omitted code-language definitions. Native builds can omit
+it explicitly with `HAVE_QT_SYNTAX=0`. Write capture itself requires an active
+eBPF backend; the Qt panel explains when that backend is unavailable.
 
 Useful configuration options:
 
@@ -61,16 +170,19 @@ Useful configuration options:
 | `--without-pipewire` | Disable audio inspection and MilkDrop |
 | `--without-milkdrop` | Disable visualization only |
 | `--without-gpu` | Disable bundled nvtop GPU backends |
+| `--with-gpu` | Require the pinned nvtop checkout |
+| `--without-android` | Omit the Android runtime bundle |
+| `--with-android` | Require the Android runtime archive |
 | `--without-ebpf` | Disable eBPF tracing and kernel program compilation |
 | `--enable-debug` / `--enable-lto` | Debug symbols and optimization choices |
 | `--prefix=/usr` | Installation prefix |
 | `BUILD_DIR=PATH` | Select a separate build directory on the Make command line |
 
 Use `make install` to install the configured tree, or
-`DESTDIR=/tmp/evemon-stage make install` to stage it. `make package`, `make deb`
-and `make rpm` package the configured install tree through CPack (the latter two
-require the respective local packaging tools). The container packaging scripts
-continue to build GTK packages. `make asan` / `make ubsan` enable sanitizers in
+`DESTDIR=/tmp/evemon-stage make install` to stage it. After `./configure`,
+`make package` packages the configured install tree through CPack. `make deb`
+and `make rpm` use the container packaging scripts and require Docker.
+`make asan` / `make ubsan` enable sanitizers in
 the current build directory; use a separate directory for diagnostic builds.
 
 Build outputs include `build/evemon` with its core linked in, the selected
@@ -136,6 +248,12 @@ modules—to `$HOME/.cache/evemon/remote`, then starts the existing Evemon core
 with `--headless`. It never invokes `sudo`: the files and daemon have exactly
 the SSH account's identity, and are root-owned only when the SSH account itself
 is root.
+A copy installed this way is replaced when the connecting build is newer: an
+older version, or the same version built later. The new build must first run on
+that host; only then is that copy's daemon for the socket in use stopped, and
+the previous build is put back if the new one will not serve. An Evemon that was
+not installed this way (a system service, a distribution package, another
+account's or a GUI's) is used as it is and is never stopped or replaced.
 Leave **Socket override (optional)** blank to choose that account's secure
 default socket (`/run/evemon/evemon.sock` for root, otherwise its private XDG or
 `/tmp/evemon-UID` runtime directory). An override is an absolute path on the
@@ -148,9 +266,10 @@ already-running Evemon; a blank socket then means `/run/evemon/evemon.sock`.
 Evemon receives a full process snapshot before switching the view. An unavailable
 daemon or failed SSH connection leaves the dialog ready to retry and keeps the
 current view, title and connection intact. Cancel also keeps the current view.
-Known failures end the attempt immediately. One five-second deadline covers the
+Known failures end the attempt immediately. One fifteen-second deadline covers the
 entire attempt, including SSH authentication, forwarding, protocol negotiation
-and the first process snapshot. A timeout ends the attempt and re-enables
+and the first process snapshot; uploading a build to install or upgrade the
+remote Evemon is allowed another minute. A timeout ends the attempt and re-enables
 Connect; cancellation and timeout tear down the attempted connection's SSH
 processes and sockets. The current view remains active throughout.
 

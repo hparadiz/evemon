@@ -113,7 +113,11 @@ static void ring_init(ring_t *r)
     r->tail    = 0;
     r->dropped = 0;
     pthread_mutex_init(&r->lock, NULL);
-    pthread_cond_init(&r->cond, NULL);
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&r->cond, &attr);
+    pthread_condattr_destroy(&attr);
 }
 
 static void ring_destroy(ring_t *r)
@@ -167,7 +171,7 @@ static int ring_pop_wait(ring_t *r, fdmon_event_t *ev, int timeout_ms)
             pthread_cond_wait(&r->cond, &r->lock);
         } else {
             struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
+            clock_gettime(CLOCK_MONOTONIC, &ts);
             ts.tv_sec  += timeout_ms / 1000;
             ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
             if (ts.tv_nsec >= 1000000000L) {
@@ -348,7 +352,8 @@ static net_io_entry_t *net_io_ht_find_or_create(net_io_entry_t *ht,
                                                  pid_t tgid)
 {
     unsigned h = (unsigned)tgid % NET_IO_HT_SIZE;
-    for (int k = 0; k < NET_IO_HT_SIZE; k++) {
+    net_io_entry_t *oldest = &ht[h];
+    for (int k = 0; k < 64; k++) {
         if (!ht[h].used) {
             ht[h].tgid = tgid;
             ht[h].used = 1;
@@ -356,9 +361,11 @@ static net_io_entry_t *net_io_ht_find_or_create(net_io_entry_t *ht,
         }
         if (ht[h].tgid == tgid)
             return &ht[h];
+        if (ht[h].last_active_ns < oldest->last_active_ns) oldest = &ht[h];
         h = (h + 1) % NET_IO_HT_SIZE;
     }
-    return NULL;  /* table full */
+    *oldest = (net_io_entry_t){.tgid = tgid, .used = 1};
+    return oldest;
 }
 
 void submit_net_event(fdmon_ctx_t *ctx, pid_t tgid, uint32_t bytes,
@@ -367,6 +374,7 @@ void submit_net_event(fdmon_ctx_t *ctx, pid_t tgid, uint32_t bytes,
     pthread_mutex_lock(&ctx->net_io_lock);
     net_io_entry_t *e = net_io_ht_find_or_create(ctx->net_io, tgid);
     if (e) {
+        e->last_active_ns = now_monotonic_ns();
         if (is_send)
             e->send_bytes += bytes;
         else
@@ -386,7 +394,7 @@ int fdmon_net_io_get(const fdmon_ctx_t *ctx, pid_t tgid,
     /* Read under lock (snapshot deltas are stable between snapshots) */
     pthread_mutex_lock((pthread_mutex_t *)&ctx->net_io_lock);
     unsigned h = (unsigned)tgid % NET_IO_HT_SIZE;
-    for (int k = 0; k < NET_IO_HT_SIZE; k++) {
+    for (int k = 0; k < 64; k++) {
         if (!ctx->net_io[h].used) {
             pthread_mutex_unlock((pthread_mutex_t *)&ctx->net_io_lock);
             return -1;
@@ -403,10 +411,30 @@ int fdmon_net_io_get(const fdmon_ctx_t *ctx, pid_t tgid,
     return -1;
 }
 
+static void net_io_gc(fdmon_ctx_t *ctx, uint64_t now);
+
+double fdmon_net_io_window(const fdmon_ctx_t *ctx)
+{
+    if (!ctx) return 1.0;
+    if (ctx->remote) return query_fdmon_window(ctx);
+    pthread_mutex_lock((pthread_mutex_t *)&ctx->net_io_lock);
+    double window = ctx->net_window_seconds;
+    pthread_mutex_unlock((pthread_mutex_t *)&ctx->net_io_lock);
+    return window > 0.0 ? window : 1.0;
+}
+
 void fdmon_net_io_snapshot(fdmon_ctx_t *ctx)
 {
     if (!ctx || ctx->remote) return;
     pthread_mutex_lock(&ctx->net_io_lock);
+    uint64_t now = now_monotonic_ns();
+    ctx->net_window_seconds = now > ctx->net_sample_ns
+        ? (double)(now - ctx->net_sample_ns) / 1e9 : 1.0;
+    ctx->net_sample_ns = now;
+    if (now - ctx->net_gc_ns >= 5000000000ULL) {
+        net_io_gc(ctx, now);
+        ctx->net_gc_ns = now;
+    }
 
     /* Snapshot per-PID counters */
     for (int i = 0; i < NET_IO_HT_SIZE; i++) {
@@ -449,7 +477,8 @@ static sock_io_entry_t *sock_io_ht_find_or_create(sock_io_entry_t *ht,
           ^ ((unsigned)lport << 16 | (unsigned)rport);
     }
     h %= SOCK_IO_HT_SIZE;
-    for (int k = 0; k < SOCK_IO_HT_SIZE; k++) {
+    sock_io_entry_t *oldest = &ht[h];
+    for (int k = 0; k < 64; k++) {
         sock_io_entry_t *e = &ht[h];
         if (!e->used) {
             e->tgid  = tgid;
@@ -467,9 +496,38 @@ static sock_io_entry_t *sock_io_ht_find_or_create(sock_io_entry_t *ht,
         if (!inode && e->tgid == tgid && e->laddr == laddr &&
             e->lport == lport && e->raddr == raddr && e->rport == rport)
             return e;
+        if (e->last_active_ns < oldest->last_active_ns) oldest = e;
         h = (h + 1) % SOCK_IO_HT_SIZE;
     }
-    return NULL;  /* table full */
+    *oldest = (sock_io_entry_t){.tgid = tgid, .laddr = laddr, .lport = lport,
+        .raddr = raddr, .rport = rport, .inode = inode, .used = 1};
+    return oldest;
+}
+
+/* Rehash survivors: deleting a linear-probing slot in place breaks lookups. */
+static void net_io_gc(fdmon_ctx_t *ctx, uint64_t now)
+{
+    net_io_entry_t *net = calloc(NET_IO_HT_SIZE, sizeof(*net));
+    sock_io_entry_t *sock = calloc(SOCK_IO_HT_SIZE, sizeof(*sock));
+    if (net && sock) {
+        for (int i = 0; i < NET_IO_HT_SIZE; i++) {
+            net_io_entry_t *e = &ctx->net_io[i];
+            if (!e->used || now - e->last_active_ns > 30000000000ULL) continue;
+            if (kill(e->tgid, 0) && errno == ESRCH) continue;
+            *net_io_ht_find_or_create(net, e->tgid) = *e;
+        }
+        for (int i = 0; i < SOCK_IO_HT_SIZE; i++) {
+            sock_io_entry_t *e = &ctx->sock_io[i];
+            if (!e->used || now - e->last_active_ns > 30000000000ULL) continue;
+            if (kill(e->tgid, 0) && errno == ESRCH) continue;
+            *sock_io_ht_find_or_create(sock, e->tgid, e->laddr, e->lport,
+                                       e->raddr, e->rport, e->inode) = *e;
+        }
+        memcpy(ctx->net_io, net, sizeof(ctx->net_io));
+        memcpy(ctx->sock_io, sock, sizeof(ctx->sock_io));
+    }
+    free(net);
+    free(sock);
 }
 
 void submit_sock_event(fdmon_ctx_t *ctx, pid_t tgid,
@@ -482,6 +540,7 @@ void submit_sock_event(fdmon_ctx_t *ctx, pid_t tgid,
     sock_io_entry_t *e = sock_io_ht_find_or_create(
         ctx->sock_io, tgid, laddr, lport, raddr, rport, inode);
     if (e) {
+        e->last_active_ns = now_monotonic_ns();
         if (is_send)
             e->send_bytes += bytes;
         else
@@ -600,10 +659,15 @@ static int fanotify_backend_init(fdmon_ctx_t *ctx)
     if (fan_fd < 0)
         return -1;
 
-    /* Mark the entire root filesystem. */
+    /* Check permission now; only retain the mark while events are consumed. */
     if (fanotify_mark(fan_fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
                       FAN_OPEN | FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE,
                       AT_FDCWD, "/") < 0) {
+        close(fan_fd);
+        return -1;
+    }
+    if (fanotify_mark(fan_fd, FAN_MARK_REMOVE | FAN_MARK_MOUNT,
+                     FAN_OPEN | FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE, AT_FDCWD, "/") < 0) {
         close(fan_fd);
         return -1;
     }
@@ -656,6 +720,8 @@ fdmon_ctx_t *fdmon_create(fdmon_backend_t backend)
     pthread_mutex_init(&ctx->net_io_lock, NULL);
     pid_set_init(&ctx->watched);
     ring_init(&ctx->ring);
+    ctx->net_sample_ns = ctx->net_gc_ns = now_monotonic_ns();
+    ctx->net_window_seconds = 1.0;
     memset(ctx->net_io, 0, sizeof(ctx->net_io));
     memset(ctx->sock_io, 0, sizeof(ctx->sock_io));
 
@@ -710,6 +776,18 @@ fdmon_backend_t fdmon_active_backend(const fdmon_ctx_t *ctx)
     return ctx && ctx->remote ? (fdmon_backend_t)query_fdmon_backend(ctx) : ctx ? ctx->backend : FDMON_BACKEND_AUTO;
 }
 
+static int open_events_enable(fdmon_ctx_t *ctx, int enabled)
+{
+    if (ctx->backend == FDMON_BACKEND_EBPF)
+        return fdmon_ebpf_open_enable(ctx, enabled);
+    if (ctx->backend == FDMON_BACKEND_FANOTIFY)
+        return fanotify_mark(ctx->fan_fd,
+            (enabled ? FAN_MARK_ADD : FAN_MARK_REMOVE) | FAN_MARK_MOUNT,
+            FAN_OPEN | FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE, AT_FDCWD, "/");
+    errno = ENOTSUP;
+    return -1;
+}
+
 int fdmon_watch_pid(fdmon_ctx_t *ctx, pid_t pid)
 {
     if (!ctx || pid <= 0) { errno = EINVAL; return -1; }
@@ -730,6 +808,10 @@ int fdmon_watch_pid(fdmon_ctx_t *ctx, pid_t pid)
         }
     }
 
+    if (!ctx->root_count && open_events_enable(ctx, 1)) {
+        pthread_mutex_unlock(&ctx->group_lock);
+        return -1;
+    }
     ctx->roots[ctx->root_count++] = pid;
 
     /* Enumerate all current descendants and add to watched set. */
@@ -760,6 +842,7 @@ int fdmon_unwatch_pid(fdmon_ctx_t *ctx, pid_t pid)
         errno = ESRCH;
         return -1;
     }
+    if (!ctx->root_count) open_events_enable(ctx, 0);
 
     /* Rebuild the watched set from remaining roots. */
     pid_set_free(&ctx->watched);

@@ -565,9 +565,9 @@ void proc_detail_update(ui_ctx_t *ctx)
         if (fdmon && pid > 0)
             fdmon_net_io_get(fdmon, (pid_t)pid, &send_b, &recv_b);
 
-        /* Format as rate (interval ≈ 2 s from monitor thread) */
+        /* Format using the interval measured by the collector. */
         char net_buf[64];
-        double interval = 2.0;
+        double interval = fdmon_net_io_window(fdmon);
         #define FMT_NET_RATE(bytes) do { \
             double _r = (interval > 0.01) ? (double)(bytes) / interval \
                                           : (double)(bytes); \
@@ -788,7 +788,7 @@ void pinned_panels_update(ui_ctx_t *ctx)
                 fdmon_net_io_get(fdmon, (pid_t)pid, &send_b, &recv_b);
 
             char net_buf[64];
-            double interval = 2.0;
+            double interval = fdmon_net_io_window(fdmon);
             #define FMT_NET_RATE(bytes) do { \
                 double _r = (interval > 0.01) ? (double)(bytes) / interval \
                                               : (double)(bytes); \

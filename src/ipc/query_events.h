@@ -19,4 +19,5 @@ void query_fdmon_destroy(fdmon_ctx_t *ctx);
 int query_fdmon_control(fdmon_ctx_t *ctx, unsigned kind, pid_t pid, int value, int remove);
 int query_fdmon_backend(const fdmon_ctx_t *ctx);
 int query_fdmon_net(const fdmon_ctx_t *ctx, pid_t pid, uint64_t *sent, uint64_t *received);
+double query_fdmon_window(const fdmon_ctx_t *ctx);
 #endif

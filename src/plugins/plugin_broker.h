@@ -79,8 +79,8 @@ void broker_cycle_free(broker_cycle_t *cycle);
  *   reg    – plugin registry (read for PID list / data_needs)
  *   fdmon  – the eBPF fd-monitor context (may be NULL)
  *
- * Spawns a pthread worker.  If a previous cycle is still running it is
- * cancelled automatically before the new one starts.
+ * Spawns a pthread worker. If a previous cycle is still running, the refresh is
+ * skipped so the in-flight gather can finish.
  * Returns 1 when a worker starts, 0 when there is no work or startup fails.
  * Call start/cancel/destroy on the owning frontend thread.
  */

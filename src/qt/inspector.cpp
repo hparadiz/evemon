@@ -22,6 +22,7 @@ void evemon_qt_audio_destroy(void *);
 #endif
 evemon_plugin_t *evemon_qt_net_init(void);
 evemon_plugin_t *evemon_qt_gentoo_init(void);
+evemon_plugin_t *evemon_qt_dpkg_init(void);
 #ifdef HAVE_NVTOP
 evemon_plugin_t *evemon_qt_gpu_init(void);
 #endif
@@ -39,7 +40,7 @@ evemon_plugin_t *evemon_qt_system_libs_init(void);
 Inspector::Inspector(Kind type, const QString &name, QWidget *parent) : QWidget(parent), kind(type), title(name)
 {
     titleBytes = name.toUtf8();
-    const char *ids[] = {"pipewire", "net", "env", "write_monitor_ui", "fd", "threads", "devices", "mmap", "libs", "cgroup", "gentoo", "milkdrop", "system_fd", "system_libs", "gpu"};
+    const char *ids[] = {"pipewire", "net", "env", "write_monitor_ui", "fd", "threads", "devices", "mmap", "libs", "cgroup", "gentoo", "dpkg", "milkdrop", "system_fd", "system_libs", "gpu"};
     idBytes = "org.evemon." + QByteArray(ids[type]);
     descriptor.abi_version = evemon_PLUGIN_ABI_VERSION;
     descriptor.id = idBytes.constData(); descriptor.name = titleBytes.constData();
@@ -52,6 +53,7 @@ Inspector::Inspector(Kind type, const QString &name, QWidget *parent) : QWidget(
     case Audio: native = evemon_qt_pipewire_init(); break;
     #endif
     case Gentoo: native = evemon_qt_gentoo_init(); break;
+    case Dpkg: native = evemon_qt_dpkg_init(); break;
     case Network: native = evemon_qt_net_init(); break;
 #ifdef HAVE_NVTOP
     case Gpu: native = evemon_qt_gpu_init(); break;
@@ -78,7 +80,13 @@ Inspector::Inspector(Kind type, const QString &name, QWidget *parent) : QWidget(
         setMediaEnabled(true);
     }
 #endif
-    if ((kind == Gpu || kind == Gentoo) && !native) { available = false; return; }
+    if ((kind == Gpu || kind == Gentoo || kind == Dpkg) && !native) { available = false; return; }
+    // Plugins that name themselves at runtime ("Ubuntu / APT") get an empty title here.
+    if (title.isEmpty() && native && native->name) {
+        title = QString::fromUtf8(native->name);
+        titleBytes = title.toUtf8();
+        descriptor.name = titleBytes.constData();
+    }
     if (native) {
         descriptor.data_needs = native->data_needs;
         descriptor.id = native->id;
@@ -156,6 +164,7 @@ void Inspector::updateData(const evemon_proc_data_t &data)
 }
 void Inspector::appendWrite(const evemon_fd_write_payload_t &write) { if (writes) writes->append(write); }
 int Inspector::writeMask() const { return writes ? writes->mask() : 0; }
+void Inspector::setWriteCaptureAvailable(bool available) { if (writes) writes->setCaptureAvailable(available); }
 
 void Inspector::showEvent(QShowEvent *event)
 {

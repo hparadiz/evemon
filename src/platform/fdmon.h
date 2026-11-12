@@ -185,6 +185,9 @@ int fdmon_net_io_get(const fdmon_ctx_t *ctx, pid_t tgid,
  */
 void fdmon_net_io_snapshot(fdmon_ctx_t *ctx);
 
+/* Measured seconds covered by the current network byte deltas. */
+double fdmon_net_io_window(const fdmon_ctx_t *ctx);
+
 /* ── per-socket (connection) network I/O ─────────────────────── */
 
 /*

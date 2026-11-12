@@ -11,12 +11,22 @@ option(EVEMON_GTK "Build the GTK 3 frontend" ON)
 option(EVEMON_QT "Build the Qt 6 frontend" OFF)
 option(EVEMON_PIPEWIRE "Enable PipeWire audio inspection" ON)
 option(EVEMON_MILKDROP "Enable MilkDrop visualization" ON)
-option(EVEMON_GPU "Enable bundled nvtop GPU backends" ON)
+set(EVEMON_GPU_DEFAULT OFF)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvtop/src/extract_gpuinfo.c")
+    set(EVEMON_GPU_DEFAULT ON)
+endif()
+option(EVEMON_GPU "Enable bundled nvtop GPU backends" ${EVEMON_GPU_DEFAULT})
 option(EVEMON_EBPF "Enable eBPF tracing and build its kernel program" ON)
 option(EVEMON_LTO "Enable link-time optimization" OFF)
+# Release builds bundle the CI-built runtime; source builds without it lose ADB only.
 set(EVEMON_ANDROID_ARCHIVE
     "${CMAKE_CURRENT_SOURCE_DIR}/data/android-arm64/evemon-arm64.tar.gz"
     CACHE FILEPATH "Prebuilt Android ARM64 Evemon runtime archive")
+set(EVEMON_ANDROID_DEFAULT OFF)
+if(EXISTS "${EVEMON_ANDROID_ARCHIVE}")
+    set(EVEMON_ANDROID_DEFAULT ON)
+endif()
+option(EVEMON_ANDROID "Bundle the prebuilt Android ARM64 runtime for ADB remotes" ${EVEMON_ANDROID_DEFAULT})
 # Visualization assets/code never enter a headless-only build.
 if(NOT EVEMON_GTK AND NOT EVEMON_QT)
     set(EVEMON_MILKDROP OFF)
@@ -57,6 +67,7 @@ add_library(evemon_core STATIC src/core/log.c src/core/monitor.c src/core/steam.
     src/ui/devices.c src/platform/desktop_session.c src/platform/compatibility.c
     src/ipc/ipc_wire.c src/ipc/query_client.c src/ipc/query_server.c src/ipc/query_snapshot.c src/ipc/query_inspect.c
     src/ipc/query_events.c src/ipc/query_fdmon.c src/ipc/query_gpu.c src/ipc/query_host.c src/ipc/query_about.c
+    src/ipc/query_dpkg.c src/plugins/dpkg_lookup.c
     src/app/client_session.c src/remote/ssh_tunnel.c src/remote/adb_tunnel.c)
 target_compile_definitions(evemon_core PRIVATE EVEMON_NO_GTK
     EVEMON_HAVE_GTK=$<BOOL:${EVEMON_GTK}> EVEMON_HAVE_QT=$<BOOL:${EVEMON_QT}>
@@ -84,19 +95,23 @@ if(EVEMON_GTK OR EVEMON_QT)
         file(CREATE_LINK "${CMAKE_CURRENT_SOURCE_DIR}/presets"
             "${CMAKE_CURRENT_BINARY_DIR}/share/evemon/milkdrop/presets" SYMBOLIC)
     endif()
-    if(NOT EXISTS "${EVEMON_ANDROID_ARCHIVE}")
-        message(FATAL_ERROR
-            "Android ADB support requires ${EVEMON_ANDROID_ARCHIVE}")
+    if(EVEMON_ANDROID)
+        if(NOT EXISTS "${EVEMON_ANDROID_ARCHIVE}")
+            message(FATAL_ERROR
+                "Android ADB support requires ${EVEMON_ANDROID_ARCHIVE} (or -DEVEMON_ANDROID=OFF)")
+        endif()
+        file(SHA256 "${EVEMON_ANDROID_ARCHIVE}" EVEMON_ANDROID_SHA256)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${EVEMON_ANDROID_ARCHIVE}")
+        file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/share/evemon/android")
+        configure_file("${EVEMON_ANDROID_ARCHIVE}"
+            "${CMAKE_CURRENT_BINARY_DIR}/share/evemon/android/evemon-arm64.tar.gz"
+            COPYONLY)
+        target_compile_definitions(evemon_core PRIVATE
+            EVEMON_ANDROID_SHA256="${EVEMON_ANDROID_SHA256}")
+    else()
+        file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/share/evemon/android/evemon-arm64.tar.gz")
     endif()
-    file(SHA256 "${EVEMON_ANDROID_ARCHIVE}" EVEMON_ANDROID_SHA256)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-        "${EVEMON_ANDROID_ARCHIVE}")
-    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/share/evemon/android")
-    configure_file("${EVEMON_ANDROID_ARCHIVE}"
-        "${CMAKE_CURRENT_BINARY_DIR}/share/evemon/android/evemon-arm64.tar.gz"
-        COPYONLY)
-    target_compile_definitions(evemon_core PRIVATE
-        EVEMON_ANDROID_SHA256="${EVEMON_ANDROID_SHA256}")
 endif()
 add_executable(evemon src/app/main.c)
 target_compile_definitions(evemon PRIVATE EVEMON_NO_GTK)
@@ -112,7 +127,11 @@ if(EVEMON_PIPEWIRE)
 endif()
 if(EVEMON_GTK OR EVEMON_QT)
     pkg_check_modules(PANGO REQUIRED IMPORTED_TARGET pangocairo gdk-pixbuf-2.0)
-    pkg_check_modules(SQLITE REQUIRED IMPORTED_TARGET sqlite3)
+    if(EVEMON_QT)
+        pkg_check_modules(SQLITE REQUIRED IMPORTED_TARGET sqlite3)
+    else()
+        pkg_check_modules(SQLITE QUIET IMPORTED_TARGET sqlite3)
+    endif()
     if(EVEMON_PIPEWIRE)
         pkg_check_modules(SOUP REQUIRED IMPORTED_TARGET libsoup-3.0)
     endif()
@@ -125,7 +144,7 @@ if(EVEMON_GTK OR EVEMON_QT)
 endif()
 if(EVEMON_GPU)
     include(cmake/Gpu.cmake)
-    target_link_libraries(evemon_core PRIVATE evemon_gpu PkgConfig::DRM PkgConfig::UDEV)
+    target_link_libraries(evemon_core PRIVATE evemon_gpu)
     target_compile_definitions(evemon_core PUBLIC HAVE_NVTOP)
     install(FILES "${NVTOP_DIR}/COPYING"
         DESTINATION ${CMAKE_INSTALL_DATADIR}/evemon/licenses RENAME nvtop-COPYING)
@@ -166,9 +185,11 @@ if(EVEMON_GTK OR EVEMON_QT)
     install(FILES icon.png DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/256x256/apps RENAME evemon.png)
     install(FILES icon.png DESTINATION ${CMAKE_INSTALL_DATADIR}/pixmaps RENAME evemon.png)
     install(FILES data/software-directory.sqlite DESTINATION ${CMAKE_INSTALL_DATADIR}/evemon)
-    install(FILES "${EVEMON_ANDROID_ARCHIVE}"
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/evemon/android
-        RENAME evemon-arm64.tar.gz)
+    if(EVEMON_ANDROID)
+        install(FILES "${EVEMON_ANDROID_ARCHIVE}"
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/evemon/android
+            RENAME evemon-arm64.tar.gz)
+    endif()
 endif()
 if(EVEMON_MILKDROP AND (EVEMON_GTK OR EVEMON_QT))
     install(DIRECTORY presets/ DESTINATION ${CMAKE_INSTALL_DATADIR}/evemon/milkdrop/presets FILES_MATCHING PATTERN "*.milk")
@@ -182,3 +203,41 @@ set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0-or-later")
 set(CPACK_GENERATOR TGZ)
 include(CPack)
 message(STATUS "Evemon: GTK=${EVEMON_GTK}, Qt=${EVEMON_QT}, default=${EVEMON_DEFAULT_UI}; headless always available")
+message(STATUS "Evemon: GPU=${EVEMON_GPU}, Android bundle=${EVEMON_ANDROID}")
+
+# The Make entry point prints this only after the configured build succeeds.
+set(EVEMON_BUILD_SUMMARY "\nEvemon build summary (built or up to date)\n  Executable: ${CMAKE_CURRENT_BINARY_DIR}/evemon (headless support included)\n  Default interface: ${EVEMON_DEFAULT_UI}\n")
+foreach(frontend GTK QT)
+    if(EVEMON_${frontend})
+        string(APPEND EVEMON_BUILD_SUMMARY "  ${frontend} frontend: enabled\n")
+    else()
+        string(APPEND EVEMON_BUILD_SUMMARY "  ${frontend} frontend: omitted by configuration\n")
+    endif()
+endforeach()
+if(EVEMON_GTK)
+    string(JOIN ", " plugin_names ${GTK_PLUGINS})
+    string(APPEND EVEMON_BUILD_SUMMARY "  GTK plugins: ${plugin_names}\n")
+    if(NOT SOURCEVIEW_FOUND)
+        string(APPEND EVEMON_BUILD_SUMMARY "  WARNING: GTK Write Log omitted; missing: gtksourceview-4\n")
+    endif()
+endif()
+if(EVEMON_QT)
+    string(JOIN ", " inspector_names ${EVEMON_INSPECTORS})
+    string(APPEND EVEMON_BUILD_SUMMARY "  Qt inspectors: ${inspector_names}\n")
+    string(APPEND EVEMON_BUILD_SUMMARY "  Qt Write Log: native code view with built-in log highlighting\n")
+    if(TARGET KF6::SyntaxHighlighting)
+        string(APPEND EVEMON_BUILD_SUMMARY "  Qt code-language highlighting: KF6SyntaxHighlighting\n")
+    else()
+        string(APPEND EVEMON_BUILD_SUMMARY "  WARNING: extra Qt code languages unavailable; optional KF6SyntaxHighlighting not found; Write Log remains available\n")
+    endif()
+endif()
+foreach(feature EBPF PIPEWIRE MILKDROP GPU ANDROID)
+    if(feature STREQUAL "ANDROID" AND NOT EVEMON_GTK AND NOT EVEMON_QT)
+        string(APPEND EVEMON_BUILD_SUMMARY "  Android runtime: omitted for headless build\n")
+    elseif(EVEMON_${feature})
+        string(APPEND EVEMON_BUILD_SUMMARY "  ${feature}: enabled\n")
+    else()
+        string(APPEND EVEMON_BUILD_SUMMARY "  WARNING: ${feature} omitted by configuration\n")
+    endif()
+endforeach()
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/build-summary.txt" CONTENT "${EVEMON_BUILD_SUMMARY}")

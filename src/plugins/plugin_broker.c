@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <limits.h>
+#include <time.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1053,7 +1054,7 @@ static void collect_sock_inodes(pid_t pid,
  *     processes without root on kernel >= 5.6.
  *
  * Both paths populate the same inode-keyed cache and produce
- * send_delta / recv_delta by diffing cumulative counters across cycles.
+ * send_delta / recv_delta as bytes per second over the observed interval.
  */
 
 #define TCPCACHE_SIZE 8192
@@ -1062,6 +1063,7 @@ typedef struct {
     unsigned long inode;
     uint64_t      prev_acked;    /* tcpi_bytes_acked from last cycle  */
     uint64_t      prev_received; /* tcpi_bytes_received from last cycle */
+    uint64_t      prev_sample_ns;
     uint64_t      delta_send;
     uint64_t      delta_recv;
 } tcp_cache_entry_t;
@@ -1072,34 +1074,55 @@ static pthread_mutex_t   g_tcp_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* -1 = not yet probed, 0 = unavailable, 1 = available */
 static int g_inet_diag_available = -1;
 
-static tcp_cache_entry_t *tcpcache_get(unsigned long inode)
+static tcp_cache_entry_t *tcpcache_get(unsigned long inode, int create)
 {
+    if (!inode) return NULL;
     size_t slot = (size_t)(inode * 2654435761UL) % TCPCACHE_SIZE;
-    for (size_t i = 0; i < TCPCACHE_SIZE; i++) {
+    tcp_cache_entry_t *oldest = &g_tcp_cache[slot];
+    for (size_t i = 0; i < 64; i++) {
         size_t s = (slot + i) % TCPCACHE_SIZE;
         if (g_tcp_cache[s].inode == inode)
             return &g_tcp_cache[s];
         if (g_tcp_cache[s].inode == 0) {
+            if (!create) return NULL;
             g_tcp_cache[s].inode = inode;
             return &g_tcp_cache[s];
         }
+        if (g_tcp_cache[s].prev_sample_ns < oldest->prev_sample_ns)
+            oldest = &g_tcp_cache[s];
     }
-    return NULL;
+    if (!create) return NULL;
+    *oldest = (tcp_cache_entry_t){.inode = inode};
+    return oldest;
+}
+
+static uint64_t tcp_counter_rate(uint64_t bytes, uint64_t elapsed_ns)
+{
+    long double rate = (long double)bytes * 1000000000.0L / elapsed_ns;
+    return rate >= (long double)UINT64_MAX ? UINT64_MAX : (uint64_t)rate;
 }
 
 static void tcpcache_update(unsigned long inode,
                             uint64_t acked, uint64_t received)
 {
-    tcp_cache_entry_t *ce = tcpcache_get(inode);
+    tcp_cache_entry_t *ce = tcpcache_get(inode, 1);
     if (!ce) return;
-    if (ce->prev_acked > 0 || ce->prev_received > 0) {
-        ce->delta_send = (acked    >= ce->prev_acked)
-                       ? acked    - ce->prev_acked    : 0;
-        ce->delta_recv = (received >= ce->prev_received)
-                       ? received - ce->prev_received : 0;
+    struct timespec now;
+    uint64_t sample_ns = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+        sample_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+    if (ce->prev_sample_ns && sample_ns - ce->prev_sample_ns < 250000000ULL)
+        return;
+    ce->delta_send = ce->delta_recv = 0;
+    if (ce->prev_sample_ns && sample_ns > ce->prev_sample_ns &&
+        acked >= ce->prev_acked && received >= ce->prev_received) {
+        uint64_t elapsed_ns = sample_ns - ce->prev_sample_ns;
+        ce->delta_send = tcp_counter_rate(acked - ce->prev_acked, elapsed_ns);
+        ce->delta_recv = tcp_counter_rate(received - ce->prev_received, elapsed_ns);
     }
     ce->prev_acked    = acked;
     ce->prev_received = received;
+    ce->prev_sample_ns = sample_ns;
 }
 
 /*
@@ -1162,6 +1185,13 @@ static int inet_diag_dump(int nlfd, int family)
  */
 static int inet_diag_refresh_cache(void)
 {
+    static uint64_t last_refresh;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+    if (last_refresh && ns - last_refresh < 250000000ULL)
+        return g_inet_diag_available > 0;
+    last_refresh = ns;
     int nlfd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC,
                       NETLINK_INET_DIAG);
     if (nlfd < 0) {
@@ -1377,7 +1407,7 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
         if (si->kind == BSOCK_TCP || si->kind == BSOCK_TCP6) {
             /* Check INET_DIAG cache first (already refreshed above) */
             pthread_mutex_lock(&g_tcp_cache_mutex);
-            tcp_cache_entry_t *ce = tcpcache_get(inodes[i]);
+            tcp_cache_entry_t *ce = tcpcache_get(inodes[i], 0);
             if (ce && (ce->delta_send || ce->delta_recv)) {
                 s->send_delta = ce->delta_send;
                 s->recv_delta = ce->delta_recv;
@@ -1398,7 +1428,7 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
                                        &acked, &received)) {
                         pthread_mutex_lock(&g_tcp_cache_mutex);
                         tcpcache_update(inodes[i], acked, received);
-                        tcp_cache_entry_t *ce2 = tcpcache_get(inodes[i]);
+                        tcp_cache_entry_t *ce2 = tcpcache_get(inodes[i], 0);
                         if (ce2) {
                             s->send_delta = ce2->delta_send;
                             s->recv_delta = ce2->delta_recv;
@@ -1434,9 +1464,10 @@ static void gather_sockets(pid_t pid, void *fdmon, broker_pid_data_t *d)
                 }
 
                 if (matched) {
-                    s->send_delta = sio->delta_send;
-                    s->recv_delta = sio->delta_recv;
-                    s->total = sio->delta_send + sio->delta_recv;
+                    double seconds = fdmon_net_io_window(fdmon);
+                    s->send_delta = (uint64_t)(sio->delta_send / seconds);
+                    s->recv_delta = (uint64_t)(sio->delta_recv / seconds);
+                    s->total = s->send_delta + s->recv_delta;
                     break;
                 }
             }
@@ -1707,7 +1738,13 @@ int broker_start(plugin_registry_t *reg, void *fdmon)
     if (!reg || reg->count == 0)
         return 0;
 
-    /* Cancel previous cycle — join so we don't orphan threads */
+    /* A slow gather must finish before the refresh timer starts another.
+     * Dispatch matches results to the current PID of each plugin instance. */
+    pthread_mutex_lock(&g_broker_mutex);
+    int busy = g_broker_running;
+    pthread_mutex_unlock(&g_broker_mutex);
+    if (busy) return 0;
+    /* Reap the completed worker before reusing its handle. */
     broker_cancel();
 
     /* Collect unique tracked PIDs — dynamically sized */

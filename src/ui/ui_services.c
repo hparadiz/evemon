@@ -7,10 +7,14 @@ int gtk_ui_host_monitor_fd_subscribe(void *host_ctx, pid_t pid, int fd)
     if (!host_ctx) return -1;
     ui_ctx_t *ctx = host_ctx;
     if (!ctx->mon || !ctx->mon->fdmon) return -1;
-    /* Ensure write probe is attached */
-    if (fdmon_write_enable(ctx->mon->fdmon) != 0)
-        return -1;
-    return fdmon_add_pid_fd(ctx->mon->fdmon, pid, fd);
+    if (pid <= 0 || (fd != 1 && fd != 2)) return -1;
+    if (!ctx->write_subscriptions)
+        ctx->write_subscriptions = g_hash_table_new(g_direct_hash, g_direct_equal);
+    gpointer key = GUINT_TO_POINTER((guint)pid * 4 + (guint)fd);
+    guint count = GPOINTER_TO_UINT(g_hash_table_lookup(ctx->write_subscriptions, key));
+    if (!count && fdmon_add_pid_fd(ctx->mon->fdmon, pid, fd)) return -1;
+    g_hash_table_insert(ctx->write_subscriptions, key, GUINT_TO_POINTER(count + 1));
+    return 0;
 }
 
 void gtk_ui_host_monitor_fd_unsubscribe(void *host_ctx, pid_t pid, int fd)
@@ -18,7 +22,16 @@ void gtk_ui_host_monitor_fd_unsubscribe(void *host_ctx, pid_t pid, int fd)
     if (!host_ctx) return;
     ui_ctx_t *ctx = host_ctx;
     if (!ctx->mon || !ctx->mon->fdmon) return;
-    fdmon_remove_pid_fd(ctx->mon->fdmon, pid, fd);
+    if (!ctx->write_subscriptions || pid <= 0 || (fd != 1 && fd != 2)) return;
+    gpointer key = GUINT_TO_POINTER((guint)pid * 4 + (guint)fd);
+    guint count = GPOINTER_TO_UINT(g_hash_table_lookup(ctx->write_subscriptions, key));
+    if (count > 1) g_hash_table_insert(ctx->write_subscriptions, key, GUINT_TO_POINTER(count - 1));
+    else if (count) {
+        g_hash_table_remove(ctx->write_subscriptions, key);
+        fdmon_remove_pid_fd(ctx->mon->fdmon, pid, fd);
+    }
+    if (!g_hash_table_size(ctx->write_subscriptions))
+        g_clear_pointer(&ctx->write_subscriptions, g_hash_table_unref);
 }
 
 int gtk_ui_host_monitor_watch_children(void *host_ctx, pid_t pid, int fd_mask)

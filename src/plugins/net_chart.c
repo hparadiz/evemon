@@ -262,8 +262,21 @@ gboolean on_chart_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
         g_object_unref(_lo);
     }
     int pad_outer = (int)(fsize * 0.55 + 0.5);
-    int ML  = lbl_w_outer + pad_outer * 3;
-    int MR  = cnt_w_outer + pad_outer * 3;
+    /* Rotated axis titles need their font height in horizontal space. */
+    int axis_h;
+    {
+        PangoLayout *layout = pango_cairo_create_layout(cr);
+        PangoFontDescription *font = pango_font_description_new();
+        pango_font_description_set_family(font, "Sans");
+        pango_font_description_set_absolute_size(font, fsize * PANGO_SCALE);
+        pango_layout_set_font_description(layout, font);
+        pango_font_description_free(font);
+        pango_layout_set_text(layout, "B/s conns", -1);
+        pango_layout_get_pixel_size(layout, NULL, &axis_h);
+        g_object_unref(layout);
+    }
+    int ML  = lbl_w_outer + pad_outer * 3 + axis_h;
+    int MR  = cnt_w_outer + pad_outer * 4 + axis_h;
     int MT  = lbl_h_outer + pad_outer;
     int MB  = lbl_h_outer * 2 + pad_outer * 4;
     int cw  = w - ML - MR;

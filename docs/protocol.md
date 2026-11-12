@@ -84,19 +84,26 @@ client should repair those for presentation. No native C struct, pointer, paddin
 | 10 | HOST | empty | hostname, boot ID, PID namespace (3 strings), evemon UID (u32) |
 | 11 | SIGNAL | PID, signal (2 × u32), kernel start ticks, evemon instance (2 × u64) | Linux errno (u32), zero on success |
 | 12 | ABOUT | empty | hostname, distro ID, distro name, kernel, evemon user, login shell, CPU model, GPU names (8 strings); CPU count (u32); uptime seconds, total memory bytes, available memory bytes (3 × u64) |
+| 13 | DPKG | u32 PID (0 = distribution label only) | package record, see below |
+| 14 | CHECKSUM | empty | u32 CRC-32 of the Evemon executable |
 
 Capabilities: snapshot=1, inspector=2, PipeWire graph=4, MPRIS=8, tracing event
-transport=16, GPU=32, process signals=64, About system information=128. The tracing transport can exist without an active tracing
+transport=16, GPU=32, process signals=64, About system information=128, dpkg
+package lookup=256. The tracing transport can exist without an active tracing
 backend. Backend values: 0 unavailable, 1 fanotify, 2 eBPF. Permission failures
-are not disguised as a working eBPF backend.
+are not disguised as a working eBPF backend. The dpkg capability is advertised
+only when the Evemon host has a populated `/var/lib/dpkg/status`.
 
 Connections persist across requests. Requests may be fragmented across writes
 or coalesced into a single write. Clients must parse frames, not socket read
 boundaries, and match replies by type and identifier. Subscription frames and
 request replies may interleave. Sending SUBSCRIBE with period 0 cancels the
-snapshot subscription; 1–3600000 enables it. The period controls delivery of the
-latest cached sample, **not** collection. Sampling remains controlled by the
-Evemon instance's `--interval`. Faster consumers receive repeated generations.
+snapshot subscription; 1–3600000 enables it. The period controls how soon a new
+sample is delivered, **not** collection. Sampling remains controlled by the
+Evemon instance's `--interval`. Each generation is sent once; while nothing new
+is published the latest snapshot is repeated every two seconds, so a client may
+treat a subscription that stays silent for five seconds as a lost connection.
+Older Evemon versions repeat the cached sample every period; clients accept both.
 
 ## Process snapshots
 
@@ -168,6 +175,26 @@ resolution and HDR are unavailable because headless Evemon has no desktop sessio
 The GUI never substitutes its local machine's information. Older Evemon versions
 without this capability show an explicit unavailable message.
 
+A DPKG reply starts with the host's distribution label (string, for example
+`Ubuntu`), a u32 flags word and a u32 install reason (two's complement: 1
+automatic, 0 manual, -1 unknown). Flags: executable readable=1, package found=2,
+snap=4, essential=8, protected=16. When "found" is set, 21 strings follow in this
+order: name, version, architecture, source, repository origin, section,
+priority, maintainer, original maintainer, homepage, license, Multi-Arch,
+installed size, install time, summary, description, dependencies, and for snaps
+revision, base, grade and confinement (empty for dpkg packages). PID 0 returns
+only the label with flags 0 and reason -1, and is answered inline. Other
+lookups run on the `ev-package` thread against Evemon's own `/proc` and dpkg
+database; an executable that belongs to another root filesystem (container,
+chroot, flatpak runtime) is reported as readable but not found. A lookup may
+take as long as a cold scan of the dpkg file lists: Evemon allows it 60 seconds
+before closing the connection, and stops it early if the client disconnects.
+
+CHECKSUM returns the CRC-32 (IEEE 802.3, as zlib computes it) of the running
+Evemon's executable, or 0 when Evemon cannot read it. A managing GUI compares
+it with its own to decide whether the Evemon it installed over SSH is another
+build. Evemon versions without the request answer with error 4.
+
 A CONTROL payload replaces that connection's complete tracing set. Each of up to
 128 records is three u32 values: kind, PID, value. Kind 1 monitors a PID/FD pair;
 kind 2 watches a PID and descendants with stdout/stderr mask 1/2/3; kind 3 enables
@@ -194,8 +221,10 @@ Each peer has at most one outgoing frame. Slow consumers cannot accumulate an
 unbounded queue. Incomplete requests and blocked writes expire after five
 seconds; an idle negotiated connection or subscription remains connected.
 Inspection has a bounded 16-job queue and its own `ev-inspect` thread, independent
-of `ev-query`, `ev-monitor` and either GUI main loop. Snapshot copies are taken
-under the monitor lock and encoded/sent outside it.
+of `ev-query`, `ev-monitor` and either GUI main loop. Package lookups have a
+separate 16-job queue and `ev-package` thread, so neither kind of request can
+fill the other's queue. A queued job whose client disconnects is discarded.
+Snapshot copies are taken under the monitor lock and encoded/sent outside it.
 
 SIGINT and SIGTERM stop the service, join workers and unlink only the socket inode
 created by that service. Active sockets cannot be taken over; stale sockets are

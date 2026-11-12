@@ -332,6 +332,16 @@ static unsigned long long read_cpu_ticks(pid_t pid)
  * Writes a short label into buf: "docker", "lxc", "podman", "k8s",
  * "containerd", "nspawn", "container" (generic), or "" (host).
  */
+static int has_container_id(const char *path)
+{
+    size_t digits = 0;
+    for (; *path; path++) {
+        digits = isxdigit((unsigned char)*path) ? digits + 1 : 0;
+        if (digits >= 32) return 1;
+    }
+    return 0;
+}
+
 static void read_container(pid_t pid, char *buf, size_t bufsz)
 {
     buf[0] = '\0';
@@ -344,7 +354,7 @@ static void read_container(pid_t pid, char *buf, size_t bufsz)
     if (f) {
         char line[1024]; // k8s pods can have very long cgroup paths
         while (fgets(line, sizeof(line), f)) {
-            if (strstr(line, "docker") || strstr(line, "/moby/")) {
+            if ((strstr(line, "docker") || strstr(line, "/moby/")) && has_container_id(line)) {
                 snprintf(buf, bufsz, "docker");
                 break;
             }
@@ -352,15 +362,15 @@ static void read_container(pid_t pid, char *buf, size_t bufsz)
                 snprintf(buf, bufsz, "lxc");
                 break;
             }
-            if (strstr(line, "libpod")) {
+            if (strstr(line, "libpod") && has_container_id(line)) {
                 snprintf(buf, bufsz, "podman");
                 break;
             }
-            if (strstr(line, "kubepods") || strstr(line, "kubelet")) {
+            if (strstr(line, "kubepods")) {
                 snprintf(buf, bufsz, "k8s");
                 break;
             }
-            if (strstr(line, "containerd")) {
+            if (strstr(line, "containerd") && has_container_id(line)) {
                 snprintf(buf, bufsz, "containerd");
                 break;
             }
@@ -803,6 +813,7 @@ typedef struct {
 } io_hist_entry_t;
 
 static io_hist_entry_t g_io_history[CPU_HT_SIZE];
+static io_hist_entry_t g_next_io_history[CPU_HT_SIZE];
 
 static io_hist_entry_t *io_hist_get(io_hist_entry_t *ht, pid_t pid)
 {
@@ -1300,7 +1311,12 @@ int monitor_state_init(monitor_state_t *state)
 
     if (pthread_mutex_init(&state->lock, NULL) != 0)
         return -1;
-    if (pthread_cond_init(&state->updated, NULL) != 0) {
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    int rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (!rc) rc = pthread_cond_init(&state->updated, &attr);
+    pthread_condattr_destroy(&attr);
+    if (rc != 0) {
         pthread_mutex_destroy(&state->lock);
         return -1;
     }
@@ -1395,21 +1411,18 @@ void *monitor_thread(void *arg)
                       snap.entries[i].io_read_bytes,
                       snap.entries[i].io_write_bytes);
 
-        /* GC stale entries from g_io_history */
-        for (int i = 0; i < CPU_HT_SIZE; i++) {
-            if (!g_io_history[i].used) continue;
-            if (cpu_ht_get(g_prev_ticks, g_io_history[i].pid) == 0 &&
-                g_io_history[i].pid != 0)
-                g_io_history[i].used = 0;
-        }
+        /* Rehash live histories without opening holes in collision chains. */
+        memset(g_next_io_history, 0, sizeof(g_next_io_history));
 
         /* Update per-PID I/O history ring buffers and copy into snapshot */
         for (uint32_t i = 0; i < snap.len; i++) {
             float combined = snap.entries[i].io_read_rate
                            + snap.entries[i].io_write_rate;
             io_hist_entry_t *hist = io_hist_get_or_create(
-                g_io_history, snap.entries[i].pid);
+                g_next_io_history, snap.entries[i].pid);
             if (hist) {
+                io_hist_entry_t *old = io_hist_get(g_io_history, snap.entries[i].pid);
+                if (old) *hist = *old;
                 io_hist_push(hist, combined);
                 snap.entries[i].io_history_len = (uint8_t)hist->count;
                 memcpy(snap.entries[i].io_history, hist->samples,
@@ -1419,6 +1432,7 @@ void *monitor_thread(void *arg)
             }
         }
 
+        memcpy(g_io_history, g_next_io_history, sizeof(g_io_history));
         g_prev_valid = 1;
         prev_ts = now_ts;
 
@@ -1462,7 +1476,7 @@ void *monitor_thread(void *arg)
          * (which the shutdown path does) unblocks us at once.          */
         {
             struct timespec deadline;
-            clock_gettime(CLOCK_REALTIME, &deadline);
+            clock_gettime(CLOCK_MONOTONIC, &deadline);
             deadline.tv_sec  += state->interval_ms / 1000;
             deadline.tv_nsec += (state->interval_ms % 1000) * 1000000L;
             if (deadline.tv_nsec >= 1000000000L) {
